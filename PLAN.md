@@ -16,17 +16,18 @@ almost none of it survives in a browser that does not run scripts.
 
 So the central bet of this project is:
 
-**2kbrowser renders HTML and CSS. It does not execute JavaScript.**
+**2kbrowser renders HTML and CSS as the web did around the year 2000. It does
+not execute JavaScript.**
 
 That is not a limitation we plan to grow out of. It is the product. It makes
 all four kinds of slop fall out of one decision:
 
-| Slop | How the no-JS engine addresses it |
+| Slop | How the engine addresses it |
 | --- | --- |
 | **Browser bloat** | No JS engine means no JIT, no sync account, no extension host, no AI sidebar, no sponsored tiles. There is nowhere to put the bloat. |
 | **Page-level junk** | Consent modals, popups, autoplay, and infinite scroll are script-driven. They simply do not run. |
 | **Resource weight** | No JIT, no JS heap, CPU rasterisation. Tens of MB of RAM, not hundreds. |
-| **AI-generated content** | Not solved by no-JS — needs its own layer (§6). It is the hardest of the four and is deliberately scheduled last. |
+| **AI-generated content** | Not solved by the engine — needs its own layer (§7). It is the hardest of the four and is deliberately scheduled last. |
 
 The sites that break without JS are, to a striking degree, the same sites that
 generate the slop. Meanwhile Wikipedia, MDN, most documentation, most blogs,
@@ -35,39 +36,87 @@ unmodified or degrade to readable HTML. **The constraint is the filter.**
 
 ### Why not "a tiny JS subset"
 
-The middle path is worse than either end. Sites feature-detect. A browser that
-runs *some* JS advertises that it runs JS, gets served the script path, and then
-fails in confusing, silent, page-specific ways. A browser that runs none gets
-served `<noscript>` content and static fallbacks, which is the behaviour we
-actually want. Partial JS support is the one option that gets the downsides of
-both.
+Settled: **no JavaScript at all.** The middle path is worse than either end.
+Sites feature-detect. A browser that runs *some* JS advertises that it runs JS,
+gets served the script path, and then fails in confusing, silent, page-specific
+ways. A browser that runs none gets served `<noscript>` content and static
+fallbacks, which is the behaviour we actually want. Partial JS support is the
+one option that gets the downsides of both.
 
-If JS becomes necessary, the right shape is an explicit, per-site, off-by-default
-escape hatch backed by a real engine — not a homegrown subset. See M6.
+There is no JS milestone on this roadmap. If that ever changes it will be an
+explicit, per-site, off-by-default escape hatch backed by a real engine
+(QuickJS) — never a homegrown subset — and it will be a new decision, not a
+deferred one.
 
 ---
 
-## 2. What we write vs. what we take
+## 2. What "2k" means: a specification with a finish line
 
-A from-scratch engine does not mean from-scratch everything. Three areas are
+The name is read as the web of ~2000, and that turns out to be the most
+important engineering decision in this document — because it converts the
+project's biggest risk into a bounded problem.
+
+A from-scratch engine chasing the modern web can never finish. CSS grows every
+year; you are behind permanently by construction. But the 2000s-era web is
+approximately **CSS 2.1**, and CSS 2.1 is a *completed specification*. It is
+frozen. It has an official test suite. It will never gain a feature again.
+
+That gives this project something almost no browser engine has: **a finish
+line.** "Done" is a state we can actually reach and then maintain, rather than
+a horizon that recedes.
+
+Concretely, the layout scope is:
+
+- **In:** the CSS 2.1 box model, block, inline, **floats**, **tables**,
+  positioned layout, and **quirks mode** (essential — pages of this era were
+  authored against it, and getting quirks wrong misrenders them badly).
+- **Out:** flexbox and grid. Not "later" — out of scope. The 2000s web laid out
+  with tables and floats, and supporting both *plus* modern layout is how the
+  scope quietly becomes unbounded again.
+
+This also fixes the era's less glamorous requirements, which are real work and
+easy to forget:
+
+- **Legacy character encodings.** windows-1252, ISO-8859-*, Shift_JIS, GB2312,
+  EUC-KR. Pages of this era frequently declare the wrong one or none at all, so
+  encoding sniffing is required, not optional. `encoding_rs` handles this.
+- **Framesets.** `<frameset>` and `<frame>` were everywhere. A period-correct
+  browser needs them; a modern one would not.
+- **Animated GIFs**, and only the era's image formats: GIF, JPEG, PNG.
+- **Plain HTTP.** Much of the surviving old web is http:// only. Needs a
+  deliberate policy (§4), not an accident.
+
+One consequence worth stating: this is a browser for reading the web, current
+and archived, as documents. Modern web *applications* are out of scope by
+construction — which is the same statement as "no JavaScript," arrived at from
+the other direction.
+
+---
+
+## 3. What we write vs. what we take
+
+A from-scratch engine does not mean from-scratch everything. Some areas are
 tarpits with no product upside, and are where CVEs live:
 
 **Do not write these.** Hostile-input parsing and text are solved problems that
 punish amateurs:
 
 - **HTML parsing** — the spec *is* an error-recovery algorithm, not a grammar.
-  Use `html5ever`.
+  Use `html5ever`. Note the modern parser is *correct* for old content: the
+  HTML5 parsing algorithm was reverse-engineered from how browsers already
+  handled exactly this era's markup.
 - **CSS tokenisation** — likewise spec-defined. Use `cssparser`.
+- **Character encoding detection and decoding** — `encoding_rs`.
 - **TLS** — never. `rustls`.
 - **Font shaping, line breaking, bidi** — the single hardest part of a renderer.
   Use `cosmic-text` (which layers `rustybuzz` + `swash` + Unicode line breaking).
-- **Image decoding** — `image`, and support fewer formats rather than more.
+- **Image decoding** — `image`, restricted to GIF, JPEG, and PNG.
 
 **Do write these.** This is the actual project:
 
 - DOM tree (arena-allocated, index-based — not `Rc<RefCell<…>>`)
-- CSS cascade: selector matching, specificity, inheritance, computed values
-- Box tree construction and layout: block, inline, then tables and flexbox
+- CSS 2.1 cascade: selector matching, specificity, inheritance, computed values
+- Box tree and layout: block, inline, floats, tables, positioning, quirks mode
 - Display list and painting
 - Resource loading, cache, and network *policy*
 - Browser chrome and input handling
@@ -82,90 +131,124 @@ GPU rasterisation is a later optimisation, not a dependency. "Fast on a
 ten-year-old laptop" is the constraint, and that laptop's GPU drivers are the
 least reliable thing about it.
 
+### Cross-platform rendering is nearly free, and we should exploit it
+
+Linux, macOS, and Windows are all first-class from M1, with reference tests
+running on all three in CI.
+
+Normally that would triple the pixel-baseline maintenance burden, because
+platform font rasterisers disagree about essentially every glyph. It does not
+here: we shape with `rustybuzz` and rasterise with `tiny-skia` on the CPU, so if
+we **bundle our own fonts and never touch the system font rasteriser**, output
+is deterministic across platforms. One set of baseline images, valid everywhere.
+
+This is a deliberate constraint with a real cost — the browser will not use your
+system fonts, and will not look native — and it buys correctness testing on all
+three platforms for the price of one. For a document renderer that is the right
+trade. It should be an ADR in M0, because a lot follows from it.
+
 ---
 
-## 3. Budgets
+## 4. Policy defaults
 
-"2k" is read here as a budget ethos: the browser should be small enough that its
-size is a stated number rather than an emergent one. These are **enforced in CI
-as failing tests**, not aspirations in a README:
+These are the "without the slop" decisions that live in code rather than UI:
+
+| Default | Rationale |
+| --- | --- |
+| **Zero third-party requests** | One policy rule eliminates essentially all advertising and tracking, with no filter lists, no subscriptions, and no update treadmill. The highest-leverage line of code in the project. |
+| **First-party, session-only cookies** | Persistent cross-site identity is the mechanism the slop economy runs on. |
+| **No JS** | §1. |
+| **Plain HTTP allowed, clearly marked** | Much of the old web is http:// only; refusing it would gut the browser's purpose. But it is unauthenticated and tamperable, and the chrome must say so plainly rather than hiding it. Never silently upgrade or silently downgrade. |
+
+### Budgets
+
+Resource weight is one of the four goals, so these are **enforced in CI as
+failing tests**, not aspirations in a README:
 
 | Budget | Target | Measured by |
 | --- | --- | --- |
 | Release binary size | ≤ 20 MB | CI check on artifact |
 | Cold start to first paint | ≤ 150 ms | benchmark on reference page |
 | RSS rendering a Wikipedia article | ≤ 100 MB | instrumented run |
-| Third-party network requests | **0 by default** | network policy test |
-| JIT / dynamic codegen | none | absence of a JS engine |
+| Third-party network requests | 0 | network policy test |
 
-Numbers are first drafts — the point is that they exist, are measured, and
-regressions break the build. If a budget needs to move, that is a deliberate,
-reviewed change.
-
-The zero-third-party-requests default deserves emphasis: **one policy rule
-eliminates essentially all advertising and tracking**, with no filter lists, no
-subscriptions, and no update treadmill. It is the highest-leverage line of code
-in the project.
+Numbers are first drafts. The point is that they exist, are measured, and
+regressions break the build.
 
 ---
 
-## 4. Repository shape
+## 5. Repository shape
 
 ```
 crates/
   net/      fetch, HTTP cache, TLS, cookie policy, request policy
-  dom/      arena tree, html5ever integration
-  css/      parsing, selector matching, cascade, computed style
-  layout/   box tree; block, inline, table, flex
+  dom/      arena tree, html5ever integration, encoding sniffing
+  css/      CSS 2.1 parsing, selector matching, cascade, computed style
+  layout/   box tree; block, inline, float, table, positioned, quirks
   paint/    display list, tiny-skia rasterisation
   text/     shaping and line-breaking wrapper over cosmic-text
   shell/    window, chrome, tabs, input, navigation
   slop/     filtering, reader mode, content heuristics
+fonts/      bundled fonts (see §3 — determinism depends on these)
 tests/
   ref/      reference tests: render → PNG → compare against expected
+  css21/    the official CSS 2.1 test suite, tracked as a pass-rate metric
   budgets/  size, memory, and startup budget enforcement
 docs/adr/   architecture decision records
 ```
 
 Reference-test infrastructure lands in **M1**, not later. A renderer without
 pixel regression tests rots silently, and retrofitting them is much harder than
-starting with them. A curated subset of Web Platform Tests follows once layout
-is real enough to pass any of them.
+starting with them.
+
+The CSS 2.1 test suite is the project's north-star metric — a frozen target with
+a published pass rate. Track the number from the first milestone that can pass
+any of it, and the roadmap becomes measurable rather than vibes.
 
 ---
 
-## 5. Milestones
+## 6. Milestones
 
 Each milestone ends in something you can run and look at.
 
 ### M0 — Foundation
-Cargo workspace, CI (build, test, clippy, fmt), ADR directory, budget harness
-skeleton, and the decisions in this document recorded as ADRs.
-*Done when:* CI is green on an empty workspace and budgets are measurable.
+Cargo workspace; CI on Linux, macOS, and Windows; ADR directory; budget harness
+skeleton. ADRs for the decisions in this document, in particular no-JS, CSS 2.1
+as the scope boundary, and bundled-fonts-for-determinism.
+*Done when:* CI is green on all three platforms and budgets are measurable.
 
 ### M1 — It renders a document
-HTTPS fetch → `html5ever` → DOM → a small CSS subset → block layout → text via
-`cosmic-text` → `tiny-skia` → a window. Reference-test harness in place.
-*Done when:* a hand-written HTML page and `example.com` render recognisably.
+HTTP(S) fetch → `html5ever` → DOM → a small CSS subset → block layout → text via
+`cosmic-text` → `tiny-skia` → a window. Reference-test harness running on all
+three platforms against a single shared baseline set.
+*Done when:* a hand-written HTML page and `example.com` render recognisably, and
+the three platforms produce identical pixels.
 
-### M2 — It renders the readable web
-The bulk of the engine work. Real cascade and selector matching, the full box
-model, inline layout with correct line breaking, images, links, scrolling, hit
-testing, backgrounds and borders, tables (the old web runs on them), then
-flexbox.
-*Done when:* a Wikipedia article, a typical blog, and Hacker News are pleasant
-to read. This is the milestone that takes the longest by a wide margin.
+### M2 — It renders the era's web
+The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
+
+1. Real cascade and selector matching; full box model; backgrounds and borders
+2. Inline layout with correct line breaking
+3. **Tables** — the era's dominant layout mechanism, so this comes early
+4. **Floats** — the other one
+5. Images, links, scrolling, hit testing
+6. Positioned layout, then **quirks mode**, then **framesets**
+
+*Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
+Internet Archive captures from ~2000 are pleasant to read. This milestone takes
+longer than all the others combined; expect the schedule to be dominated by
+items 2 and 3.
 
 ### M3 — Browser chrome
 Tabs, URL bar, history, back/forward, bookmarks, find-in-page. Keyboard-first.
 This is where "without the slop" becomes visible as UX rather than as an
-absence — no sponsored tiles, no feed, no account, no onboarding.
+absence — no sponsored tiles, no feed, no account, no onboarding. The HTTP
+transparency requirement from §4 lands here.
 *Done when:* it is the browser you reach for to read something.
 
 ### M4 — Hardening
-Cookie policy (first-party, session-only by default), a process/sandbox model,
-continuous fuzzing of the HTML and CSS parsers, TLS configuration review,
-`AccessKit` integration for screen readers.
+Process/sandbox model, continuous fuzzing of the HTML, CSS, and image-decode
+paths, TLS configuration review, `AccessKit` integration for screen readers.
 *Done when:* we are willing to tell a stranger to browse untrusted sites with it.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
@@ -173,14 +256,9 @@ continuous fuzzing of the HTML and CSS parsers, TLS configuration review,
 Reader mode as a first-class view. Content-quality signals surfaced in the UI.
 Optional community blocklists for content farms.
 
-### M6 — JS escape hatch (optional, and possibly never)
-If and only if M1–M5 prove the no-JS thesis insufficient: embed QuickJS behind a
-per-site, off-by-default toggle with a deliberately minimal DOM binding surface.
-Revisited as a decision, not assumed as a roadmap item.
-
 ---
 
-## 6. The AI-slop problem
+## 7. The AI-slop problem
 
 This is the one goal the architecture does not give us for free, and it is worth
 being blunt: **reliable detection of AI-generated text does not currently exist.**
@@ -204,43 +282,55 @@ decides; the browser explains its reasoning.
 
 ---
 
-## 7. Risks worth stating plainly
+## 8. Risks worth stating plainly
 
-- **Web compatibility is a treadmill we will never win.** A from-scratch engine
-  will not render the whole web, ever. This only works if incompatibility is
-  positioned as intent rather than as a bug backlog. If the goal quietly becomes
-  "render everything," the project has failed and should be a Chromium shell
-  instead.
-- **M2 is most of the work.** Layout and inline text are where engine projects
-  stall. Expect the schedule to be dominated by it and plan the scope of tables
-  and flexbox accordingly.
+- **The scope boundary will be under constant pressure.** CSS 2.1 gives us a
+  finish line only if we defend it. Every "just add flexbox" is the compat
+  treadmill coming back. If the goal quietly becomes "render the modern web,"
+  the project has failed and should be a Chromium shell instead. This is the
+  risk most likely to actually kill the project, because it kills it pleasantly.
+- **Modern sites will look wrong, not just plain.** Without JS *and* without
+  flexbox or grid, many current pages will render as jumbled boxes rather than
+  as clean documents. Reader mode (M5) is what makes this tolerable, and there
+  is an argument for pulling it earlier than M5.
+- **M2 is most of the work.** Inline text layout and table layout are where
+  engine projects stall. Table layout in particular is far more intricate than
+  it looks.
 - **Security is not free from Rust.** Rust removes memory-safety bugs, not logic
   bugs, not same-origin mistakes, not resource exhaustion. M4 is not optional
   before recommending this to anyone.
 - **Accessibility is a correctness requirement**, not a feature. A browser
   without screen-reader support is not a browser. `AccessKit` from M4, and the
-  DOM should be designed so that retrofitting it is not painful.
+  DOM should be designed so retrofitting it is not painful.
 - **Solo-maintainer risk.** Every dependency avoided is code we maintain
-  forever. The "do not write these" list in §2 is the main defence.
+  forever. The "do not write these" list in §3 is the main defence.
 
 ---
 
-## 8. Open questions
+## 9. Open questions
 
-1. **What does "2k" mean?** §3 assumes a budget ethos. If it means 2000-era web
-   aesthetics, table layout moves earlier and flexbox may be unnecessary. If it
-   means a literal line-count budget, most of §5 needs rescoping.
-2. **Confirm no-JS.** §1 argues against the "tiny subset" option. This is the
-   single decision that most changes the project, and it should be explicit.
-3. **Platform priority.** Linux-first is assumed. macOS and Windows are mostly a
-   `winit` and packaging concern, but "first" determines where the polish goes.
-4. **Dependency posture.** §2 takes a pragmatic line. A stricter
+Resolved: the meaning of "2k" (§2), the JavaScript decision (§1), and platform
+priority (§3). Remaining:
+
+1. **How period-authentic should the chrome be?** §2 settles the engine's era;
+   it does not settle whether M3's UI should *look* like 2000 (beveled buttons,
+   throbber, status bar) or be a clean modern shell around a period engine.
+   Affects M3 only, but affects all of it.
+2. **Reader mode earlier than M5?** Per the second risk in §8, it may be the
+   thing that makes the browser usable on the modern web at all, which would
+   argue for M3.
+3. **Legacy TLS.** Old sites that are still up often support only outdated TLS
+   that `rustls` will refuse by default. Do we allow a marked, opt-in downgrade
+   for them, or accept that those sites are unreachable?
+4. **Dependency posture.** §3 takes a pragmatic line. A stricter
    near-zero-dependency stance is defensible but roughly doubles M1 and M2 and
    moves shaping and TLS in-house, which is not recommended.
 
 ---
 
-## 9. Immediate next step
+## 10. Immediate next step
 
-If the direction above is right, M0 is a few hours: workspace, CI, ADRs, budget
-harness. It commits to nothing beyond the language choice and makes M1 startable.
+M0 is a few hours: workspace, three-platform CI, ADRs, budget harness. It
+commits to nothing beyond the language choice and makes M1 startable.
+
+None of the open questions in §9 block it.
