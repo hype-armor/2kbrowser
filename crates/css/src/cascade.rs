@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use dom::{Document, ElementData, NodeId};
 
 use crate::style::{
-    BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack,
-    FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
-    parse_border_style, parse_clear, parse_display, parse_float, parse_list_style_type,
-    parse_position, parse_text_decoration,
+    BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges,
+    FontStack, FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
+    parse_background_repeat, parse_border_style, parse_clear, parse_display, parse_float,
+    parse_list_style_type, parse_position, parse_text_decoration,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -189,6 +189,22 @@ fn compute(
     style
 }
 
+/// Reads a `url(...)` value in either of its two token forms.
+///
+/// Unquoted it arrives as a URL token; quoted, the tokenizer sees an ordinary
+/// function call. Both are ordinary in the wild.
+fn url_value(raw: &Raw) -> Option<&str> {
+    match raw {
+        Raw::Url(url) => Some(url),
+        Raw::Function(name, args) if name == "url" => match args.first() {
+            Some(Raw::Str(url)) => Some(url),
+            Some(Raw::Url(url)) => Some(url),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Applies one declaration to a style in progress.
 ///
 /// Unknown properties and unparseable values are dropped, which is the
@@ -219,9 +235,40 @@ fn apply(
                 style.color = color;
             }
         }
-        "background-color" | "background" => {
+        "background-color" => {
             if let Some(color) = parse_color(first) {
                 style.background_color = color;
+            }
+        }
+        "background-image" => {
+            // `none` is the way to remove an inherited-looking background that
+            // a broader rule set; it must clear rather than be ignored.
+            style.background_image = url_value(first).map(str::to_owned);
+        }
+        "background-repeat" => {
+            if let Raw::Ident(name) = first
+                && let Some(repeat) = parse_background_repeat(name)
+            {
+                style.background_repeat = repeat;
+            }
+        }
+        // The shorthand sets everything it names and resets everything it does
+        // not — that reset is the whole reason `background: white` reliably
+        // clears an image, and skipping it leaves the image showing through.
+        "background" => {
+            style.background_color = Color::TRANSPARENT;
+            style.background_image = None;
+            style.background_repeat = BackgroundRepeat::Repeat;
+            for value in values {
+                if let Some(url) = url_value(value) {
+                    style.background_image = Some(url.to_owned());
+                } else if let Raw::Ident(name) = value
+                    && let Some(repeat) = parse_background_repeat(name)
+                {
+                    style.background_repeat = repeat;
+                } else if let Some(color) = parse_color(value) {
+                    style.background_color = color;
+                }
             }
         }
         // font-size resolves em and % against the *parent's* size, not its own.
@@ -507,6 +554,19 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
     let tag = element.local_name();
     if let Some(color) = element.attr("bgcolor") {
         push("background-color", &attr_color(color));
+    }
+    // `<body background="tile.gif">` is how the era's tiled backgrounds were
+    // almost always written — the CSS property existed but the attribute is
+    // what pages used. Quoted so a filename with parentheses or spaces still
+    // makes it through the tokenizer intact.
+    if matches!(tag, "body" | "table" | "td" | "th" | "tr")
+        && let Some(source) = element.attr("background")
+        && !source.trim().is_empty()
+    {
+        push(
+            "background-image",
+            &format!("url(\"{}\")", source.trim().replace('"', "%22")),
+        );
     }
     // `text` on <body> sets the document's foreground colour.
     if tag == "body"
@@ -805,7 +865,7 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{Display, ListStyleType};
+    use crate::style::{BackgroundRepeat, Display, ListStyleType};
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
         let doc = dom::parse(html);
@@ -1244,6 +1304,67 @@ mod tests {
                 .used_width(16.0),
             0.0
         );
+    }
+
+    #[test]
+    fn background_image_parses_both_url_forms() {
+        for css in [
+            "body { background-image: url(tile.gif) }",
+            r#"body { background-image: url("tile.gif") }"#,
+            "body { background-image: url('tile.gif') }",
+        ] {
+            assert_eq!(
+                style_of("<body>x</body>", css, "body")
+                    .background_image
+                    .as_deref(),
+                Some("tile.gif"),
+                "failed for {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_background_shorthand_resets_what_it_does_not_name() {
+        // Without the reset, `background: white` leaves an earlier rule's tile
+        // showing through — the shorthand is how a page clears one.
+        let style = style_of(
+            "<body>x</body>",
+            "body { background-image: url(tile.gif) } body { background: #ffffff }",
+            "body",
+        );
+        assert_eq!(style.background_image, None);
+        assert_eq!(style.background_color, crate::Color::WHITE);
+    }
+
+    #[test]
+    fn the_background_shorthand_reads_its_parts_in_any_order() {
+        let style = style_of(
+            "<body>x</body>",
+            "body { background: no-repeat #ff0000 url(tile.gif) }",
+            "body",
+        );
+        assert_eq!(style.background_image.as_deref(), Some("tile.gif"));
+        assert_eq!(style.background_color, crate::Color::rgb(255, 0, 0));
+        assert_eq!(style.background_repeat, BackgroundRepeat::NoRepeat);
+    }
+
+    #[test]
+    fn the_background_attribute_sets_a_tile() {
+        // How the era actually wrote it. The CSS property existed; the
+        // attribute is what pages used.
+        let style =
+            standards_style_of(r#"<body background="images/tile.gif">x</body>"#, "", "body");
+        assert_eq!(style.background_image.as_deref(), Some("images/tile.gif"));
+    }
+
+    #[test]
+    fn a_background_image_is_not_inherited() {
+        // Inheriting it would draw the tile again on every descendant box,
+        // which is both wrong and expensive.
+        let doc = dom::parse("<body background=\"tile.gif\"><p>x</p></body>");
+        let map = cascade(&doc, &[]);
+        let paragraph = doc.find_element("p").expect("p");
+        assert_eq!(map.get(paragraph).expect("styled").background_image, None);
     }
 
     #[test]

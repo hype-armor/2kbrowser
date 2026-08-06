@@ -102,12 +102,15 @@ fn render_sized(
     // discards the author's layout, and pulling in its images with it would
     // spend requests on decoration nobody is going to see.
     let images = match (&mode, base) {
-        (RenderMode::Authored, Some((origin, path))) => load_images(&doc, origin, path),
+        (RenderMode::Authored, Some((origin, path))) => load_images(&doc, &styles, origin, path),
         _ => ImageStore::new(),
     };
+    // Only content images have an intrinsic size layout cares about: a
+    // background tile is drawn at its natural size and never sizes its box.
     let intrinsic: IntrinsicSizes = images
         .iter()
-        .map(|(node, image)| (*node, (image.width(), image.height())))
+        .filter(|(key, _)| key.slot == paint::ImageSlot::Content)
+        .map(|(key, image)| (key.node, (image.width(), image.height())))
         .collect();
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
@@ -254,35 +257,53 @@ fn render_frameset(
 /// Failures are silent by design: a missing or corrupt image is an ordinary
 /// thing to find on the web, and the element simply lays out at its declared
 /// size with nothing drawn in it.
-fn load_images(doc: &dom::Document, origin: &Origin, path: &str) -> ImageStore {
+fn load_images(
+    doc: &dom::Document,
+    styles: &css::cascade::StyleMap,
+    origin: &Origin,
+    path: &str,
+) -> ImageStore {
     let fetcher = Fetcher::default();
     let mut store = ImageStore::new();
     let mut cache: std::collections::HashMap<String, Option<paint::DecodedImage>> =
         std::collections::HashMap::new();
 
+    // The same image often appears many times on a page — a tile appears on
+    // every cell of a table — so fetching each URL once matters more here than
+    // usual, since every fetch is synchronous.
+    let load = |url: &str, cache: &mut std::collections::HashMap<_, _>| {
+        cache
+            .entry(url.to_owned())
+            .or_insert_with(|| {
+                // Subresource, so ADR-0006's third-party rule applies.
+                let bytes = fetcher
+                    .fetch_bytes(url, Some(origin), RequestKind::Subresource)
+                    .ok()?;
+                paint::decode(&bytes)
+            })
+            .clone()
+    };
+
     for node in doc.descendants(doc.root()) {
         let Some(element) = doc.element(node) else {
             continue;
         };
-        if element.local_name() != "img" {
-            continue;
+        if element.local_name() == "img"
+            && let Some(src) = element.attr("src")
+        {
+            let url = net::resolve(origin, path, src);
+            if let Some(image) = load(&url, &mut cache) {
+                store.insert(paint::ImageKey::content(node), image);
+            }
         }
-        let Some(src) = element.attr("src") else {
-            continue;
-        };
-        let url = net::resolve(origin, path, src);
-
-        // The same image often appears many times on a page; fetching it once
-        // matters more here than usual, since every fetch is synchronous.
-        let decoded = cache.entry(url.clone()).or_insert_with(|| {
-            // Subresource, so ADR-0006's third-party rule applies.
-            let bytes = fetcher
-                .fetch_bytes(&url, Some(origin), RequestKind::Subresource)
-                .ok()?;
-            paint::decode(&bytes)
-        });
-        if let Some(image) = decoded {
-            store.insert(node, image.clone());
+        if let Some(source) = styles
+            .get(node)
+            .and_then(|style| style.background_image.as_deref())
+        {
+            let url = net::resolve(origin, path, source);
+            if let Some(image) = load(&url, &mut cache) {
+                store.insert(paint::ImageKey::background(node), image);
+            }
         }
     }
     store

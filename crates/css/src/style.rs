@@ -148,6 +148,48 @@ pub fn parse_text_decoration(words: &[String]) -> TextDecoration {
     out
 }
 
+/// The `background-repeat` property.
+///
+/// Tiling is the point: the era's pages were built on small images repeated
+/// across the whole canvas, because that was the only way to get a texture
+/// without paying for the bandwidth of a full-size one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundRepeat {
+    /// Tile in both directions.
+    #[default]
+    Repeat,
+    /// Tile horizontally only.
+    RepeatX,
+    /// Tile vertically only.
+    RepeatY,
+    /// Draw once.
+    NoRepeat,
+}
+
+impl BackgroundRepeat {
+    /// Whether the image tiles along each axis, as `(horizontal, vertical)`.
+    pub fn axes(self) -> (bool, bool) {
+        match self {
+            BackgroundRepeat::Repeat => (true, true),
+            BackgroundRepeat::RepeatX => (true, false),
+            BackgroundRepeat::RepeatY => (false, true),
+            BackgroundRepeat::NoRepeat => (false, false),
+        }
+    }
+}
+
+/// Parses a `background-repeat` keyword.
+pub fn parse_background_repeat(name: &str) -> Option<BackgroundRepeat> {
+    let value = match name {
+        "repeat" => BackgroundRepeat::Repeat,
+        "repeat-x" => BackgroundRepeat::RepeatX,
+        "repeat-y" => BackgroundRepeat::RepeatY,
+        "no-repeat" => BackgroundRepeat::NoRepeat,
+        _ => return None,
+    };
+    Some(value)
+}
+
 /// The `list-style-type` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListStyleType {
@@ -576,6 +618,12 @@ pub struct ComputedStyle {
     pub color: Color,
     /// `background-color`.
     pub background_color: Color,
+    /// `background-image`, as the URL was authored. Resolved against the
+    /// document's base when the image is fetched, not here: the cascade has no
+    /// business knowing where the document came from.
+    pub background_image: Option<String>,
+    /// `background-repeat`.
+    pub background_repeat: BackgroundRepeat,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -626,6 +674,8 @@ impl Default for ComputedStyle {
             display: Display::Inline,
             color: Color::BLACK,
             background_color: Color::TRANSPARENT,
+            background_image: None,
+            background_repeat: BackgroundRepeat::Repeat,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,

@@ -204,6 +204,11 @@ pub struct LayoutBox {
     /// Set when this box is a replaced element, naming the node so paint can
     /// find its decoded image.
     pub replaced: Option<NodeId>,
+    /// The element this box was generated from, where there is one.
+    ///
+    /// Anonymous boxes — the canvas root, a list marker — have none. Paint uses
+    /// it to find the element's background image, and hit testing will want it.
+    pub node: Option<NodeId>,
 }
 
 impl LayoutBox {
@@ -222,6 +227,11 @@ pub struct Layout {
     pub root: LayoutBox,
     /// Total content height, which may exceed the viewport.
     pub height: f32,
+    /// Background image the whole canvas takes, with the element it came from
+    /// and how it repeats. Propagated from the root or the body by the same
+    /// §14.2 rule as the colour, and for the same reason: a tile that stopped
+    /// at the content height would leave a band of blank canvas below it.
+    pub canvas_image: Option<(NodeId, css::style::BackgroundRepeat)>,
     /// Colour the whole canvas takes, per CSS 2.1 §14.2.
     ///
     /// The root element's background covers the canvas however tall that
@@ -255,6 +265,7 @@ pub fn layout(
         content_width: viewport_width,
         children: Vec::new(),
         replaced: None,
+        node: None,
     };
 
     let height = layout_block(
@@ -275,9 +286,9 @@ pub fn layout(
 
     // §14.2: the root element's background paints the canvas, and only when it
     // has none does the body's get used in its place.
-    let html_background = doc
-        .find_element("html")
-        .and_then(|node| styles.get(node))
+    let html = doc.find_element("html");
+    let html_style = html.and_then(|node| styles.get(node));
+    let html_background = html_style
         .map(|style| style.background_color)
         .unwrap_or(css::Color::TRANSPARENT);
     let canvas_background = if html_background.is_transparent() {
@@ -286,10 +297,21 @@ pub fn layout(
         html_background
     };
 
+    // The image propagates independently of the colour: a root with a colour
+    // and a body with a tile is ordinary markup, and both belong on the canvas.
+    let canvas_image = match (html, html_style) {
+        (Some(node), Some(style)) if style.background_image.is_some() => {
+            Some((node, style.background_repeat))
+        }
+        _ if body_style.background_image.is_some() => Some((body, body_style.background_repeat)),
+        _ => None,
+    };
+
     Layout {
         root,
         height,
         canvas_background,
+        canvas_image,
     }
 }
 
@@ -374,6 +396,7 @@ fn marker_box(
         content_width: width,
         children: Vec::new(),
         replaced: None,
+        node: None,
     })
 }
 
@@ -440,6 +463,7 @@ fn layout_block(
             content_width: image_width,
             children: Vec::new(),
             replaced: Some(node),
+            node: Some(node),
         };
         let outer = box_.outer_height(font_size);
         parent.children.push(box_);
@@ -459,6 +483,7 @@ fn layout_block(
         content_width,
         children: Vec::new(),
         replaced: None,
+        node: Some(node),
     };
 
     // Inline children become styled runs shaped as one paragraph, so a <b> or
@@ -674,6 +699,7 @@ fn layout_block(
             content_width: 0.0,
             children: Vec::new(),
             replaced: None,
+            node: None,
         };
         // An absolutely positioned box with `width: auto` shrinks to fit its
         // content rather than filling its containing block — the difference
@@ -863,6 +889,7 @@ fn layout_table(
                 content_width: width,
                 children: Vec::new(),
                 replaced: None,
+                node: None,
             };
             // A cell establishes its own formatting context, so floats outside
             // the table do not reach into it.
@@ -905,6 +932,7 @@ fn layout_table(
             content_width: row_width,
             children: Vec::new(),
             replaced: None,
+            node: Some(row.node),
         });
 
         // Cells stretch to the row's height so backgrounds and borders line up.
@@ -986,6 +1014,7 @@ fn place_float(
         content_width: float_width,
         children: Vec::new(),
         replaced: None,
+        node: None,
     };
     let float_height = layout_block(
         doc,

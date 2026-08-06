@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tiled backgrounds</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 0 }
+    .panel {
+      background: #ffffff;
+      margin: 16px;
+      padding: 12px;
+      border: 1px solid #888888;
+    }
+    .strip {
+      background-image: url(assets/tile.png);
+      background-repeat: repeat-x;
+      height: 32px;
+      margin-bottom: 10px;
+      border: 1px solid #888888;
+    }
+    .column {
+      background-image: url("assets/tile.png");
+      background-repeat: repeat-y;
+      width: 40px;
+      height: 70px;
+      border: 1px solid #888888;
+    }
+    .once {
+      background-image: url(assets/tile.png);
+      background-repeat: no-repeat;
+      width: 70px;
+      height: 70px;
+      border: 1px solid #888888;
+    }
+    /* The shorthand resets what it does not name, so this clears the image
+       above it rather than tinting through it. */
+    .cleared { background: #ffe8e8; padding: 8px; border: 1px solid #888888 }
+  </style>
+</head>
+<body background="assets/tile.png">
+  <div class="panel">
+    <h2>The tile behind everything</h2>
+    <p>The page's background is a sixteen-pixel image repeated across the whole
+    canvas — not stretched to fit it, and not stopping where the text does.
+    This panel sits on top with a background of its own.</p>
+
+    <div class="strip"></div>
+    <div class="column"></div>
+    <div class="once"></div>
+
+    <p class="cleared">The <code>background</code> shorthand resets every part
+    it does not mention, which is how a page turns an inherited-looking tile
+    back into a flat colour.</p>
+  </div>
+</body>
+</html>

@@ -28,6 +28,8 @@ pub enum Raw {
     Hash(String),
     /// A function call and its arguments, e.g. `rgb(1, 2, 3)`.
     Function(String, Vec<Raw>),
+    /// A `url(...)` token, with the quotes and parentheses removed.
+    Url(String),
     /// A comma separator, kept because some properties are comma-delimited.
     Comma,
     /// Any token we do not model. Its presence usually invalidates a value.
@@ -57,6 +59,7 @@ pub fn read_components(input: &mut Parser<'_, '_>) -> Vec<Raw> {
                 unit: unit.as_ref().to_ascii_lowercase(),
             },
             Token::Hash(h) | Token::IDHash(h) => Raw::Hash(h.as_ref().to_owned()),
+            Token::UnquotedUrl(url) => Raw::Url(url.as_ref().to_owned()),
             Token::Comma => Raw::Comma,
             Token::Function(name) => {
                 let name = name.as_ref().to_ascii_lowercase();

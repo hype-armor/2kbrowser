@@ -13,7 +13,7 @@ use tiny_skia::{FillRule, Paint, PathBuilder};
 
 // Re-exported so consumers do not need their own tiny-skia dependency, and so
 // the rasteriser choice stays an implementation detail of this crate.
-pub use images::{DecodedImage, ImageStore, decode};
+pub use images::{DecodedImage, ImageKey, ImageSlot, ImageStore, decode};
 // Re-exported for consumers that composite pixmaps of their own, such as the
 // frameset renderer.
 pub use tiny_skia::{Color as RasterColor, Pixmap, PixmapPaint, Transform};
@@ -39,6 +39,15 @@ pub enum DisplayItem {
         /// Destination rectangle; the image is scaled to fill it.
         rect: Rect,
     },
+    /// A background image tiled across a rectangle.
+    Tile {
+        /// The element whose background this is.
+        node: dom::NodeId,
+        /// Area the tiling is clipped to.
+        rect: Rect,
+        /// Which axes the image repeats along.
+        repeat: css::style::BackgroundRepeat,
+    },
     /// A single positioned glyph.
     Glyph {
         /// Glyph to draw, already positioned by the shaper.
@@ -61,6 +70,8 @@ pub struct DisplayList {
     /// be taller than the content — a frame's cell, or a window showing a short
     /// page — and the background has to reach the bottom of it either way.
     pub canvas: Color,
+    /// Image tiled across the whole canvas, for the same reason.
+    pub canvas_image: Option<(dom::NodeId, css::style::BackgroundRepeat)>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
 }
@@ -71,6 +82,7 @@ impl Default for DisplayList {
         // otherwise composite against whatever the window happened to contain.
         Self {
             canvas: Color::WHITE,
+            canvas_image: None,
             items: Vec::new(),
         }
     }
@@ -83,15 +95,27 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
         // (CSS 2.1 §14.2). It is composited over white so a translucent one
         // still has something opaque behind it.
         canvas: layout.canvas_background.over(Color::WHITE),
+        canvas_image: layout.canvas_image,
         items: Vec::new(),
     };
-    paint_box(&layout.root, 0.0, 0.0, &mut list);
+    // §14.2 again: an element whose background was propagated to the canvas
+    // does not paint it a second time. Drawing it twice is invisible while the
+    // colour is opaque and wrong the moment it is not.
+    let propagated = layout.canvas_image.map(|(node, _)| node);
+    paint_box(&layout.root, 0.0, 0.0, propagated, &mut list);
     list
 }
 
-fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayList) {
+fn paint_box(
+    box_: &LayoutBox,
+    offset_x: f32,
+    offset_y: f32,
+    propagated: Option<dom::NodeId>,
+    list: &mut DisplayList,
+) {
     let x = offset_x + box_.rect.x;
     let y = offset_y + box_.rect.y;
+    let is_canvas_background = box_.node.is_some() && box_.node == propagated;
 
     if !box_.style.background_color.is_transparent() {
         list.items.push(DisplayItem::Rect {
@@ -102,6 +126,25 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
                 height: box_.rect.height,
             },
             color: box_.style.background_color,
+        });
+    }
+
+    // The background image goes over the background colour and under
+    // everything else, which is the order CSS 2.1 §14.2 specifies and the
+    // reason a tile with transparent pixels shows the colour through it.
+    if box_.style.background_image.is_some()
+        && !is_canvas_background
+        && let Some(node) = box_.node
+    {
+        list.items.push(DisplayItem::Tile {
+            node,
+            rect: Rect {
+                x,
+                y,
+                width: box_.rect.width,
+                height: box_.rect.height,
+            },
+            repeat: box_.style.background_repeat,
         });
     }
 
@@ -160,7 +203,7 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
     }
 
     for child in &box_.children {
-        paint_box(child, x, y, list);
+        paint_box(child, x, y, propagated, list);
     }
 }
 
@@ -247,12 +290,30 @@ pub fn rasterise(
         canvas.r, canvas.g, canvas.b, canvas.a,
     ));
 
+    // The canvas tile goes over the canvas colour and under everything else.
+    if let Some((node, repeat)) = list.canvas_image
+        && let Some(image) = images.get(&ImageKey::background(node))
+    {
+        let full = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: pixmap.width() as f32,
+            height: pixmap.height() as f32,
+        };
+        tile_image(&mut pixmap, image, &full, repeat);
+    }
+
     for item in &list.items {
         match item {
             DisplayItem::Rect { rect, color } => fill_rect(&mut pixmap, rect, *color),
             DisplayItem::Image { node, rect } => {
-                if let Some(image) = images.get(node) {
+                if let Some(image) = images.get(&ImageKey::content(*node)) {
                     draw_image(&mut pixmap, image, rect);
+                }
+            }
+            DisplayItem::Tile { node, rect, repeat } => {
+                if let Some(image) = images.get(&ImageKey::background(*node)) {
+                    tile_image(&mut pixmap, image, rect, *repeat);
                 }
             }
             DisplayItem::Glyph {
@@ -290,6 +351,70 @@ fn draw_image(pixmap: &mut Pixmap, image: &DecodedImage, rect: &Rect) {
         Transform::from_translate(rect.x / scale_x, rect.y / scale_y).post_scale(scale_x, scale_y),
         None,
     );
+}
+
+/// Tiles a background image across `rect`, at its natural size.
+///
+/// A background image is never scaled — that is what distinguishes it from a
+/// content image, and it is why a 20-pixel tile fills a page rather than being
+/// stretched across it. Tiles are drawn from the box's top-left corner, which
+/// is `background-position: 0 0`.
+fn tile_image(
+    pixmap: &mut Pixmap,
+    image: &DecodedImage,
+    rect: &Rect,
+    repeat: css::style::BackgroundRepeat,
+) {
+    let (width, height) = (image.width(), image.height());
+    if rect.width <= 0.0 || rect.height <= 0.0 || width < 1.0 || height < 1.0 {
+        return;
+    }
+
+    let (tile_x, tile_y) = repeat.axes();
+    // A tile count rather than a while-loop on coordinates: with a 1px tile and
+    // a tall page the loop is long, and bounding it here keeps a pathological
+    // image from turning into an unbounded amount of work.
+    let columns = if tile_x {
+        (rect.width / width).ceil() as u32
+    } else {
+        1
+    };
+    let rows = if tile_y {
+        (rect.height / height).ceil() as u32
+    } else {
+        1
+    };
+
+    let clip = tiny_skia::IntRect::from_xywh(
+        rect.x.floor() as i32,
+        rect.y.floor() as i32,
+        rect.width.ceil() as u32,
+        rect.height.ceil() as u32,
+    );
+    let Some(mask) = clip.and_then(|clip| {
+        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+        let mut builder = PathBuilder::new();
+        builder.push_rect(clip.to_rect());
+        let path = builder.finish()?;
+        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+        Some(mask)
+    }) else {
+        return;
+    };
+
+    let paint = PixmapPaint::default();
+    for row in 0..rows {
+        for column in 0..columns {
+            pixmap.draw_pixmap(
+                (rect.x + column as f32 * width).round() as i32,
+                (rect.y + row as f32 * height).round() as i32,
+                image.pixmap.as_ref(),
+                &paint,
+                Transform::identity(),
+                Some(&mask),
+            );
+        }
+    }
 }
 
 fn fill_rect(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
@@ -556,5 +681,174 @@ mod tests {
                 .unwrap_or(width)
         };
         assert!(leftmost_ink("p { text-align: center }") > leftmost_ink("p { text-align: left }"));
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+    use css::style::BackgroundRepeat;
+
+    /// A 4x4 image, entirely opaque red.
+    fn red_tile() -> DecodedImage {
+        let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        DecodedImage { pixmap }
+    }
+
+    fn canvas() -> Pixmap {
+        let mut pixmap = Pixmap::new(20, 20).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::WHITE);
+        pixmap
+    }
+
+    /// White is also high in red, so the green channel is what tells them
+    /// apart — checking red alone counts the whole blank canvas.
+    fn red_pixels(pixmap: &Pixmap) -> usize {
+        pixmap
+            .pixels()
+            .iter()
+            .filter(|p| p.red() > 200 && p.green() < 100)
+            .count()
+    }
+
+    /// Whether the pixel at `(x, y)` is red.
+    fn is_red(pixmap: &Pixmap, x: u32, y: u32) -> bool {
+        let pixel = pixmap.pixels()[(y * pixmap.width() + x) as usize];
+        pixel.red() > 200 && pixel.green() < 100
+    }
+
+    #[test]
+    fn a_tile_repeats_across_the_whole_box() {
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::Repeat);
+        assert_eq!(red_pixels(&pixmap), 400, "every pixel covered");
+    }
+
+    #[test]
+    fn a_tile_is_never_scaled_to_its_box() {
+        // This is what separates a background from a content image: a 4px tile
+        // in a 20px box repeats five times, it does not stretch to 20px.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 4.0,
+        };
+        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::RepeatX);
+        assert!(is_red(&pixmap, 19, 3), "the last tile is drawn");
+        assert!(!is_red(&pixmap, 0, 4), "and nothing below the box");
+    }
+
+    #[test]
+    fn repeat_x_and_repeat_y_tile_one_axis_only() {
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let mut horizontal = canvas();
+        tile_image(
+            &mut horizontal,
+            &red_tile(),
+            &rect,
+            BackgroundRepeat::RepeatX,
+        );
+        assert_eq!(red_pixels(&horizontal), 80, "one row of tiles");
+
+        let mut vertical = canvas();
+        tile_image(&mut vertical, &red_tile(), &rect, BackgroundRepeat::RepeatY);
+        assert_eq!(red_pixels(&vertical), 80, "one column of tiles");
+    }
+
+    #[test]
+    fn no_repeat_draws_exactly_one_tile() {
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::NoRepeat);
+        assert_eq!(red_pixels(&pixmap), 16);
+    }
+
+    #[test]
+    fn a_tile_is_clipped_to_its_box() {
+        // The last tile in a row usually overhangs. Without clipping it paints
+        // over whatever sits beside the box.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 2.0,
+            y: 2.0,
+            width: 6.0,
+            height: 6.0,
+        };
+        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::Repeat);
+        assert!(is_red(&pixmap, 7, 7), "inside the box");
+        assert!(!is_red(&pixmap, 8, 7), "past its right edge");
+        assert!(!is_red(&pixmap, 1, 1), "before its top-left corner");
+    }
+}
+
+#[cfg(test)]
+mod canvas_background_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    fn list_for(html: &str) -> (DisplayList, dom::Document) {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::default()]);
+        let mut fonts = FontStore::new();
+        let sizes = layout::IntrinsicSizes::new();
+        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, 200.0);
+        (build_display_list(&layout), doc)
+    }
+
+    fn tiles(list: &DisplayList) -> usize {
+        list.items
+            .iter()
+            .filter(|item| matches!(item, DisplayItem::Tile { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_body_tile_goes_to_the_canvas_and_is_not_drawn_again() {
+        // §14.2: the propagated background belongs to the canvas, and the body
+        // box must not paint it a second time. With an opaque tile that is
+        // merely wasteful; with a translucent one it doubles the alpha.
+        let (list, doc) = list_for(r#"<body background="tile.gif"><p>x</p></body>"#);
+        let body = doc.find_element("body").expect("body");
+        assert_eq!(list.canvas_image.map(|(node, _)| node), Some(body));
+        assert_eq!(tiles(&list), 0, "the body must not tile itself as well");
+    }
+
+    #[test]
+    fn a_tile_on_an_ordinary_element_is_drawn_where_it_sits() {
+        let (list, _) =
+            list_for(r#"<body><table background="tile.gif"><tr><td>x</td></tr></table></body>"#);
+        assert_eq!(list.canvas_image, None, "a table is not the canvas");
+        assert_eq!(tiles(&list), 1);
+    }
+
+    #[test]
+    fn the_root_tile_wins_over_the_body_one() {
+        let (list, doc) = list_for(
+            "<html style=\"background-image: url(root.gif)\">\
+             <body background=\"body.gif\"><p>x</p></body></html>",
+        );
+        let html = doc.find_element("html").expect("html");
+        assert_eq!(list.canvas_image.map(|(node, _)| node), Some(html));
+        // The body's own tile is not propagated, so it still paints normally.
+        assert_eq!(tiles(&list), 1);
     }
 }

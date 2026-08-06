@@ -67,8 +67,48 @@ pub fn decode(bytes: &[u8]) -> Option<DecodedImage> {
     Some(DecodedImage { pixmap })
 }
 
-/// Decoded images, keyed by the element that referenced them.
-pub type ImageStore = HashMap<NodeId, DecodedImage>;
+/// Which of an element's two possible images this is.
+///
+/// One element can have both: an `<img>` with a background behind it, or more
+/// commonly a `<td>` whose content and tile are separate images. Keying on the
+/// node alone would let one silently replace the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageSlot {
+    /// The element's own content, as for `<img src>`.
+    Content,
+    /// The element's `background-image`.
+    Background,
+}
+
+/// Identifies one decoded image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageKey {
+    /// The element that referenced it.
+    pub node: NodeId,
+    /// Which of that element's images it is.
+    pub slot: ImageSlot,
+}
+
+impl ImageKey {
+    /// The element's content image.
+    pub fn content(node: NodeId) -> Self {
+        Self {
+            node,
+            slot: ImageSlot::Content,
+        }
+    }
+
+    /// The element's background image.
+    pub fn background(node: NodeId) -> Self {
+        Self {
+            node,
+            slot: ImageSlot::Background,
+        }
+    }
+}
+
+/// Decoded images, keyed by the element that referenced them and the slot.
+pub type ImageStore = HashMap<ImageKey, DecodedImage>;
 
 #[cfg(test)]
 mod tests {
