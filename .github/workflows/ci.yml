@@ -33,8 +33,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Includes the reference tests, which compare rendered output against a
+      # single baseline set shared by all three platforms (ADR-0005). A
+      # per-platform pixel difference is a bug, and this is where it surfaces.
       - name: Test
         run: cargo test --workspace
+
+      - name: Upload reference-test diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reftest-actual-${{ matrix.os }}
+          path: tests/ref/baselines/*.actual.png
+          if-no-files-found: ignore
 
       - name: Build (release)
         run: cargo build --release

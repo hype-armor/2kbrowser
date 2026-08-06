@@ -25,17 +25,18 @@ const MAX_BINARY_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Maximum size of the bundled font payload (ADR-0008).
 ///
-/// Fonts ship beside the binary rather than inside it, so they get their own
-/// budget instead of inflating the one above. Real Unicode coverage — CJK and
-/// colour emoji in particular — costs tens of megabytes, and cutting coverage
-/// to fit a smaller number would render much of the web as tofu.
-const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Maximum size of everything we ship: binary plus fonts plus data.
+/// Real Unicode coverage — CJK and colour emoji in particular — costs tens of
+/// megabytes, and cutting coverage to fit a smaller number would render much of
+/// the web as tofu.
 ///
-/// Tracked separately because the two budgets above can each pass while the
-/// thing a user actually downloads grows without anyone noticing.
-const MAX_DISTRIBUTION_BYTES: u64 = 84 * 1024 * 1024;
+/// M1 bundles only the Liberation core (~4 MiB) and does so with `include_bytes!`,
+/// which **embeds the fonts in the binary** rather than shipping them beside it
+/// as ADR-0008 describes. That is a deliberate M1 simplification: at 4 MiB it
+/// fits the binary budget comfortably and avoids runtime path resolution. It
+/// does not scale — adding Noto CJK and colour emoji would blow the binary
+/// budget outright — so fonts must move out of the binary before the full
+/// payload lands. Tracked with the vendor-versus-fetch decision in issue #7.
+const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Result of evaluating a single budget.
 enum Outcome {
@@ -66,37 +67,24 @@ fn main() -> ExitCode {
             name: "cold start to first paint",
             limit: "<= 150 ms".to_owned(),
             outcome: Outcome::Pending {
-                blocked_on: "M1 (nothing paints yet)",
+                blocked_on: "the window; headless render works, startup path does not exist",
             },
         },
         Check {
             name: "RSS rendering a reference page",
             limit: "<= 100 MB".to_owned(),
             outcome: Outcome::Pending {
-                blocked_on: "M1 (nothing renders yet)",
+                blocked_on: "memory instrumentation; rendering itself now works",
             },
         },
         Check {
             name: "third-party network requests",
             limit: "0".to_owned(),
             outcome: Outcome::Pending {
-                blocked_on: "M1 (no network stack yet)",
+                blocked_on: "the net crate (ADR-0006)",
             },
         },
-        Check {
-            name: "bundled font payload",
-            limit: format!("<= {}", human_bytes(MAX_FONT_PAYLOAD_BYTES)),
-            outcome: Outcome::Pending {
-                blocked_on: "M1 (fonts land with the text stack, ADR-0008)",
-            },
-        },
-        Check {
-            name: "total distribution",
-            limit: format!("<= {}", human_bytes(MAX_DISTRIBUTION_BYTES)),
-            outcome: Outcome::Pending {
-                blocked_on: "M1 (fonts land with the text stack, ADR-0008)",
-            },
-        },
+        font_payload(),
     ];
 
     report(&checks)
@@ -155,6 +143,71 @@ fn binary_size() -> Check {
     }
 }
 
+/// Measures the vendored font tree against the font budget.
+fn font_payload() -> Check {
+    let name = "bundled font payload";
+    let limit = format!("<= {}", human_bytes(MAX_FONT_PAYLOAD_BYTES));
+
+    let dir = repo_root().map(|root| root.join("fonts"));
+    let Some(total) = dir.as_deref().and_then(directory_size) else {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Fail {
+                measured: "not found".to_owned(),
+                reason: "fonts/ is missing".to_owned(),
+            },
+        };
+    };
+
+    let measured = human_bytes(total);
+    let outcome = if total <= MAX_FONT_PAYLOAD_BYTES {
+        Outcome::Pass { measured }
+    } else {
+        Outcome::Fail {
+            measured,
+            reason: format!(
+                "over budget by {}",
+                human_bytes(total - MAX_FONT_PAYLOAD_BYTES)
+            ),
+        }
+    };
+    Check {
+        name,
+        limit,
+        outcome,
+    }
+}
+
+/// Total size of every regular file under `dir`, recursively.
+fn directory_size(dir: &std::path::Path) -> Option<u64> {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).ok()? {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                total += entry.metadata().ok()?.len();
+            }
+        }
+    }
+    Some(total)
+}
+
+/// The repository root, derived from this crate's location.
+fn repo_root() -> Option<PathBuf> {
+    // CARGO_MANIFEST_DIR is <repo>/tests/budgets.
+    Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()?
+            .parent()?
+            .to_path_buf(),
+    )
+}
+
 /// Locates the release binary: first CLI argument, else the conventional path.
 fn binary_path() -> Option<PathBuf> {
     if let Some(arg) = std::env::args_os().nth(1) {
@@ -167,12 +220,7 @@ fn binary_path() -> Option<PathBuf> {
     } else {
         "2kbrowser"
     };
-    // CARGO_MANIFEST_DIR is <repo>/tests/budgets.
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .parent()?
-        .to_path_buf();
-    let path = root.join("target").join("release").join(exe);
+    let path = repo_root()?.join("target").join("release").join(exe);
     path.is_file().then_some(path)
 }
 

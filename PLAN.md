@@ -241,6 +241,11 @@ three platforms against a single shared baseline set.
 *Done when:* a hand-written HTML page and `example.com` render recognisably, and
 the three platforms produce identical pixels.
 
+**Status: mostly landed.** Parsing, cascade, block layout, shaping, painting,
+the document-fallback classifier, and the reference-test harness all work; the
+binary renders a local file to a PNG. Outstanding: the network stack (so
+`example.com` can be fetched at all) and the window.
+
 ### M2 — It renders the era's web
 The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 

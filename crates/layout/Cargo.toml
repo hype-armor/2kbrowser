@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+css = { path = "../css" }
+dom = { path = "../dom" }
+text = { path = "../text" }
+
 [lints]
 workspace = true

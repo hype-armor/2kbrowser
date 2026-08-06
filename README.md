@@ -16,9 +16,14 @@ See [PLAN.md](PLAN.md) for the full rationale and roadmap, and
 
 ## Status
 
-**M0 — foundation.** Workspace, three-platform CI, architecture decision
-records, and the budget harness. There is no engine yet: the binary starts,
-prints its version, and exits. M1 is the first milestone that renders anything.
+**M1 in progress — it renders.** HTML is parsed into an arena DOM, cascaded
+through a CSS 2.1 subset, laid out as block boxes, shaped against bundled
+Liberation faces, and rasterised on the CPU. Rendering is deterministic across
+Linux, macOS, and Windows, checked by reference tests against one shared
+baseline set.
+
+Not built yet: networking (local files only), a window, and inline layout with
+per-span styles. See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
 > TLS review all land in M4. Until then this is a tool for its authors.
@@ -32,11 +37,34 @@ cargo build --release
 cargo test --workspace
 ```
 
-Budgets are enforced in CI and can be run locally after a release build. Checks
-that cannot be measured yet report `PENDING` rather than passing:
+## Rendering a page
 
 ```sh
-cargo run --release -p budgets
+2kbrowser render page.html --out page.png --width 800
+```
+
+When a page's layout depends on features this engine does not implement, it is
+re-rendered as a document and told so — never silently (ADR-0009):
+
+```text
+Rendered as a document: 100% of this page's content uses layout this
+browser does not implement.
+```
+
+## Reference tests and budgets
+
+Reference tests render `tests/ref/fixtures/` and compare against
+`tests/ref/baselines/`. After an intentional rendering change:
+
+```sh
+BLESS=1 cargo test -p reftests    # then review the new images before committing
+```
+
+Budgets are enforced in CI. Checks that cannot be measured yet report `PENDING`
+rather than passing:
+
+```sh
+cargo build --release && cargo run --release -p budgets
 ```
 
 ## Licence

@@ -9,5 +9,12 @@ publish = false
 name = "2kbrowser"
 path = "src/main.rs"
 
+[dependencies]
+css = { path = "../css" }
+dom = { path = "../dom" }
+layout = { path = "../layout" }
+paint = { path = "../paint" }
+text = { path = "../text" }
+
 [lints]
 workspace = true
