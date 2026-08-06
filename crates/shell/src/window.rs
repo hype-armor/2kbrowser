@@ -26,6 +26,15 @@ const SCROLL_STEP: f32 = 60.0;
 /// Multiplier applied to line-based mouse wheel deltas.
 const WHEEL_LINE_HEIGHT: f32 = 40.0;
 
+/// Packs a rendered pixel for softbuffer.
+///
+/// softbuffer wants 0RGB in a u32; tiny-skia stores premultiplied RGBA.
+/// Demultiplying is unnecessary because everything drawn here is composited
+/// over an opaque background already.
+fn pack(pixel: &paint::PremultipliedColor) -> u32 {
+    (u32::from(pixel.red()) << 16) | (u32::from(pixel.green()) << 8) | u32::from(pixel.blue())
+}
+
 /// Clamps a scroll offset to the scrollable range.
 ///
 /// Pure, and therefore testable without a display — which is most of what this
@@ -79,6 +88,13 @@ struct App {
     error: Option<String>,
     /// Held because a key event does not carry the modifier state with it.
     modifiers: winit::event::Modifiers,
+    /// The chrome bar, redrawn whenever what it says changes.
+    chrome: paint::Pixmap,
+    /// Whether the reader has overruled the document fallback (ADR-0009).
+    /// Reset on navigation: it is a decision about this page, not a setting.
+    forcing_authored: bool,
+    /// Whether this page had a fallback decision to overrule.
+    can_toggle_layout: bool,
 }
 
 impl App {
@@ -91,13 +107,28 @@ impl App {
         }
         // The canvas is the full document height, not the viewport height:
         // scrolling then costs a blit offset rather than a re-layout.
-        let page = crate::render::render_with_base(
-            &self.loaded.html,
-            width,
-            u32::MAX,
-            &mut self.fonts,
-            Some((&self.loaded.origin, &self.loaded.path)),
-        );
+        let base = Some((&self.loaded.origin, self.loaded.path.as_str()));
+        let page = if self.forcing_authored {
+            crate::render::render_as_authored(
+                &self.loaded.html,
+                width,
+                u32::MAX,
+                &mut self.fonts,
+                base,
+            )
+        } else {
+            crate::render::render_with_base(
+                &self.loaded.html,
+                width,
+                u32::MAX,
+                &mut self.fonts,
+                base,
+            )
+        };
+        // Whether there is anything to overrule. Once overruling, the answer is
+        // yes by construction — the reader has to be able to get back.
+        self.can_toggle_layout =
+            self.forcing_authored || !matches!(page.mode, layout::RenderMode::Authored);
         if let Some(window) = &self.window {
             window.set_title(&title_for(
                 self.history.current(),
@@ -105,7 +136,21 @@ impl App {
                 self.error.as_deref(),
             ));
         }
-        self.scroll = clamp_scroll(self.scroll, page.content_height, height as f32);
+        self.chrome = crate::chrome::render(
+            &crate::chrome::State {
+                url: self.history.current(),
+                mode: &page.mode,
+                error: self.error.as_deref(),
+                can_go_back: self.history.can_go_back(),
+                can_go_forward: self.history.can_go_forward(),
+                forcing_authored: self.forcing_authored,
+                can_toggle_layout: self.can_toggle_layout,
+            },
+            width,
+            &mut self.fonts,
+        );
+        let _ = height;
+        self.scroll = clamp_scroll(self.scroll, page.content_height, self.viewport_height());
         self.page = Some(page);
     }
 
@@ -123,6 +168,8 @@ impl App {
                 };
                 self.error = None;
                 self.scroll = 0.0;
+                // A decision about the previous page, not a setting.
+                self.forcing_authored = false;
             }
             // The page that failed stays on screen rather than being replaced
             // with a blank one: what was there is more useful than nothing, and
@@ -154,16 +201,52 @@ impl App {
         }
     }
 
-    /// The link under the pointer, if any, in canvas coordinates.
+    /// The chrome control under the pointer, if any.
+    fn control_under_pointer(&self) -> Option<crate::chrome::Control> {
+        let mode = self.page.as_ref().map(|page| page.mode.clone());
+        let mode = mode.unwrap_or(layout::RenderMode::Authored);
+        crate::chrome::control_at(
+            &crate::chrome::State {
+                url: self.history.current(),
+                mode: &mode,
+                error: self.error.as_deref(),
+                can_go_back: self.history.can_go_back(),
+                can_go_forward: self.history.can_go_forward(),
+                forcing_authored: self.forcing_authored,
+                can_toggle_layout: self.can_toggle_layout,
+            },
+            self.size.0 as f32,
+            self.pointer.0,
+            self.pointer.1,
+        )
+    }
+
+    /// The link under the pointer, if any.
+    ///
+    /// The pointer is in window coordinates; the page starts below the bar and
+    /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
         let page = self.page.as_ref()?;
-        page.link_at(self.pointer.0, self.pointer.1 + self.scroll)
+        let y = self.pointer.1 - crate::chrome::HEIGHT as f32;
+        if y < 0.0 {
+            return None;
+        }
+        page.link_at(self.pointer.0, y + self.scroll)
+    }
+
+    /// Height of the page area, which is the window less the chrome.
+    fn viewport_height(&self) -> f32 {
+        (self.size.1.saturating_sub(crate::chrome::HEIGHT)) as f32
     }
 
     fn scroll_by(&mut self, delta: f32) {
         let Some(page) = &self.page else { return };
         let before = self.scroll;
-        self.scroll = clamp_scroll(self.scroll + delta, page.content_height, self.size.1 as f32);
+        self.scroll = clamp_scroll(
+            self.scroll + delta,
+            page.content_height,
+            self.viewport_height(),
+        );
         if self.scroll != before
             && let Some(window) = &self.window
         {
@@ -191,9 +274,23 @@ impl App {
         let pixmap = &page.pixmap;
         let offset = self.scroll as u32;
         let viewport_width = width.get() as usize;
+        let bar_height = crate::chrome::HEIGHT.min(height.get());
 
-        for row in 0..height.get() {
-            let source_row = row + offset;
+        // The bar first, across the top.
+        let bar = &self.chrome;
+        for row in 0..bar_height {
+            let start = row as usize * viewport_width;
+            let source_start = row as usize * bar.width() as usize;
+            for column in 0..viewport_width {
+                buffer[start + column] = match bar.pixels().get(source_start + column) {
+                    Some(pixel) => pack(pixel),
+                    None => 0x00ff_ffff,
+                };
+            }
+        }
+
+        for row in bar_height..height.get() {
+            let source_row = row - bar_height + offset;
             let start = row as usize * viewport_width;
             if source_row >= pixmap.height() {
                 // Past the end of the document: white, not stale pixels.
@@ -203,18 +300,10 @@ impl App {
             let pixels = pixmap.pixels();
             let source_start = source_row as usize * pixmap.width() as usize;
             for column in 0..viewport_width {
-                let value = match pixels.get(source_start + column) {
-                    // softbuffer wants 0RGB packed into a u32; tiny-skia stores
-                    // premultiplied RGBA, and demultiplying is unnecessary here
-                    // because the page is composited over opaque white already.
-                    Some(pixel) => {
-                        (u32::from(pixel.red()) << 16)
-                            | (u32::from(pixel.green()) << 8)
-                            | u32::from(pixel.blue())
-                    }
+                buffer[start + column] = match pixels.get(source_start + column) {
+                    Some(pixel) => pack(pixel),
                     None => 0x00ff_ffff,
                 };
-                buffer[start + column] = value;
             }
         }
 
@@ -295,7 +384,22 @@ impl ApplicationHandler for App {
                 ..
             } => match button {
                 MouseButton::Left => {
-                    if let Some(url) = self.link_under_pointer() {
+                    // The bar owns the top of the window, so it gets first
+                    // refusal on a click there.
+                    if self.pointer.1 < crate::chrome::HEIGHT as f32 {
+                        match self.control_under_pointer() {
+                            Some(crate::chrome::Control::Back) => self.go_back(),
+                            Some(crate::chrome::Control::Forward) => self.go_forward(),
+                            Some(crate::chrome::Control::ToggleLayout) => {
+                                self.forcing_authored = !self.forcing_authored;
+                                self.rerender();
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            None => {}
+                        }
+                    } else if let Some(url) = self.link_under_pointer() {
                         self.navigate(url);
                     }
                 }
@@ -306,7 +410,7 @@ impl ApplicationHandler for App {
                 _ => {}
             },
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let viewport = self.size.1 as f32;
+                let viewport = self.viewport_height();
                 // Alt+Left and Alt+Right are the platform convention;
                 // Backspace is what the era's browsers used and many hands
                 // still reach for.
@@ -380,6 +484,9 @@ pub fn open(
         over_link: false,
         error: None,
         modifiers: winit::event::Modifiers::default(),
+        chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
+        forcing_authored: false,
+        can_toggle_layout: false,
     };
     event_loop
         .run_app(&mut app)

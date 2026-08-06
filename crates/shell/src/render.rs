@@ -115,7 +115,7 @@ pub fn render_with_base(
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
-    render_sized(html, width, max_height, false, fonts, base)
+    render_sized(html, width, max_height, Settings::default(), fonts, base)
 }
 
 /// Renders HTML into a canvas of exactly `height`, whatever the content needs.
@@ -132,14 +132,59 @@ pub fn render_in_viewport(
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
-    render_sized(html, width, height, true, fonts, base)
+    render_sized(
+        html,
+        width,
+        height,
+        Settings {
+            fill_height: true,
+            ..Settings::default()
+        },
+        fonts,
+        base,
+    )
+}
+
+/// Renders with the author's layout even when classification says not to.
+///
+/// The override ADR-0009 requires: the fallback is automatic, and the reader
+/// can always overrule it and see what the author actually wrote. A browser
+/// that decides for you and gives you no way to look is worse than one that
+/// gets the decision wrong.
+pub fn render_as_authored(
+    html: &str,
+    width: u32,
+    max_height: u32,
+    fonts: &mut FontStore,
+    base: Option<(&Origin, &str)>,
+) -> Page {
+    render_sized(
+        html,
+        width,
+        max_height,
+        Settings {
+            force_authored: true,
+            ..Settings::default()
+        },
+        fonts,
+        base,
+    )
+}
+
+/// How to render, beyond the document itself.
+#[derive(Debug, Clone, Copy, Default)]
+struct Settings {
+    /// Fill the canvas to the height given rather than shrinking to content.
+    fill_height: bool,
+    /// Use the author's layout whatever classification decided.
+    force_authored: bool,
 }
 
 fn render_sized(
     html: &str,
     width: u32,
     max_height: u32,
-    fill_height: bool,
+    settings: Settings,
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
@@ -159,7 +204,13 @@ fn render_sized(
 
     // Classify before laying out: if the page needs layout we do not implement,
     // producing the wrong layout first and discarding it would be wasted work.
-    let mode = layout::classify(&doc, &styles);
+    let mode = if settings.force_authored {
+        // The reader asked to see what the author wrote. Classification still
+        // ran — the answer is just not being acted on.
+        RenderMode::Authored
+    } else {
+        layout::classify(&doc, &styles)
+    };
 
     let styles = match mode {
         RenderMode::Authored => styles,
@@ -189,7 +240,7 @@ fn render_sized(
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
-    let height = if fill_height {
+    let height = if settings.fill_height {
         max_height.max(1)
     } else {
         (laid_out.height.ceil().max(1.0) as u32).min(max_height)

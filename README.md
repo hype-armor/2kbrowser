@@ -50,8 +50,14 @@ back and forward, and the cursor changes over a link. `2kbrowser links <page>`
 prints every link rectangle and where it leads, and
 `cargo run -p shell --example link-map` draws them over the page.
 
-Still to come in M3: tabs, a URL bar, bookmarks, find-in-page, and the banner
-that says a page was re-rendered as a document.
+There is a chrome bar. It shows the URL, marks plain HTTP as unencrypted
+(never the reverse — decorating the secure case teaches people to look for a
+signal whose absence is easy to miss), and says when a page was re-rendered as
+a document, with a control to overrule that and see the author's layout
+(ADR-0009). An ordinary page over HTTPS says nothing at all.
+`cargo run -p shell --example chrome-strip` draws every state of it.
+
+Still to come in M3: tabs, an editable URL bar, bookmarks, and find-in-page.
 See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
