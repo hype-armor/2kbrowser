@@ -53,26 +53,38 @@ pub enum DisplayItem {
 }
 
 /// An ordered list of paint operations, back to front.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DisplayList {
+    /// Colour the whole canvas is cleared to before anything is drawn.
+    ///
+    /// Held here rather than emitted as the first item because the canvas can
+    /// be taller than the content — a frame's cell, or a window showing a short
+    /// page — and the background has to reach the bottom of it either way.
+    pub canvas: Color,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
 }
 
+impl Default for DisplayList {
+    fn default() -> Self {
+        // White, not transparent: a page that declares no background would
+        // otherwise composite against whatever the window happened to contain.
+        Self {
+            canvas: Color::WHITE,
+            items: Vec::new(),
+        }
+    }
+}
+
 /// Builds a display list from a layout.
 pub fn build_display_list(layout: &Layout) -> DisplayList {
-    let mut list = DisplayList::default();
-    // The canvas starts white; a transparent page background would otherwise
-    // composite against whatever the window happened to contain.
-    list.items.push(DisplayItem::Rect {
-        rect: Rect {
-            x: 0.0,
-            y: 0.0,
-            width: layout.root.rect.width,
-            height: layout.height,
-        },
-        color: Color::WHITE,
-    });
+    let mut list = DisplayList {
+        // The page's background covers the canvas, not just the root box
+        // (CSS 2.1 §14.2). It is composited over white so a translucent one
+        // still has something opaque behind it.
+        canvas: layout.canvas_background.over(Color::WHITE),
+        items: Vec::new(),
+    };
     paint_box(&layout.root, 0.0, 0.0, &mut list);
     list
 }
@@ -212,7 +224,12 @@ pub fn rasterise(
     height: u32,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
-    pixmap.fill(tiny_skia::Color::WHITE);
+    // Clearing to the canvas colour rather than white is what carries the
+    // page's background down past the end of its content.
+    let canvas = list.canvas;
+    pixmap.fill(tiny_skia::Color::from_rgba8(
+        canvas.r, canvas.g, canvas.b, canvas.a,
+    ));
 
     for item in &list.items {
         match item {

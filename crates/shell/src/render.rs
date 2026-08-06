@@ -41,6 +41,34 @@ pub fn render_with_base(
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
+    render_sized(html, width, max_height, false, fonts, base)
+}
+
+/// Renders HTML into a canvas of exactly `height`, whatever the content needs.
+///
+/// This is what a frame gets: a frame is a viewport in its own right, so its
+/// document's canvas is the cell it was given rather than however tall the
+/// document happened to be. Shrinking to the content instead would leave the
+/// rest of the cell showing whatever was underneath — which, for a page with a
+/// background of its own, means a band of the wrong colour.
+pub fn render_in_viewport(
+    html: &str,
+    width: u32,
+    height: u32,
+    fonts: &mut FontStore,
+    base: Option<(&Origin, &str)>,
+) -> Page {
+    render_sized(html, width, height, true, fonts, base)
+}
+
+fn render_sized(
+    html: &str,
+    width: u32,
+    max_height: u32,
+    fill_height: bool,
+    fonts: &mut FontStore,
+    base: Option<(&Origin, &str)>,
+) -> Page {
     let doc = dom::parse(html);
 
     // A frameset document has no body to lay out: each frame is a separate
@@ -84,7 +112,11 @@ pub fn render_with_base(
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
-    let height = (laid_out.height.ceil().max(1.0) as u32).min(max_height);
+    let height = if fill_height {
+        max_height.max(1)
+    } else {
+        (laid_out.height.ceil().max(1.0) as u32).min(max_height)
+    };
     let pixmap = rasterise(&list, fonts, &images, width, height)
         .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
@@ -190,7 +222,7 @@ fn render_frameset(
                 continue;
             }
             loaded += 1;
-            render_with_base(
+            render_in_viewport(
                 &resource.body,
                 cell_width as u32,
                 cell_height as u32,
@@ -325,6 +357,60 @@ mod tests {
             &mut fonts,
         );
         assert_eq!(page.mode, RenderMode::Authored);
+    }
+
+    /// Colour of the canvas's bottom-left pixel, past any content.
+    fn bottom_left(page: &Page) -> (u8, u8, u8) {
+        let y = page.pixmap.height() - 1;
+        let pixel = page.pixmap.pixels()[(y * page.pixmap.width()) as usize];
+        (pixel.red(), pixel.green(), pixel.blue())
+    }
+
+    #[test]
+    fn a_page_background_reaches_the_bottom_of_the_viewport() {
+        // CSS 2.1 §14.2: the background covers the canvas, not just the box.
+        // A page is nearly always shorter than the window showing it, so
+        // getting this wrong ends every such page in a band of white.
+        let mut fonts = FontStore::new();
+        let page = render_in_viewport(
+            r##"<body bgcolor="#ff0000">short</body>"##,
+            50,
+            400,
+            &mut fonts,
+            None,
+        );
+        assert_eq!(
+            page.pixmap.height(),
+            400,
+            "a viewport is filled, not shrunk"
+        );
+        assert!(
+            page.content_height < 400.0,
+            "the content must be shorter than the canvas for this to test anything"
+        );
+        assert_eq!(bottom_left(&page), (255, 0, 0));
+    }
+
+    #[test]
+    fn the_root_background_wins_over_the_body_one() {
+        // Only when the root has none does the body's get propagated.
+        let mut fonts = FontStore::new();
+        let page = render_in_viewport(
+            "<style>html { background: #0000ff } body { background: #ff0000 }</style>\
+             <body>short</body>",
+            50,
+            300,
+            &mut fonts,
+            None,
+        );
+        assert_eq!(bottom_left(&page), (0, 0, 255));
+    }
+
+    #[test]
+    fn a_page_with_no_background_still_gets_an_opaque_canvas() {
+        let mut fonts = FontStore::new();
+        let page = render_in_viewport("<body>short</body>", 50, 300, &mut fonts, None);
+        assert_eq!(bottom_left(&page), (255, 255, 255));
     }
 
     #[test]

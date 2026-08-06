@@ -108,6 +108,53 @@ impl Color {
     pub fn is_transparent(&self) -> bool {
         self.a == 0
     }
+
+    /// This colour composited over an opaque `backdrop`.
+    ///
+    /// Source-over with a straight (non-premultiplied) source, which is how
+    /// these are stored. Used where a colour must be flattened before it can be
+    /// handed to something that only takes opaque values.
+    pub fn over(self, backdrop: Color) -> Color {
+        if self.a == 255 {
+            return self;
+        }
+        let alpha = f32::from(self.a) / 255.0;
+        let mix = |source: u8, under: u8| {
+            (f32::from(source) * alpha + f32::from(under) * (1.0 - alpha)).round() as u8
+        };
+        Color {
+            r: mix(self.r, backdrop.r),
+            g: mix(self.g, backdrop.g),
+            b: mix(self.b, backdrop.b),
+            a: 255,
+        }
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::Color;
+
+    #[test]
+    fn compositing_over_a_backdrop() {
+        let half_red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
+        assert_eq!(half_red.over(Color::WHITE), Color::rgb(255, 127, 127));
+        assert_eq!(
+            Color::TRANSPARENT.over(Color::WHITE),
+            Color::WHITE,
+            "nothing over white is white"
+        );
+        assert_eq!(
+            Color::rgb(1, 2, 3).over(Color::WHITE),
+            Color::rgb(1, 2, 3),
+            "an opaque colour is unchanged"
+        );
+    }
 }
 
 /// The seventeen named colours of CSS 2.1, plus `transparent`.

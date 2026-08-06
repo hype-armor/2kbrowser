@@ -222,6 +222,13 @@ pub struct Layout {
     pub root: LayoutBox,
     /// Total content height, which may exceed the viewport.
     pub height: f32,
+    /// Colour the whole canvas takes, per CSS 2.1 §14.2.
+    ///
+    /// The root element's background covers the canvas however tall that
+    /// canvas is, and when the root has none the body's is used instead. This
+    /// is not a detail: a page is usually shorter than the window it is shown
+    /// in, so without it a `<body bgcolor>` page ends in a band of white.
+    pub canvas_background: css::Color,
 }
 
 /// Lays out a styled document at a given viewport width.
@@ -265,7 +272,25 @@ pub fn layout(
         &mut root,
     );
     root.rect.height = height;
-    Layout { root, height }
+
+    // §14.2: the root element's background paints the canvas, and only when it
+    // has none does the body's get used in its place.
+    let html_background = doc
+        .find_element("html")
+        .and_then(|node| styles.get(node))
+        .map(|style| style.background_color)
+        .unwrap_or(css::Color::TRANSPARENT);
+    let canvas_background = if html_background.is_transparent() {
+        body_style.background_color
+    } else {
+        html_background
+    };
+
+    Layout {
+        root,
+        height,
+        canvas_background,
+    }
 }
 
 /// Lays out `node` as a block box at `(x, y)` within `available_width`,
