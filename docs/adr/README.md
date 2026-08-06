@@ -13,3 +13,4 @@ that ADRs are superseded rather than edited.
 | [0005](0005-deterministic-rendering.md) | CPU rasterisation and bundled fonts | accepted |
 | [0006](0006-network-policy-defaults.md) | Network policy defaults | accepted |
 | [0007](0007-dependency-posture.md) | Dependency posture | accepted |
+| [0008](0008-font-selection.md) | Font selection | accepted |

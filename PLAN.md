@@ -145,7 +145,15 @@ is deterministic across platforms. One set of baseline images, valid everywhere.
 This is a deliberate constraint with a real cost — the browser will not use your
 system fonts, and will not look native — and it buys correctness testing on all
 three platforms for the price of one. For a document renderer that is the right
-trade. It should be an ADR in M0, because a lot follows from it.
+trade. Recorded as ADR-0005.
+
+Which fonts to bundle is ADR-0008: metric-compatible substitutes for the faces
+pages actually name (Liberation Sans/Serif/Mono for Arial, Times New Roman, and
+Courier New; Gelasio for Georgia), backed by Noto for pan-Unicode coverage
+including CJK and colour emoji. Metric compatibility matters more than it
+sounds: substituting different advance widths changes line breaking, and
+therefore layout. Coverage matters more still — without it, pages in most of the
+world's scripts render as tofu.
 
 ---
 
@@ -167,13 +175,22 @@ failing tests**, not aspirations in a README:
 
 | Budget | Target | Measured by |
 | --- | --- | --- |
-| Release binary size | ≤ 20 MB | CI check on artifact |
+| Release binary size | ≤ 20 MiB | CI check on artifact |
+| Bundled font payload | ≤ 64 MiB | CI check on artifact |
+| Total distribution | ≤ 84 MiB | CI check on artifact |
 | Cold start to first paint | ≤ 150 ms | benchmark on reference page |
 | RSS rendering a Wikipedia article | ≤ 100 MB | instrumented run |
 | Third-party network requests | 0 | network policy test |
 
 Numbers are first drafts. The point is that they exist, are measured, and
 regressions break the build.
+
+The font payload has its own budget rather than counting against the binary
+(ADR-0008). Real Unicode coverage — CJK and colour emoji especially — costs tens
+of megabytes, and trimming it to fit a smaller number would render much of the
+web as tofu boxes. Fonts are memory-mapped and load lazily, so the payload costs
+install size rather than RAM or startup time. Install size growing roughly
+fourfold is the accepted cost, recorded rather than glossed.
 
 ---
 

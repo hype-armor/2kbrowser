@@ -23,6 +23,20 @@ use std::process::ExitCode;
 /// Maximum size of the stripped release binary.
 const MAX_BINARY_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Maximum size of the bundled font payload (ADR-0008).
+///
+/// Fonts ship beside the binary rather than inside it, so they get their own
+/// budget instead of inflating the one above. Real Unicode coverage — CJK and
+/// colour emoji in particular — costs tens of megabytes, and cutting coverage
+/// to fit a smaller number would render much of the web as tofu.
+const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum size of everything we ship: binary plus fonts plus data.
+///
+/// Tracked separately because the two budgets above can each pass while the
+/// thing a user actually downloads grows without anyone noticing.
+const MAX_DISTRIBUTION_BYTES: u64 = 84 * 1024 * 1024;
+
 /// Result of evaluating a single budget.
 enum Outcome {
     Pass {
@@ -67,6 +81,20 @@ fn main() -> ExitCode {
             limit: "0".to_owned(),
             outcome: Outcome::Pending {
                 blocked_on: "M1 (no network stack yet)",
+            },
+        },
+        Check {
+            name: "bundled font payload",
+            limit: format!("<= {}", human_bytes(MAX_FONT_PAYLOAD_BYTES)),
+            outcome: Outcome::Pending {
+                blocked_on: "M1 (fonts land with the text stack, ADR-0008)",
+            },
+        },
+        Check {
+            name: "total distribution",
+            limit: format!("<= {}", human_bytes(MAX_DISTRIBUTION_BYTES)),
+            outcome: Outcome::Pending {
+                blocked_on: "M1 (fonts land with the text stack, ADR-0008)",
             },
         },
     ];
