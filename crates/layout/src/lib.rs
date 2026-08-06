@@ -6,12 +6,14 @@
 //! (ADR-0004).
 
 pub mod classify;
+pub mod floats;
 pub mod table;
 
 use css::cascade::StyleMap;
-use css::style::{ComputedStyle, Display, TextAlign, WhiteSpace};
+use css::style::{ComputedStyle, Display, Float, TextAlign, WhiteSpace};
 use css::value::Length;
 use dom::{Document, NodeId};
+use floats::FloatContext;
 use text::{FontStore, InlineRun, TextLayout};
 
 pub use classify::{RenderMode, classify};
@@ -100,6 +102,7 @@ pub fn layout(
         0.0,
         0.0,
         viewport_width,
+        FloatContext::new(viewport_width),
         &mut root,
     );
     root.rect.height = height;
@@ -121,6 +124,7 @@ fn layout_block(
     x: f32,
     y: f32,
     available_width: f32,
+    inherited: FloatContext,
     parent: &mut LayoutBox,
 ) -> f32 {
     let font_size = style.font_size;
@@ -164,9 +168,60 @@ fn layout_block(
     // with the text around it.
     let runs = collect_inline_runs(doc, styles, node, style);
     let mut content_height = 0.0;
+    // Floats declared by ancestors still apply here, shifted into this block's
+    // coordinates; this block's own floats are added on top.
+    let mut context = inherited.translated(
+        padding_left + border_left,
+        padding_top + border_top,
+        content_width,
+    );
+
+    // Floats declared before any in-flow block are placed first, so this
+    // block's own text knows to flow around them. Floats declared later are
+    // placed during the walk below, at the height they actually appear —
+    // placing everything up front would lift a float above content that
+    // precedes it in the source.
+    let mut early: Vec<(NodeId, ComputedStyle)> = Vec::new();
+    let mut late: Vec<(NodeId, ComputedStyle)> = Vec::new();
+    let mut seen_in_flow = false;
+    for &child in doc.children(node) {
+        let Some(child_style) = styles.get(child) else {
+            continue;
+        };
+        if child_style.display == Display::None {
+            continue;
+        }
+        if child_style.float != Float::None {
+            if seen_in_flow {
+                late.push((child, child_style.clone()));
+            } else {
+                early.push((child, child_style.clone()));
+            }
+        } else if !child_style.display.is_inline() && !child_style.display.is_table_internal() {
+            seen_in_flow = true;
+        }
+    }
+    for (child, child_style) in &early {
+        place_float(
+            doc,
+            styles,
+            fonts,
+            *child,
+            child_style,
+            content_width,
+            0.0,
+            (padding_left + border_left, padding_top + border_top),
+            &mut context,
+            &mut box_,
+        );
+    }
 
     if runs.iter().any(|run| !run.text.trim().is_empty()) {
-        let layout = fonts.layout_runs(&runs, style, content_width);
+        let layout = if context.is_empty() {
+            fonts.layout_runs(&runs, style, content_width)
+        } else {
+            fonts.layout_runs_constrained(&runs, style, |y, height| context.line_box(y, height))
+        };
         content_height = layout.height;
         box_.text = Some(layout);
     }
@@ -200,9 +255,36 @@ fn layout_block(
         if child_style.display == Display::None
             || child_style.display.is_inline()
             || child_style.display.is_table_internal()
+            // Floated children were placed above, out of the normal flow.
+            || child_style.float != Float::None
         {
             continue;
         }
+        // Place any float declared before this child, at the height reached so
+        // far rather than at the top of the container.
+        while let Some((float_node, float_style)) = late.first().cloned() {
+            if !precedes(doc, node, float_node, child) {
+                break;
+            }
+            late.remove(0);
+            place_float(
+                doc,
+                styles,
+                fonts,
+                float_node,
+                &float_style,
+                content_width,
+                cursor_y - padding_top - border_top,
+                (padding_left + border_left, padding_top + border_top),
+                &mut context,
+                &mut box_,
+            );
+        }
+
+        // `clear` pushes this box below the floats it names.
+        cursor_y = context.clearance(child_style.clear, cursor_y);
+        let child_context =
+            context.translated(0.0, cursor_y - padding_top - border_top, content_width);
         let consumed = layout_block(
             doc,
             styles,
@@ -212,12 +294,17 @@ fn layout_block(
             padding_left + border_left,
             cursor_y,
             content_width,
+            child_context,
             &mut box_,
         );
         cursor_y += consumed;
     }
 
-    let content_end = cursor_y + padding_bottom + border_bottom;
+    // A block must be tall enough to contain its own floats, or the next
+    // block would start beside one and overlap it.
+    let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
+        + padding_bottom
+        + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
         length => {
@@ -343,6 +430,8 @@ fn layout_table(
                 content_width: width,
                 children: Vec::new(),
             };
+            // A cell establishes its own formatting context, so floats outside
+            // the table do not reach into it.
             let consumed = layout_block(
                 doc,
                 styles,
@@ -352,6 +441,7 @@ fn layout_table(
                 cell_x,
                 cursor_y,
                 width,
+                FloatContext::new(width),
                 &mut holder,
             );
             row_height = row_height.max(consumed);
@@ -369,6 +459,92 @@ fn layout_table(
     }
 
     cursor_y - y
+}
+
+/// Lays out a floated child and places it in `context`.
+///
+/// `y` is where the float may first sit, in the container's content
+/// coordinates; `origin` is the container's content-box offset within its own
+/// border box, needed to position the resulting box.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn place_float(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    child: NodeId,
+    child_style: &ComputedStyle,
+    content_width: f32,
+    y: f32,
+    origin: (f32, f32),
+    context: &mut FloatContext,
+    parent: &mut LayoutBox,
+) {
+    // A float shrinks to fit its content unless a width is declared, so its
+    // natural width has to be measured before it can be placed.
+    let runs = collect_inline_runs(doc, styles, child, child_style);
+    let (_, natural) = fonts.intrinsic_widths(&runs, child_style);
+    let surround = child_style
+        .padding
+        .left
+        .to_px(child_style.font_size, content_width)
+        + child_style
+            .padding
+            .right
+            .to_px(child_style.font_size, content_width)
+        + child_style.border.left.used_width(child_style.font_size)
+        + child_style.border.right.used_width(child_style.font_size);
+    let float_width = match child_style.width {
+        Length::Auto => (natural + surround).min(content_width),
+        length => length.to_px(child_style.font_size, content_width) + surround,
+    };
+
+    let mut probe = LayoutBox {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: float_width,
+            height: 0.0,
+        },
+        style: child_style.clone(),
+        text: None,
+        content_origin: (0.0, 0.0),
+        content_width: float_width,
+        children: Vec::new(),
+    };
+    let float_height = layout_block(
+        doc,
+        styles,
+        fonts,
+        child,
+        child_style,
+        0.0,
+        0.0,
+        float_width,
+        FloatContext::new(float_width),
+        &mut probe,
+    );
+    let (left, top) = context.place(child_style.float, float_width, float_height, y);
+
+    if let Some(mut float_box) = probe.children.pop() {
+        // Offsetting rather than assigning keeps the float's own margins,
+        // which `layout_block` already folded into its rect.
+        float_box.rect.x += origin.0 + left;
+        float_box.rect.y += origin.1 + top;
+        parent.children.push(float_box);
+    }
+}
+
+/// Whether `first` comes before `second` among `parent`'s children.
+fn precedes(doc: &Document, parent: NodeId, first: NodeId, second: NodeId) -> bool {
+    let children = doc.children(parent);
+    let index = |target: NodeId| children.iter().position(|&c| c == target);
+    match (index(first), index(second)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
 }
 
 /// Collects a block's inline content as styled runs, stopping at block children
@@ -808,6 +984,116 @@ mod tests {
         assert!(
             spanning >= below - 5.0,
             "span {spanning} should cover both columns {below}"
+        );
+    }
+
+    #[test]
+    fn text_flows_beside_a_left_float() {
+        let html = "<body><div class=\"f\">side</div><p>the quick brown fox jumps over the \
+                    lazy dog and keeps on running for a good while longer than one line \
+                    so that several lines sit beside the float</p></body>";
+        // Tall enough to narrow several lines; a one-line float would narrow
+        // only the first and the test could not tell the cases apart.
+        let floated = run(
+            html,
+            "body { margin: 0 } .f { float: left; width: 150px; height: 120px }",
+            500.0,
+        );
+        let plain = run(
+            html,
+            "body { margin: 0 } .f { width: 150px; height: 120px }",
+            500.0,
+        );
+
+        let float_box = content_boxes(&floated)
+            .into_iter()
+            .find(|b| b.style.float == Float::Left)
+            .expect("float box");
+        assert_eq!(
+            float_box.rect.y, 0.0,
+            "the float sits at the top, not below the text"
+        );
+
+        // Beside a 150px float the paragraph has less room, so it needs more
+        // lines than the same paragraph laid out at full width.
+        let lines = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .filter_map(|b| b.text.as_ref().map(|t| t.lines.len()))
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(
+            lines(&floated) > lines(&plain),
+            "text did not narrow beside the float: {} vs {}",
+            lines(&floated),
+            lines(&plain)
+        );
+    }
+
+    #[test]
+    fn a_right_float_sits_against_the_right_edge() {
+        let rendered = run(
+            "<body><div class=\"f\">side</div><p>text</p></body>",
+            "body { margin: 0 } .f { float: right; width: 100px }",
+            600.0,
+        );
+        let float_box = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.float == Float::Right)
+            .expect("float box");
+        assert!(
+            float_box.rect.x > 400.0,
+            "expected a right-hand position, got {}",
+            float_box.rect.x
+        );
+    }
+
+    #[test]
+    fn clear_pushes_a_block_below_the_float() {
+        let cleared = run(
+            "<body><div class=\"f\">side</div><p class=\"c\">after</p></body>",
+            "body { margin: 0 } .f { float: left; width: 100px; height: 80px } .c { clear: left }",
+            500.0,
+        );
+        let uncleared = run(
+            "<body><div class=\"f\">side</div><p class=\"c\">after</p></body>",
+            "body { margin: 0 } .f { float: left; width: 100px; height: 80px }",
+            500.0,
+        );
+        // Select the paragraph specifically: the float also has text, and it is
+        // pushed into the box list first.
+        let paragraph_y = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .find(|b| b.style.float == Float::None && b.text.is_some())
+                .map(|b| b.rect.y)
+                .expect("paragraph box")
+        };
+        assert!(
+            paragraph_y(&cleared) >= 80.0,
+            "clear:left must move below the 80px float, got {}",
+            paragraph_y(&cleared)
+        );
+        assert!(
+            paragraph_y(&uncleared) < 80.0,
+            "without clear it stays alongside"
+        );
+    }
+
+    #[test]
+    fn a_container_encloses_a_float_taller_than_its_text() {
+        // Otherwise the next block starts beside the float and overlaps it.
+        let rendered = run(
+            "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
+            "body { margin: 0 } .f { float: left; width: 60px; height: 120px }",
+            400.0,
+        );
+        let container = content_boxes(&rendered)[0];
+        assert!(
+            container.rect.height >= 120.0,
+            "container must enclose its float, got {}",
+            container.rect.height
         );
     }
 

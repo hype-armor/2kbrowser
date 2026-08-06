@@ -7,7 +7,7 @@ use dom::{Document, NodeId};
 use crate::style::{
     BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack,
     FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
-    parse_border_style, parse_display,
+    parse_border_style, parse_clear, parse_display, parse_float,
 };
 use crate::value::{Color, Length, Raw, parse_color, parse_length};
 use crate::{Declaration, Specificity, Stylesheet};
@@ -206,6 +206,20 @@ fn apply(style: &mut ComputedStyle, declaration: &Declaration, parent: &Computed
                     "nowrap" => WhiteSpace::NoWrap,
                     _ => WhiteSpace::Normal,
                 };
+            }
+        }
+        "float" => {
+            if let Raw::Ident(name) = first
+                && let Some(float) = parse_float(name)
+            {
+                style.float = float;
+            }
+        }
+        "clear" => {
+            if let Raw::Ident(name) = first
+                && let Some(clear) = parse_clear(name)
+            {
+                style.clear = clear;
             }
         }
         "margin" => style.margin = parse_edges(values),

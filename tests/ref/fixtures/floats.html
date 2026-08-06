@@ -1,0 +1,18 @@
+<!doctype html><html><head><style>
+  body { margin: 14px; }
+  .left  { float: left;  width: 120px; height: 90px; background-color: #cfe3ff;
+           border: 1px solid #5588cc; padding: 4px; margin-right: 10px; }
+  .right { float: right; width: 100px; height: 70px; background-color: #ffe0cc;
+           border: 1px solid #cc8855; padding: 4px; margin-left: 10px; }
+  .cleared { clear: both; background-color: #eeeeee; padding: 6px; }
+</style></head><body>
+<div class="left">Floated left</div>
+<p>Text flows down the right-hand side of a left float, taking a narrower line
+   box for as long as the float is beside it, and regaining the full width once
+   the float has been passed. This paragraph is long enough to do both.</p>
+<div class="right">Floated right</div>
+<p>A right float narrows the line box from the other side without offsetting
+   where each line starts. Again there is enough text here to run past the
+   bottom of the float and widen out again.</p>
+<p class="cleared">This block clears both floats, so it starts below them.</p>
+</body></html>

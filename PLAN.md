@@ -259,7 +259,8 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 3. **Tables** — *mostly done.* Automatic column sizing from cell content,
    `colspan`, row groups, and declared widths. Missing: `rowspan`, collapsed
    borders, fixed layout, `border-spacing` parsing
-4. **Floats** — the other one
+4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
+   narrow beside them, `clear`, and containers that enclose their floats
 5. Images, links, scrolling, hit testing
 6. Positioned layout, then **quirks mode**, then **framesets**
 

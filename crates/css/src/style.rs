@@ -149,6 +149,53 @@ impl Default for FontStack {
     }
 }
 
+/// The `float` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Float {
+    /// Not floated.
+    #[default]
+    None,
+    /// Floated to the left; content flows down its right side.
+    Left,
+    /// Floated to the right.
+    Right,
+}
+
+/// The `clear` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clear {
+    /// Does not clear.
+    #[default]
+    None,
+    /// Moves below any left float.
+    Left,
+    /// Moves below any right float.
+    Right,
+    /// Moves below every float.
+    Both,
+}
+
+/// Parses a `float` keyword.
+pub fn parse_float(name: &str) -> Option<Float> {
+    match name {
+        "none" => Some(Float::None),
+        "left" => Some(Float::Left),
+        "right" => Some(Float::Right),
+        _ => None,
+    }
+}
+
+/// Parses a `clear` keyword.
+pub fn parse_clear(name: &str) -> Option<Clear> {
+    match name {
+        "none" => Some(Clear::None),
+        "left" => Some(Clear::Left),
+        "right" => Some(Clear::Right),
+        "both" => Some(Clear::Both),
+        _ => None,
+    }
+}
+
 /// The `border-style` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BorderStyle {
@@ -323,6 +370,10 @@ pub struct ComputedStyle {
     pub padding: Edges,
     /// `border`.
     pub border: Borders,
+    /// `float`.
+    pub float: Float,
+    /// `clear`.
+    pub clear: Clear,
     /// `width`.
     pub width: Length,
     /// `height`.
@@ -351,6 +402,8 @@ impl Default for ComputedStyle {
             margin: Edges::ZERO,
             padding: Edges::ZERO,
             border: Borders::default(),
+            float: Float::None,
+            clear: Clear::None,
             width: Length::Auto,
             height: Length::Auto,
         }
