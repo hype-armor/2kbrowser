@@ -33,7 +33,8 @@ tab-separated file: edit it in anything.
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
-In a window: click a link to follow it. Alt+Left and Alt+Right, or Backspace,
+In a window: click a link to follow it, or Tab to it and press Enter — Shift+Tab
+goes back, Escape drops the focus. Alt+Left and Alt+Right, or Backspace,
 go back and forward. Ctrl+L focuses the URL bar and Ctrl+F searches the page;
 Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
 switches. Ctrl+D saves the page and Ctrl+B shows the saved list. Arrows and

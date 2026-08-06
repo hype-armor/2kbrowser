@@ -1,14 +1,18 @@
 //! The browser window.
 //!
-//! Manually verified once, on Linux: the window opens and draws correctly.
-//! Automated coverage is limited to the pure logic below — scroll clamping and
-//! the title string — because CI has no display server. Event handling and
-//! blitting are therefore exercised only by hand, and a regression in them
-//! would not be caught by `cargo test`. The pipeline underneath is the same one
-//! the reference tests cover on all three platforms.
+//! Manually verified on Linux: the window opens and draws correctly. Automated
+//! coverage is limited to the pure logic below — scroll clamping, the title
+//! string, the find highlights and the focus outline — because CI has no
+//! display server. Event handling and blitting are therefore exercised only by
+//! hand, and a regression in them would not be caught by `cargo test`. The
+//! pipeline underneath is the same one the reference tests cover on all three
+//! platforms.
 //!
-//! Deliberately thin. Tabs, a URL bar, history, and the mode banner are M3
-//! (ADR-0009); this is a viewport onto an already-rendered page.
+//! Kept as thin as it can be. Everything with a testable shape lives somewhere
+//! else — [`crate::history`], [`crate::tabs`], [`crate::field`],
+//! [`crate::chrome`], [`crate::bookmarks`] — precisely because this module is
+//! the part that cannot be tested. What is left here is the event loop, the
+//! blit, and the wiring between them.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -110,6 +114,17 @@ struct Tab {
     matches: Vec<layout::Rect>,
     /// Which match the reader is on.
     current_match: usize,
+    /// Which link has keyboard focus, as an index into `link_groups()`.
+    ///
+    /// `None` is the resting state, and is not the same as "the first one":
+    /// a page that opened with a link already outlined would be shouting about
+    /// something the reader has not asked for.
+    focused_link: Option<usize>,
+    /// Where that link is, in canvas coordinates.
+    ///
+    /// Cached rather than looked up each frame: the lookup walks the whole
+    /// document, and this is read on every redraw including every scroll step.
+    focused_rects: Vec<layout::Rect>,
 }
 
 impl Tab {
@@ -125,6 +140,8 @@ impl Tab {
             finding: None,
             matches: Vec::new(),
             current_match: 0,
+            focused_link: None,
+            focused_rects: Vec::new(),
         }
     }
 
@@ -215,6 +232,9 @@ impl App {
             };
             tab.current_match = tab.current_match.min(tab.matches.len().saturating_sub(1));
         }
+        // Same reason: the focused link is still the same link, but it is no
+        // longer in the same place.
+        self.refresh_focus();
 
         if let Some(window) = &self.window {
             // The page's own title, falling back to the URL: a titled page is
@@ -246,6 +266,9 @@ impl App {
                 self.tab_mut().scroll = 0.0;
                 // A decision about the previous page, not a setting.
                 self.tab_mut().forcing_authored = false;
+                // Focus belonged to a link on the page that just left.
+                self.tab_mut().focused_link = None;
+                self.tab_mut().focused_rects.clear();
             }
             // The page that failed stays on screen rather than being replaced
             // with a blank one: what was there is more useful than nothing, and
@@ -402,6 +425,109 @@ impl App {
         self.rerender();
     }
 
+    /// Moves keyboard focus to the next or previous link.
+    ///
+    /// The thing `links()` was built for: a browser that can only be driven
+    /// with a pointer is not keyboard-first, however many shortcuts the chrome
+    /// has. Wraps, because a reader who has tabbed to the bottom of a page
+    /// wants the top rather than a dead key.
+    fn step_link(&mut self, forward: bool) {
+        // Gathered once. Collecting the links walks the whole document, and
+        // doing it separately to count, to place, and to scroll would walk a
+        // long page three times per keystroke.
+        let Some(links) = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::render::Page::link_groups)
+        else {
+            return;
+        };
+        let count = links.len();
+        if count == 0 {
+            return;
+        }
+        let at = match (self.tab().focused_link, forward) {
+            // The first Tab lands on the first link rather than the second:
+            // there is no focus to advance from yet.
+            (None, true) => 0,
+            (None, false) => count - 1,
+            (Some(at), true) => (at + 1) % count,
+            (Some(at), false) => (at + count - 1) % count,
+        };
+        self.tab_mut().focused_link = Some(at);
+        self.tab_mut().focused_rects = links[at].rects.clone();
+        self.scroll_into_view(links[at].bounds());
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Drops keyboard focus, if anything had it. Returns whether it did.
+    fn clear_focused_link(&mut self) -> bool {
+        let had = self.tab_mut().focused_link.take().is_some();
+        self.tab_mut().focused_rects.clear();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
+    }
+
+    /// Follows the focused link, if there is one.
+    fn follow_focused_link(&mut self) {
+        let Some(url) = self.focused().map(|link| link.url) else {
+            return;
+        };
+        self.navigate(url);
+    }
+
+    /// The focused link, looked up afresh.
+    fn focused(&self) -> Option<crate::render::Link> {
+        let at = self.tab().focused_link?;
+        self.tab().page.as_ref()?.link_groups().into_iter().nth(at)
+    }
+
+    /// Re-derives where the focused link is after a re-layout.
+    ///
+    /// The index survives a resize; the geometry does not. A focus outline left
+    /// over a stale rectangle would be drawn around whatever now happens to be
+    /// there.
+    fn refresh_focus(&mut self) {
+        if self.tab().focused_link.is_none() {
+            return;
+        }
+        let rects = self.focused().map(|link| link.rects).unwrap_or_default();
+        // A page that lost the link — re-rendered as a document, say — has no
+        // focus to keep.
+        if rects.is_empty() {
+            self.tab_mut().focused_link = None;
+        }
+        self.tab_mut().focused_rects = rects;
+    }
+
+    /// Scrolls `bounds` into view, if it is not already.
+    ///
+    /// Only when it is off screen, for the same reason find does it: moving the
+    /// page under someone who can already see the thing is disorienting.
+    ///
+    /// The whole rectangle, which for a link means all of it — a link that
+    /// wraps across a line break can be scrolled to and still be half off
+    /// screen.
+    fn scroll_into_view(&mut self, bounds: layout::Rect) {
+        let Some(height) = self.tab().page.as_ref().map(|page| page.content_height) else {
+            return;
+        };
+        let viewport = self.viewport_height();
+        let (top, bottom) = (self.tab().scroll, self.tab().scroll + viewport);
+        if bounds.y >= top && bounds.y + bounds.height <= bottom {
+            return;
+        }
+        // A third of the way down, which leaves it in context rather than
+        // jammed against the top edge.
+        let target = bounds.y - viewport / 3.0;
+        self.tab_mut().scroll = clamp_scroll(target, height, viewport);
+    }
+
     /// Saves the current page, or forgets it if it is already saved.
     ///
     /// Written through immediately rather than on exit: a browser that lost
@@ -499,24 +625,11 @@ impl App {
     }
 
     /// Brings the current match into view, if it is not already.
-    ///
-    /// Only when it is off screen: a match already visible should stay where
-    /// it is, because scrolling the page under someone who can see what they
-    /// were looking for is disorienting.
     fn scroll_to_current_match(&mut self) {
         let Some(rect) = self.tab().matches.get(self.tab().current_match).copied() else {
             return;
         };
-        let Some(page) = &self.tab().page else { return };
-        let viewport = self.viewport_height();
-        let (top, bottom) = (self.tab().scroll, self.tab().scroll + viewport);
-        if rect.y >= top && rect.y + rect.height <= bottom {
-            return;
-        }
-        // A third of the way down, which leaves the match in context rather
-        // than jammed against the top edge.
-        let target = rect.y - viewport / 3.0;
-        self.tab_mut().scroll = clamp_scroll(target, page.content_height, viewport);
+        self.scroll_into_view(rect);
     }
 
     /// Handles a key while find is open.
@@ -757,7 +870,70 @@ impl App {
             (width.get(), height.get()),
             bar_height,
         );
+        outline_focus(
+            &mut buffer,
+            &tab.focused_rects,
+            tab.scroll,
+            (width.get(), height.get()),
+            bar_height,
+        );
         let _ = buffer.present();
+    }
+}
+
+/// Colour of the keyboard focus outline. The chrome's focus blue, because it
+/// means the same thing there.
+const FOCUS_OUTLINE: u32 = 0x003a_6ea5;
+/// Thickness of that outline.
+const FOCUS_WIDTH: i64 = 2;
+
+/// Draws a box around the focused link.
+///
+/// An outline rather than a tint, so it does not read as a find match — the two
+/// can be on screen at once and mean different things — and so it stays visible
+/// over a link's own background.
+///
+/// Drawn into the window buffer for the same reason the highlights are: focus
+/// moves on every Tab and the page underneath is unchanged.
+fn outline_focus(
+    buffer: &mut [u32],
+    rects: &[layout::Rect],
+    scroll: f32,
+    size: (u32, u32),
+    bar_height: u32,
+) {
+    let (width, height) = size;
+    for rect in rects {
+        // A pixel or two of air, so the outline sits around the text rather
+        // than on it.
+        let left = rect.x.round() as i64 - FOCUS_WIDTH;
+        let right = (rect.x + rect.width).round() as i64 + FOCUS_WIDTH;
+        let top = (rect.y - scroll + bar_height as f32).round() as i64 - FOCUS_WIDTH;
+        let bottom =
+            (rect.y + rect.height - scroll + bar_height as f32).round() as i64 + FOCUS_WIDTH;
+
+        for y in top..bottom {
+            for x in left..right {
+                // Only the frame: inside it the page shows through.
+                let on_edge = y < top + FOCUS_WIDTH
+                    || y >= bottom - FOCUS_WIDTH
+                    || x < left + FOCUS_WIDTH
+                    || x >= right - FOCUS_WIDTH;
+                // Clipped to the page area: the bar is not part of the page and
+                // an outline must never be drawn over it.
+                if !on_edge
+                    || y < bar_height as i64
+                    || y >= height as i64
+                    || x < 0
+                    || x >= width as i64
+                {
+                    continue;
+                }
+                if let Some(pixel) = buffer.get_mut((y * width as i64 + x) as usize) {
+                    *pixel = FOCUS_OUTLINE;
+                }
+            }
+        }
     }
 }
 
@@ -1031,6 +1207,17 @@ impl ApplicationHandler for App {
                     self.focus_url();
                     return;
                 }
+                // Tab walks the page's links, Enter follows the one it is on.
+                // A browser that can only be driven with a pointer is not
+                // keyboard-first however many shortcuts its chrome has.
+                if matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
+                    self.step_link(!shift);
+                    return;
+                }
+                if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
+                    self.follow_focused_link();
+                    return;
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::ArrowLeft) if alt => {
                         self.go_back();
@@ -1047,7 +1234,14 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
                 match event.logical_key {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    // Escape gives up whatever is in progress before it gives
+                    // up the window: quitting out from under someone who only
+                    // meant to drop a focus ring would be unforgivable.
+                    Key::Named(NamedKey::Escape) => {
+                        if !self.clear_focused_link() {
+                            event_loop.exit();
+                        }
+                    }
                     Key::Named(NamedKey::ArrowDown) => self.scroll_by(SCROLL_STEP),
                     Key::Named(NamedKey::ArrowUp) => self.scroll_by(-SCROLL_STEP),
                     Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
@@ -1311,5 +1505,117 @@ mod highlight_tests {
         let mut buffer = buffer();
         highlight_matches(&mut buffer, &[], 0, 0.0, (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
+    }
+}
+
+#[cfg(test)]
+mod focus_outline_tests {
+    use super::{FOCUS_OUTLINE, outline_focus};
+    use layout::Rect;
+
+    /// A 12x12 white buffer, big enough for a box with a hole in it.
+    fn buffer() -> Vec<u32> {
+        vec![0x00ff_ffff; 144]
+    }
+
+    fn at(buffer: &[u32], x: usize, y: usize) -> u32 {
+        buffer[y * 12 + x]
+    }
+
+    #[test]
+    fn the_outline_is_a_frame_and_not_a_fill() {
+        // A filled box would paint over the link it is drawing attention to.
+        let mut buffer = buffer();
+        outline_focus(
+            &mut buffer,
+            &[Rect {
+                x: 4.0,
+                y: 4.0,
+                width: 4.0,
+                height: 4.0,
+            }],
+            0.0,
+            (12, 12),
+            0,
+        );
+        assert_eq!(at(&buffer, 2, 2), FOCUS_OUTLINE, "top-left of the frame");
+        assert_eq!(at(&buffer, 6, 6), 0x00ff_ffff, "the middle shows through");
+        assert_eq!(at(&buffer, 0, 0), 0x00ff_ffff, "and outside is untouched");
+    }
+
+    #[test]
+    fn every_piece_of_a_wrapped_link_is_outlined() {
+        // A link that breaks across a line is several rectangles and one
+        // destination; outlining the first alone would look like a bug.
+        let piece = |y: f32| Rect {
+            x: 4.0,
+            y,
+            width: 3.0,
+            height: 1.0,
+        };
+        let mut one = buffer();
+        outline_focus(&mut one, &[piece(3.0)], 0.0, (12, 12), 0);
+        let mut both = buffer();
+        outline_focus(&mut both, &[piece(3.0), piece(8.0)], 0.0, (12, 12), 0);
+        assert_ne!(one, both);
+        assert!(
+            both.iter().filter(|p| **p == FOCUS_OUTLINE).count()
+                > one.iter().filter(|p| **p == FOCUS_OUTLINE).count()
+        );
+    }
+
+    #[test]
+    fn the_outline_does_not_bleed_into_the_chrome() {
+        // The bar is not part of the page, and a link scrolled under it must
+        // not draw over the URL.
+        let mut buffer = buffer();
+        outline_focus(
+            &mut buffer,
+            &[Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 12.0,
+                height: 2.0,
+            }],
+            0.0,
+            (12, 12),
+            5,
+        );
+        for y in 0..5 {
+            for x in 0..12 {
+                assert_eq!(at(&buffer, x, y), 0x00ff_ffff, "chrome row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_scrolled_off_the_page_is_clipped_rather_than_wrapping() {
+        // Negative and oversized coordinates are arithmetic on i64 here for
+        // exactly this reason: as unsigned they would wrap and paint a stripe
+        // across the wrong row.
+        let mut buffer = buffer();
+        outline_focus(
+            &mut buffer,
+            &[Rect {
+                x: -50.0,
+                y: -50.0,
+                width: 500.0,
+                height: 500.0,
+            }],
+            0.0,
+            (12, 12),
+            0,
+        );
+        assert!(
+            buffer.iter().all(|p| *p == 0x00ff_ffff),
+            "the frame is entirely outside the window"
+        );
+    }
+
+    #[test]
+    fn nothing_focused_leaves_the_buffer_alone() {
+        let mut buffer = buffer();
+        outline_focus(&mut buffer, &[], 0.0, (12, 12), 0);
+        assert!(buffer.iter().all(|p| *p == 0x00ff_ffff));
     }
 }

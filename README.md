@@ -80,6 +80,12 @@ and its own bugs. `2kbrowser bookmarks` prints the same list. It is stored as a
 tab-separated file under your config directory: a few kilobytes, editable in
 anything, and the only state this browser keeps between runs.
 
+Links can be followed without a pointer: Tab walks them in document order,
+Shift+Tab goes back, Enter follows, Escape drops the focus. The focused link is
+outlined rather than tinted, so it does not read as a find match — both can be
+on screen at once and they mean different things — and a link that wraps across
+a line break is outlined in every piece, because it is one link.
+
 M3 is complete. See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and

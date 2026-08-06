@@ -98,6 +98,25 @@ impl Page {
     /// What a keyboard-first browser needs: something to number, highlight, and
     /// jump between without a pointer ever being involved.
     pub fn links(&self) -> Vec<(layout::Rect, String)> {
+        self.link_groups()
+            .into_iter()
+            .flat_map(|link| {
+                link.rects
+                    .into_iter()
+                    .map(move |rect| (rect, link.url.clone()))
+            })
+            .collect()
+    }
+
+    /// The same links, with each one's rectangles kept together.
+    ///
+    /// A link that wraps across a line break is several rectangles and one
+    /// destination. Keyboard focus has to move link by link — stepping through
+    /// rectangles would stop twice inside one link and look like nothing
+    /// happened — so the grouping cannot be recovered afterwards and is kept.
+    ///
+    /// Document order, which is the order a reader would meet them in.
+    pub fn link_groups(&self) -> Vec<Link> {
         let mut out = Vec::new();
         for frame in &self.frames {
             for node in frame.doc.descendants(frame.doc.root()) {
@@ -107,15 +126,54 @@ impl Page {
                 if link != node || href.starts_with('#') {
                     continue;
                 }
-                let url = net::resolve(&frame.origin, &frame.path, href);
-                for mut rect in frame.layout.rects_for(node) {
-                    rect.x += frame.rect.x;
-                    rect.y += frame.rect.y;
-                    out.push((rect, url.clone()));
+                let rects: Vec<layout::Rect> = frame
+                    .layout
+                    .rects_for(node)
+                    .into_iter()
+                    .map(|mut rect| {
+                        rect.x += frame.rect.x;
+                        rect.y += frame.rect.y;
+                        rect
+                    })
+                    .collect();
+                if rects.is_empty() {
+                    continue;
                 }
+                out.push(Link {
+                    rects,
+                    url: net::resolve(&frame.origin, &frame.path, href),
+                });
             }
         }
         out
+    }
+}
+
+/// One link: everywhere it is on the canvas, and where it leads.
+#[derive(Debug, Clone)]
+pub struct Link {
+    /// Its rectangles. More than one when it wraps across a line break.
+    pub rects: Vec<layout::Rect>,
+    /// The absolute URL it leads to.
+    pub url: String,
+}
+
+impl Link {
+    /// The rectangle enclosing all of this link's pieces.
+    ///
+    /// What scrolling to it uses: bringing the first fragment of a wrapped link
+    /// into view can leave the rest of it off screen.
+    pub fn bounds(&self) -> layout::Rect {
+        let mut bounds = self.rects[0];
+        for rect in &self.rects[1..] {
+            let right = (bounds.x + bounds.width).max(rect.x + rect.width);
+            let bottom = (bounds.y + bounds.height).max(rect.y + rect.height);
+            bounds.x = bounds.x.min(rect.x);
+            bounds.y = bounds.y.min(rect.y);
+            bounds.width = right - bounds.x;
+            bounds.height = bottom - bounds.y;
+        }
+        bounds
     }
 }
 
@@ -831,6 +889,73 @@ mod link_geometry_tests {
         assert_eq!(
             page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
             None
+        );
+    }
+
+    #[test]
+    fn a_wrapped_link_is_one_link_with_several_rectangles() {
+        // Keyboard focus moves link by link. Stepping through rectangles would
+        // stop twice inside one link and look like the key did nothing.
+        let (page, _) = page_at(
+            "wrapped.html",
+            &format!(
+                "<body><p><a href=\"b.html\">{}</a></p></body>",
+                "a long link that has to wrap ".repeat(6)
+            ),
+        );
+        let groups = page.link_groups();
+        assert_eq!(groups.len(), 1, "one link");
+        assert!(
+            groups[0].rects.len() > 1,
+            "it should have wrapped: {:?}",
+            groups[0].rects
+        );
+        assert_eq!(
+            page.links().len(),
+            groups[0].rects.len(),
+            "and the flat list still has every rectangle"
+        );
+    }
+
+    #[test]
+    fn a_links_bounds_enclose_all_of_its_pieces() {
+        // Scrolling to the first fragment of a wrapped link can leave the rest
+        // of it off screen.
+        let (page, _) = page_at(
+            "bounds.html",
+            &format!(
+                "<body><p><a href=\"b.html\">{}</a></p></body>",
+                "wrap me around several lines please ".repeat(6)
+            ),
+        );
+        let link = page.link_groups().pop().expect("a link");
+        let bounds = link.bounds();
+        for rect in &link.rects {
+            assert!(rect.x >= bounds.x, "{rect:?} vs {bounds:?}");
+            assert!(rect.y >= bounds.y, "{rect:?} vs {bounds:?}");
+            assert!(rect.x + rect.width <= bounds.x + bounds.width, "{rect:?}");
+            assert!(rect.y + rect.height <= bounds.y + bounds.height, "{rect:?}");
+        }
+        assert!(bounds.height > link.rects[0].height, "more than one line");
+    }
+
+    #[test]
+    fn links_come_back_in_document_order() {
+        // The order a reader would meet them in, which is what Tab has to
+        // follow.
+        let (page, base) = page_at(
+            "order.html",
+            r#"<body><p><a href="one.html">one</a> <a href="two.html">two</a></p>
+               <p><a href="three.html">three</a></p></body>"#,
+        );
+        let urls: Vec<String> = page.link_groups().into_iter().map(|l| l.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                format!("{base}/one.html"),
+                format!("{base}/two.html"),
+                format!("{base}/three.html"),
+            ]
         );
     }
 
