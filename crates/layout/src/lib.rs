@@ -808,6 +808,16 @@ fn layout_block(
             &mut margin_left,
             &mut margin_right,
         );
+        // `<center>` and `align="center"` centre their block children as well
+        // as their text. `text-align` inherits, so a box can tell by looking at
+        // its own — which is exactly why this needs its own value rather than
+        // reusing plain `center`.
+        if style.text_align == TextAlign::CenterBlocks
+            && style.margin.left == Length::Px(0.0)
+            && style.margin.right == Length::Px(0.0)
+        {
+            margin_left = ((available_width - outer_width) / 2.0).max(0.0);
+        }
     }
 
     if is_replaced(doc, node) {
@@ -994,6 +1004,14 @@ fn layout_block(
                 &mut left,
                 &mut right,
             );
+            // A shrink-to-fit table inside `<center>` is the era's commonest
+            // way of centring one, and its real width is only known now.
+            if style.text_align == TextAlign::CenterBlocks
+                && style.margin.left == Length::Px(0.0)
+                && style.margin.right == Length::Px(0.0)
+            {
+                left = ((available_width - box_.rect.width) / 2.0).max(0.0);
+            }
             box_.rect.x = x + left;
         }
         let outer = box_.outer_height(font_size);
@@ -1841,7 +1859,9 @@ fn collapse_whitespace_from(text: &str, after_space: bool) -> String {
 pub fn line_offset(align: TextAlign, line_width: f32, content_width: f32) -> f32 {
     match align {
         TextAlign::Left | TextAlign::Justify => 0.0,
-        TextAlign::Center => ((content_width - line_width) / 2.0).max(0.0),
+        TextAlign::Center | TextAlign::CenterBlocks => {
+            ((content_width - line_width) / 2.0).max(0.0)
+        }
         TextAlign::Right => (content_width - line_width).max(0.0),
     }
 }
@@ -2371,6 +2391,55 @@ mod tests {
         );
         let box_ = content_boxes(&rendered)[0];
         assert_eq!((box_.rect.x, box_.rect.width), (0.0, 600.0));
+    }
+
+    #[test]
+    fn center_moves_its_block_children_and_text_align_center_does_not() {
+        // `<center><table></center>` was the commonest way to centre a table,
+        // and plain `text-align: center` does not move a table at all. Sharing
+        // one value between them either stops `<center>` working or starts
+        // moving boxes for stylesheets that only asked for centred text.
+        let table_x = |html: &str, css: &str| {
+            let rendered = run(html, css, 600.0);
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.style.display == Display::Table)
+                .expect("a table")
+                .rect
+                .x
+        };
+
+        let centred = table_x(
+            r#"<body><center><table width="300"><tr><td>x</td></tr></table></center></body>"#,
+            "body { margin: 0 }",
+        );
+        assert!(centred > 100.0, "the table sits at {centred}");
+
+        let not_centred = table_x(
+            r#"<body><div><table width="300"><tr><td>x</td></tr></table></div></body>"#,
+            "body { margin: 0 } div { text-align: center }",
+        );
+        assert_eq!(not_centred, 0.0, "a stylesheet must not move the table");
+    }
+
+    #[test]
+    fn a_shrink_to_fit_table_is_centred_too() {
+        // Its real width is only known after its columns are sized.
+        let rendered = run(
+            "<body><center><table><tr><td>narrow</td></tr></table></center></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let table = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("a table");
+        assert!(
+            table.rect.x > 100.0,
+            "table at {} is {} wide",
+            table.rect.x,
+            table.rect.width
+        );
     }
 
     #[test]

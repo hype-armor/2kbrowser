@@ -57,7 +57,9 @@ ul ul ul { list-style-type: square; }
 
 blockquote { padding-left: 40px; padding-right: 40px; }
 
-center { text-align: center; }
+/* Not plain `center`: `<center>` centres block children too, which is how
+   `<center><table>` centred a table and is why the element existed. */
+center { text-align: -webkit-center; }
 
 /* A rule is an empty block with a border, which is how every browser has
    drawn it. Without one it is a zero-height box that draws nothing, and the

@@ -99,10 +99,26 @@ pub enum TextAlign {
     Left,
     /// Centre within the line box.
     Center,
+    /// Centre the line box *and* any block child narrow enough to move.
+    ///
+    /// What `<center>` and `align="center"` actually do, and the difference
+    /// between them and the CSS property: `<center><table></center>` was the
+    /// commonest way to centre a table on the era's web, and plain
+    /// `text-align: center` does not move a table at all. Browsers spell this
+    /// `-webkit-center`; it is a separate value precisely so a stylesheet
+    /// asking for centred *text* does not start moving boxes around.
+    CenterBlocks,
     /// Align to the end edge.
     Right,
     /// Stretch to both edges.
     Justify,
+}
+
+impl TextAlign {
+    /// Whether lines are centred.
+    pub fn centres_text(self) -> bool {
+        matches!(self, TextAlign::Center | TextAlign::CenterBlocks)
+    }
 }
 
 /// The `text-decoration` property.

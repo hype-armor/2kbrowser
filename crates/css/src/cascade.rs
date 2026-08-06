@@ -315,6 +315,10 @@ fn apply(
             if let Raw::Ident(name) = first {
                 style.text_align = match name.as_str() {
                     "center" => TextAlign::Center,
+                    // Browsers spell this `-webkit-center`; it centres block
+                    // children as well as text, which is what `<center>` and
+                    // `align="center"` mean and what plain `center` does not.
+                    "-webkit-center" | "-moz-center" => TextAlign::CenterBlocks,
                     "right" => TextAlign::Right,
                     "justify" => TextAlign::Justify,
                     _ => TextAlign::Left,
@@ -601,14 +605,10 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
                 push("margin-left", "auto");
                 push("margin-right", "auto");
             }
-            "left" | "right" | "center" | "middle" | "justify" => {
-                let value = if align.eq_ignore_ascii_case("middle") {
-                    "center"
-                } else {
-                    align
-                };
-                push("text-align", value);
-            }
+            // `align="center"` centres the block children too, which is how
+            // `<div align="center"><table>` centres its table.
+            "center" | "middle" => push("text-align", "-webkit-center"),
+            "left" | "right" | "justify" => push("text-align", align),
             _ => {}
         }
     }
@@ -1255,8 +1255,14 @@ mod tests {
 
     #[test]
     fn align_becomes_text_align_but_floats_an_image() {
+        // `align="center"` centres block children too, so it is the value that
+        // does both — not the one a stylesheet gets from `text-align: center`.
         let paragraph = standards_style_of(r#"<p align="center">x</p>"#, "", "p");
-        assert_eq!(paragraph.text_align, TextAlign::Center);
+        assert_eq!(paragraph.text_align, TextAlign::CenterBlocks);
+        assert!(paragraph.text_align.centres_text());
+
+        let right = standards_style_of(r#"<p align="right">x</p>"#, "", "p");
+        assert_eq!(right.text_align, TextAlign::Right);
 
         // On an image the same attribute means float, not text alignment.
         let image = standards_style_of(r#"<body><img align="right"></body>"#, "", "img");
