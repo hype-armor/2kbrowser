@@ -14,13 +14,15 @@ use crate::value::{
 };
 use crate::{Declaration, Specificity, Stylesheet};
 
-/// Where a stylesheet came from. Origin outranks specificity in the cascade.
+/// Where a declaration came from. Origin outranks specificity in the cascade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Origin {
     /// The user-agent stylesheet.
     UserAgent,
     /// Stylesheets supplied by the page.
     Author,
+    /// A `style` attribute on the element itself, which outranks every rule.
+    Inline,
 }
 
 /// Computed styles for every element in a document.
@@ -125,6 +127,25 @@ fn compute(
                 }
             }
         }
+    }
+
+    // A `style` attribute applies to this element alone and beats every rule.
+    let inline = doc
+        .element(node)
+        .and_then(|element| element.attr("style"))
+        .map(crate::parse_style_attribute)
+        .unwrap_or_default();
+    for declaration in &inline {
+        order += 1;
+        matched.push((
+            Precedence {
+                important: declaration.important,
+                origin: Origin::Inline,
+                specificity: Specificity::default(),
+                order,
+            },
+            declaration,
+        ));
     }
 
     matched.sort_by(|a, b| a.0.cmp(&b.0));

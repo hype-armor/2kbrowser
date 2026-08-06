@@ -42,6 +42,16 @@ pub fn render_with_base(
     base: Option<(&Origin, &str)>,
 ) -> Page {
     let doc = dom::parse(html);
+
+    // A frameset document has no body to lay out: each frame is a separate
+    // page, fetched and rendered in its own right, then composited into the
+    // window. Handled before styling because there is nothing here to style.
+    if let Some(frameset) = doc.find_element("frameset")
+        && let Some((origin, path)) = base
+    {
+        return render_frameset(&doc, frameset, width, max_height, fonts, origin, path, 0);
+    }
+
     let author_sheets = collect_stylesheets(&doc);
     let styles = css::cascade::cascade(&doc, &author_sheets);
 
@@ -83,6 +93,127 @@ pub fn render_with_base(
         mode,
         content_height: laid_out.height,
         images_loaded: images.len(),
+    }
+}
+
+/// How deeply framesets may nest before we stop following them.
+///
+/// A frameset can name itself, directly or through a cycle, and a browser that
+/// followed that would fetch forever.
+const MAX_FRAME_DEPTH: usize = 4;
+
+/// Viewport height assumed for a frameset when none is supplied.
+///
+/// An ordinary page has an intrinsic height — its content — and `max_height` is
+/// only a cap. A frameset has none: it *is* the viewport, and its rows are
+/// shares of a height that has to come from somewhere. Headless rendering has
+/// no window to ask, so it picks one rather than stretching frames down a
+/// content-sized canvas.
+const DEFAULT_FRAMESET_HEIGHT: u32 = 600;
+
+/// Renders a frameset by rendering each frame and compositing the results.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "render context, threaded explicitly for clarity"
+)]
+fn render_frameset(
+    doc: &dom::Document,
+    frameset: dom::NodeId,
+    width: u32,
+    max_height: u32,
+    fonts: &mut FontStore,
+    origin: &Origin,
+    path: &str,
+    depth: usize,
+) -> Page {
+    let height = max_height.clamp(1, DEFAULT_FRAMESET_HEIGHT);
+    let mut pixmap = Pixmap::new(width.max(1), height).expect("frameset canvas");
+    pixmap.fill(paint::RasterColor::WHITE);
+
+    let element = doc.element(frameset);
+    let rows =
+        layout::frameset::parse_spec(element.and_then(|e| e.attr("rows")).unwrap_or_default());
+    let columns =
+        layout::frameset::parse_spec(element.and_then(|e| e.attr("cols")).unwrap_or_default());
+    let row_sizes = layout::frameset::distribute(&rows, height as f32);
+    let column_sizes = layout::frameset::distribute(&columns, width as f32);
+    let cells = layout::frameset::cells(&row_sizes, &column_sizes);
+
+    // Only `frame` and nested `frameset` children occupy cells, in order.
+    let children: Vec<dom::NodeId> = doc
+        .children(frameset)
+        .iter()
+        .copied()
+        .filter(|&child| {
+            doc.element(child)
+                .is_some_and(|e| matches!(e.local_name(), "frame" | "frameset"))
+        })
+        .collect();
+
+    let fetcher = Fetcher::default();
+    let mut loaded = 0usize;
+
+    for (child, cell) in children.iter().zip(cells) {
+        let (x, y, cell_width, cell_height) = cell;
+        if cell_width < 1.0 || cell_height < 1.0 {
+            continue;
+        }
+        let Some(element) = doc.element(*child) else {
+            continue;
+        };
+
+        let sub = if element.local_name() == "frameset" {
+            if depth + 1 > MAX_FRAME_DEPTH {
+                continue;
+            }
+            render_frameset(
+                doc,
+                *child,
+                cell_width as u32,
+                cell_height as u32,
+                fonts,
+                origin,
+                path,
+                depth + 1,
+            )
+        } else {
+            let Some(src) = element.attr("src") else {
+                continue;
+            };
+            let url = net::resolve(origin, path, src);
+            // A frame is a navigation to another document, not a subresource,
+            // so it is not subject to the third-party rule (ADR-0006).
+            let Ok(resource) = fetcher.fetch(&url, None, RequestKind::Navigation) else {
+                continue;
+            };
+            if depth + 1 > MAX_FRAME_DEPTH {
+                continue;
+            }
+            loaded += 1;
+            render_with_base(
+                &resource.body,
+                cell_width as u32,
+                cell_height as u32,
+                fonts,
+                Some((&resource.origin, &resource.path)),
+            )
+        };
+
+        pixmap.draw_pixmap(
+            x as i32,
+            y as i32,
+            sub.pixmap.as_ref(),
+            &paint::PixmapPaint::default(),
+            paint::Transform::identity(),
+            None,
+        );
+    }
+
+    Page {
+        pixmap,
+        mode: RenderMode::Authored,
+        content_height: height as f32,
+        images_loaded: loaded,
     }
 }
 

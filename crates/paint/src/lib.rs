@@ -9,12 +9,14 @@ pub mod images;
 use css::value::Color;
 use layout::{Layout, LayoutBox, Rect, line_offset};
 use text::FontStore;
-use tiny_skia::{FillRule, Paint, PathBuilder, PixmapPaint, Transform};
+use tiny_skia::{FillRule, Paint, PathBuilder};
 
 // Re-exported so consumers do not need their own tiny-skia dependency, and so
 // the rasteriser choice stays an implementation detail of this crate.
 pub use images::{DecodedImage, ImageStore, decode};
-pub use tiny_skia::Pixmap;
+// Re-exported for consumers that composite pixmaps of their own, such as the
+// frameset renderer.
+pub use tiny_skia::{Color as RasterColor, Pixmap, PixmapPaint, Transform};
 
 /// One paint operation.
 ///

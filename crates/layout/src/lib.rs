@@ -7,6 +7,7 @@
 
 pub mod classify;
 pub mod floats;
+pub mod frameset;
 pub mod table;
 
 use css::cascade::StyleMap;

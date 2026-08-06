@@ -266,7 +266,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 6. **Positioned layout** — *done.* Relative shifts, absolute placement against
    the nearest positioned ancestor, `top`/`right`/`bottom`/`left`, shrink-to-fit
    widths. **Quirks mode** — *started;* unitless lengths and hash-less hex
-   colours parse, other quirks outstanding. **Framesets** remain
+   colours parse, other quirks outstanding. **Framesets** — *done*
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes

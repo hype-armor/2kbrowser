@@ -65,6 +65,22 @@ impl Stylesheet {
     }
 }
 
+/// Parses the contents of a `style` attribute.
+///
+/// An inline `style` has no selector: it is a bare declaration block that
+/// applies to one element, and it outranks every author rule regardless of
+/// specificity. Extremely common in the era's markup, and without it a page's
+/// colours and spacing simply do not appear.
+pub fn parse_style_attribute(source: &str) -> Vec<Declaration> {
+    let mut input = ParserInput::new(source);
+    let mut parser = Parser::new(&mut input);
+    let mut declaration_parser = DeclarationBlock;
+    let body = RuleBodyParser::new(&mut parser, &mut declaration_parser);
+    // `flatten` drops declarations that fail to parse, which is the specified
+    // recovery — one bad property must not discard the rest of the attribute.
+    body.flatten().collect()
+}
+
 /// Parses top-level qualified rules. At-rules are skipped: `@media` and
 /// `@import` are M2 work, and skipping is the specified recovery.
 struct TopLevel;
