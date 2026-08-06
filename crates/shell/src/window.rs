@@ -26,6 +26,25 @@ const SCROLL_STEP: f32 = 60.0;
 /// Multiplier applied to line-based mouse wheel deltas.
 const WHEEL_LINE_HEIGHT: f32 = 40.0;
 
+/// Turns what someone typed into a URL.
+///
+/// A bare host is the overwhelmingly common case and has to work: typing
+/// `example.com` and getting a file-not-found would be absurd. Anything naming
+/// a scheme is left alone, and anything that looks like a path is treated as
+/// one.
+fn entered_url(typed: &str) -> String {
+    if net::policy::has_scheme(typed) {
+        return typed.to_owned();
+    }
+    if typed.starts_with('/') || typed.starts_with('.') {
+        return format!("file://{typed}");
+    }
+    // https, not http: the browser should not quietly downgrade what it
+    // reaches for, even though it will happily show a page that is only
+    // available over http when a link leads there (ADR-0006).
+    format!("https://{typed}")
+}
+
 /// Packs a rendered pixel for softbuffer.
 ///
 /// softbuffer wants 0RGB in a u32; tiny-skia stores premultiplied RGBA.
@@ -95,6 +114,9 @@ struct App {
     forcing_authored: bool,
     /// Whether this page had a fallback decision to overrule.
     can_toggle_layout: bool,
+    /// The URL bar when it has focus. `None` means it is showing where you
+    /// are rather than accepting where you want to go.
+    editing: Option<crate::field::Field>,
 }
 
 impl App {
@@ -145,6 +167,7 @@ impl App {
                 can_go_forward: self.history.can_go_forward(),
                 forcing_authored: self.forcing_authored,
                 can_toggle_layout: self.can_toggle_layout,
+                editing: self.editing.as_ref(),
             },
             width,
             &mut self.fonts,
@@ -201,6 +224,102 @@ impl App {
         }
     }
 
+    /// Redraws only the bar, which is all that changed.
+    ///
+    /// A keystroke in the URL bar must not re-lay-out the page: that is the
+    /// difference between a field that feels instant and one that stutters on
+    /// every character of a long document.
+    fn refresh_chrome(&mut self) {
+        let mode = self
+            .page
+            .as_ref()
+            .map(|page| page.mode.clone())
+            .unwrap_or(layout::RenderMode::Authored);
+        self.chrome = crate::chrome::render(
+            &crate::chrome::State {
+                url: self.history.current(),
+                mode: &mode,
+                error: self.error.as_deref(),
+                can_go_back: self.history.can_go_back(),
+                can_go_forward: self.history.can_go_forward(),
+                forcing_authored: self.forcing_authored,
+                can_toggle_layout: self.can_toggle_layout,
+                editing: self.editing.as_ref(),
+            },
+            self.size.0,
+            &mut self.fonts,
+        );
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Gives the URL bar focus, with the current URL selected.
+    fn focus_url(&mut self) {
+        self.editing = Some(crate::field::Field::with_all_selected(
+            self.history.current(),
+        ));
+        self.refresh_chrome();
+    }
+
+    /// Gives up editing without navigating.
+    fn cancel_editing(&mut self) {
+        if self.editing.take().is_some() {
+            self.refresh_chrome();
+        }
+    }
+
+    /// Handles a key while the URL bar has focus.
+    ///
+    /// Returns whether the key was consumed, so a keystroke meant for the field
+    /// never also scrolls the page underneath it.
+    fn edit_key(&mut self, key: &Key, alt: bool, ctrl: bool, shift: bool) -> bool {
+        let Some(field) = &mut self.editing else {
+            return false;
+        };
+        // Word motion is Ctrl+arrow everywhere except macOS, where it is
+        // Alt+arrow. Accepting both costs nothing and spares the question.
+        let by_word = ctrl || alt;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_editing();
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let typed = field.text().trim().to_owned();
+                self.editing = None;
+                if typed.is_empty() {
+                    self.refresh_chrome();
+                } else {
+                    self.navigate(entered_url(&typed));
+                }
+                return true;
+            }
+            Key::Named(NamedKey::Backspace) => field.backspace(),
+            Key::Named(NamedKey::Delete) => field.delete(),
+            Key::Named(NamedKey::ArrowLeft) if by_word => field.word_left(shift),
+            Key::Named(NamedKey::ArrowRight) if by_word => field.word_right(shift),
+            Key::Named(NamedKey::ArrowLeft) => field.left(shift),
+            Key::Named(NamedKey::ArrowRight) => field.right(shift),
+            Key::Named(NamedKey::Home) => field.home(shift),
+            Key::Named(NamedKey::End) => field.end(shift),
+            Key::Named(NamedKey::Space) => field.insert(" "),
+            Key::Character(text) if ctrl => {
+                if text.as_str() == "a" {
+                    field.select_all();
+                } else {
+                    return true;
+                }
+            }
+            Key::Character(text) => field.insert(text.as_str()),
+            // Anything else is swallowed rather than falling through to the
+            // page: while the field has focus, it has focus.
+            _ => return true,
+        }
+        self.refresh_chrome();
+        true
+    }
+
     /// The chrome control under the pointer, if any.
     fn control_under_pointer(&self) -> Option<crate::chrome::Control> {
         let mode = self.page.as_ref().map(|page| page.mode.clone());
@@ -214,6 +333,7 @@ impl App {
                 can_go_forward: self.history.can_go_forward(),
                 forcing_authored: self.forcing_authored,
                 can_toggle_layout: self.can_toggle_layout,
+                editing: self.editing.as_ref(),
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -397,10 +517,17 @@ impl ApplicationHandler for App {
                                     window.request_redraw();
                                 }
                             }
-                            None => {}
+                            // Anywhere else in the bar is the URL, and clicking
+                            // a URL bar is how most people focus one.
+                            None => self.focus_url(),
                         }
-                    } else if let Some(url) = self.link_under_pointer() {
-                        self.navigate(url);
+                    } else {
+                        // A click on the page is a click on the page, even if
+                        // it is not on a link: the URL bar loses focus.
+                        self.cancel_editing();
+                        if let Some(url) = self.link_under_pointer() {
+                            self.navigate(url);
+                        }
                     }
                 }
                 // The mouse's own back and forward buttons, which people who
@@ -414,7 +541,23 @@ impl ApplicationHandler for App {
                 // Alt+Left and Alt+Right are the platform convention;
                 // Backspace is what the era's browsers used and many hands
                 // still reach for.
-                let alt = self.modifiers.state().alt_key();
+                let state = self.modifiers.state();
+                let (alt, ctrl, shift) = (state.alt_key(), state.control_key(), state.shift_key());
+
+                // The URL bar takes every key while it has focus.
+                if self.editing.is_some() {
+                    self.edit_key(&event.logical_key, alt, ctrl, shift);
+                    return;
+                }
+                // Ctrl+L is the URL bar everywhere; F6 and Alt+D are the other
+                // two spellings people's hands know.
+                if (ctrl && matches!(&event.logical_key, Key::Character(c) if c == "l"))
+                    || matches!(event.logical_key, Key::Named(NamedKey::F6))
+                    || (alt && matches!(&event.logical_key, Key::Character(c) if c == "d"))
+                {
+                    self.focus_url();
+                    return;
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::ArrowLeft) if alt => {
                         self.go_back();
@@ -487,6 +630,7 @@ pub fn open(
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         forcing_authored: false,
         can_toggle_layout: false,
+        editing: None,
     };
     event_loop
         .run_app(&mut app)
@@ -541,5 +685,40 @@ mod tests {
         // chrome yet the title is the only place that can say so.
         let title = title_for("b.html", &RenderMode::Authored, Some("404"));
         assert!(title.contains("404"), "got {title}");
+    }
+}
+
+#[cfg(test)]
+mod entered_url_tests {
+    use super::entered_url;
+
+    #[test]
+    fn a_bare_host_becomes_https() {
+        // The overwhelmingly common thing typed into a URL bar. Getting a
+        // file-not-found for `example.com` would be absurd.
+        assert_eq!(entered_url("example.com"), "https://example.com");
+        assert_eq!(
+            entered_url("example.com/a/b.html"),
+            "https://example.com/a/b.html"
+        );
+    }
+
+    #[test]
+    fn a_scheme_is_left_alone() {
+        // Including http: the browser will show a page that is only available
+        // over http when a link leads there, and typing one is the same thing.
+        for typed in [
+            "http://example.org/old.html",
+            "https://example.com/",
+            "file:///home/user/a.html",
+        ] {
+            assert_eq!(entered_url(typed), typed);
+        }
+    }
+
+    #[test]
+    fn a_path_becomes_a_file_url() {
+        assert_eq!(entered_url("/home/user/a.html"), "file:///home/user/a.html");
+        assert_eq!(entered_url("./a.html"), "file://./a.html");
     }
 }

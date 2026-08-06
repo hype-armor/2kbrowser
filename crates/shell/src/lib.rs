@@ -4,6 +4,7 @@
 //! pipeline the binary uses, rather than a reimplementation of it.
 
 pub mod chrome;
+pub mod field;
 pub mod history;
 pub mod render;
 pub mod window;

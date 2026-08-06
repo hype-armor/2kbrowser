@@ -20,6 +20,14 @@ fn main() {
     };
     let scripting = RenderMode::RequiresScripting;
 
+    // Three editing states, so the caret and selection are visible.
+    let selected = shell::field::Field::with_all_selected("https://example.com/a-page.html");
+    let mut typing = shell::field::Field::with_all_selected("https://example.com/");
+    typing.insert("example.org/new");
+    let mut partial = shell::field::Field::with_all_selected("https://example.com/index.html");
+    partial.end(false);
+    partial.word_left(true);
+
     let cases: Vec<chrome::State> = vec![
         chrome::State {
             url: "https://example.com/a-perfectly-ordinary-page.html",
@@ -29,6 +37,7 @@ fn main() {
             can_go_forward: false,
             forcing_authored: false,
             can_toggle_layout: false,
+            editing: None,
         },
         chrome::State {
             url: "http://example.org/an-old-page.html",
@@ -38,6 +47,7 @@ fn main() {
             can_go_forward: false,
             forcing_authored: false,
             can_toggle_layout: false,
+            editing: None,
         },
         chrome::State {
             url: "file:///home/user/pages/index.html",
@@ -47,6 +57,7 @@ fn main() {
             can_go_forward: true,
             forcing_authored: false,
             can_toggle_layout: false,
+            editing: None,
         },
         chrome::State {
             url: "https://example.com/something-modern",
@@ -56,6 +67,7 @@ fn main() {
             can_go_forward: false,
             forcing_authored: false,
             can_toggle_layout: true,
+            editing: None,
         },
         chrome::State {
             url: "https://example.com/app",
@@ -65,6 +77,7 @@ fn main() {
             can_go_forward: false,
             forcing_authored: true,
             can_toggle_layout: true,
+            editing: None,
         },
         chrome::State {
             url: "https://example.com/gone.html",
@@ -74,6 +87,37 @@ fn main() {
             can_go_forward: false,
             forcing_authored: false,
             can_toggle_layout: false,
+            editing: None,
+        },
+        chrome::State {
+            url: "https://example.com/a-page.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: Some(&selected),
+        },
+        chrome::State {
+            url: "https://example.com/",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: Some(&typing),
+        },
+        chrome::State {
+            url: "https://example.com/index.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: Some(&partial),
         },
     ];
 

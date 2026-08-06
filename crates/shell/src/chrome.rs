@@ -36,6 +36,10 @@ const DIM: Color = Color::rgb(0x8a, 0x8a, 0x88);
 /// Warnings. Not red: nothing here is an error, and a browser that shouts at
 /// people about plain HTTP teaches them to ignore it.
 const NOTICE: Color = Color::rgb(0x8a, 0x5a, 0x10);
+/// Behind selected text in the URL bar.
+const SELECTION: Color = Color::rgb(0xb4, 0xd0, 0xf0);
+/// The focused field's surround, so it is obvious where the typing goes.
+const FOCUS: Color = Color::rgb(0x3a, 0x6e, 0xa5);
 
 /// What the bar has to show.
 pub struct State<'a> {
@@ -53,6 +57,9 @@ pub struct State<'a> {
     pub forcing_authored: bool,
     /// Whether there is a fallback decision to overrule at all.
     pub can_toggle_layout: bool,
+    /// The URL bar's editing state, when it has focus. `None` means the bar is
+    /// showing where you are rather than where you are going.
+    pub editing: Option<&'a crate::field::Field>,
 }
 
 /// A control in the bar.
@@ -93,7 +100,10 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
         (Control::Back, button(PADDING, BUTTON)),
         (Control::Forward, button(PADDING + BUTTON, BUTTON)),
     ];
-    if state.can_toggle_layout {
+    // Not while editing: the bar gives its right-hand side over to the field,
+    // so the toggle is not drawn — and a control that is not drawn must not
+    // still be catching clicks.
+    if state.can_toggle_layout && state.editing.is_none() {
         out.push((Control::ToggleLayout, button(-TOGGLE, TOGGLE)));
     }
     out
@@ -239,6 +249,27 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     }
 
     let url_x = PADDING * 2.0 + BUTTON * 2.0;
+    // While editing, the bar is a field and nothing else: the status describes
+    // the page you are on, and you are in the middle of leaving it.
+    if let Some(field) = state.editing {
+        let style = ui_style(14.0);
+        let box_ = Rect {
+            x: url_x - PADDING / 2.0,
+            y: 4.0,
+            width: (width_f - url_x - PADDING / 2.0).max(0.0),
+            height: HEIGHT as f32 - 9.0,
+        };
+        draw_field(&mut list, fonts, field, &style, &box_);
+        return rasterise(
+            &list,
+            fonts,
+            &paint::ImageStore::new(),
+            width.max(1),
+            HEIGHT,
+        )
+        .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
+    }
+
     let status = status(state);
     // The status takes what it needs from the right; the URL gets the rest,
     // because a truncated URL is survivable and a truncated warning is not.
@@ -288,11 +319,82 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"))
 }
 
+/// Draws the URL bar in its editing state.
+fn draw_field(
+    list: &mut DisplayList,
+    fonts: &mut FontStore,
+    field: &crate::field::Field,
+    style: &ComputedStyle,
+    box_: &Rect,
+) {
+    outline_in(list, box_, FOCUS);
+
+    let text_x = box_.x + PADDING / 2.0;
+    let max_width = (box_.width - PADDING).max(0.0);
+
+    // Measuring a prefix is how a byte index becomes an x: the field knows
+    // where the cursor is in the text, and only the shaper knows where that is
+    // on screen.
+    let offset_of = |fonts: &mut FontStore, at: usize| {
+        measure(fonts, &field.text()[..at], style).min(max_width)
+    };
+
+    if let Some((start, end)) = field.selection() {
+        let (from, to) = (offset_of(fonts, start), offset_of(fonts, end));
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x: text_x + from,
+                y: box_.y + 3.0,
+                width: (to - from).max(0.0),
+                height: box_.height - 6.0,
+            },
+            color: SELECTION,
+        });
+    }
+
+    draw_text(
+        list,
+        fonts,
+        field.text(),
+        style,
+        text_x,
+        baseline(),
+        INK,
+        max_width,
+    );
+
+    // The caret goes over the text, so it is visible inside a selection.
+    let caret = offset_of(fonts, field.cursor());
+    list.items.push(DisplayItem::Rect {
+        rect: Rect {
+            x: text_x + caret,
+            y: box_.y + 3.0,
+            width: 1.0,
+            height: box_.height - 6.0,
+        },
+        color: INK,
+    });
+}
+
 /// Draws a one-pixel outline around a control.
 fn outline(list: &mut DisplayList, rect: &Rect) {
     let inset = 5.0;
-    let (x, y) = (rect.x, rect.y + inset);
-    let (w, h) = (rect.width, rect.height - inset * 2.0);
+    outline_in(
+        list,
+        &Rect {
+            x: rect.x,
+            y: rect.y + inset,
+            width: rect.width,
+            height: rect.height - inset * 2.0,
+        },
+        RULE,
+    );
+}
+
+/// Draws a one-pixel outline in a given colour.
+fn outline_in(list: &mut DisplayList, rect: &Rect, color: Color) {
+    let (x, y) = (rect.x, rect.y);
+    let (w, h) = (rect.width, rect.height);
     for edge in [
         Rect {
             x,
@@ -319,10 +421,7 @@ fn outline(list: &mut DisplayList, rect: &Rect) {
             height: h,
         },
     ] {
-        list.items.push(DisplayItem::Rect {
-            rect: edge,
-            color: RULE,
-        });
+        list.items.push(DisplayItem::Rect { rect: edge, color });
     }
 }
 
@@ -407,6 +506,7 @@ mod tests {
             can_go_forward: false,
             forcing_authored: false,
             can_toggle_layout: false,
+            editing: None,
         }
     }
 
@@ -513,6 +613,27 @@ mod tests {
     }
 
     #[test]
+    fn the_toggle_stops_catching_clicks_while_the_url_bar_is_focused() {
+        // It is not drawn then, and an invisible control that still works is
+        // how a stray click becomes an inexplicable change.
+        let mode = RenderMode::Document {
+            unsupported_share: 0.9,
+        };
+        let mut state = state("https://example.com/", &mode);
+        state.can_toggle_layout = true;
+        assert_eq!(
+            control_at(&state, 600.0, 560.0, 17.0),
+            Some(Control::ToggleLayout)
+        );
+
+        let field = crate::field::Field::with_all_selected("https://example.com/");
+        state.editing = Some(&field);
+        assert_eq!(control_at(&state, 600.0, 560.0, 17.0), None);
+        // Back and forward are still drawn, so they still work.
+        assert_eq!(control_at(&state, 600.0, 12.0, 17.0), Some(Control::Back));
+    }
+
+    #[test]
     fn the_toggle_says_where_it_leads() {
         let mode = RenderMode::Document {
             unsupported_share: 0.9,
@@ -526,6 +647,48 @@ mod tests {
             "as document",
             "once overruling, it has to offer the way back"
         );
+    }
+
+    #[test]
+    fn the_editing_bar_shows_the_field_and_not_the_status() {
+        // Mid-edit the bar is a field and nothing else: the status describes
+        // the page you are on, and you are in the middle of leaving it.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let field = crate::field::Field::with_all_selected("http://example.com/");
+
+        let mut resting = state("http://example.com/", &mode);
+        let resting_bar = render(&resting, 600, &mut fonts);
+
+        resting.editing = Some(&field);
+        let editing_bar = render(&resting, 600, &mut fonts);
+
+        assert_ne!(
+            resting_bar.data(),
+            editing_bar.data(),
+            "focusing the URL bar changed nothing on screen"
+        );
+    }
+
+    #[test]
+    fn the_caret_moves_when_the_cursor_does() {
+        // The field knows where the cursor is in the text; only the shaper
+        // knows where that is on screen, and this is the join between them.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+
+        let mut at_start = crate::field::Field::with_all_selected("example.com");
+        at_start.home(false);
+        let mut at_end = crate::field::Field::with_all_selected("example.com");
+        at_end.end(false);
+
+        let mut state = state("https://example.com/", &mode);
+        state.editing = Some(&at_start);
+        let start_bar = render(&state, 600, &mut fonts);
+        state.editing = Some(&at_end);
+        let end_bar = render(&state, 600, &mut fonts);
+
+        assert_ne!(start_bar.data(), end_bar.data());
     }
 
     #[test]

@@ -57,7 +57,11 @@ a document, with a control to overrule that and see the author's layout
 (ADR-0009). An ordinary page over HTTPS says nothing at all.
 `cargo run -p shell --example chrome-strip` draws every state of it.
 
-Still to come in M3: tabs, an editable URL bar, bookmarks, and find-in-page.
+The URL bar is editable: Ctrl+L (or F6, or clicking it) focuses it with the
+URL selected, Enter navigates, Escape gives up. A bare host gets `https://`,
+because that is what typing `example.com` means.
+
+Still to come in M3: tabs, bookmarks, and find-in-page.
 See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
