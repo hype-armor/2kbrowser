@@ -2,9 +2,11 @@
 
 > A web browser without the slop.
 
-Status: **under construction**, in M2. M0 and M1 are done; the engine renders
-the era's HTML and CSS and the three platforms agree pixel for pixel. See §6
-for what each milestone covers and what is known to be missing.
+Status: **under construction**. M0 through M3 are done: the engine renders the
+era's HTML and CSS, the three platforms agree pixel for pixel, and there is a
+browser around it — tabs, history, a URL bar, find-in-page, bookmarks, and the
+document fallback. M4 is next, and until it lands this is a tool for its
+authors. See §6 for what each milestone covers and what is known to be missing.
 
 This document started as a proposal and is now also the record of what was
 decided and why. Decisions that would be expensive to revisit are in
@@ -348,6 +350,17 @@ wrong — telling the user it did so, with a control to force the raw layout.
 *Done when:* it is the browser you reach for to read something, and modern pages
 are readable rather than jumbled.
 
+**Status: done.** Hit testing and link geometry first, then the chrome on top of
+them: back and forward with a real history stack, an editable URL bar,
+find-in-page, tabs with a strip that only appears once there are two, the
+document-fallback notice and its override, the HTTP-transparency marker §4
+requires, and bookmarks in a text file. The chrome is drawn by building a
+display list and handing it to the same rasteriser the page goes through, so it
+is not a second rendering path that can drift — and so it is tested headlessly,
+which is where nearly all of its coverage comes from. What is *not* tested is
+the event loop itself: CI has no display server, so key and pointer handling are
+exercised by hand and a regression in them would not be caught by `cargo test`.
+
 ### M4 — Hardening
 Process/sandbox model, continuous fuzzing of the HTML, CSS, and image-decode
 paths, TLS configuration review, `AccessKit` integration for screen readers.
@@ -422,7 +435,7 @@ that it has one home and can be closed:
 
 | # | Question | Blocks |
 | --- | --- | --- |
-| [1](https://github.com/hype-armor/2kbrowser/issues/1) | Period-authentic chrome, or a modern shell? | M3 |
+| ~~[1](https://github.com/hype-armor/2kbrowser/issues/1)~~ | ~~Period-authentic chrome, or a modern shell?~~ Resolved: a modern shell around a period engine (ADR-0011) | — |
 | ~~[2](https://github.com/hype-armor/2kbrowser/issues/2)~~ | ~~Move reader mode earlier than M5?~~ Resolved: yes, M3 (ADR-0009) | — |
 | [3](https://github.com/hype-armor/2kbrowser/issues/3) | Legacy TLS: marked downgrade, or unreachable? | M4 |
 | [4](https://github.com/hype-armor/2kbrowser/issues/4) | Revisit dependency posture? | nothing |
@@ -438,7 +451,13 @@ text stack lands rather than at the start of the milestone.
 
 ## 10. Immediate next step
 
-M0 is a few hours: workspace, three-platform CI, ADRs, budget harness. It
-commits to nothing beyond the language choice and makes M1 startable.
+M4, hardening. The browser is now usable enough that the honest next question is
+whether it is safe to point at something you did not write, and the answer is
+no: there is no sandbox, the parsers have never been fuzzed, and the TLS
+configuration has not been reviewed. Issue #3 blocks part of it; nothing else
+in §9 does.
 
-None of the open questions in §9 block it.
+The engine's known gaps — collapsed borders, fixed table layout, dashed and
+dotted borders, `background-position`, proper block-in-inline splitting — are
+listed under M2 and are not scheduled. They are places the browser is wrong
+rather than places it falls over, and none of them is what makes this unsafe.

@@ -72,8 +72,15 @@ strip only appears once there is a second tab — above a single tab it would be
 a row of chrome that says nothing the URL bar has not already said. A tab is
 named by the page's `<title>`, or by its URL when it has none.
 
-Still to come in M3: bookmarks.
-See [PLAN.md](PLAN.md).
+Bookmarks are on Ctrl+D, and the bar's rightmost control says whether the page
+you are on is saved. Ctrl+B opens the saved list — as a page, in a tab, because
+the browser already knows how to show a document with links in it and a
+bookmarks *panel* would be a second piece of interface with its own scrolling
+and its own bugs. `2kbrowser bookmarks` prints the same list. It is stored as a
+tab-separated file under your config directory: a few kilobytes, editable in
+anything, and the only state this browser keeps between runs.
+
+M3 is complete. See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
 > TLS review all land in M4. Until then this is a tool for its authors.

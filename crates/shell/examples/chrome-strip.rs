@@ -44,6 +44,7 @@ fn main() {
             can_toggle_layout: false,
             editing: None,
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "http://example.org/an-old-page.html",
@@ -55,6 +56,7 @@ fn main() {
             can_toggle_layout: false,
             editing: None,
             finding: None,
+            saved: true,
         },
         chrome::State {
             url: "file:///home/user/pages/index.html",
@@ -66,6 +68,7 @@ fn main() {
             can_toggle_layout: false,
             editing: None,
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/something-modern",
@@ -77,6 +80,7 @@ fn main() {
             can_toggle_layout: true,
             editing: None,
             finding: None,
+            saved: true,
         },
         chrome::State {
             url: "https://example.com/app",
@@ -88,6 +92,7 @@ fn main() {
             can_toggle_layout: true,
             editing: None,
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/gone.html",
@@ -99,6 +104,7 @@ fn main() {
             can_toggle_layout: false,
             editing: None,
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/a-page.html",
@@ -110,6 +116,7 @@ fn main() {
             can_toggle_layout: false,
             editing: Some(&selected),
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/",
@@ -121,6 +128,7 @@ fn main() {
             can_toggle_layout: false,
             editing: Some(&typing),
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -132,6 +140,7 @@ fn main() {
             can_toggle_layout: false,
             editing: Some(&partial),
             finding: None,
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -143,6 +152,7 @@ fn main() {
             can_toggle_layout: false,
             editing: None,
             finding: Some((&searching, 2, 7)),
+            saved: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -154,6 +164,7 @@ fn main() {
             can_toggle_layout: false,
             editing: None,
             finding: Some((&fruitless, 0, 0)),
+            saved: false,
         },
     ];
 

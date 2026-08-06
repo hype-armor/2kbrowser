@@ -158,6 +158,11 @@ struct App {
     /// The URL bar when it has focus. `None` means it is showing where you
     /// are rather than accepting where you want to go.
     editing: Option<crate::field::Field>,
+    /// The saved list, shared by every tab: a bookmark is a property of the
+    /// browser, not of the window you happened to press Ctrl+D in.
+    bookmarks: crate::bookmarks::Bookmarks,
+    /// Where that list is written back to.
+    bookmarks_path: std::path::PathBuf,
 }
 
 impl App {
@@ -286,6 +291,7 @@ impl App {
             chrome,
             editing,
             size,
+            bookmarks,
             ..
         } = self;
         let tab = tabs.active();
@@ -308,6 +314,7 @@ impl App {
                     .finding
                     .as_ref()
                     .map(|field| (field, tab.current_match, tab.matches.len())),
+                saved: bookmarks.contains(tab.history.current()),
             },
             size.0,
             fonts,
@@ -393,6 +400,49 @@ impl App {
         // The new tab may never have been rendered, or was rendered at another
         // width, so it is laid out rather than merely redrawn.
         self.rerender();
+    }
+
+    /// Saves the current page, or forgets it if it is already saved.
+    ///
+    /// Written through immediately rather than on exit: a browser that lost
+    /// your bookmarks because it was closed the wrong way would be worse than
+    /// one with no bookmarks at all, and the file is a few kilobytes.
+    fn toggle_bookmark(&mut self) {
+        let url = self.tab().history.current().to_owned();
+        let title = self
+            .tab()
+            .page
+            .as_ref()
+            .and_then(|page| page.title.clone())
+            .unwrap_or_default();
+        self.bookmarks.toggle(&url, &title);
+        // A failed write is reported where every other navigation failure is,
+        // because silently not saving looks exactly like saving.
+        if let Err(error) = self.bookmarks.save(&self.bookmarks_path) {
+            self.tab_mut().error = Some(format!("could not save bookmarks: {error}"));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Opens the saved list, as a page, in a new tab.
+    ///
+    /// Written out and loaded like any other file so that back, forward, find,
+    /// and the links on it all work without a second code path.
+    fn open_bookmarks(&mut self) {
+        let path = crate::bookmarks::page_path();
+        let html = crate::bookmarks::page(&self.bookmarks);
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&format!("file://{}", path.display())),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write the saved list: {error}"));
+                self.refresh_chrome();
+            }
+        }
     }
 
     /// Opens find-in-page, or refocuses it if it is already open.
@@ -580,6 +630,7 @@ impl App {
                     .finding
                     .as_ref()
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
+                saved: self.bookmarks.contains(self.tab().history.current()),
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -856,6 +907,7 @@ impl ApplicationHandler for App {
                         match self.control_under_pointer() {
                             Some(crate::chrome::Control::Back) => self.go_back(),
                             Some(crate::chrome::Control::Forward) => self.go_forward(),
+                            Some(crate::chrome::Control::Bookmark) => self.toggle_bookmark(),
                             Some(crate::chrome::Control::ToggleLayout) => {
                                 self.tab_mut().forcing_authored = !self.tab().forcing_authored;
                                 self.rerender();
@@ -923,6 +975,16 @@ impl ApplicationHandler for App {
                         }
                         Key::Character(c) if c == "w" => {
                             self.close_tab(self.tabs.active_index());
+                            return;
+                        }
+                        // Ctrl+D saves and Ctrl+B shows the list, which is
+                        // where every browser has put them for twenty years.
+                        Key::Character(c) if c == "d" => {
+                            self.toggle_bookmark();
+                            return;
+                        }
+                        Key::Character(c) if c == "b" => {
+                            self.open_bookmarks();
                             return;
                         }
                         Key::Named(NamedKey::Tab) => {
@@ -1037,6 +1099,8 @@ pub fn open(
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         strip: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         editing: None,
+        bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
+        bookmarks_path: crate::bookmarks::default_path(),
     };
     event_loop
         .run_app(&mut app)

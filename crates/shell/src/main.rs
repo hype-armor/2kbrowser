@@ -17,6 +17,7 @@ USAGE:
     2kbrowser open   <url-or-file> [--width <px>] [--height <px>]
     2kbrowser render <url-or-file> [--out <file.png>] [--width <px>] [--height <px>]
     2kbrowser links  <url-or-file> [--width <px>]
+    2kbrowser bookmarks
 
 OPTIONS:
     --out <path>     Where to write the PNG (render only; default: page.png)
@@ -26,13 +27,17 @@ OPTIONS:
 `links` lists every link on the page with the rectangle you would click to
 follow it — the same geometry the window uses, printed instead of drawn.
 
+`bookmarks` prints the saved list, and says where the file is. It is a plain
+tab-separated file: edit it in anything.
+
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
 In a window: click a link to follow it. Alt+Left and Alt+Right, or Backspace,
 go back and forward. Ctrl+L focuses the URL bar and Ctrl+F searches the page;
 Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
-switches. Arrows and PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
+switches. Ctrl+D saves the page and Ctrl+B shows the saved list. Arrows and
+PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +45,7 @@ fn main() -> ExitCode {
         Some("render") => report(run_render(&args[1..])),
         Some("links") => report(run_links(&args[1..])),
         Some("open") => report(run_open(&args[1..])),
+        Some("bookmarks") => report(run_bookmarks()),
         Some("--help" | "-h" | "help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -154,6 +160,28 @@ fn run_links(args: &[String]) -> Result<String, String> {
             rect.width.round(),
             rect.height.round(),
         ));
+    }
+    Ok(message)
+}
+
+/// Prints the saved list.
+///
+/// The file is the only state this browser keeps between runs, so it is worth
+/// being able to see it without opening a window — and worth saying where it
+/// is, because it is a text file anyone can edit.
+fn run_bookmarks() -> Result<String, String> {
+    let path = shell::bookmarks::default_path();
+    let marks = shell::bookmarks::Bookmarks::load(&path);
+    if marks.is_empty() {
+        return Ok(format!("nothing saved yet ({})", path.display()));
+    }
+    let mut message = format!("{} saved page(s) in {}:", marks.len(), path.display());
+    for entry in marks.iter() {
+        message.push_str("\n  ");
+        message.push_str(&entry.url);
+        if !entry.title.is_empty() {
+            message.push_str(&format!("\n      {}", entry.title));
+        }
     }
     Ok(message)
 }

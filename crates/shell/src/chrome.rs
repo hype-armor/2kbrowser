@@ -173,6 +173,8 @@ pub struct State<'a> {
     pub editing: Option<&'a crate::field::Field>,
     /// The find field, with which match is current and how many there are.
     pub finding: Option<(&'a crate::field::Field, usize, usize)>,
+    /// Whether this page is in the saved list.
+    pub saved: bool,
 }
 
 /// A control in the bar.
@@ -185,10 +187,18 @@ pub enum Control {
     /// Show the author's layout instead of the document fallback, or return to
     /// the fallback from it.
     ToggleLayout,
+    /// Save this page, or forget it if it is already saved.
+    Bookmark,
 }
 
 /// Width of the layout toggle, which carries a word rather than an arrow.
 const TOGGLE: f32 = 96.0;
+/// Width of the bookmark control, which also carries a word.
+///
+/// A word rather than a star because the bundled fonts have no star in them
+/// (ADR-0008 bundles four families and nothing else), and a control that draws
+/// as a hollow box is worse than one that says what it does.
+const BOOKMARK: f32 = 56.0;
 
 /// Where each control sits, so the window can route a click without knowing
 /// how the bar is drawn.
@@ -214,10 +224,17 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
         (Control::Forward, button(PADDING + BUTTON, BUTTON)),
     ];
     // Not while editing: the bar gives its right-hand side over to the field,
-    // so the toggle is not drawn — and a control that is not drawn must not
-    // still be catching clicks.
-    if state.can_toggle_layout && state.editing.is_none() && state.finding.is_none() {
-        out.push((Control::ToggleLayout, button(-TOGGLE, TOGGLE)));
+    // so these are not drawn — and a control that is not drawn must not still
+    // be catching clicks.
+    if state.editing.is_some() || state.finding.is_some() {
+        return out;
+    }
+    // Outermost, because it is there on every page; the toggle appears beside
+    // it only when there is a decision to overrule, and a control that moved
+    // depending on the page would be one you had to look for every time.
+    out.push((Control::Bookmark, button(-BOOKMARK, BOOKMARK)));
+    if state.can_toggle_layout {
+        out.push((Control::ToggleLayout, button(-(BOOKMARK + TOGGLE), TOGGLE)));
     }
     out
 }
@@ -255,6 +272,15 @@ pub fn toggle_label(state: &State<'_>) -> &'static str {
     } else {
         "as authored"
     }
+}
+
+/// The word on the bookmark control.
+///
+/// Past tense for the saved state, imperative for the other: the control has to
+/// say both what pressing it does and what is true now, and a single word can
+/// only do that if the two readings differ.
+pub fn bookmark_label(state: &State<'_>) -> &'static str {
+    if state.saved { "saved" } else { "save" }
 }
 
 /// What to say about the URL's scheme, if anything.
@@ -312,7 +338,9 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         color: RULE,
     });
 
-    let mut toggle_left = width_f - PADDING;
+    // Where the right-hand controls start, which is where the status has to
+    // stop.
+    let mut right_edge = width_f - PADDING;
     // Find takes the whole bar: its label sits where the back button would be,
     // and drawing both puts one on top of the other.
     let nav_controls = if state.finding.is_some() {
@@ -346,12 +374,18 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
                     BUTTON,
                 );
             }
-            Control::ToggleLayout => {
-                toggle_left = rect.x;
-                // Outlined rather than filled: it is an escape hatch, not the
-                // thing the reader came here to press.
+            Control::ToggleLayout | Control::Bookmark => {
+                right_edge = right_edge.min(rect.x);
+                // Outlined rather than filled: these are escape hatches, not
+                // the thing the reader came here to press.
                 outline(&mut list, &rect);
-                let label = toggle_label(state);
+                let (label, ink) = if control == Control::ToggleLayout {
+                    (toggle_label(state), INK)
+                } else {
+                    // Dimmed until the page is saved, so the two states differ
+                    // at a glance and not only by reading the word.
+                    (bookmark_label(state), if state.saved { INK } else { DIM })
+                };
                 let label_style = ui_style(12.0);
                 let text_width = measure(fonts, label, &label_style);
                 draw_text(
@@ -361,7 +395,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
                     &label_style,
                     rect.x + (rect.width - text_width) / 2.0,
                     baseline() + 1.0,
-                    INK,
+                    ink,
                     rect.width,
                 );
             }
@@ -457,7 +491,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         .as_ref()
         .map(|text| measure(fonts, text, &ui_style(13.0)).min(width_f * 0.5))
         .unwrap_or(0.0);
-    let status_x = toggle_left - PADDING - status_width;
+    let status_x = right_edge - PADDING - status_width;
     let url_width = (status_x - PADDING - url_x).max(0.0);
 
     draw_text(
@@ -688,6 +722,7 @@ mod tests {
             can_toggle_layout: false,
             editing: None,
             finding: None,
+            saved: false,
         }
     }
 
@@ -747,7 +782,7 @@ mod tests {
         let mode = RenderMode::Authored;
         let state = state("https://example.com/", &mode);
         let placed = controls(&state);
-        assert_eq!(placed.len(), 2, "no toggle on an ordinary page");
+        assert_eq!(placed.len(), 3, "back, forward, save — no toggle");
 
         assert_eq!(
             control_at(&state, 600.0, placed[0].1.x + 1.0, 5.0),
@@ -771,14 +806,15 @@ mod tests {
         // ADR-0009 requires the override. A control that does nothing on every
         // ordinary page is worse than no control, so it is not there.
         let authored = RenderMode::Authored;
-        assert!(
+        assert_eq!(
             control_at(
                 &state("https://example.com/", &authored),
                 600.0,
-                560.0,
+                460.0,
                 17.0
-            )
-            .is_none()
+            ),
+            None,
+            "nothing there on an ordinary page"
         );
 
         let mode = RenderMode::Document {
@@ -787,9 +823,9 @@ mod tests {
         let mut fallback = state("https://example.com/", &mode);
         fallback.can_toggle_layout = true;
         assert_eq!(
-            control_at(&fallback, 600.0, 560.0, 17.0),
+            control_at(&fallback, 600.0, 460.0, 17.0),
             Some(Control::ToggleLayout),
-            "the toggle sits at the right edge"
+            "the toggle sits beside the save control"
         );
     }
 
@@ -803,15 +839,75 @@ mod tests {
         let mut state = state("https://example.com/", &mode);
         state.can_toggle_layout = true;
         assert_eq!(
-            control_at(&state, 600.0, 560.0, 17.0),
+            control_at(&state, 600.0, 460.0, 17.0),
             Some(Control::ToggleLayout)
+        );
+        assert_eq!(
+            control_at(&state, 600.0, 560.0, 17.0),
+            Some(Control::Bookmark)
         );
 
         let field = crate::field::Field::with_all_selected("https://example.com/");
         state.editing = Some(&field);
+        assert_eq!(control_at(&state, 600.0, 460.0, 17.0), None);
         assert_eq!(control_at(&state, 600.0, 560.0, 17.0), None);
         // Back and forward are still drawn, so they still work.
         assert_eq!(control_at(&state, 600.0, 12.0, 17.0), Some(Control::Back));
+    }
+
+    #[test]
+    fn saving_is_offered_on_every_page_and_says_which_state_it_is_in() {
+        let mode = RenderMode::Authored;
+        let mut state = state("https://example.com/", &mode);
+        assert_eq!(
+            control_at(&state, 600.0, 560.0, 17.0),
+            Some(Control::Bookmark),
+            "there is always a page to save"
+        );
+        assert_eq!(bookmark_label(&state), "save");
+        state.saved = true;
+        assert_eq!(
+            bookmark_label(&state),
+            "saved",
+            "it has to say what is true now, not only what pressing it does"
+        );
+    }
+
+    #[test]
+    fn the_saved_state_actually_reaches_the_pixels() {
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let mut state = state("https://example.com/", &mode);
+        let unsaved = render(&state, 600, &mut fonts);
+        state.saved = true;
+        let saved = render(&state, 600, &mut fonts);
+        assert_ne!(
+            unsaved.data(),
+            saved.data(),
+            "saving a page changed nothing on screen"
+        );
+    }
+
+    #[test]
+    fn the_status_stops_short_of_the_controls() {
+        // A status that ran under the buttons would be unreadable exactly when
+        // it matters, which is when there is something to warn about.
+        let mode = RenderMode::Document {
+            unsupported_share: 0.9,
+        };
+        let mut state = state("http://example.com/", &mode);
+        state.can_toggle_layout = true;
+        let placed = placed_controls(&state, 600.0);
+        let leftmost = placed
+            .iter()
+            .filter(|(control, _)| *control != Control::Back && *control != Control::Forward)
+            .map(|(_, rect)| rect.x)
+            .fold(f32::MAX, f32::min);
+        assert!(leftmost < 600.0 - BOOKMARK, "{leftmost}");
+
+        let text = status(&state).expect("a status");
+        let width = measure(&mut FontStore::new(), &text, &ui_style(13.0)).min(300.0);
+        assert!(leftmost - PADDING - width > 0.0, "no room left for the URL");
     }
 
     #[test]
