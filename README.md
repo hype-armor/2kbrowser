@@ -16,18 +16,34 @@ See [PLAN.md](PLAN.md) for the full rationale and roadmap, and
 
 ## Status
 
-**M1 — it renders.** HTML is fetched over HTTP(S) or read from disk, parsed into
-an arena DOM, cascaded through a CSS 2.1 subset, laid out as block boxes, shaped
-against bundled Liberation faces, and rasterised on the CPU. Rendering is
-deterministic across Linux, macOS, and Windows, checked by reference tests
-against one shared baseline set.
+**M2 — it renders the era's web.** HTML is fetched over HTTP(S) or read from
+disk, parsed into an arena DOM, cascaded through a CSS 2.1 subset, laid out,
+shaped against bundled Liberation faces, and rasterised on the CPU.
+
+Working: the cascade with selectors, specificity, and inheritance; the box
+model with borders and backgrounds; inline layout with per-span styles and
+Unicode line breaking; floats; tables with automatic column sizing; images,
+including ones sitting in a line; relative and absolute positioning;
+framesets; quirks-mode value parsing; the presentational attributes the era's
+markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
+text decorations; tiled background images; and external stylesheets.
+
+Rendering is deterministic across Linux, macOS, and Windows, checked by
+reference tests against one shared baseline set — verified, not assumed: all
+three platforms have rendered it byte for byte in CI.
 
 The window has been verified by hand on Linux. CI has no display, so its event
 handling and blitting are not covered by automated tests — only its scroll
 arithmetic is.
 
-Not built yet: inline layout with per-span styles, subresource loading, and
-everything from M2 onward. See [PLAN.md](PLAN.md).
+Known to be missing or wrong, rather than hidden: `rowspan` (a spanning cell
+occupies only its first row), collapsed borders, fixed table layout,
+`cellspacing`, dashed and dotted borders painting solid, `background-position`,
+`@media`/`@import`, and legacy character-encoding detection — pages of this
+era declare the wrong encoding or none at all often enough that this is real
+work, not a footnote. Links are styled but not clickable — hit testing and
+navigation are M3, along with the rest of the browser chrome.
+See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
 > TLS review all land in M4. Until then this is a tool for its authors.

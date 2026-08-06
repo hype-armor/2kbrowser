@@ -2,8 +2,14 @@
 
 > A web browser without the slop.
 
-Status: **proposal**. Nothing here is built yet. This document exists to get the
-direction right before any code is written.
+Status: **under construction**, in M2. M0 and M1 are done; the engine renders
+the era's HTML and CSS and the three platforms agree pixel for pixel. See §6
+for what each milestone covers and what is known to be missing.
+
+This document started as a proposal and is now also the record of what was
+decided and why. Decisions that would be expensive to revisit are in
+`docs/adr/` instead, one file each, and those are immutable — where this
+document and an ADR disagree, the ADR is what was actually decided.
 
 ---
 

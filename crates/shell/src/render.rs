@@ -80,7 +80,7 @@ fn render_sized(
         return render_frameset(&doc, frameset, width, max_height, fonts, origin, path, 0);
     }
 
-    let author_sheets = collect_stylesheets(&doc);
+    let author_sheets = collect_stylesheets(&doc, base);
     let styles = css::cascade::cascade(&doc, &author_sheets);
 
     // Classify before laying out: if the page needs layout we do not implement,
@@ -313,12 +313,55 @@ fn load_images(
 ///
 /// `<link rel=stylesheet>` is not followed here: fetching is the net crate's
 /// job, and same-origin policy (ADR-0006) applies to it.
-fn collect_stylesheets(doc: &dom::Document) -> Vec<Stylesheet> {
-    doc.descendants(doc.root())
-        .into_iter()
-        .filter(|&node| doc.element(node).is_some_and(|e| e.local_name() == "style"))
-        .map(|node| Stylesheet::parse(&doc.text_content(node)))
-        .collect()
+/// Whether a `<link rel>` names a stylesheet this browser should apply.
+///
+/// `rel` is a space-separated list and the era's markup puts other tokens
+/// beside `stylesheet` freely. An `alternate` sheet is one the reader may
+/// choose rather than one to apply, and there is no UI to choose with — so it
+/// is skipped rather than applied on top of the real one.
+fn is_applied_stylesheet(rel: Option<&str>) -> bool {
+    let Some(rel) = rel else { return false };
+    let mut stylesheet = false;
+    for token in rel.split_ascii_whitespace() {
+        if token.eq_ignore_ascii_case("alternate") {
+            return false;
+        }
+        stylesheet |= token.eq_ignore_ascii_case("stylesheet");
+    }
+    stylesheet
+}
+
+fn collect_stylesheets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Vec<Stylesheet> {
+    let fetcher = Fetcher::default();
+    let mut sheets = Vec::new();
+
+    for node in doc.descendants(doc.root()) {
+        let Some(element) = doc.element(node) else {
+            continue;
+        };
+        match element.local_name() {
+            "style" => sheets.push(Stylesheet::parse(&doc.text_content(node))),
+            // An external stylesheet is how a site of this era shared one look
+            // across every page; skipping them leaves those pages unstyled.
+            "link" => {
+                if !is_applied_stylesheet(element.attr("rel")) {
+                    continue;
+                }
+                let Some((origin, path)) = base else { continue };
+                let Some(href) = element.attr("href") else {
+                    continue;
+                };
+                let url = net::resolve(origin, path, href);
+                // Subresource, so ADR-0006's third-party rule applies: a sheet
+                // from another origin is refused like any other.
+                if let Ok(resource) = fetcher.fetch(&url, Some(origin), RequestKind::Subresource) {
+                    sheets.push(Stylesheet::parse(&resource.body));
+                }
+            }
+            _ => {}
+        }
+    }
+    sheets
 }
 
 #[cfg(test)]
@@ -444,5 +487,34 @@ mod tests {
             page.content_height > 400.0,
             "content should exceed the canvas"
         );
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::is_applied_stylesheet;
+
+    #[test]
+    fn a_stylesheet_link_is_applied() {
+        assert!(is_applied_stylesheet(Some("stylesheet")));
+        // Case-insensitive, and other tokens beside it are ordinary.
+        assert!(is_applied_stylesheet(Some("StyleSheet")));
+        assert!(is_applied_stylesheet(Some("preload stylesheet")));
+    }
+
+    #[test]
+    fn other_link_relations_are_not_stylesheets() {
+        for rel in ["icon", "shortcut icon", "next", "canonical", ""] {
+            assert!(!is_applied_stylesheet(Some(rel)), "applied {rel:?}");
+        }
+        assert!(!is_applied_stylesheet(None), "a link with no rel");
+    }
+
+    #[test]
+    fn an_alternate_stylesheet_is_skipped() {
+        // It is one the reader may choose, not one to apply. Applying it as
+        // well as the real sheet gives a page both looks at once.
+        assert!(!is_applied_stylesheet(Some("alternate stylesheet")));
+        assert!(!is_applied_stylesheet(Some("stylesheet alternate")));
     }
 }

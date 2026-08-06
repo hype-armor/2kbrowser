@@ -1,0 +1,6 @@
+/* An external stylesheet, as a site of this era would have shared across
+   every page rather than repeating it in each one. */
+body { font-family: Georgia, serif; margin: 16px; background: #fbfbf7 }
+h1 { color: #21406b; border-bottom: 2px solid #21406b; padding-bottom: 4px }
+.note { background: #fff6d8; border: 1px solid #d9c37a; padding: 8px }
+a[href] { color: #7a2020 }

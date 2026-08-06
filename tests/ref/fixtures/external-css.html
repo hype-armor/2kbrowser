@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>An external stylesheet</title>
+  <link rel="stylesheet" type="text/css" href="styles/site.css">
+  <!-- An alternate sheet is one the reader may choose, not one to apply. -->
+  <link rel="alternate stylesheet" title="Large" href="styles/nonexistent.css">
+  <style>
+    /* A local sheet applies after the linked one, so it wins on a tie. */
+    .note { font-style: italic }
+  </style>
+</head>
+<body>
+  <h1>Styled from another file</h1>
+  <p>The whole look of this page comes from <code>styles/site.css</code>,
+  which is how a site of this era shared one design across every page it
+  served. A browser that reads only <code>&lt;style&gt;</code> elements
+  renders all of them unstyled.</p>
+  <p class="note">This box is styled by the linked sheet and italicised by the
+  local one, which comes after it.</p>
+  <p>Links are <a href="elsewhere.html">recoloured by the linked sheet</a>
+  through an attribute selector.</p>
+</body>
+</html>
