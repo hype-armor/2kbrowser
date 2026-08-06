@@ -7,7 +7,7 @@ use dom::{Document, NodeId};
 use crate::style::{
     BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack,
     FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
-    parse_border_style, parse_clear, parse_display, parse_float,
+    parse_border_style, parse_clear, parse_display, parse_float, parse_position,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -230,6 +230,23 @@ fn apply(
                     "nowrap" => WhiteSpace::NoWrap,
                     _ => WhiteSpace::Normal,
                 };
+            }
+        }
+        "position" => {
+            if let Raw::Ident(name) = first
+                && let Some(position) = parse_position(name)
+            {
+                style.position = position;
+            }
+        }
+        "top" | "right" | "bottom" | "left" => {
+            if let Some(length) = parse_length(first) {
+                match declaration.name.as_str() {
+                    "top" => style.offsets.top = length,
+                    "right" => style.offsets.right = length,
+                    "bottom" => style.offsets.bottom = length,
+                    _ => style.offsets.left = length,
+                }
             }
         }
         "float" => {

@@ -149,6 +149,68 @@ impl Default for FontStack {
     }
 }
 
+/// The `position` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Position {
+    /// In normal flow.
+    #[default]
+    Static,
+    /// In normal flow, then shifted; the space it would have taken is kept.
+    Relative,
+    /// Out of flow, placed against the nearest positioned ancestor.
+    Absolute,
+    /// Out of flow, placed against the viewport.
+    Fixed,
+}
+
+impl Position {
+    /// Whether this element establishes a containing block for absolutely
+    /// positioned descendants.
+    pub fn is_positioned(self) -> bool {
+        self != Position::Static
+    }
+
+    /// Whether the element is removed from normal flow.
+    pub fn is_out_of_flow(self) -> bool {
+        matches!(self, Position::Absolute | Position::Fixed)
+    }
+}
+
+/// Parses a `position` keyword.
+pub fn parse_position(name: &str) -> Option<Position> {
+    match name {
+        "static" => Some(Position::Static),
+        "relative" => Some(Position::Relative),
+        "absolute" => Some(Position::Absolute),
+        "fixed" => Some(Position::Fixed),
+        _ => None,
+    }
+}
+
+/// The `top`, `right`, `bottom`, and `left` offsets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Offsets {
+    /// `top`.
+    pub top: Length,
+    /// `right`.
+    pub right: Length,
+    /// `bottom`.
+    pub bottom: Length,
+    /// `left`.
+    pub left: Length,
+}
+
+impl Default for Offsets {
+    fn default() -> Self {
+        Self {
+            top: Length::Auto,
+            right: Length::Auto,
+            bottom: Length::Auto,
+            left: Length::Auto,
+        }
+    }
+}
+
 /// The `float` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Float {
@@ -370,6 +432,10 @@ pub struct ComputedStyle {
     pub padding: Edges,
     /// `border`.
     pub border: Borders,
+    /// `position`.
+    pub position: Position,
+    /// `top`/`right`/`bottom`/`left`.
+    pub offsets: Offsets,
     /// `float`.
     pub float: Float,
     /// `clear`.
@@ -402,6 +468,8 @@ impl Default for ComputedStyle {
             margin: Edges::ZERO,
             padding: Edges::ZERO,
             border: Borders::default(),
+            position: Position::Static,
+            offsets: Offsets::default(),
             float: Float::None,
             clear: Clear::None,
             width: Length::Auto,

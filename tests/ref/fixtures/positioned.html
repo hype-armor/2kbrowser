@@ -1,0 +1,25 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; }
+  .rel { position: relative; left: 60px; top: 8px;
+         background-color: #ffe9c0; padding: 6px; }
+  .frame { position: relative; height: 130px; border: 2px solid #666666;
+           background-color: #f4f4f4; margin-top: 12px; }
+  .tl { position: absolute; left: 8px; top: 8px;
+        background-color: #cfe3ff; padding: 4px; }
+  .br { position: absolute; right: 8px; bottom: 8px; width: 130px;
+        background-color: #ffd0d0; padding: 4px; }
+  .flowing { position: absolute; background-color: #d8f0d8; padding: 4px; }
+</style></head><body>
+<p>A paragraph before, to establish the flow.</p>
+<p class="rel">Relatively positioned: shifted right and down, but the space it
+would have taken is kept, so the next paragraph does not move.</p>
+<p>A paragraph after, sitting exactly where it would have without the shift.</p>
+<div class="frame">
+  <div class="tl">Absolute, top-left of the positioned frame.</div>
+  <div class="br">Absolute, offset from the right and bottom edges.</div>
+</div>
+<div class="frame">
+  <p>Content above.</p>
+  <div class="flowing">No offsets, so it stays where flow put it.</div>
+</div>
+</body></html>

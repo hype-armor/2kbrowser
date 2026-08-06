@@ -10,7 +10,7 @@ pub mod floats;
 pub mod table;
 
 use css::cascade::StyleMap;
-use css::style::{ComputedStyle, Display, Float, TextAlign, WhiteSpace};
+use css::style::{ComputedStyle, Display, Float, Position, TextAlign, WhiteSpace};
 use css::value::Length;
 use dom::{Document, NodeId};
 use floats::FloatContext;
@@ -27,6 +27,94 @@ pub type IntrinsicSizes = std::collections::HashMap<NodeId, (f32, f32)>;
 /// Default box for an image that has not loaded, matching what browsers show
 /// for a broken image with no dimensions given.
 const BROKEN_IMAGE_SIZE: (f32, f32) = (20.0, 20.0);
+
+/// The containing block that absolutely positioned descendants resolve against.
+///
+/// Boxes are stored parent-relative, but an absolutely positioned element is
+/// placed against a possibly distant ancestor. Carrying that ancestor's size,
+/// plus where the current box sits inside it, is what lets the two coordinate
+/// systems be reconciled without a second tree walk.
+#[derive(Debug, Clone, Copy)]
+pub struct ContainingBlock {
+    /// Position of the current box's content origin within the containing
+    /// block's coordinate system.
+    offset: (f32, f32),
+    /// The containing block's content size.
+    size: (f32, f32),
+}
+
+impl ContainingBlock {
+    /// The initial containing block: the viewport.
+    fn viewport(width: f32, height: f32) -> Self {
+        Self {
+            offset: (0.0, 0.0),
+            size: (width, height),
+        }
+    }
+
+    /// This containing block seen from a child at `(dx, dy)` in local content
+    /// coordinates.
+    fn descend(self, dx: f32, dy: f32) -> Self {
+        Self {
+            offset: (self.offset.0 + dx, self.offset.1 + dy),
+            size: self.size,
+        }
+    }
+
+    /// A box establishing itself as the containing block for its descendants.
+    fn establish(size: (f32, f32)) -> Self {
+        Self {
+            offset: (0.0, 0.0),
+            size,
+        }
+    }
+}
+
+/// Resolves an absolutely positioned box's offset within its containing block.
+///
+/// `left` wins over `right` when both are given, which is the correct
+/// behaviour for left-to-right text; a box with neither stays where normal flow
+/// would have put it, which is what makes `position: absolute` with no offsets
+/// behave like a hoisted static box.
+fn absolute_offset(
+    style: &ComputedStyle,
+    containing: (f32, f32),
+    size: (f32, f32),
+    static_position: (f32, f32),
+) -> (f32, f32) {
+    let font_size = style.font_size;
+    let offsets = style.offsets;
+
+    let x = match (offsets.left, offsets.right) {
+        (Length::Auto, Length::Auto) => static_position.0,
+        (Length::Auto, right) => containing.0 - right.to_px(font_size, containing.0) - size.0,
+        (left, _) => left.to_px(font_size, containing.0),
+    };
+    let y = match (offsets.top, offsets.bottom) {
+        (Length::Auto, Length::Auto) => static_position.1,
+        (Length::Auto, bottom) => containing.1 - bottom.to_px(font_size, containing.1) - size.1,
+        (top, _) => top.to_px(font_size, containing.1),
+    };
+    (x, y)
+}
+
+/// Shift applied by `position: relative`, which moves the box without
+/// disturbing anything around it.
+fn relative_shift(style: &ComputedStyle, containing: (f32, f32)) -> (f32, f32) {
+    let font_size = style.font_size;
+    let offsets = style.offsets;
+    let x = match (offsets.left, offsets.right) {
+        (Length::Auto, Length::Auto) => 0.0,
+        (Length::Auto, right) => -right.to_px(font_size, containing.0),
+        (left, _) => left.to_px(font_size, containing.0),
+    };
+    let y = match (offsets.top, offsets.bottom) {
+        (Length::Auto, Length::Auto) => 0.0,
+        (Length::Auto, bottom) => -bottom.to_px(font_size, containing.1),
+        (top, _) => top.to_px(font_size, containing.1),
+    };
+    (x, y)
+}
 
 /// Resolves a replaced element's used size.
 ///
@@ -172,6 +260,7 @@ pub fn layout(
         0.0,
         viewport_width,
         FloatContext::new(viewport_width),
+        ContainingBlock::viewport(viewport_width, viewport_width),
         &mut root,
     );
     root.rect.height = height;
@@ -195,6 +284,7 @@ fn layout_block(
     y: f32,
     available_width: f32,
     inherited: FloatContext,
+    containing: ContainingBlock,
     parent: &mut LayoutBox,
 ) -> f32 {
     let font_size = style.font_size;
@@ -344,6 +434,7 @@ fn layout_block(
         return outer;
     }
 
+    let mut absolutes: Vec<(NodeId, ComputedStyle, f32)> = Vec::new();
     let mut cursor_y = padding_top + border_top + content_height;
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
@@ -359,6 +450,12 @@ fn layout_block(
         // in it. Standalone and floated images, which is most of the era's
         // usage, come out right.
         let replaced = is_replaced(doc, child);
+        if child_style.position.is_out_of_flow() {
+            // Laid out after the in-flow content, when this block's height —
+            // and so its containing-block size — is finally known.
+            absolutes.push((child, child_style.clone(), cursor_y));
+            continue;
+        }
         if child_style.display == Display::None
             || (child_style.display.is_inline() && !replaced)
             || child_style.display.is_table_internal()
@@ -393,6 +490,7 @@ fn layout_block(
         cursor_y = context.clearance(child_style.clear, cursor_y);
         let child_context =
             context.translated(0.0, cursor_y - padding_top - border_top, content_width);
+        let child_containing = containing.descend(padding_left + border_left, cursor_y);
         let consumed = layout_block(
             doc,
             styles,
@@ -404,6 +502,7 @@ fn layout_block(
             cursor_y,
             content_width,
             child_context,
+            child_containing,
             &mut box_,
         );
         cursor_y += consumed;
@@ -424,6 +523,107 @@ fn layout_block(
                 + border_bottom
         }
     };
+
+    // Absolutely positioned children, now that this block's size is known.
+    // A positioned box becomes the containing block for its own descendants;
+    // otherwise the one inherited from an ancestor still applies.
+    let own_size = (
+        content_width,
+        (box_.rect.height - padding_top - padding_bottom - border_top - border_bottom).max(0.0),
+    );
+    for (child, child_style, static_y) in absolutes {
+        let child_containing = if style.position.is_positioned() {
+            ContainingBlock::establish(own_size)
+        } else {
+            containing.descend(padding_left + border_left, padding_top + border_top)
+        };
+
+        let mut probe = LayoutBox {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+            style: child_style.clone(),
+            text: None,
+            content_origin: (0.0, 0.0),
+            content_width: 0.0,
+            children: Vec::new(),
+            replaced: None,
+        };
+        // An absolutely positioned box with `width: auto` shrinks to fit its
+        // content rather than filling its containing block — the difference
+        // between a tooltip-sized box and a full-width band. Measured from the
+        // box's own inline content; nested block children are not accounted
+        // for, which would need a full intrinsic-width pass over the subtree.
+        let available = child_containing.size.0;
+        let width_basis = match child_style.width {
+            Length::Auto => {
+                let runs = collect_inline_runs(doc, styles, child, &child_style);
+                let (min, max) = fonts.intrinsic_widths(&runs, &child_style);
+                let surround = child_style
+                    .padding
+                    .left
+                    .to_px(child_style.font_size, available)
+                    + child_style
+                        .padding
+                        .right
+                        .to_px(child_style.font_size, available)
+                    + child_style.border.left.used_width(child_style.font_size)
+                    + child_style.border.right.used_width(child_style.font_size);
+                if max <= 0.0 {
+                    available
+                } else {
+                    (max + surround)
+                        .min(available)
+                        .max((min + surround).min(available))
+                }
+            }
+            _ => available,
+        };
+        layout_block(
+            doc,
+            styles,
+            fonts,
+            child,
+            &child_style,
+            intrinsic,
+            0.0,
+            0.0,
+            width_basis,
+            FloatContext::new(width_basis),
+            ContainingBlock::viewport(width_basis, child_containing.size.1),
+            &mut probe,
+        );
+        let Some(mut child_box) = probe.children.pop() else {
+            continue;
+        };
+
+        let size = (child_box.rect.width, child_box.rect.height);
+        let (cb_x, cb_y) = absolute_offset(
+            &child_style,
+            child_containing.size,
+            size,
+            // With no offsets given the box stays where flow would have put it.
+            (
+                child_containing.offset.0 + padding_left + border_left,
+                child_containing.offset.1 + static_y,
+            ),
+        );
+        // Convert from containing-block coordinates to this box's own.
+        child_box.rect.x = cb_x - child_containing.offset.0;
+        child_box.rect.y = cb_y - child_containing.offset.1;
+        box_.children.push(child_box);
+    }
+
+    // `position: relative` shifts the box after everything around it has been
+    // placed, so siblings keep the space it would have occupied.
+    if style.position == Position::Relative {
+        let (dx, dy) = relative_shift(style, (available_width, available_width));
+        box_.rect.x += dx;
+        box_.rect.y += dy;
+    }
 
     let outer = box_.outer_height(font_size);
     parent.children.push(box_);
@@ -554,6 +754,7 @@ fn layout_table(
                 cursor_y,
                 width,
                 FloatContext::new(width),
+                ContainingBlock::viewport(width, width),
                 &mut holder,
             );
             row_height = row_height.max(consumed);
@@ -653,6 +854,7 @@ fn place_float(
         0.0,
         float_width,
         FloatContext::new(float_width),
+        ContainingBlock::viewport(float_width, float_width),
         &mut probe,
     );
     let (left, top) = context.place(child_style.float, float_width, float_height, y);
@@ -1348,6 +1550,131 @@ mod tests {
         assert!(
             first_glyph_x >= 90.0,
             "text should start past the 90px float, got {first_glyph_x}"
+        );
+    }
+
+    #[test]
+    fn relative_positioning_shifts_a_box_without_moving_its_siblings() {
+        let html = "<body><p>one</p><p class=\"r\">two</p><p>three</p></body>";
+        let shifted = run(
+            html,
+            "body { margin: 0 } .r { position: relative; left: 40px; top: 5px }",
+            400.0,
+        );
+        let plain = run(html, "body { margin: 0 }", 400.0);
+
+        let shifted_boxes = content_boxes(&shifted);
+        let plain_boxes = content_boxes(&plain);
+        assert_eq!(shifted_boxes[1].rect.x, plain_boxes[1].rect.x + 40.0);
+        assert_eq!(shifted_boxes[1].rect.y, plain_boxes[1].rect.y + 5.0);
+
+        // The space it would have taken is kept, so the third paragraph does
+        // not move — that is the whole difference from absolute positioning.
+        assert_eq!(shifted_boxes[2].rect.y, plain_boxes[2].rect.y);
+        assert_eq!(shifted.layout.height, plain.layout.height);
+    }
+
+    #[test]
+    fn a_negative_relative_offset_moves_the_other_way() {
+        let html = "<body><p>one</p><p class=\"r\">two</p></body>";
+        let shifted = run(
+            html,
+            "body { margin: 0 } .r { position: relative; right: 30px }",
+            400.0,
+        );
+        let plain = run(html, "body { margin: 0 }", 400.0);
+        assert_eq!(
+            content_boxes(&shifted)[1].rect.x,
+            content_boxes(&plain)[1].rect.x - 30.0,
+            "`right` shifts leftwards"
+        );
+    }
+
+    #[test]
+    fn an_absolute_box_leaves_the_flow() {
+        let html = "<body><p>one</p><p class=\"a\">floating free</p><p>three</p></body>";
+        let positioned = run(
+            html,
+            "body { margin: 0 } .a { position: absolute; top: 200px }",
+            400.0,
+        );
+        let plain = run(html, "body { margin: 0 }", 400.0);
+
+        // The paragraph after it moves up into the space it vacated.
+        let after = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .filter(|b| b.style.position != Position::Absolute)
+                .filter(|b| b.text.is_some())
+                .map(|b| b.rect.y)
+                .next_back()
+                .expect("last in-flow paragraph")
+        };
+        assert!(
+            after(&positioned) < after(&plain),
+            "in-flow content should close the gap: {} vs {}",
+            after(&positioned),
+            after(&plain)
+        );
+    }
+
+    #[test]
+    fn absolute_offsets_resolve_against_the_nearest_positioned_ancestor() {
+        let rendered = run(
+            "<body><div class=\"outer\"><div class=\"inner\">x</div></div></body>",
+            "body { margin: 0 } \
+             .outer { position: relative; margin-top: 50px; padding: 10px } \
+             .inner { position: absolute; left: 20px; top: 30px }",
+            400.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.position == Position::Absolute)
+            .expect("absolute box");
+        // Coordinates are parent-relative, and the positioned parent is the
+        // containing block, so the offsets land unchanged.
+        assert_eq!(inner.rect.x, 20.0);
+        assert_eq!(inner.rect.y, 30.0);
+    }
+
+    #[test]
+    fn right_and_bottom_offsets_measure_from_the_far_edges() {
+        let rendered = run(
+            "<body><div class=\"outer\"><div class=\"inner\">x</div></div></body>",
+            "body { margin: 0 } \
+             .outer { position: relative; height: 200px } \
+             .inner { position: absolute; right: 0; bottom: 0; width: 50px; height: 20px }",
+            400.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.position == Position::Absolute)
+            .expect("absolute box");
+        assert_eq!(
+            inner.rect.x, 350.0,
+            "400 wide container, 50 wide box, right: 0"
+        );
+        assert_eq!(
+            inner.rect.y, 180.0,
+            "200 tall container, 20 tall box, bottom: 0"
+        );
+    }
+
+    #[test]
+    fn an_absolute_box_with_no_offsets_stays_where_flow_would_have_put_it() {
+        let rendered = run(
+            "<body><p>one</p><p class=\"a\">two</p></body>",
+            "body { margin: 0 } .a { position: absolute }",
+            400.0,
+        );
+        let absolute = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.position == Position::Absolute)
+            .expect("absolute box");
+        assert!(
+            absolute.rect.y > 0.0,
+            "should sit below the first paragraph, got {}",
+            absolute.rect.y
         );
     }
 
