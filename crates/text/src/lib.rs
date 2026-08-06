@@ -588,7 +588,17 @@ impl FontStore {
                     // Whitespace with no text of its own still advances the pen
                     // and can still carry a mandatory break, so it must not be
                     // dropped — a blank line in a <pre> is exactly this case.
-                    if let Some(last) = out.last_mut() {
+                    //
+                    // A second break in a row needs a segment of its own. Only
+                    // one flag exists per segment, so folding it into the
+                    // previous one would turn `<br><br>` into a single break —
+                    // and the era's pages used exactly that pair wherever a
+                    // paragraph gap was wanted.
+                    let already_breaking =
+                        out.last().is_some_and(|last| last.mandatory_break) && mandatory;
+                    if let Some(last) = out.last_mut()
+                        && !already_breaking
+                    {
                         last.trailing_space += space_width;
                         last.mandatory_break |= mandatory;
                     } else if mandatory {
@@ -1084,5 +1094,76 @@ mod decoration_tests {
         for (index, line) in layout.lines.iter().enumerate() {
             assert_eq!(line.decorations.len(), 1, "line {index} has no rule");
         }
+    }
+}
+
+#[cfg(test)]
+mod break_tests {
+    use super::*;
+
+    fn pre(text: &str) -> InlineRun {
+        InlineRun {
+            text: text.to_owned(),
+            style: ComputedStyle {
+                white_space: WhiteSpace::Pre,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn plain(text: &str) -> InlineRun {
+        InlineRun {
+            text: text.to_owned(),
+            style: ComputedStyle::default(),
+        }
+    }
+
+    #[test]
+    fn a_forced_break_starts_a_new_line() {
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(
+            &[plain("one"), pre("\n"), plain("two")],
+            &ComputedStyle::default(),
+            1000.0,
+        );
+        assert_eq!(layout.lines.len(), 2);
+    }
+
+    #[test]
+    fn two_forced_breaks_leave_a_blank_line() {
+        // `<br><br>` was how the era's pages spaced paragraphs. Folding the
+        // second break into the first gives one break, not two, and the gap
+        // the author asked for disappears.
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(
+            &[plain("one"), pre("\n"), pre("\n"), plain("two")],
+            &ComputedStyle::default(),
+            1000.0,
+        );
+        assert_eq!(layout.lines.len(), 3, "one blank line between the two");
+        assert!(
+            layout.lines[1].glyphs.is_empty(),
+            "the middle line is the blank one"
+        );
+    }
+
+    #[test]
+    fn a_run_boundary_alone_does_not_break_a_line() {
+        // The break algorithm reports Mandatory at end of text as well as at a
+        // real break, so `<b>one</b> <i>two</i>` would otherwise wrap.
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(
+            &[plain("one "), plain("two")],
+            &ComputedStyle::default(),
+            1000.0,
+        );
+        assert_eq!(layout.lines.len(), 1);
+    }
+
+    #[test]
+    fn blank_lines_in_preformatted_text_survive() {
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(&[pre("a\n\nb")], &ComputedStyle::default(), 1000.0);
+        assert_eq!(layout.lines.len(), 3);
     }
 }

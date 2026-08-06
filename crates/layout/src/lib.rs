@@ -1078,6 +1078,22 @@ fn gather_runs(
             if style.display == Display::None || !style.display.is_inline() {
                 continue;
             }
+            // `<br>` is a forced break, not an element with content. Emitted as
+            // a newline the segmenter must honour, which means marking the run
+            // preformatted so collapsing does not turn it back into a space.
+            if doc
+                .element(child)
+                .is_some_and(|element| element.local_name() == "br")
+            {
+                out.push(InlineRun {
+                    text: "\n".to_owned(),
+                    style: ComputedStyle {
+                        white_space: WhiteSpace::Pre,
+                        ..style.clone()
+                    },
+                });
+                continue;
+            }
             gather_runs(doc, styles, child, style, out);
         }
     }

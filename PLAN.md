@@ -147,6 +147,11 @@ system fonts, and will not look native — and it buys correctness testing on al
 three platforms for the price of one. For a document renderer that is the right
 trade. Recorded as ADR-0005.
 
+**This is now measured rather than argued.** As of `986e602` all three
+platforms rendered the shared baseline set byte for byte in CI, macOS included.
+That was the assumption the whole approach rested on and the one that would
+have been expensive to discover was false; it holds.
+
 Which fonts to bundle is ADR-0008: metric-compatible substitutes for the faces
 pages actually name (Liberation Sans/Serif/Mono for Arial, Times New Roman, and
 Courier New; Gelasio for Georgia), backed by Noto for pan-Unicode coverage
