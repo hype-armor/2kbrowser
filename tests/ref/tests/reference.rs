@@ -90,6 +90,31 @@ fn fixtures_match_their_baselines() {
 }
 
 #[test]
+fn a_fixture_with_non_ascii_bytes_declares_its_encoding() {
+    // A page that declares nothing is windows-1252, which is right for the era
+    // and wrong for a fixture written in UTF-8 — the em dash in one of these
+    // silently became three characters, and the mojibake was blessed into two
+    // baselines before anyone looked. Declaring it is what a real page should
+    // do anyway; the legacy-encoding fixture declares its own on purpose.
+    let mut silent = Vec::new();
+    for path in fixtures() {
+        let bytes = std::fs::read(&path).expect("fixture readable");
+        if !bytes.iter().any(|byte| *byte >= 0x80) {
+            continue;
+        }
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+        if !head.contains("charset") {
+            silent.push(path.display().to_string());
+        }
+    }
+    assert!(
+        silent.is_empty(),
+        "fixtures with non-ASCII bytes and no charset declaration:\n  {}",
+        silent.join("\n  ")
+    );
+}
+
+#[test]
 fn rendering_is_stable_across_runs() {
     // Same input, same bytes — the property the single baseline set rests on.
     // A failure here means the baselines are meaningless, so it is worth

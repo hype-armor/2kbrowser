@@ -44,6 +44,12 @@ pub struct Rule {
 pub struct Stylesheet {
     /// Rules in source order, which the cascade uses to break specificity ties.
     pub rules: Vec<Rule>,
+    /// URLs named by `@import`, in source order.
+    ///
+    /// Fetching them is the caller's job: this crate has no network and should
+    /// not acquire one. An imported sheet's rules come *before* the importing
+    /// sheet's, which is what the caller has to preserve.
+    pub imports: Vec<String>,
 }
 
 impl Stylesheet {
@@ -55,13 +61,17 @@ impl Stylesheet {
     pub fn parse(source: &str) -> Self {
         let mut input = ParserInput::new(source);
         let mut parser = Parser::new(&mut input);
-        let mut rule_parser = TopLevel;
+        let mut rule_parser = TopLevel::default();
         // `flatten` discards the Err arm, which is the specified recovery: a
         // rule that fails to parse is dropped and the sheet continues.
-        let rules = StyleSheetParser::new(&mut parser, &mut rule_parser)
+        let rules: Vec<Rule> = StyleSheetParser::new(&mut parser, &mut rule_parser)
+            .flatten()
             .flatten()
             .collect();
-        Self { rules }
+        Self {
+            rules,
+            imports: rule_parser.imports,
+        }
     }
 }
 
@@ -81,13 +91,44 @@ pub fn parse_style_attribute(source: &str) -> Vec<Declaration> {
     body.flatten().collect()
 }
 
-/// Parses top-level qualified rules. At-rules are skipped: `@media` and
-/// `@import` are M2 work, and skipping is the specified recovery.
-struct TopLevel;
+/// Whether a media query list applies to this browser.
+///
+/// CSS 2.1 has media *types*, not media features: `screen`, `print`, `all`,
+/// and a handful of others. A query carrying features — `screen and
+/// (min-width: 600px)` — is CSS 3, and is treated as not applying rather than
+/// as applying: a rule written for one viewport size, applied unconditionally,
+/// misrenders the page more badly than not applying it at all. Pages that
+/// depend on such rules are re-rendered as documents anyway (ADR-0009).
+pub fn media_applies(query: &str) -> bool {
+    // An empty query list is `all`, which is why `@media { … }` works.
+    if query.trim().is_empty() {
+        return true;
+    }
+    query.split(',').any(|entry| {
+        let entry = entry.trim().to_ascii_lowercase();
+        matches!(entry.as_str(), "all" | "screen")
+    })
+}
+
+/// What an at-rule turned out to be.
+enum AtRule {
+    /// `@media`, with whether its query applies.
+    Media(bool),
+    /// `@import`, with the URL it names.
+    Import(String),
+    /// Something we do not implement. Skipping is the specified recovery.
+    Unhandled,
+}
+
+/// Parses top-level rules, including the two at-rules that matter.
+#[derive(Default)]
+struct TopLevel {
+    imports: Vec<String>,
+}
 
 impl<'i> QualifiedRuleParser<'i> for TopLevel {
     type Prelude = Vec<Selector>;
-    type QualifiedRule = Rule;
+    type QualifiedRule = Vec<Rule>;
     type Error = ();
 
     fn parse_prelude<'t>(
@@ -108,27 +149,159 @@ impl<'i> QualifiedRuleParser<'i> for TopLevel {
         prelude: Self::Prelude,
         _: &ParserState,
         input: &mut Parser<'i, 't>,
-    ) -> Result<Rule, ParseError<'i, ()>> {
+    ) -> Result<Vec<Rule>, ParseError<'i, ()>> {
         if prelude.is_empty() {
             return Err(input.new_custom_error(()));
         }
-        let mut declarations = Vec::new();
-        let mut declaration_parser = DeclarationBlock;
-        let mut body = RuleBodyParser::new(input, &mut declaration_parser);
-        while let Some(Ok(declaration)) = body.next() {
-            declarations.push(declaration);
-        }
-        Ok(Rule {
+        Ok(vec![Rule {
             selectors: prelude,
-            declarations,
-        })
+            declarations: read_declarations(input),
+        }])
     }
 }
 
 impl<'i> AtRuleParser<'i> for TopLevel {
+    type Prelude = AtRule;
+    type AtRule = Vec<Rule>;
+    type Error = ();
+
+    fn parse_prelude<'t>(
+        &mut self,
+        name: cssparser::CowRcStr<'i>,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+        match name.as_ref().to_ascii_lowercase().as_str() {
+            "media" => {
+                let start = input.position();
+                while input.next().is_ok() {}
+                Ok(AtRule::Media(media_applies(input.slice_from(start))))
+            }
+            "import" => {
+                // `@import url(x.css)` and `@import "x.css"` are both ordinary,
+                // and either may be followed by a media query list.
+                let url = match input.next()?.clone() {
+                    cssparser::Token::UnquotedUrl(url) => url.as_ref().to_owned(),
+                    cssparser::Token::QuotedString(url) => url.as_ref().to_owned(),
+                    cssparser::Token::Function(name) if name.as_ref() == "url" => input
+                        .parse_nested_block(|inner| {
+                            Ok::<_, ParseError<'i, ()>>(match inner.next() {
+                                Ok(cssparser::Token::QuotedString(url)) => url.as_ref().to_owned(),
+                                Ok(cssparser::Token::UnquotedUrl(url)) => url.as_ref().to_owned(),
+                                _ => String::new(),
+                            })
+                        })?,
+                    _ => return Ok(AtRule::Unhandled),
+                };
+                let start = input.position();
+                while input.next().is_ok() {}
+                if url.is_empty() || !media_applies(input.slice_from(start)) {
+                    return Ok(AtRule::Unhandled);
+                }
+                Ok(AtRule::Import(url))
+            }
+            _ => Ok(AtRule::Unhandled),
+        }
+    }
+
+    /// `@import` has no block; this is where it is recorded.
+    fn rule_without_block(
+        &mut self,
+        prelude: Self::Prelude,
+        _: &ParserState,
+    ) -> Result<Self::AtRule, ()> {
+        match prelude {
+            AtRule::Import(url) => {
+                self.imports.push(url);
+                Ok(Vec::new())
+            }
+            // An at-rule that needs a block and has none is malformed.
+            _ => Err(()),
+        }
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        _: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::AtRule, ParseError<'i, ()>> {
+        let AtRule::Media(applies) = prelude else {
+            return Err(input.new_custom_error(()));
+        };
+        // The block is consumed either way — leaving it unparsed would make the
+        // rest of the sheet look like garbage to the tokenizer.
+        let mut nested = Nested;
+        let rules: Vec<Rule> = RuleBodyParser::new(input, &mut nested).flatten().collect();
+        Ok(if applies { rules } else { Vec::new() })
+    }
+}
+
+/// Parses the qualified rules inside an `@media` block.
+///
+/// Nested at-rules and declarations are not CSS 2.1 inside `@media`, so this
+/// only handles the one thing that belongs there.
+struct Nested;
+
+impl<'i> QualifiedRuleParser<'i> for Nested {
+    type Prelude = Vec<Selector>;
+    type QualifiedRule = Rule;
+    type Error = ();
+
+    fn parse_prelude<'t>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+        let start = input.position();
+        while input.next().is_ok() {}
+        Ok(selector::parse_selector_list(input.slice_from(start)))
+    }
+
+    fn parse_block<'t>(
+        &mut self,
+        prelude: Self::Prelude,
+        _: &ParserState,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Rule, ParseError<'i, ()>> {
+        if prelude.is_empty() {
+            return Err(input.new_custom_error(()));
+        }
+        Ok(Rule {
+            selectors: prelude,
+            declarations: read_declarations(input),
+        })
+    }
+}
+
+impl<'i> AtRuleParser<'i> for Nested {
     type Prelude = ();
     type AtRule = Rule;
     type Error = ();
+}
+
+/// Required by the body parser, and never reached: `parse_declarations` is
+/// false, so a stray declaration inside `@media` is skipped rather than
+/// offered here.
+impl<'i> DeclarationParser<'i> for Nested {
+    type Declaration = Rule;
+    type Error = ();
+}
+
+impl<'i> RuleBodyItemParser<'i, Rule, ()> for Nested {
+    fn parse_declarations(&self) -> bool {
+        false
+    }
+
+    fn parse_qualified(&self) -> bool {
+        true
+    }
+}
+
+/// Reads a `{ … }` body as declarations.
+fn read_declarations(input: &mut Parser<'_, '_>) -> Vec<Declaration> {
+    let mut declaration_parser = DeclarationBlock;
+    RuleBodyParser::new(input, &mut declaration_parser)
+        .flatten()
+        .collect()
 }
 
 /// Parses the declarations inside `{ … }`.
@@ -240,5 +413,115 @@ mod tests {
             Some(Length::Px(0.0)),
             "unitless zero is a length"
         );
+    }
+}
+
+#[cfg(test)]
+mod at_rule_tests {
+    use super::*;
+
+    fn colors(sheet: &Stylesheet) -> Vec<&str> {
+        sheet
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.declarations)
+            .filter(|d| d.name == "color")
+            .filter_map(|d| match d.value.first() {
+                Some(Raw::Ident(name)) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn media_screen_rules_are_applied() {
+        // Skipping the whole block, which is what happened before, loses the
+        // styling of any page that wrapped its rules in `@media screen`.
+        let sheet = Stylesheet::parse(
+            "p { color: red } @media screen { p { color: lime } } div { color: blue }",
+        );
+        assert_eq!(colors(&sheet), vec!["red", "lime", "blue"]);
+    }
+
+    #[test]
+    fn media_all_and_an_empty_query_apply() {
+        assert_eq!(
+            colors(&Stylesheet::parse("@media all { p { color: lime } }")),
+            vec!["lime"]
+        );
+        assert_eq!(
+            colors(&Stylesheet::parse("@media { p { color: lime } }")),
+            vec!["lime"]
+        );
+    }
+
+    #[test]
+    fn media_print_rules_are_not() {
+        let sheet = Stylesheet::parse("@media print { p { color: lime } } p { color: red }");
+        assert_eq!(colors(&sheet), vec!["red"]);
+    }
+
+    #[test]
+    fn a_comma_list_applies_if_any_type_matches() {
+        assert!(media_applies("print, screen"));
+        assert!(media_applies("screen, projection"));
+        assert!(!media_applies("print, tty"));
+    }
+
+    #[test]
+    fn a_feature_query_does_not_apply() {
+        // CSS 3, and applying a rule written for one viewport size to every
+        // size misrenders the page worse than dropping it.
+        assert!(!media_applies("screen and (min-width: 600px)"));
+        assert!(!media_applies("(max-width: 400px)"));
+        let sheet = Stylesheet::parse("@media screen and (min-width: 9px) { p { color: lime } }");
+        assert!(colors(&sheet).is_empty());
+    }
+
+    #[test]
+    fn a_skipped_media_block_does_not_derail_the_rest_of_the_sheet() {
+        // The block still has to be consumed, or the tokenizer treats the
+        // remainder of the sheet as garbage.
+        let sheet = Stylesheet::parse(
+            "@media print { p { color: lime } .x { color: teal } } div { color: red }",
+        );
+        assert_eq!(colors(&sheet), vec!["red"]);
+    }
+
+    #[test]
+    fn imports_are_recorded_in_both_forms() {
+        for source in [
+            "@import url(site.css);",
+            "@import url(\"site.css\");",
+            "@import 'site.css';",
+            "@import \"site.css\" screen;",
+        ] {
+            let sheet = Stylesheet::parse(source);
+            assert_eq!(sheet.imports, vec!["site.css".to_owned()], "for {source}");
+        }
+    }
+
+    #[test]
+    fn an_import_for_another_medium_is_not_recorded() {
+        // No point fetching a print stylesheet to then not apply it.
+        assert!(
+            Stylesheet::parse("@import url(print.css) print;")
+                .imports
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_import_does_not_swallow_the_rules_after_it() {
+        let sheet = Stylesheet::parse("@import url(a.css); p { color: red }");
+        assert_eq!(sheet.imports, vec!["a.css".to_owned()]);
+        assert_eq!(colors(&sheet), vec!["red"]);
+    }
+
+    #[test]
+    fn an_unknown_at_rule_is_still_skipped() {
+        let sheet = Stylesheet::parse("@font-face { src: url(x.ttf) } p { color: red }");
+        assert_eq!(colors(&sheet), vec!["red"]);
+        assert!(sheet.imports.is_empty());
     }
 }

@@ -27,7 +27,8 @@ Unicode line breaking; floats; tables with automatic column sizing, `colspan` an
 including ones sitting in a line; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
-text decorations; tiled background images; external stylesheets; and legacy
+text decorations; tiled background images; external stylesheets, including
+`@import` chains and `@media` blocks; and legacy
 character encodings, which most of the surviving old web needs — a page in
 windows-1252 read as UTF-8 is replacement characters where every accented
 letter and curly quote should be.
@@ -41,8 +42,8 @@ handling and blitting are not covered by automated tests — only its scroll
 arithmetic is.
 
 Known to be missing or wrong, rather than hidden: collapsed borders, fixed
-table layout, dashed and dotted borders painting solid, `background-position`,
-and `@media`/`@import`. Links are styled but not clickable — hit testing and
+table layout, dashed and dotted borders painting solid, and
+`background-position`. Links are styled but not clickable — hit testing and
 navigation are M3, along with the rest of the browser chrome.
 See [PLAN.md](PLAN.md).
 

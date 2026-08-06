@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>@import and @media</title>
+  <link rel="stylesheet" href="styles/imported.css">
+</head>
+<body>
+  <h1>Rules from three files</h1>
+  <div class="panel">
+    <p>This page links one stylesheet, which imports another. The imported
+    sheet's rules come first, so the importing sheet's heading colour and panel
+    background win over the ones it inherited — reversing that order inverts
+    every override a site relies on.</p>
+
+    <p>A <code>@media print</code> block would hide this text entirely if it
+    applied, and a feature query would put a twenty-pixel border round this
+    panel. Neither does.</p>
+  </div>
+</body>
+</html>

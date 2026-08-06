@@ -313,6 +313,46 @@ fn load_images(
 ///
 /// `<link rel=stylesheet>` is not followed here: fetching is the net crate's
 /// job, and same-origin policy (ADR-0006) applies to it.
+/// How deeply `@import` may nest before we stop following it.
+///
+/// A stylesheet can import itself, directly or through a cycle, and a browser
+/// that followed that would fetch forever.
+const MAX_IMPORT_DEPTH: usize = 4;
+
+/// Adds a sheet, with everything it imports placed *before* it.
+///
+/// Order is the point: CSS says an imported sheet's rules come before the
+/// importing sheet's own, so a rule in the importing sheet overrides the one it
+/// imported. Appending them afterwards inverts every such override.
+fn push_with_imports(
+    sheets: &mut Vec<Stylesheet>,
+    sheet: Stylesheet,
+    fetcher: &Fetcher,
+    base: Option<(&Origin, &str)>,
+    depth: usize,
+) {
+    if depth < MAX_IMPORT_DEPTH
+        && let Some((origin, path)) = base
+    {
+        for href in &sheet.imports {
+            let url = net::resolve(origin, path, href);
+            let Ok(resource) = fetcher.fetch(&url, Some(origin), RequestKind::Subresource) else {
+                continue;
+            };
+            // The imported sheet's own imports resolve against *it*, not
+            // against whatever imported it.
+            push_with_imports(
+                sheets,
+                Stylesheet::parse(&resource.body),
+                fetcher,
+                Some((&resource.origin, &resource.path)),
+                depth + 1,
+            );
+        }
+    }
+    sheets.push(sheet);
+}
+
 /// Whether a `<link rel>` names a stylesheet this browser should apply.
 ///
 /// `rel` is a space-separated list and the era's markup puts other tokens
@@ -340,7 +380,11 @@ fn collect_stylesheets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Ve
             continue;
         };
         match element.local_name() {
-            "style" => sheets.push(Stylesheet::parse(&doc.text_content(node))),
+            "style" => {
+                let sheet = Stylesheet::parse(&doc.text_content(node));
+                // A `<style>` block's imports resolve against the document.
+                push_with_imports(&mut sheets, sheet, &fetcher, base, 0);
+            }
             // An external stylesheet is how a site of this era shared one look
             // across every page; skipping them leaves those pages unstyled.
             "link" => {
@@ -355,7 +399,16 @@ fn collect_stylesheets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Ve
                 // Subresource, so ADR-0006's third-party rule applies: a sheet
                 // from another origin is refused like any other.
                 if let Ok(resource) = fetcher.fetch(&url, Some(origin), RequestKind::Subresource) {
-                    sheets.push(Stylesheet::parse(&resource.body));
+                    let sheet = Stylesheet::parse(&resource.body);
+                    // An imported sheet's URLs resolve against the sheet that
+                    // imported it, not against the document.
+                    push_with_imports(
+                        &mut sheets,
+                        sheet,
+                        &fetcher,
+                        Some((&resource.origin, &resource.path)),
+                        0,
+                    );
                 }
             }
             _ => {}

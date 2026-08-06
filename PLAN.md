@@ -291,10 +291,15 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 9. **Tiled backgrounds** — *done.* `background-image`, `background-repeat`, the
    `background` shorthand and its reset, `<body background>`, and canvas
    propagation
+10. **Stylesheets from elsewhere** — *done.* `<link rel=stylesheet>`, `@import`
+   chains in the order CSS specifies, and `@media` blocks by media type.
+   Feature queries are CSS 3 and do not apply
+11. **Legacy character encodings** — *done.* Byte-order mark, `Content-Type`,
+   a `<meta>` prescan, then windows-1252 — which most of the surviving old web
+   needs and which the plan called required rather than optional
 
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, dashed and dotted borders painting solid, `background-position`, and
-`@media`/`@import`.
+layout, dashed and dotted borders painting solid, and `background-position`.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes

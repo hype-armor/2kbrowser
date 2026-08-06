@@ -1,0 +1,4 @@
+/* Imported by site.css. Its rules come first, so site.css overrides them. */
+body { font-family: Georgia, serif; margin: 16px; background: #ffffff }
+h1 { color: #000000 }
+.panel { border: 1px solid #cccccc; padding: 10px }
