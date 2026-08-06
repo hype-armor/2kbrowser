@@ -9,7 +9,9 @@ use crate::style::{
     FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
     parse_border_style, parse_clear, parse_display, parse_float,
 };
-use crate::value::{Color, Length, Raw, parse_color, parse_length};
+use crate::value::{
+    Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
+};
 use crate::{Declaration, Specificity, Stylesheet};
 
 /// Where a stylesheet came from. Origin outranks specificity in the cascade.
@@ -50,7 +52,18 @@ pub fn cascade(doc: &Document, author_sheets: &[Stylesheet]) -> StyleMap {
     let ua = Stylesheet::parse(crate::ua::UA_STYLESHEET);
     let mut map = StyleMap::default();
     let root_style = ComputedStyle::default();
-    style_subtree(doc, doc.root(), &root_style, &ua, author_sheets, &mut map);
+    // Quirks mode is a property of the document, decided by its doctype, and
+    // changes how values parse (ADR-0004).
+    let quirks = doc.is_quirks();
+    style_subtree(
+        doc,
+        doc.root(),
+        &root_style,
+        &ua,
+        author_sheets,
+        quirks,
+        &mut map,
+    );
     map
 }
 
@@ -60,10 +73,11 @@ fn style_subtree(
     parent_style: &ComputedStyle,
     ua: &Stylesheet,
     author: &[Stylesheet],
+    quirks: bool,
     out: &mut StyleMap,
 ) {
     let style = if doc.element(node).is_some() {
-        let computed = compute(doc, node, parent_style, ua, author);
+        let computed = compute(doc, node, parent_style, ua, author, quirks);
         out.styles.insert(node, computed.clone());
         computed
     } else {
@@ -71,7 +85,7 @@ fn style_subtree(
     };
 
     for &child in doc.children(node) {
-        style_subtree(doc, child, &style, ua, author, out);
+        style_subtree(doc, child, &style, ua, author, quirks, out);
     }
 }
 
@@ -81,6 +95,7 @@ fn compute(
     parent: &ComputedStyle,
     ua: &Stylesheet,
     author: &[Stylesheet],
+    quirks: bool,
 ) -> ComputedStyle {
     let mut matched: Vec<(Precedence, &Declaration)> = Vec::new();
     let mut order = 0usize;
@@ -118,7 +133,7 @@ fn compute(
     // The UA sheet gives `display: block` to block-level elements; everything
     // else starts inline, which is the CSS initial value.
     for (_, declaration) in matched {
-        apply(&mut style, declaration, parent);
+        apply(&mut style, declaration, parent, quirks);
     }
     style
 }
@@ -127,9 +142,18 @@ fn compute(
 ///
 /// Unknown properties and unparseable values are dropped, which is the
 /// specified behaviour and the only workable one for the real web.
-fn apply(style: &mut ComputedStyle, declaration: &Declaration, parent: &ComputedStyle) {
+fn apply(
+    style: &mut ComputedStyle,
+    declaration: &Declaration,
+    parent: &ComputedStyle,
+    quirks: bool,
+) {
     let values = &declaration.value;
     let Some(first) = values.first() else { return };
+    // Shadow the strict parsers so every property below picks up the
+    // quirks-mode forms without each having to remember to ask.
+    let parse_length = |raw: &Raw| parse_length_quirky(raw, quirks);
+    let parse_color = |raw: &Raw| parse_color_quirky(raw, quirks);
 
     match declaration.name.as_str() {
         "display" => {
@@ -222,8 +246,8 @@ fn apply(style: &mut ComputedStyle, declaration: &Declaration, parent: &Computed
                 style.clear = clear;
             }
         }
-        "margin" => style.margin = parse_edges(values),
-        "padding" => style.padding = parse_edges(values),
+        "margin" => style.margin = parse_edges(values, quirks),
+        "padding" => style.padding = parse_edges(values, quirks),
         "width" => {
             if let Some(length) = parse_length(first) {
                 style.width = length;
@@ -277,9 +301,9 @@ fn apply(style: &mut ComputedStyle, declaration: &Declaration, parent: &Computed
         }
         name => {
             if let Some(side) = name.strip_prefix("margin-") {
-                set_edge(&mut style.margin, side, first);
+                set_edge(&mut style.margin, side, first, quirks);
             } else if let Some(side) = name.strip_prefix("padding-") {
-                set_edge(&mut style.padding, side, first);
+                set_edge(&mut style.padding, side, first, quirks);
             } else if let Some(rest) = name.strip_prefix("border-") {
                 apply_border_longhand(&mut style.border, rest, values);
             }
@@ -335,8 +359,11 @@ fn parse_font_family(values: &[Raw]) -> FontStack {
 }
 
 /// Parses the one-to-four value `margin`/`padding` shorthand.
-fn parse_edges(values: &[Raw]) -> Edges {
-    let lengths: Vec<Length> = values.iter().filter_map(parse_length).collect();
+fn parse_edges(values: &[Raw], quirks: bool) -> Edges {
+    let lengths: Vec<Length> = values
+        .iter()
+        .filter_map(|raw| parse_length_quirky(raw, quirks))
+        .collect();
     match lengths.len() {
         1 => Edges::all(lengths[0]),
         2 => Edges {
@@ -489,8 +516,8 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
     }
 }
 
-fn set_edge(edges: &mut Edges, side: &str, raw: &Raw) {
-    let Some(length) = parse_length(raw) else {
+fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
+    let Some(length) = parse_length_quirky(raw, quirks) else {
         return;
     };
     match side {
@@ -698,6 +725,88 @@ mod tests {
         assert_eq!(style.border.right.style, BorderStyle::Dashed);
         assert_eq!(style.border.bottom.style, BorderStyle::Solid);
         assert_eq!(style.border.left.style, BorderStyle::Dashed);
+    }
+
+    /// Same helper as `style_of`, but without a doctype, so the parser puts the
+    /// document in quirks mode.
+    fn quirks_style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
+        let doc = dom::parse(html);
+        assert!(doc.is_quirks(), "fixture should be in quirks mode");
+        let sheets = [Stylesheet::parse(css)];
+        let map = cascade(&doc, &sheets);
+        let node = doc.find_element(tag).expect("element present");
+        map.get(node).expect("element styled").clone()
+    }
+
+    fn standards_style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
+        let doc = dom::parse(&format!("<!doctype html>{html}"));
+        assert!(!doc.is_quirks(), "fixture should be in standards mode");
+        let sheets = [Stylesheet::parse(css)];
+        let map = cascade(&doc, &sheets);
+        let node = doc.find_element(tag).expect("element present");
+        map.get(node).expect("element styled").clone()
+    }
+
+    #[test]
+    fn quirks_mode_accepts_a_unitless_length() {
+        // `width: 100` is invalid in standards mode and everywhere in the era's
+        // markup. Rejecting it collapses the page it was meant to size.
+        let quirky = quirks_style_of("<p>x</p>", "p { width: 100; margin: 20 }", "p");
+        assert_eq!(quirky.width, Length::Px(100.0));
+        assert_eq!(quirky.margin.top, Length::Px(20.0));
+
+        let strict = standards_style_of("<p>x</p>", "p { width: 100; margin: 20 }", "p");
+        assert_eq!(strict.width, Length::Auto, "standards mode must reject it");
+        assert_eq!(strict.margin.top, Length::Px(0.0));
+    }
+
+    #[test]
+    fn quirks_mode_accepts_a_hashless_hex_colour() {
+        let quirky = quirks_style_of("<p>x</p>", "p { color: ff0000 }", "p");
+        assert_eq!(quirky.color, crate::Color::rgb(255, 0, 0));
+
+        let strict = standards_style_of("<p>x</p>", "p { color: ff0000 }", "p");
+        assert_eq!(
+            strict.color,
+            crate::Color::BLACK,
+            "standards mode must reject it"
+        );
+    }
+
+    #[test]
+    fn a_three_digit_hashless_colour_expands_like_a_hash_one() {
+        assert_eq!(
+            quirks_style_of("<p>x</p>", "p { color: f00 }", "p").color,
+            crate::Color::rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_hashless_colour_starting_with_digits_still_parses() {
+        // `00ff00` tokenises as a dimension — the number 00 with unit ff00 —
+        // not as an identifier, so it needs its own path.
+        assert_eq!(
+            quirks_style_of("<p>x</p>", "p { color: 00ff00 }", "p").color,
+            crate::Color::rgb(0, 255, 0)
+        );
+    }
+
+    #[test]
+    fn a_keyword_is_not_mistaken_for_a_hashless_colour() {
+        // `dad` and `beaded` are hex-looking words; `solid` and `inherit` are
+        // not. Only three- and six-digit strings may be read as colours, and a
+        // real keyword must keep winning.
+        let style = quirks_style_of("<p>x</p>", "p { color: red; display: block }", "p");
+        assert_eq!(style.color, crate::Color::rgb(255, 0, 0));
+        assert_eq!(style.display, Display::Block);
+    }
+
+    #[test]
+    fn quirks_parsing_does_not_leak_into_standards_documents() {
+        // The whole point of gating: a standards-mode page must not silently
+        // gain permissive parsing.
+        let strict = standards_style_of("<p>x</p>", "p { padding: 5 }", "p");
+        assert_eq!(strict.padding.top, Length::Px(0.0));
     }
 
     #[test]

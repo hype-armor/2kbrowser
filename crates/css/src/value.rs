@@ -225,6 +225,69 @@ impl Length {
     }
 }
 
+/// Parses a length, accepting the quirks-mode forms as well.
+///
+/// In quirks mode a bare number is a pixel length. Pages of this era wrote
+/// `width: 100` constantly, and in standards mode that declaration is simply
+/// invalid — so honouring it is the difference between a laid-out page and a
+/// collapsed one.
+pub fn parse_length_quirky(raw: &Raw, quirks: bool) -> Option<Length> {
+    if quirks && let Raw::Number(value) = raw {
+        return Some(Length::Px(*value));
+    }
+    parse_length(raw)
+}
+
+/// Parses a colour, accepting the quirks-mode forms as well.
+///
+/// In quirks mode a hash-less hex colour is accepted: `color: ffffff` and
+/// `bgcolor`-style values were widespread before authors settled on `#`.
+pub fn parse_color_quirky(raw: &Raw, quirks: bool) -> Option<Color> {
+    if let Some(color) = parse_color(raw) {
+        return Some(color);
+    }
+    if !quirks {
+        return None;
+    }
+    match raw {
+        // An identifier that is entirely hex digits, e.g. `ffffff` or `fff`.
+        Raw::Ident(name) => hex_string(name),
+        // `00ff00` tokenises as a dimension: the number `00` with unit `ff00`.
+        // The parsed number has lost its leading zeros, so they are restored by
+        // padding to whichever total length — six or three — fits the unit.
+        Raw::Dimension { value, unit } => {
+            let number = format!("{}", *value as i64);
+            [6usize, 3]
+                .into_iter()
+                .filter_map(|total| {
+                    let digits = total.checked_sub(unit.len())?;
+                    (digits >= number.len()).then(|| format!("{number:0>digits$}{unit}"))
+                })
+                .find_map(|candidate| hex_string(&candidate))
+        }
+        Raw::Number(value) => {
+            let number = format!("{}", *value as i64);
+            [6usize, 3]
+                .into_iter()
+                .filter(|total| *total >= number.len())
+                .find_map(|total| hex_string(&format!("{number:0>total$}")))
+        }
+        _ => None,
+    }
+}
+
+/// Parses a bare hex colour string of three or six digits.
+fn hex_string(text: &str) -> Option<Color> {
+    let text = text.trim();
+    if !text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match text.len() {
+        3 | 6 => parse_color(&Raw::Hash(text.to_owned())),
+        _ => None,
+    }
+}
+
 /// Parses a length from a single component value.
 pub fn parse_length(raw: &Raw) -> Option<Length> {
     match raw {

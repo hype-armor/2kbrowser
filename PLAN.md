@@ -263,7 +263,8 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
    dimensions, floatable. Links, scrolling, and hit testing remain
-6. Positioned layout, then **quirks mode**, then **framesets**
+6. **Quirks mode** — *started.* Unitless lengths and hash-less hex colours
+   parse; other quirks outstanding. Positioned layout and **framesets** remain
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes

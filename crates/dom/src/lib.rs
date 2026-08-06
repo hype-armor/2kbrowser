@@ -118,6 +118,14 @@ impl Document {
         self.quirks
     }
 
+    /// Whether the document is in any flavour of quirks mode.
+    ///
+    /// Exposed so consumers do not have to depend on `html5ever`'s enum just to
+    /// ask the one question they actually have.
+    pub fn is_quirks(&self) -> bool {
+        self.quirks != QuirksMode::NoQuirks
+    }
+
     /// Total node count, including the root.
     pub fn len(&self) -> usize {
         self.nodes.len()
