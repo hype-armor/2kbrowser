@@ -16,7 +16,7 @@ use std::rc::Rc;
 use layout::RenderMode;
 use text::FontStore;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -39,7 +39,13 @@ fn clamp_scroll(offset: f32, content_height: f32, viewport_height: f32) -> f32 {
 ///
 /// ADR-0009 forbids switching rendering mode silently. Until M3 provides a
 /// banner, the title bar is where the browser says what it did.
-fn title_for(source: &str, mode: &RenderMode) -> String {
+fn title_for(source: &str, mode: &RenderMode, error: Option<&str>) -> String {
+    // A failed navigation is the most important thing the title can say, and
+    // it outranks the mode: the page on screen is not the page that was asked
+    // for, and nothing else would tell the reader that.
+    if let Some(error) = error {
+        return format!("{source} — {error} — 2kbrowser");
+    }
     match mode {
         RenderMode::Authored => format!("{source} — 2kbrowser"),
         RenderMode::Document { .. } => format!("{source} — rendered as document — 2kbrowser"),
@@ -47,16 +53,32 @@ fn title_for(source: &str, mode: &RenderMode) -> String {
     }
 }
 
+/// A document that has been fetched and is ready to render.
+struct Loaded {
+    html: String,
+    origin: net::Origin,
+    path: String,
+}
+
 /// Everything the event loop needs between frames.
 struct App {
-    html: String,
-    source: String,
+    loaded: Loaded,
+    history: crate::history::History,
+    fetcher: net::Fetcher,
     fonts: FontStore,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     page: Option<crate::render::Page>,
     scroll: f32,
     size: (u32, u32),
+    /// Last known pointer position, in window coordinates.
+    pointer: (f32, f32),
+    /// Whether the pointer is over a link, so the cursor can say so.
+    over_link: bool,
+    /// What went wrong with the last navigation, shown in the title.
+    error: Option<String>,
+    /// Held because a key event does not carry the modifier state with it.
+    modifiers: winit::event::Modifiers,
 }
 
 impl App {
@@ -69,12 +91,73 @@ impl App {
         }
         // The canvas is the full document height, not the viewport height:
         // scrolling then costs a blit offset rather than a re-layout.
-        let page = crate::render::render(&self.html, width, u32::MAX, &mut self.fonts);
+        let page = crate::render::render_with_base(
+            &self.loaded.html,
+            width,
+            u32::MAX,
+            &mut self.fonts,
+            Some((&self.loaded.origin, &self.loaded.path)),
+        );
         if let Some(window) = &self.window {
-            window.set_title(&title_for(&self.source, &page.mode));
+            window.set_title(&title_for(
+                self.history.current(),
+                &page.mode,
+                self.error.as_deref(),
+            ));
         }
         self.scroll = clamp_scroll(self.scroll, page.content_height, height as f32);
         self.page = Some(page);
+    }
+
+    /// Fetches `url` and shows it, without touching history.
+    ///
+    /// Used by back and forward as well as by following a link, so the history
+    /// bookkeeping stays in one place rather than being repeated per caller.
+    fn show(&mut self, url: &str) {
+        match self.fetcher.fetch(url, None, net::RequestKind::Navigation) {
+            Ok(resource) => {
+                self.loaded = Loaded {
+                    html: resource.body,
+                    origin: resource.origin,
+                    path: resource.path,
+                };
+                self.error = None;
+                self.scroll = 0.0;
+            }
+            // The page that failed stays on screen rather than being replaced
+            // with a blank one: what was there is more useful than nothing, and
+            // the title says what happened.
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Follows a link.
+    fn navigate(&mut self, url: String) {
+        self.history.visit(url);
+        let target = self.history.current().to_owned();
+        self.show(&target);
+    }
+
+    fn go_back(&mut self) {
+        if let Some(url) = self.history.back().map(str::to_owned) {
+            self.show(&url);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(url) = self.history.forward().map(str::to_owned) {
+            self.show(&url);
+        }
+    }
+
+    /// The link under the pointer, if any, in canvas coordinates.
+    fn link_under_pointer(&self) -> Option<String> {
+        let page = self.page.as_ref()?;
+        page.link_at(self.pointer.0, self.pointer.1 + self.scroll)
     }
 
     fn scroll_by(&mut self, delta: f32) {
@@ -142,7 +225,7 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes()
-            .with_title(&self.source)
+            .with_title(self.history.current())
             .with_inner_size(winit::dpi::LogicalSize::new(self.size.0, self.size.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
@@ -182,6 +265,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             WindowEvent::MouseWheel { delta, .. } => {
                 let pixels = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE_HEIGHT,
@@ -189,8 +273,59 @@ impl ApplicationHandler for App {
                 };
                 self.scroll_by(pixels);
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x as f32, position.y as f32);
+                // The cursor says whether there is a link here, which is how a
+                // pointer-driven browser has always answered that question.
+                let over = self.link_under_pointer().is_some();
+                if over != self.over_link
+                    && let Some(window) = &self.window
+                {
+                    self.over_link = over;
+                    window.set_cursor(if over {
+                        winit::window::CursorIcon::Pointer
+                    } else {
+                        winit::window::CursorIcon::Default
+                    });
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => match button {
+                MouseButton::Left => {
+                    if let Some(url) = self.link_under_pointer() {
+                        self.navigate(url);
+                    }
+                }
+                // The mouse's own back and forward buttons, which people who
+                // have them use constantly.
+                MouseButton::Back => self.go_back(),
+                MouseButton::Forward => self.go_forward(),
+                _ => {}
+            },
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let viewport = self.size.1 as f32;
+                // Alt+Left and Alt+Right are the platform convention;
+                // Backspace is what the era's browsers used and many hands
+                // still reach for.
+                let alt = self.modifiers.state().alt_key();
+                match event.logical_key {
+                    Key::Named(NamedKey::ArrowLeft) if alt => {
+                        self.go_back();
+                        return;
+                    }
+                    Key::Named(NamedKey::ArrowRight) if alt => {
+                        self.go_forward();
+                        return;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        self.go_back();
+                        return;
+                    }
+                    _ => {}
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Named(NamedKey::ArrowDown) => self.scroll_by(SCROLL_STEP),
@@ -210,10 +345,20 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Opens a window showing `html`, and runs until the user closes it.
+/// Opens a window showing the document already fetched from `url`, and runs
+/// until the user closes it.
 ///
-/// `source` is shown in the title bar. Blocks for the lifetime of the window.
-pub fn open(html: String, source: String, width: u32, height: u32) -> Result<(), String> {
+/// The fetched body is passed in rather than re-fetched so the caller can
+/// report a failure before a window ever appears. Blocks for the lifetime of
+/// the window.
+pub fn open(
+    html: String,
+    url: String,
+    origin: net::Origin,
+    path: String,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|error| {
         format!("could not start the event loop ({error}); is a display available?")
     })?;
@@ -222,14 +367,19 @@ pub fn open(html: String, source: String, width: u32, height: u32) -> Result<(),
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App {
-        html,
-        source,
+        loaded: Loaded { html, origin, path },
+        history: crate::history::History::new(url),
+        fetcher: net::Fetcher::default(),
         fonts: FontStore::new(),
         window: None,
         surface: None,
         page: None,
         scroll: 0.0,
         size: (width.max(1), height.max(1)),
+        pointer: (0.0, 0.0),
+        over_link: false,
+        error: None,
+        modifiers: winit::event::Modifiers::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -260,7 +410,7 @@ mod tests {
         // ADR-0009: never switch rendering mode silently. Until M3 has a
         // banner, the title bar carries it.
         assert_eq!(
-            title_for("a.html", &RenderMode::Authored),
+            title_for("a.html", &RenderMode::Authored, None),
             "a.html — 2kbrowser"
         );
         assert!(
@@ -268,10 +418,21 @@ mod tests {
                 "a.html",
                 &RenderMode::Document {
                     unsupported_share: 0.9
-                }
+                },
+                None
             )
             .contains("rendered as document")
         );
-        assert!(title_for("a.html", &RenderMode::RequiresScripting).contains("needs JavaScript"));
+        assert!(
+            title_for("a.html", &RenderMode::RequiresScripting, None).contains("needs JavaScript")
+        );
+    }
+
+    #[test]
+    fn a_failed_navigation_outranks_the_mode_in_the_title() {
+        // The page on screen is not the page that was asked for, and with no
+        // chrome yet the title is the only place that can say so.
+        let title = title_for("b.html", &RenderMode::Authored, Some("404"));
+        assert!(title.contains("404"), "got {title}");
     }
 }

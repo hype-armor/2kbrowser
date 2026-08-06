@@ -681,3 +681,90 @@ mod link_tests {
         assert!(!is_applied_stylesheet(Some("stylesheet alternate")));
     }
 }
+
+#[cfg(test)]
+mod link_geometry_tests {
+    use super::*;
+
+    /// Renders `html` as if it were a file in a real directory, so relative
+    /// links have something to resolve against.
+    fn page_at(name: &str, html: &str) -> (Page, String) {
+        let dir = std::env::temp_dir().join("2kbrowser-link-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, html).expect("write");
+        let url = format!("file://{}", path.display());
+        let (origin, path) = net::parse_url(&url).expect("parses");
+
+        let mut fonts = FontStore::new();
+        let page = render_with_base(html, 600, 2000, &mut fonts, Some((&origin, &path)));
+        let base = url.rsplit_once('/').expect("a directory").0.to_owned();
+        (page, base)
+    }
+
+    /// The URL reported at the centre of the first link rectangle.
+    fn follow_first_link(page: &Page) -> Option<String> {
+        let rect = page.links().first().map(|(rect, _)| *rect)?;
+        page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    #[test]
+    fn clicking_a_relative_link_resolves_it_against_the_page() {
+        let (page, base) = page_at(
+            "a.html",
+            r#"<body><p>go <a href="b.html">there</a></p></body>"#,
+        );
+        assert_eq!(follow_first_link(&page), Some(format!("{base}/b.html")));
+    }
+
+    #[test]
+    fn a_fragment_link_is_not_a_navigation() {
+        // It names a destination inside this document. There is nothing to
+        // fetch, and treating it as a fetch reloads the page for no reason.
+        let (page, _) = page_at(
+            "frag.html",
+            r##"<body><p><a href="#section">jump</a></p></body>"##,
+        );
+        assert!(
+            page.links().is_empty(),
+            "a fragment is not a link to follow"
+        );
+
+        let rects = page.frames[0].layout.rects_for(
+            page.frames[0]
+                .doc
+                .find_element("a")
+                .expect("the anchor exists"),
+        );
+        let rect = rects.first().expect("it still has geometry");
+        assert_eq!(
+            page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_point_on_ordinary_text_is_not_a_link() {
+        let (page, _) = page_at(
+            "plain.html",
+            r#"<body><p>just words here, and <a href="b.html">one link</a></p></body>"#,
+        );
+        // Far to the right of the text, on the same line.
+        assert_eq!(page.link_at(580.0, 12.0), None);
+    }
+
+    #[test]
+    fn a_page_with_no_base_has_no_link_geometry() {
+        // Nothing to resolve against, so there is nowhere a click could lead.
+        let mut fonts = FontStore::new();
+        let page = render(
+            r#"<body><a href="b.html">x</a></body>"#,
+            300,
+            300,
+            &mut fonts,
+        );
+        assert!(page.frames.is_empty());
+        assert!(page.links().is_empty());
+        assert_eq!(page.link_at(5.0, 5.0), None);
+    }
+}

@@ -45,9 +45,13 @@ Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and
 `background-position`.
 
-Links have geometry — `2kbrowser links <page>` prints every link rectangle and
-where it leads, and `cargo run -p shell --example link-map` draws them over the
-page. Following one needs the chrome, which is the rest of M3.
+Links work in the window: click to follow, Alt+Left/Right or Backspace for
+back and forward, and the cursor changes over a link. `2kbrowser links <page>`
+prints every link rectangle and where it leads, and
+`cargo run -p shell --example link-map` draws them over the page.
+
+Still to come in M3: tabs, a URL bar, bookmarks, find-in-page, and the banner
+that says a page was re-rendered as a document.
 See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
@@ -67,7 +71,7 @@ cargo test --workspace
 ```sh
 2kbrowser render https://example.com --out page.png --width 800
 2kbrowser render page.html --out page.png
-2kbrowser open page.html            # window: arrows scroll, Esc quits
+2kbrowser open page.html            # click links; Alt+Left goes back
 2kbrowser links page.html           # every link, and where you would click
 ```
 

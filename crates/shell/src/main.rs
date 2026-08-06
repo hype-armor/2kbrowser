@@ -29,7 +29,9 @@ follow it — the same geometry the window uses, printed instead of drawn.
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
-In a window: arrows and PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
+In a window: click a link to follow it. Alt+Left and Alt+Right, or Backspace,
+go back and forward. Arrows and PageUp/PageDown scroll, Home/End jump, Esc or
+q quits.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -68,10 +70,12 @@ fn report(outcome: Result<String, String>) -> ExitCode {
 fn run_open(args: &[String]) -> Result<String, String> {
     let options = Options::parse(args)?;
     let input = options.input.ok_or("no input given")?;
-    let resource = load(&input)?;
+    let (resource, url) = load_from(&input)?;
     window::open(
         resource.body,
-        input,
+        url,
+        resource.origin,
+        resource.path,
         options.width,
         options.height.min(2000),
     )?;
@@ -208,24 +212,39 @@ fn run_render(args: &[String]) -> Result<String, String> {
 /// everything downstream sees one representation and the policy has an origin
 /// to judge subresources against.
 fn load(input: &str) -> Result<net::Resource, String> {
-    let fetcher = net::Fetcher::default();
-    let url = if input.contains("://") {
-        input.to_owned()
-    } else {
-        let path = std::path::Path::new(input);
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(path)
-        };
-        format!("file://{}", absolute.display())
-    };
+    load_from(input).map(|(resource, _)| resource)
+}
 
-    fetcher
+/// Fetches, and reports the absolute URL it settled on.
+///
+/// The window needs that URL: it is the first history entry, and every
+/// relative link on the page is resolved against it.
+fn load_from(input: &str) -> Result<(net::Resource, String), String> {
+    let fetcher = net::Fetcher::default();
+    let url = absolute_url(input)?;
+    let resource = fetcher
         .fetch(&url, None, net::RequestKind::Navigation)
-        .map_err(|error| format!("{url}: {error}"))
+        .map_err(|error| format!("{url}: {error}"))?;
+    Ok((resource, url))
+}
+
+/// Turns a command-line argument into a URL.
+///
+/// A bare path is taken as a file, which is what someone typing a filename
+/// means; anything naming a scheme is left alone.
+fn absolute_url(input: &str) -> Result<String, String> {
+    if net::policy::has_scheme(input) {
+        return Ok(input.to_owned());
+    }
+    let path = std::path::Path::new(input);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    Ok(format!("file://{}", absolute.display()))
 }
 
 fn take(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
