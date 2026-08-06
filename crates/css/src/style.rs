@@ -148,6 +148,38 @@ pub fn parse_text_decoration(words: &[String]) -> TextDecoration {
     out
 }
 
+/// The `vertical-align` property, restricted to the values a table cell uses.
+///
+/// Only the cell case is modelled. Vertical alignment *within a line box* — a
+/// superscript, an image raised off the baseline — is a different mechanism in
+/// a different place, and the era's markup reaches for `valign` on cells far
+/// more than for either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerticalAlign {
+    /// Align the content's top with the cell's.
+    Top,
+    /// Centre it in the cell. The default for a cell, and the reason a short
+    /// column looks centred against a long one unless told otherwise.
+    #[default]
+    Middle,
+    /// Align the content's bottom with the cell's.
+    Bottom,
+    /// Align the first line's baseline with the row's.
+    Baseline,
+}
+
+/// Parses a `vertical-align` keyword, or `None` for a value out of scope.
+pub fn parse_vertical_align(name: &str) -> Option<VerticalAlign> {
+    let value = match name {
+        "top" | "text-top" => VerticalAlign::Top,
+        "middle" => VerticalAlign::Middle,
+        "bottom" | "text-bottom" => VerticalAlign::Bottom,
+        "baseline" => VerticalAlign::Baseline,
+        _ => return None,
+    };
+    Some(value)
+}
+
 /// The `background-repeat` property.
 ///
 /// Tiling is the point: the era's pages were built on small images repeated
@@ -624,6 +656,8 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     /// `background-repeat`.
     pub background_repeat: BackgroundRepeat,
+    /// `vertical-align`, as it applies to a table cell.
+    pub vertical_align: VerticalAlign,
     /// `border-spacing`, the gap between cell borders in the separated model.
     ///
     /// On a table only. Kept as a length rather than pixels because it is
@@ -687,6 +721,7 @@ impl Default for ComputedStyle {
             background_color: Color::TRANSPARENT,
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
+            vertical_align: VerticalAlign::Middle,
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,

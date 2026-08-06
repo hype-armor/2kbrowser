@@ -11,7 +11,7 @@ pub mod frameset;
 pub mod table;
 
 use css::cascade::StyleMap;
-use css::style::{ComputedStyle, Display, Float, Position, TextAlign, WhiteSpace};
+use css::style::{ComputedStyle, Display, Float, Position, TextAlign, VerticalAlign, WhiteSpace};
 use css::value::Length;
 use dom::{Document, NodeId};
 use floats::FloatContext;
@@ -450,6 +450,224 @@ fn emit_replaced_boxes(
     }
 }
 
+/// Whether an inline element has a block-level element inside it.
+///
+/// `<font>…<hr>…</font>` is ordinary in the era's markup, and an inline box
+/// cannot contain a block one: CSS 2.1 §9.2.1.1 says the inline box is split
+/// around it. Splitting properly is a larger piece of machinery than this
+/// engine has; treating the offending inline element as a block instead
+/// produces the same visual result for the shapes that actually occur — the
+/// content before the block, the block, the content after — because a block
+/// container with mixed children already handles exactly that.
+///
+/// Without this the block child is never laid out at all: it is skipped when
+/// gathering inline runs and never reached by the block walk, so it vanishes.
+fn contains_block(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize) -> bool {
+    if depth >= MAX_INTRINSIC_DEPTH {
+        return false;
+    }
+    doc.children(node).iter().any(|&child| {
+        styles.get(child).is_some_and(|style| {
+            if style.display == Display::None || style.position.is_out_of_flow() {
+                return false;
+            }
+            if !style.display.is_inline() {
+                return true;
+            }
+            contains_block(doc, styles, child, depth + 1)
+        })
+    })
+}
+
+/// Whether a child participates in its parent's inline formatting context.
+///
+/// An inline element wrapping a block one does not: see [`contains_block`].
+fn is_inline_child(doc: &Document, styles: &StyleMap, node: NodeId, style: &ComputedStyle) -> bool {
+    style.display.is_inline() && !contains_block(doc, styles, node, 0)
+}
+
+/// How deep the intrinsic-width walk goes before giving up.
+///
+/// Era pages nest tables several deep on purpose; a hostile one can nest them
+/// arbitrarily. The cap bounds the work without affecting anything real.
+const MAX_INTRINSIC_DEPTH: usize = 24;
+
+/// Intrinsic widths of a whole subtree, as `(minimum, preferred)`.
+///
+/// Measuring a box's inline runs alone reports zero for anything whose content
+/// is not text — a cell holding a nested table, an image, or a `<div>` — and a
+/// table column sized from that collapses to nothing. Since the era's pages are
+/// built out of tables inside tables, that is not an edge case: it is the
+/// common shape.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn subtree_widths(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available: f32,
+    depth: usize,
+) -> (f32, f32) {
+    let font_size = style.font_size;
+    let surround = style.padding.left.to_px(font_size, available)
+        + style.padding.right.to_px(font_size, available)
+        + style.border.left.used_width(font_size)
+        + style.border.right.used_width(font_size);
+
+    // A declared width settles it: the box wants exactly that much, whatever
+    // is inside. This is how `<td width="150">` sizes its column, which is how
+    // the era's layout tables were built.
+    if let Length::Px(width) = style.width {
+        return (width + surround, width + surround);
+    }
+    if depth >= MAX_INTRINSIC_DEPTH {
+        return (0.0, 0.0);
+    }
+
+    if is_replaced(doc, node) {
+        let (width, _) = replaced_size(
+            style,
+            intrinsic.get(&node).copied(),
+            size_attr(doc, node, "width"),
+            size_attr(doc, node, "height"),
+            available,
+        );
+        return (width + surround, width + surround);
+    }
+
+    if style.display == Display::Table {
+        let (min, max) = table_widths(doc, styles, fonts, node, style, intrinsic, available, depth);
+        return (min + surround, max + surround);
+    }
+
+    // The box's own inline content, then every block child, whichever is
+    // widest — they stack, so the container must fit the widest of them.
+    let runs = collect_inline_runs(doc, styles, node, style, intrinsic, available);
+    let (mut min, mut max) = fonts.intrinsic_widths(&runs, style);
+
+    for &child in doc.children(node) {
+        let Some(child_style) = styles.get(child) else {
+            continue;
+        };
+        if child_style.display == Display::None
+            || is_inline_child(doc, styles, child, child_style)
+            || child_style.display.is_table_internal()
+            || child_style.position.is_out_of_flow()
+        {
+            continue;
+        }
+        let (child_min, child_max) = subtree_widths(
+            doc,
+            styles,
+            fonts,
+            child,
+            child_style,
+            intrinsic,
+            available,
+            depth + 1,
+        );
+        let margins = child_style
+            .margin
+            .left
+            .to_px(child_style.font_size, available)
+            + child_style
+                .margin
+                .right
+                .to_px(child_style.font_size, available);
+        min = min.max(child_min + margins);
+        max = max.max(child_max + margins);
+    }
+    (min + surround, max.max(min) + surround)
+}
+
+/// Intrinsic widths of a table's content box, summed across its columns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn table_widths(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available: f32,
+    depth: usize,
+) -> (f32, f32) {
+    let grid = table::build_grid(doc, styles, node);
+    if grid.columns == 0 {
+        return (0.0, 0.0);
+    }
+    let spacing = style
+        .border_spacing
+        .to_px(style.font_size, available)
+        .max(0.0);
+
+    let mut mins = vec![0.0f32; grid.columns];
+    let mut maxes = vec![0.0f32; grid.columns];
+    let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
+
+    for row in &grid.rows {
+        for cell in &row.cells {
+            let (min, max) = subtree_widths(
+                doc,
+                styles,
+                fonts,
+                cell.node,
+                &cell.style,
+                intrinsic,
+                available,
+                depth + 1,
+            );
+            if cell.colspan == 1 {
+                if let (Some(column_min), Some(column_max)) =
+                    (mins.get_mut(cell.column), maxes.get_mut(cell.column))
+                {
+                    *column_min = column_min.max(min);
+                    *column_max = column_max.max(max);
+                }
+            } else {
+                spans.push((cell.column, cell.colspan, min, max));
+            }
+        }
+    }
+    for (column, colspan, min, max) in spans {
+        table::apply_span(&mut mins, column, colspan, min, spacing);
+        table::apply_span(&mut maxes, column, colspan, max, spacing);
+    }
+
+    let gaps = spacing * (grid.columns + 1) as f32;
+    (
+        mins.iter().sum::<f32>() + gaps,
+        maxes.iter().sum::<f32>() + gaps,
+    )
+}
+
+/// Resolves `margin-left: auto` and `margin-right: auto` against the space a
+/// box leaves over.
+///
+/// Two auto margins split it, which centres the box. One takes all of it,
+/// which pushes the box to the other side. Neither, and the leftover simply
+/// sits to the right, as an over-constrained box does in left-to-right text.
+fn distribute_auto_margins(style: &ComputedStyle, leftover: f32, left: &mut f32, right: &mut f32) {
+    let leftover = leftover.max(0.0);
+    match (style.margin.left, style.margin.right) {
+        (Length::Auto, Length::Auto) => {
+            *left = leftover / 2.0;
+            *right = leftover / 2.0;
+        }
+        (Length::Auto, _) => *left = (leftover - *right).max(0.0),
+        (_, Length::Auto) => *right = (leftover - *left).max(0.0),
+        _ => {}
+    }
+}
+
 /// Lays out a stretch of inline children as an anonymous block box.
 ///
 /// CSS 2.1 §9.2.1.1: when a block container holds both inline and block
@@ -558,8 +776,8 @@ fn layout_block(
     parent: &mut LayoutBox,
 ) -> f32 {
     let font_size = style.font_size;
-    let margin_left = style.margin.left.to_px(font_size, available_width);
-    let margin_right = style.margin.right.to_px(font_size, available_width);
+    let mut margin_left = style.margin.left.to_px(font_size, available_width);
+    let mut margin_right = style.margin.right.to_px(font_size, available_width);
     let margin_top = style.margin.top.to_px(font_size, available_width);
     let padding_left = style.padding.left.to_px(font_size, available_width);
     let padding_right = style.padding.right.to_px(font_size, available_width);
@@ -578,6 +796,19 @@ fn layout_block(
         length => length.to_px(font_size, available_width) + surround,
     };
     let content_width = (outer_width - surround).max(0.0);
+
+    // CSS 2.1 §10.3.3. An auto margin beside a definite width takes the space
+    // left over; two of them split it, which is how a block is centred and so
+    // how both `margin: 0 auto` and `<table align="center">` work. With an auto
+    // *width* there is nothing left over, and auto margins are zero.
+    if style.width != Length::Auto {
+        distribute_auto_margins(
+            style,
+            available_width - outer_width,
+            &mut margin_left,
+            &mut margin_right,
+        );
+    }
 
     if is_replaced(doc, node) {
         let (image_width, image_height) = replaced_size(
@@ -634,7 +865,7 @@ fn layout_block(
     let all_inline = !doc.children(node).iter().any(|&child| {
         styles.get(child).is_some_and(|child_style| {
             child_style.display != Display::None
-                && !child_style.display.is_inline()
+                && !is_inline_child(doc, styles, child, child_style)
                 && !child_style.display.is_table_internal()
                 && child_style.float == Float::None
                 && !child_style.position.is_out_of_flow()
@@ -675,7 +906,9 @@ fn layout_block(
             } else {
                 early.push((child, child_style.clone()));
             }
-        } else if !child_style.display.is_inline() && !child_style.display.is_table_internal() {
+        } else if !is_inline_child(doc, styles, child, child_style)
+            && !child_style.display.is_table_internal()
+        {
             seen_in_flow = true;
         }
     }
@@ -750,6 +983,18 @@ fn layout_block(
         // background stretch across the page while the cells huddle at one end.
         if style.width == Length::Auto {
             box_.rect.width = (table_width + surround).min(outer_width);
+            // Now that the real width is known, auto margins have something to
+            // work with. A shrink-to-fit table with `align="center"` has no
+            // leftover space until this point, so centring it has to wait.
+            let mut left = margin_left;
+            let mut right = margin_right;
+            distribute_auto_margins(
+                style,
+                available_width - box_.rect.width,
+                &mut left,
+                &mut right,
+            );
+            box_.rect.x = x + left;
         }
         let outer = box_.outer_height(font_size);
         parent.children.push(box_);
@@ -778,6 +1023,7 @@ fn layout_block(
         // placed on a line by `collect_inline_runs`. Only one given a
         // block-level `display` reaches block flow.
         let replaced = is_replaced(doc, child) && !child_style.display.is_inline();
+        let inline = is_inline_child(doc, styles, child, child_style);
         if child_style.position.is_out_of_flow() {
             // Laid out after the in-flow content, when this block's height —
             // and so its containing-block size — is finally known.
@@ -791,7 +1037,7 @@ fn layout_block(
         {
             continue;
         }
-        if child_style.display.is_inline() && !replaced {
+        if inline && !replaced {
             if !all_inline {
                 pending.push(child);
             }
@@ -1030,26 +1276,24 @@ fn layout_table(
     // Intrinsic widths per column, from the cells that span exactly one.
     let mut mins = vec![0.0f32; grid.columns];
     let mut maxes = vec![0.0f32; grid.columns];
+    let mut declared = vec![false; grid.columns];
     let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
 
     for row in &grid.rows {
         for cell in &row.cells {
-            let runs = collect_inline_runs(
+            // The whole subtree, not just the cell's text: a cell holding a
+            // nested table measures as nothing otherwise, and its column
+            // collapses to zero width.
+            let (min, max) = subtree_widths(
                 doc,
                 styles,
+                fonts,
                 cell.node,
                 &cell.style,
                 intrinsic,
                 available_width,
+                0,
             );
-            let (mut min, mut max) = fonts.intrinsic_widths(&runs, &cell.style);
-            // A cell's own padding and borders are part of what it needs.
-            let surround = cell.style.padding.left.to_px(cell.style.font_size, 0.0)
-                + cell.style.padding.right.to_px(cell.style.font_size, 0.0)
-                + cell.style.border.left.used_width(cell.style.font_size)
-                + cell.style.border.right.used_width(cell.style.font_size);
-            min += surround;
-            max += surround;
 
             if cell.colspan == 1 {
                 if let (Some(column_min), Some(column_max)) =
@@ -1057,6 +1301,13 @@ fn layout_table(
                 {
                     *column_min = column_min.max(min);
                     *column_max = column_max.max(max);
+                }
+                // A column whose cell declared a width has asked for exactly
+                // that, and must not be stretched when the table is widened.
+                if matches!(cell.style.width, Length::Px(_) | Length::Percent(_))
+                    && let Some(fixed) = declared.get_mut(cell.column)
+                {
+                    *fixed = true;
                 }
             } else {
                 // Spanning cells are applied after the single-column cells have
@@ -1080,9 +1331,40 @@ fn layout_table(
     if style.width != Length::Auto {
         let total: f32 = widths.iter().sum();
         if total > 0.0 && usable > total {
-            let scale = usable / total;
-            for width in &mut widths {
-                *width *= scale;
+            let surplus = usable - total;
+            // The surplus goes to the columns that did not ask for a width. A
+            // `<td width="150">` beside a flexible column means a 150-pixel
+            // sidebar and a content column that takes the rest — stretching
+            // both in proportion gives a sidebar that grows with the window,
+            // which is the opposite of what the markup asked for.
+            let flexible: f32 = widths
+                .iter()
+                .zip(&declared)
+                .filter(|(_, fixed)| !**fixed)
+                .map(|(width, _)| *width)
+                .sum();
+            let flexible_count = declared.iter().filter(|fixed| !**fixed).count();
+
+            if flexible_count > 0 {
+                for (width, fixed) in widths.iter_mut().zip(&declared) {
+                    if *fixed {
+                        continue;
+                    }
+                    *width += if flexible > 0.0 {
+                        surplus * *width / flexible
+                    } else {
+                        // Every flexible column is empty; share evenly rather
+                        // than leaving them all at zero.
+                        surplus / flexible_count as f32
+                    };
+                }
+            } else {
+                // Every column declared a width and they do not add up. Scale
+                // them together rather than leaving the table short.
+                let scale = usable / total;
+                for width in &mut widths {
+                    *width *= scale;
+                }
             }
         }
     }
@@ -1218,7 +1500,25 @@ fn layout_table(
         let spanned: f32 =
             heights[cell.row..end].iter().sum::<f32>() + spacing * (end - cell.row - 1) as f32;
         cell.box_.rect.y = tops[cell.row];
-        cell.box_.rect.height = cell.box_.rect.height.max(spanned);
+        let stretched = cell.box_.rect.height.max(spanned);
+
+        // The cell's content is aligned within the space the row gave it.
+        // `middle` is the default, which is why a short column looks centred
+        // against a long one until `valign="top"` says otherwise.
+        let slack = (stretched - cell.height).max(0.0);
+        let shift = match cell.box_.style.vertical_align {
+            VerticalAlign::Top | VerticalAlign::Baseline => 0.0,
+            VerticalAlign::Middle => slack / 2.0,
+            VerticalAlign::Bottom => slack,
+        };
+        if shift > 0.0 {
+            cell.box_.content_origin.1 += shift;
+            for child in &mut cell.box_.children {
+                child.rect.y += shift;
+            }
+        }
+
+        cell.box_.rect.height = stretched;
         parent.children.push(cell.box_);
     }
 
@@ -1261,26 +1561,25 @@ fn place_float(
         + child_style.border.left.used_width(child_style.font_size)
         + child_style.border.right.used_width(child_style.font_size);
 
-    // A float shrinks to fit its content unless a width is declared. For a
-    // replaced element the content is the image, not text: measuring its runs
-    // finds nothing and registers a zero-width float, which reserves no room
-    // and lets the following text run straight over the image.
-    let float_width = if is_replaced(doc, child) {
-        let (width, _) = replaced_size(
-            child_style,
-            intrinsic.get(&child).copied(),
-            size_attr(doc, child, "width"),
-            size_attr(doc, child, "height"),
-            content_width,
-        );
-        (width + surround).min(content_width)
-    } else {
-        let runs = collect_inline_runs(doc, styles, child, child_style, intrinsic, content_width);
-        let (_, natural) = fonts.intrinsic_widths(&runs, child_style);
-        match child_style.width {
-            Length::Auto => (natural + surround).min(content_width),
-            length => length.to_px(child_style.font_size, content_width) + surround,
+    // A float shrinks to fit its content unless a width is declared. Measured
+    // over the whole subtree: a float whose content is an image or a nested
+    // table has no text to measure, and a zero-width float reserves no room —
+    // the text beside it then runs straight over it.
+    let float_width = match child_style.width {
+        Length::Auto => {
+            let (_, natural) = subtree_widths(
+                doc,
+                styles,
+                fonts,
+                child,
+                child_style,
+                intrinsic,
+                content_width,
+                0,
+            );
+            natural.min(content_width)
         }
+        length => length.to_px(child_style.font_size, content_width) + surround,
     };
 
     let mut probe = LayoutBox {
@@ -1312,7 +1611,20 @@ fn place_float(
         ContainingBlock::viewport(float_width, float_width),
         &mut probe,
     );
-    let (left, top) = context.place(child_style.float, float_width, float_height, y);
+    // The space a float reserves is its *margin* box, not its border box: an
+    // image with `hspace="8"` is asking for text to keep eight pixels away,
+    // and reserving only the border box lets the text touch it.
+    let font_size = child_style.font_size;
+    let margin_x = child_style.margin.left.to_px(font_size, content_width)
+        + child_style.margin.right.to_px(font_size, content_width);
+    let margin_y = child_style.margin.top.to_px(font_size, content_width)
+        + child_style.margin.bottom.to_px(font_size, content_width);
+    let (left, top) = context.place(
+        child_style.float,
+        float_width + margin_x,
+        float_height + margin_y,
+        y,
+    );
 
     if let Some(mut float_box) = probe.children.pop() {
         // Offsetting rather than assigning keeps the float's own margins,
@@ -1423,7 +1735,7 @@ fn gather_one(
     let Some(style) = styles.get(child) else {
         return;
     };
-    if style.display == Display::None || !style.display.is_inline() {
+    if style.display == Display::None || !is_inline_child(doc, styles, child, style) {
         return;
     }
 
@@ -2027,6 +2339,208 @@ mod tests {
             row.rect
         );
         assert!(row.rect.height > 0.0, "a row with cells has height");
+    }
+
+    #[test]
+    fn auto_margins_centre_a_block_of_definite_width() {
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { width: 200px; margin-left: auto; margin-right: auto }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.x, 200.0);
+    }
+
+    #[test]
+    fn one_auto_margin_pushes_a_block_to_the_other_side() {
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { width: 200px; margin-left: auto }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.x, 400.0);
+    }
+
+    #[test]
+    fn auto_margins_do_nothing_without_a_width() {
+        // There is no leftover space to share, so the box still fills.
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { margin-left: auto; margin-right: auto }",
+            600.0,
+        );
+        let box_ = content_boxes(&rendered)[0];
+        assert_eq!((box_.rect.x, box_.rect.width), (0.0, 600.0));
+    }
+
+    #[test]
+    fn a_centred_table_is_centred_without_centring_its_text() {
+        // `<table align="center">` mapped to `text-align` centres every line on
+        // the page, because `text-align` inherits and a table of this era wraps
+        // the whole document.
+        let rendered = run(
+            r#"<body><table align="center" width="200"><tr><td>cell</td></tr></table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let all = content_boxes(&rendered);
+        let table = all
+            .iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("a table");
+        assert!(
+            table.rect.x > 100.0,
+            "the table should be centred, not at {}",
+            table.rect.x
+        );
+        let cell = all
+            .iter()
+            .find(|b| b.text.is_some())
+            .expect("the cell's text");
+        assert_eq!(
+            cell.style.text_align,
+            TextAlign::Left,
+            "the contents must not be centred"
+        );
+    }
+
+    #[test]
+    fn a_cell_holding_a_nested_table_does_not_collapse() {
+        // Measuring only a cell's text reports zero for one whose content is a
+        // nested table, and its column collapses to nothing — which is the
+        // shape nearly every page of this era is built out of.
+        let rendered = run(
+            "<body><table><tr>\
+               <td>nav</td>\
+               <td><table><tr><td>the content column</td></tr></table></td>\
+             </tr></table></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        // The widest text box is the inner column; if its cell collapsed it
+        // would be narrower than the word "nav" beside it.
+        let widest = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .map(|b| b.content_width)
+            .fold(0.0f32, f32::max);
+        assert!(widest > 100.0, "the inner column is {widest} wide");
+    }
+
+    #[test]
+    fn a_declared_column_width_is_not_stretched_to_fill_the_table() {
+        // A 150px sidebar beside a flexible column means a fixed sidebar and a
+        // content column that takes the rest. Scaling both in proportion gives
+        // a sidebar that grows with the window, which is the opposite of what
+        // the markup asked for.
+        let rendered = run(
+            r#"<body><table width="600"><tr>
+                 <td width="150">nav</td><td>content</td>
+               </tr></table></body>"#,
+            "body { margin: 0 } td { padding: 0 } table { border-spacing: 0 }",
+            600.0,
+        );
+        let cells: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].rect.width, 150.0);
+        assert!(
+            (cells[1].rect.width - 450.0).abs() < 0.01,
+            "content column is {}",
+            cells[1].rect.width
+        );
+    }
+
+    #[test]
+    fn a_float_reserves_its_margins_too() {
+        // `hspace="8"` on an image is asking for text to keep eight pixels
+        // away; reserving only the border box lets the text touch it.
+        let start = |css: &str| {
+            let rendered = run(
+                "<body><div class=\"f\">float</div><p>Text beside it.</p></body>",
+                css,
+                600.0,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .filter(|b| b.text.is_some())
+                .filter(|b| b.style.float == Float::None)
+                .map(|b| b.rect.x)
+                .next()
+                .expect("the paragraph")
+        };
+        let bare = start("body { margin: 0 } .f { float: left; width: 100px }");
+        let spaced =
+            start("body { margin: 0 } .f { float: left; width: 100px; margin-right: 20px }");
+        // The paragraph's box still starts at 0; what moves is where its text
+        // may begin, so compare the first line's offset instead.
+        assert_eq!(bare, spaced, "the block itself is not moved by a float");
+
+        let line_start = |css: &str| {
+            let rendered = run(
+                "<body><div class=\"f\">float</div><p>Text beside it.</p></body>",
+                css,
+                600.0,
+            );
+            let rendered_boxes = content_boxes(&rendered);
+            let paragraph = rendered_boxes
+                .into_iter()
+                .rfind(|b| b.text.is_some() && b.style.float == Float::None)
+                .expect("the paragraph");
+            paragraph.text.as_ref().expect("text").lines[0].glyphs[0].x
+        };
+        assert_eq!(
+            line_start("body { margin: 0 } .f { float: left; width: 100px; margin-right: 20px }")
+                - line_start("body { margin: 0 } .f { float: left; width: 100px }"),
+            20.0
+        );
+    }
+
+    #[test]
+    fn an_inline_element_wrapping_a_block_still_lays_the_block_out() {
+        // `<font>…<hr>…</font>` is ordinary markup. Skipped when gathering
+        // inline runs and never reached by the block walk, the `<hr>`
+        // disappears from the page entirely.
+        let rendered = run(
+            "<body><font>before<hr>after</font></body>",
+            "body { margin: 0 } hr { height: 4px; background: #ff0000 }",
+            600.0,
+        );
+        let rule = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
+        assert!(rule.is_some(), "the rule inside the font element vanished");
+    }
+
+    #[test]
+    fn a_cell_is_middle_aligned_unless_told_otherwise() {
+        let offset = |markup: &str| {
+            let rendered = run(
+                &format!("<body><table><tr>{markup}<td>a<br>b<br>c<br>d</td></tr></table></body>"),
+                "body { margin: 0 } td { padding: 0 }",
+                600.0,
+            );
+            let cells: Vec<&LayoutBox> = content_boxes(&rendered)
+                .into_iter()
+                .filter(|b| b.text.is_some())
+                .collect();
+            cells[0].content_origin.1
+        };
+        assert!(
+            offset("<td>short</td>") > 0.0,
+            "a short cell is centred against a tall one"
+        );
+        assert_eq!(
+            offset(r#"<td valign="top">short</td>"#),
+            0.0,
+            "valign=\"top\" is what stops it"
+        );
+        assert!(
+            offset(r#"<td valign="bottom">short</td>"#) > offset("<td>short</td>"),
+            "bottom sits lower than middle"
+        );
     }
 
     #[test]

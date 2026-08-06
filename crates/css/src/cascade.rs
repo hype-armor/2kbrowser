@@ -8,7 +8,7 @@ use crate::style::{
     BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges,
     FontStack, FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
     parse_background_repeat, parse_border_style, parse_clear, parse_display, parse_float,
-    parse_list_style_type, parse_position, parse_text_decoration,
+    parse_list_style_type, parse_position, parse_text_decoration, parse_vertical_align,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -348,6 +348,13 @@ fn apply(
         // Two values are allowed — horizontal then vertical — but a table
         // using different ones is vanishingly rare, so the first is used for
         // both rather than modelling an axis that nothing sets.
+        "vertical-align" => {
+            if let Raw::Ident(name) = first
+                && let Some(align) = parse_vertical_align(name)
+            {
+                style.vertical_align = align;
+            }
+        }
         "border-spacing" => {
             if let Some(length) = parse_length(first) {
                 style.border_spacing = length;
@@ -586,6 +593,14 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
         match align.trim().to_ascii_lowercase().as_str() {
             // On an image or table, `align` floats it; elsewhere it aligns text.
             "left" | "right" if matches!(tag, "img" | "table") => push("float", align),
+            // `<table align="center">` centres the *table*, not its contents.
+            // Mapping it to `text-align` centres every line of text on the
+            // page, because `text-align` inherits and a table of this era
+            // wraps the whole document.
+            "center" if tag == "table" => {
+                push("margin-left", "auto");
+                push("margin-right", "auto");
+            }
             "left" | "right" | "center" | "middle" | "justify" => {
                 let value = if align.eq_ignore_ascii_case("middle") {
                     "center"
@@ -596,6 +611,40 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
             }
             _ => {}
         }
+    }
+    // `valign` is the cell's vertical alignment. `valign="top"` in particular
+    // is on nearly every layout table's cells, to stop a short column being
+    // centred against a long one.
+    if matches!(tag, "td" | "th" | "tr")
+        && let Some(align) = element.attr("valign")
+        && let value @ ("top" | "middle" | "bottom" | "baseline") =
+            align.trim().to_ascii_lowercase().as_str()
+    {
+        push("vertical-align", value);
+    }
+    // `hspace` and `vspace` are margins, and are how the era's markup kept
+    // text off a floated image.
+    if tag == "img" {
+        if let Some(space) = element.attr("hspace") {
+            let space = attr_length(space);
+            push("margin-left", &space);
+            push("margin-right", &space);
+        }
+        if let Some(space) = element.attr("vspace") {
+            let space = attr_length(space);
+            push("margin-top", &space);
+            push("margin-bottom", &space);
+        }
+    }
+    // `<body link>` colours every link in the document, so a link has to look
+    // up to the body for it — the same shape as a cell reading its table's
+    // `cellpadding`. `vlink` and `alink` need history and interaction, neither
+    // of which exists yet, so they are deliberately not read.
+    if tag == "a"
+        && element.attr("href").is_some()
+        && let Some(color) = body_of(doc).and_then(|body| body.attr("link"))
+    {
+        push("color", &attr_color(color));
     }
     if let Some(color) = element.attr("color")
         && tag == "font"
@@ -656,6 +705,11 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
         push("border-spacing", &attr_length(spacing));
     }
     out
+}
+
+/// The document's `body`, if it has one.
+fn body_of(doc: &Document) -> Option<&ElementData> {
+    doc.find_element("body").and_then(|node| doc.element(node))
 }
 
 /// The `table` element enclosing a cell, skipping the row and row group.
@@ -882,7 +936,7 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{BackgroundRepeat, Display, ListStyleType};
+    use crate::style::{BackgroundRepeat, Display, ListStyleType, VerticalAlign};
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
         let doc = dom::parse(html);
@@ -1496,6 +1550,89 @@ mod tests {
             "tr",
         );
         assert_eq!(style.background_color, crate::Color::rgb(192, 192, 192));
+    }
+
+    #[test]
+    fn a_centred_table_gets_auto_margins_not_centred_text() {
+        // `text-align` inherits, and a table of this era wraps the whole
+        // document — so mapping `align="center"` to it centres every line on
+        // the page rather than the table.
+        let style = standards_style_of(
+            r#"<table align="center"><tr><td>x</td></tr></table>"#,
+            "",
+            "table",
+        );
+        assert_eq!(style.margin.left, Length::Auto);
+        assert_eq!(style.margin.right, Length::Auto);
+        assert_eq!(style.text_align, TextAlign::Left);
+    }
+
+    #[test]
+    fn valign_sets_a_cells_vertical_alignment() {
+        let cell = |markup: &str| standards_style_of(markup, "", "td").vertical_align;
+        assert_eq!(
+            cell("<table><tr><td>x</td></tr></table>"),
+            VerticalAlign::Middle,
+            "a cell is middle-aligned by default, which is why valign exists"
+        );
+        assert_eq!(
+            cell(r#"<table><tr><td valign="top">x</td></tr></table>"#),
+            VerticalAlign::Top
+        );
+        assert_eq!(
+            cell(r#"<table><tr><td valign="BOTTOM">x</td></tr></table>"#),
+            VerticalAlign::Bottom
+        );
+    }
+
+    #[test]
+    fn hspace_and_vspace_are_margins() {
+        let style = standards_style_of(r#"<img src="x.png" hspace="8" vspace="4">"#, "", "img");
+        assert_eq!(style.margin.left, Length::Px(8.0));
+        assert_eq!(style.margin.right, Length::Px(8.0));
+        assert_eq!(style.margin.top, Length::Px(4.0));
+        assert_eq!(style.margin.bottom, Length::Px(4.0));
+    }
+
+    #[test]
+    fn the_body_link_attribute_colours_every_link() {
+        // It is written once on `<body>` and applies to every link in the
+        // document, so a link has to look up to find it.
+        let html = r##"<body link="#000080"><p><a href="x.html">go</a></p>
+                       <a name="here">not a link</a></body>"##;
+        assert_eq!(
+            standards_style_of(html, "", "a").color,
+            crate::Color::rgb(0, 0, 128)
+        );
+
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[]);
+        let anchor = doc
+            .descendants(doc.root())
+            .into_iter()
+            .rfind(|&node| {
+                doc.element(node)
+                    .is_some_and(|element| element.local_name() == "a")
+            })
+            .expect("the named anchor");
+        assert_eq!(
+            map.get(anchor).expect("styled").color,
+            crate::Color::BLACK,
+            "a named anchor is a destination, not a link"
+        );
+    }
+
+    #[test]
+    fn cellspacing_maps_to_border_spacing() {
+        let style = standards_style_of(
+            r#"<table cellspacing="0"><tr><td>x</td></tr></table>"#,
+            "",
+            "table",
+        );
+        assert_eq!(style.border_spacing, Length::Px(0.0));
+
+        let default = standards_style_of("<table><tr><td>x</td></tr></table>", "", "table");
+        assert_eq!(default.border_spacing, Length::Px(2.0));
     }
 
     #[test]

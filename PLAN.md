@@ -280,11 +280,11 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    the nearest positioned ancestor, `top`/`right`/`bottom`/`left`, shrink-to-fit
    widths. **Quirks mode** — *started;* unitless lengths and hash-less hex
    colours parse, other quirks outstanding. **Framesets** — *done*
-7. **Presentational attributes** — *done.* `bgcolor`, `text`, `align`,
-   `<font>`, `background`, and the table attributes, at their own cascade
-   origin between the UA sheet and author CSS. The era's markup keeps most of
-   its styling here rather than in CSS, so without this these pages render as
-   unstyled text
+7. **Presentational attributes** — *done.* `bgcolor`, `text`, `link`, `align`,
+   `valign`, `hspace`/`vspace`, `<font>`, `background`, and the table
+   attributes, at their own cascade origin between the UA sheet and author
+   CSS. The era's markup keeps most of its styling here rather than in CSS, so
+   without this these pages render as unstyled text
 8. **Lists, decorations, rules, and forced breaks** — *done.* Markers with
    `<ol start>` and `<li value>`, `text-decoration` propagated per §16.3,
    underlined links via attribute selectors, `<hr>`, and `<br>`
@@ -298,8 +298,17 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    a `<meta>` prescan, then windows-1252 — which most of the surviving old web
    needs and which the plan called required rather than optional
 
+12. **Intrinsic sizing over whole subtrees** — *done.* A cell holding a nested
+   table, an image, or a block is measured by what is inside it rather than by
+   its text; declared column widths hold rather than being stretched; auto
+   margins centre a block; and an inline element wrapping a block one still
+   lays that block out
+
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, dashed and dotted borders painting solid, and `background-position`.
+layout, dashed and dotted borders painting solid, `background-position`, and
+proper block-in-inline splitting — an inline element containing a block is
+laid out as a block instead, which matches for the shapes that occur but is
+not what CSS 2.1 §9.2.1.1 describes.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes

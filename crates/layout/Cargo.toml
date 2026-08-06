@@ -10,5 +10,8 @@ css = { path = "../css" }
 dom = { path = "../dom" }
 text = { path = "../text" }
 
+[dev-dependencies]
+net = { path = "../net" }
+
 [lints]
 workspace = true
