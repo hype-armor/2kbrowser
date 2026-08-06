@@ -330,6 +330,16 @@ This is where "without the slop" becomes visible as UX rather than as an
 absence — no sponsored tiles, no feed, no account, no onboarding. The HTTP
 transparency requirement from §4 lands here.
 
+**The chrome is modern; only the engine is period** (ADR-0011). The engine's
+constraints are load-bearing — refusing JavaScript is what removes the slop —
+and a period tab strip would remove nothing while costing the user fluency.
+Restraint shows as absence, which is the point of §1, and does not need bevels.
+The era shows through in the viewport and nowhere else.
+
+Before any of the chrome, two pieces of engine work it all rests on: hit
+testing — turning a point into the element under it — and link geometry, so a
+link has a rectangle to click. Neither depends on what the chrome looks like.
+
 **Reader mode also lands here rather than in M5** (ADR-0009), because it is what
 makes the browser work on the modern web at all. When a page's layout depends on
 features we do not implement, the engine detects that during cascade and
