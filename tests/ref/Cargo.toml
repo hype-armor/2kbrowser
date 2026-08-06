@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+net = { path = "../../crates/net" }
 paint = { path = "../../crates/paint" }
 shell = { path = "../../crates/shell" }
 text = { path = "../../crates/text" }

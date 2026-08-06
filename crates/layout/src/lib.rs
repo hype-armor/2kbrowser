@@ -18,6 +18,69 @@ use text::{FontStore, InlineRun, TextLayout};
 
 pub use classify::{RenderMode, classify};
 
+/// Intrinsic sizes of replaced elements, keyed by node.
+///
+/// Layout needs an image's natural size but must not depend on the decoder, so
+/// the sizes are handed in rather than looked up.
+pub type IntrinsicSizes = std::collections::HashMap<NodeId, (f32, f32)>;
+
+/// Default box for an image that has not loaded, matching what browsers show
+/// for a broken image with no dimensions given.
+const BROKEN_IMAGE_SIZE: (f32, f32) = (20.0, 20.0);
+
+/// Resolves a replaced element's used size.
+///
+/// When only one dimension is given the other follows from the intrinsic
+/// aspect ratio, which is what keeps `<img width="200">` from squashing.
+pub fn replaced_size(
+    style: &ComputedStyle,
+    intrinsic: Option<(f32, f32)>,
+    attr_width: Option<f32>,
+    attr_height: Option<f32>,
+    available_width: f32,
+) -> (f32, f32) {
+    let font_size = style.font_size;
+    // CSS wins over the presentational attribute, which is only a fallback.
+    let width = match style.width {
+        Length::Auto => attr_width,
+        length => Some(length.to_px(font_size, available_width)),
+    };
+    let height = match style.height {
+        Length::Auto => attr_height,
+        length => Some(length.to_px(font_size, available_width)),
+    };
+
+    match (width, height, intrinsic) {
+        (Some(w), Some(h), _) => (w, h),
+        (Some(w), None, Some((iw, ih))) if iw > 0.0 => (w, w * ih / iw),
+        (None, Some(h), Some((iw, ih))) if ih > 0.0 => (h * iw / ih, h),
+        (Some(w), None, None) => (w, w),
+        (None, Some(h), None) => (h, h),
+        (None, None, Some(size)) => size,
+        (None, None, None) => BROKEN_IMAGE_SIZE,
+        (Some(w), None, Some(_)) => (w, w),
+        (None, Some(h), Some(_)) => (h, h),
+    }
+}
+
+/// Whether an element is a replaced element this engine lays out as a box of
+/// intrinsic size rather than from its children.
+fn is_replaced(doc: &Document, node: NodeId) -> bool {
+    doc.element(node).is_some_and(|e| e.local_name() == "img")
+}
+
+/// Reads a presentational width/height attribute, which the era's markup used
+/// far more than CSS.
+fn size_attr(doc: &Document, node: NodeId, name: &str) -> Option<f32> {
+    let value = doc.element(node)?.attr(name)?.trim();
+    // Percentages in these attributes are not supported; they were rare and
+    // ambiguous, and treating them as pixels would be worse than ignoring them.
+    if value.ends_with('%') {
+        return None;
+    }
+    value.parse::<f32>().ok().filter(|v| *v >= 0.0)
+}
+
 /// A rectangle in CSS pixels, with the origin at the top left of the canvas.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -49,6 +112,9 @@ pub struct LayoutBox {
     pub content_width: f32,
     /// Child boxes.
     pub children: Vec<LayoutBox>,
+    /// Set when this box is a replaced element, naming the node so paint can
+    /// find its decoded image.
+    pub replaced: Option<NodeId>,
 }
 
 impl LayoutBox {
@@ -74,6 +140,7 @@ pub fn layout(
     doc: &Document,
     styles: &StyleMap,
     fonts: &mut FontStore,
+    intrinsic: &IntrinsicSizes,
     viewport_width: f32,
 ) -> Layout {
     let body = doc.find_element("body").unwrap_or_else(|| doc.root());
@@ -91,6 +158,7 @@ pub fn layout(
         content_origin: (0.0, 0.0),
         content_width: viewport_width,
         children: Vec::new(),
+        replaced: None,
     };
 
     let height = layout_block(
@@ -99,6 +167,7 @@ pub fn layout(
         fonts,
         body,
         &body_style,
+        intrinsic,
         0.0,
         0.0,
         viewport_width,
@@ -121,6 +190,7 @@ fn layout_block(
     fonts: &mut FontStore,
     node: NodeId,
     style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
     x: f32,
     y: f32,
     available_width: f32,
@@ -149,6 +219,33 @@ fn layout_block(
     };
     let content_width = (outer_width - surround).max(0.0);
 
+    if is_replaced(doc, node) {
+        let (image_width, image_height) = replaced_size(
+            style,
+            intrinsic.get(&node).copied(),
+            size_attr(doc, node, "width"),
+            size_attr(doc, node, "height"),
+            available_width,
+        );
+        let box_ = LayoutBox {
+            rect: Rect {
+                x: x + margin_left,
+                y: y + margin_top,
+                width: image_width + surround,
+                height: image_height + padding_top + padding_bottom + border_top + border_bottom,
+            },
+            style: style.clone(),
+            text: None,
+            content_origin: (padding_left + border_left, padding_top + border_top),
+            content_width: image_width,
+            children: Vec::new(),
+            replaced: Some(node),
+        };
+        let outer = box_.outer_height(font_size);
+        parent.children.push(box_);
+        return outer;
+    }
+
     let mut box_ = LayoutBox {
         rect: Rect {
             x: x + margin_left,
@@ -161,6 +258,7 @@ fn layout_block(
         content_origin: (padding_left + border_left, padding_top + border_top),
         content_width,
         children: Vec::new(),
+        replaced: None,
     };
 
     // Inline children become styled runs shaped as one paragraph, so a <b> or
@@ -208,6 +306,7 @@ fn layout_block(
             fonts,
             *child,
             child_style,
+            intrinsic,
             content_width,
             0.0,
             (padding_left + border_left, padding_top + border_top),
@@ -233,6 +332,7 @@ fn layout_block(
             fonts,
             node,
             style,
+            intrinsic,
             padding_left + border_left,
             padding_top + border_top,
             content_width,
@@ -252,8 +352,15 @@ fn layout_block(
         // Table-internal boxes are positioned by their table, not by block
         // flow. A stray one outside a table falls through to block layout so
         // its content is still shown.
+        // A replaced element is inline by default, but this engine has no way
+        // to put an image inside a line box — `TextLayout` holds glyphs only.
+        // Flowing it as a block keeps it visible and correctly sized; the cost
+        // is that an image amid running text breaks the line instead of sitting
+        // in it. Standalone and floated images, which is most of the era's
+        // usage, come out right.
+        let replaced = is_replaced(doc, child);
         if child_style.display == Display::None
-            || child_style.display.is_inline()
+            || (child_style.display.is_inline() && !replaced)
             || child_style.display.is_table_internal()
             // Floated children were placed above, out of the normal flow.
             || child_style.float != Float::None
@@ -273,6 +380,7 @@ fn layout_block(
                 fonts,
                 float_node,
                 &float_style,
+                intrinsic,
                 content_width,
                 cursor_y - padding_top - border_top,
                 (padding_left + border_left, padding_top + border_top),
@@ -291,6 +399,7 @@ fn layout_block(
             fonts,
             child,
             child_style,
+            intrinsic,
             padding_left + border_left,
             cursor_y,
             content_width,
@@ -336,6 +445,7 @@ fn layout_table(
     fonts: &mut FontStore,
     node: NodeId,
     style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
     x: f32,
     y: f32,
     available_width: f32,
@@ -429,6 +539,7 @@ fn layout_table(
                 content_origin: (0.0, 0.0),
                 content_width: width,
                 children: Vec::new(),
+                replaced: None,
             };
             // A cell establishes its own formatting context, so floats outside
             // the table do not reach into it.
@@ -438,6 +549,7 @@ fn layout_table(
                 fonts,
                 cell.node,
                 &cell.style,
+                intrinsic,
                 cell_x,
                 cursor_y,
                 width,
@@ -476,16 +588,13 @@ fn place_float(
     fonts: &mut FontStore,
     child: NodeId,
     child_style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
     content_width: f32,
     y: f32,
     origin: (f32, f32),
     context: &mut FloatContext,
     parent: &mut LayoutBox,
 ) {
-    // A float shrinks to fit its content unless a width is declared, so its
-    // natural width has to be measured before it can be placed.
-    let runs = collect_inline_runs(doc, styles, child, child_style);
-    let (_, natural) = fonts.intrinsic_widths(&runs, child_style);
     let surround = child_style
         .padding
         .left
@@ -496,9 +605,27 @@ fn place_float(
             .to_px(child_style.font_size, content_width)
         + child_style.border.left.used_width(child_style.font_size)
         + child_style.border.right.used_width(child_style.font_size);
-    let float_width = match child_style.width {
-        Length::Auto => (natural + surround).min(content_width),
-        length => length.to_px(child_style.font_size, content_width) + surround,
+
+    // A float shrinks to fit its content unless a width is declared. For a
+    // replaced element the content is the image, not text: measuring its runs
+    // finds nothing and registers a zero-width float, which reserves no room
+    // and lets the following text run straight over the image.
+    let float_width = if is_replaced(doc, child) {
+        let (width, _) = replaced_size(
+            child_style,
+            intrinsic.get(&child).copied(),
+            size_attr(doc, child, "width"),
+            size_attr(doc, child, "height"),
+            content_width,
+        );
+        (width + surround).min(content_width)
+    } else {
+        let runs = collect_inline_runs(doc, styles, child, child_style);
+        let (_, natural) = fonts.intrinsic_widths(&runs, child_style);
+        match child_style.width {
+            Length::Auto => (natural + surround).min(content_width),
+            length => length.to_px(child_style.font_size, content_width) + surround,
+        }
     };
 
     let mut probe = LayoutBox {
@@ -513,6 +640,7 @@ fn place_float(
         content_origin: (0.0, 0.0),
         content_width: float_width,
         children: Vec::new(),
+        replaced: None,
     };
     let float_height = layout_block(
         doc,
@@ -520,6 +648,7 @@ fn place_float(
         fonts,
         child,
         child_style,
+        intrinsic,
         0.0,
         0.0,
         float_width,
@@ -665,7 +794,7 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
         Rendered {
-            layout: layout(&doc, &styles, &mut fonts, width),
+            layout: layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), width),
         }
     }
 
@@ -1094,6 +1223,131 @@ mod tests {
             container.rect.height >= 120.0,
             "container must enclose its float, got {}",
             container.rect.height
+        );
+    }
+
+    #[test]
+    fn an_image_uses_its_intrinsic_size_when_nothing_is_declared() {
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(&style, Some((80.0, 40.0)), None, None, 500.0),
+            (80.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn one_declared_dimension_preserves_the_aspect_ratio() {
+        // `<img width="200">` on a 2:1 image must not squash it.
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(&style, Some((100.0, 50.0)), Some(200.0), None, 500.0),
+            (200.0, 100.0)
+        );
+        assert_eq!(
+            replaced_size(&style, Some((100.0, 50.0)), None, Some(25.0), 500.0),
+            (50.0, 25.0)
+        );
+    }
+
+    #[test]
+    fn both_declared_dimensions_win_over_the_ratio() {
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(&style, Some((100.0, 50.0)), Some(30.0), Some(300.0), 500.0),
+            (30.0, 300.0)
+        );
+    }
+
+    #[test]
+    fn css_overrides_the_presentational_attribute() {
+        let style = ComputedStyle {
+            width: Length::Px(64.0),
+            ..ComputedStyle::default()
+        };
+        let (width, _) = replaced_size(&style, Some((100.0, 100.0)), Some(999.0), None, 500.0);
+        assert_eq!(width, 64.0);
+    }
+
+    #[test]
+    fn an_image_that_never_loaded_still_occupies_its_declared_box() {
+        // A broken image must not collapse the layout around it.
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(&style, None, Some(120.0), Some(60.0), 500.0),
+            (120.0, 60.0)
+        );
+        assert_eq!(
+            replaced_size(&style, None, None, None, 500.0),
+            BROKEN_IMAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn an_image_element_becomes_a_replaced_box() {
+        let doc = dom::parse(r#"<body><img src="x.png" width="90" height="45"></body>"#);
+        let styles = css::cascade::cascade(&doc, &[]);
+        let mut fonts = FontStore::new();
+        let sizes = IntrinsicSizes::new();
+        let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 500.0);
+        let image = laid_out
+            .root
+            .children
+            .first()
+            .and_then(|body| body.children.first())
+            .expect("image box");
+        assert!(image.replaced.is_some(), "img must be marked replaced");
+        assert_eq!(image.rect.width, 90.0);
+        assert_eq!(image.rect.height, 45.0);
+    }
+
+    #[test]
+    fn a_percentage_size_attribute_is_ignored_rather_than_read_as_pixels() {
+        let doc = dom::parse(r#"<body><img src="x.png" width="50%"></body>"#);
+        assert_eq!(
+            size_attr(&doc, doc.find_element("img").expect("img"), "width"),
+            None,
+            "50% must not be read as 50px"
+        );
+    }
+
+    #[test]
+    fn text_flows_beside_a_floated_image() {
+        // A floated image has no text to measure, so its width has to come from
+        // its intrinsic or declared size. Measuring it as text registered a
+        // zero-width float and let the paragraph run straight over the image.
+        let doc = dom::parse(
+            r#"<body><p>before</p><img src="x.png" width="90" height="60">
+               <p>the quick brown fox jumps over the lazy dog and runs on and on</p></body>"#,
+        );
+        let sheets = [css::Stylesheet::parse(
+            "body { margin: 0 } img { float: left }",
+        )];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        let laid = layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 400.0);
+
+        let rendered = Rendered { layout: laid };
+        let boxes = content_boxes(&rendered);
+        let image = boxes
+            .iter()
+            .find(|b| b.replaced.is_some())
+            .expect("image box");
+        assert_eq!(image.rect.width, 90.0);
+
+        let after = boxes
+            .iter()
+            .rfind(|b| b.text.is_some())
+            .expect("trailing paragraph");
+        let first_glyph_x = after
+            .text
+            .as_ref()
+            .and_then(|t| t.lines.first())
+            .and_then(|l| l.glyphs.first())
+            .map(|g| g.x)
+            .expect("glyphs");
+        assert!(
+            first_glyph_x >= 90.0,
+            "text should start past the 90px float, got {first_glyph_x}"
         );
     }
 

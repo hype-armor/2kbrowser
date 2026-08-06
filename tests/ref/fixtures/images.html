@@ -1,0 +1,18 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; }
+  .side { float: left; margin-right: 10px; border: 1px solid #888888; }
+  .frame { border: 2px solid #cc0000; }
+</style></head><body>
+<p>Intrinsic size:</p>
+<img src="assets/logo.png">
+<p>Width only, aspect ratio preserved:</p>
+<img src="assets/logo.png" width="120">
+<p>Both dimensions, ratio ignored:</p>
+<img src="assets/logo.png" width="150" height="20">
+<p>Floated, with text beside it:</p>
+<img class="side" src="assets/logo.png" width="90">
+<p>This paragraph flows beside the floated image, whose width comes from its
+   declared size rather than from any text it contains.</p>
+<p>A missing image keeps its declared box:</p>
+<img class="frame" src="nope.png" width="80" height="30">
+</body></html>

@@ -199,12 +199,152 @@ pub fn parse_url(url: &str) -> Result<(Origin, String), Refusal> {
     ))
 }
 
+/// Resolves a possibly-relative URL against the document it appeared in.
+///
+/// Covers the forms that actually appear in markup: absolute URLs,
+/// protocol-relative `//host/path`, root-relative `/path`, and plain relative
+/// paths including `../`. Not a full RFC 3986 implementation — that arrives
+/// with the rest of URL handling — but wrong resolution silently loads the
+/// wrong resource, so the cases it does handle are tested.
+pub fn resolve(base: &Origin, base_path: &str, relative: &str) -> String {
+    let relative = relative.trim();
+    if relative.contains("://") {
+        return relative.to_owned();
+    }
+    let scheme = match base.scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+        Scheme::File => "file",
+    };
+    if let Some(rest) = relative.strip_prefix("//") {
+        return format!("{scheme}://{rest}");
+    }
+
+    let authority = if base.host.is_empty() {
+        String::new()
+    } else {
+        let default_port = if base.scheme == Scheme::Https {
+            443
+        } else {
+            80
+        };
+        if base.port == default_port {
+            base.host.clone()
+        } else {
+            format!("{}:{}", base.host, base.port)
+        }
+    };
+
+    if let Some(rest) = relative.strip_prefix('/') {
+        return format!("{scheme}://{authority}/{rest}");
+    }
+
+    // Relative to the document's directory, which is everything up to and
+    // including the last slash.
+    let directory = match base_path.rfind('/') {
+        Some(index) => &base_path[..=index],
+        None => "/",
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in directory.split('/').chain(relative.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    // A trailing slash on the input means a directory, not a file.
+    let trailing = if relative.ends_with('/') { "/" } else { "" };
+    format!("{scheme}://{authority}/{}{trailing}", segments.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn origin(url: &str) -> Origin {
         parse_url(url).expect("parses").0
+    }
+
+    fn resolve_from(base_url: &str, relative: &str) -> String {
+        let (origin, path) = parse_url(base_url).expect("parses");
+        resolve(&origin, &path, relative)
+    }
+
+    #[test]
+    fn an_absolute_url_is_returned_unchanged() {
+        assert_eq!(
+            resolve_from("https://example.com/a/b.html", "https://other.org/x.png"),
+            "https://other.org/x.png"
+        );
+    }
+
+    #[test]
+    fn a_protocol_relative_url_takes_the_document_scheme() {
+        assert_eq!(
+            resolve_from("https://example.com/a.html", "//cdn.example.net/x.png"),
+            "https://cdn.example.net/x.png"
+        );
+    }
+
+    #[test]
+    fn a_root_relative_url_keeps_the_host() {
+        assert_eq!(
+            resolve_from("https://example.com/deep/page.html", "/logo.png"),
+            "https://example.com/logo.png"
+        );
+    }
+
+    #[test]
+    fn a_relative_url_resolves_against_the_documents_directory() {
+        assert_eq!(
+            resolve_from("https://example.com/a/b/page.html", "img/logo.png"),
+            "https://example.com/a/b/img/logo.png"
+        );
+        // A document at the root has no directory to descend from.
+        assert_eq!(
+            resolve_from("https://example.com/page.html", "logo.png"),
+            "https://example.com/logo.png"
+        );
+    }
+
+    #[test]
+    fn dot_segments_are_removed() {
+        assert_eq!(
+            resolve_from("https://example.com/a/b/page.html", "../logo.png"),
+            "https://example.com/a/logo.png"
+        );
+        assert_eq!(
+            resolve_from("https://example.com/a/b/page.html", "./logo.png"),
+            "https://example.com/a/b/logo.png"
+        );
+        assert_eq!(
+            resolve_from("https://example.com/a/b/page.html", "../../up/logo.png"),
+            "https://example.com/up/logo.png"
+        );
+    }
+
+    #[test]
+    fn a_non_default_port_survives_resolution() {
+        assert_eq!(
+            resolve_from("http://example.com:8080/a/page.html", "logo.png"),
+            "http://example.com:8080/a/logo.png"
+        );
+        // The default port is not written back out.
+        assert_eq!(
+            resolve_from("https://example.com:443/page.html", "logo.png"),
+            "https://example.com/logo.png"
+        );
+    }
+
+    #[test]
+    fn file_urls_resolve_relative_to_the_document() {
+        assert_eq!(
+            resolve_from("file:///home/user/site/page.html", "img/logo.png"),
+            "file:///home/user/site/img/logo.png"
+        );
     }
 
     #[test]

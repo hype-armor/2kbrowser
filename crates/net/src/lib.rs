@@ -6,7 +6,7 @@
 
 pub mod policy;
 
-pub use policy::{Origin, Policy, Refusal, RequestKind, Scheme, parse_url};
+pub use policy::{Origin, Policy, Refusal, RequestKind, Scheme, parse_url, resolve};
 
 /// Anything that can go wrong fetching a resource.
 #[derive(Debug)]
@@ -49,10 +49,18 @@ pub const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
 /// A fetched resource.
 #[derive(Debug, Clone)]
 pub struct Resource {
-    /// Decoded body.
+    /// Body decoded as text. Empty for resources fetched as bytes.
     pub body: String,
+    /// Raw body bytes.
+    ///
+    /// Images are not text: decoding them through `String` would mangle every
+    /// byte that is not valid UTF-8, which is most of a PNG.
+    pub bytes: Vec<u8>,
     /// Origin it came from, for the policy to judge subresources against.
     pub origin: Origin,
+    /// Path it was fetched from, which relative subresource URLs resolve
+    /// against.
+    pub path: String,
 }
 
 impl Resource {
@@ -87,23 +95,49 @@ impl Fetcher {
             .check(document, &origin, kind)
             .map_err(FetchError::Refused)?;
 
-        let body = match origin.scheme {
+        let bytes = match origin.scheme {
             Scheme::File => read_file(&path)?,
             Scheme::Http | Scheme::Https => fetch_http(url)?,
         };
-        Ok(Resource { body, origin })
+        // Lossy rather than strict: a page served with a broken encoding
+        // declaration should still render, which is the whole reason
+        // encoding sniffing exists (ADR-0004).
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(Resource {
+            body,
+            bytes,
+            origin,
+            path,
+        })
+    }
+
+    /// Fetches a URL, keeping only the raw bytes.
+    pub fn fetch_bytes(
+        &self,
+        url: &str,
+        document: Option<&Origin>,
+        kind: RequestKind,
+    ) -> Result<Vec<u8>, FetchError> {
+        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
+        self.policy
+            .check(document, &origin, kind)
+            .map_err(FetchError::Refused)?;
+        match origin.scheme {
+            Scheme::File => read_file(&path),
+            Scheme::Http | Scheme::Https => fetch_http(url),
+        }
     }
 }
 
-fn read_file(path: &str) -> Result<String, FetchError> {
+fn read_file(path: &str) -> Result<Vec<u8>, FetchError> {
     let metadata = std::fs::metadata(path).map_err(FetchError::Io)?;
     if metadata.len() > MAX_BODY_BYTES {
         return Err(FetchError::TooLarge);
     }
-    std::fs::read_to_string(path).map_err(FetchError::Io)
+    std::fs::read(path).map_err(FetchError::Io)
 }
 
-fn fetch_http(url: &str) -> Result<String, FetchError> {
+fn fetch_http(url: &str) -> Result<Vec<u8>, FetchError> {
     // No custom User-Agent games: this browser does not run scripts, and
     // pretending otherwise to get the script path served would produce exactly
     // the silent breakage ADR-0003 rejects.
@@ -116,7 +150,7 @@ fn fetch_http(url: &str) -> Result<String, FetchError> {
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
-        .read_to_string()
+        .read_to_vec()
         .map_err(|error| FetchError::Transport(error.to_string()))
 }
 

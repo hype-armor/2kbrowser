@@ -43,7 +43,17 @@ fn fixtures_match_their_baselines() {
             .to_string_lossy()
             .to_string();
         let html = std::fs::read_to_string(path).expect("fixture readable");
-        let page = shell::render::render(&html, WIDTH, MAX_HEIGHT, &mut fonts);
+        // Render with the fixture's own location as the base, so relative
+        // subresource URLs resolve and image fixtures actually exercise images.
+        let url = format!("file://{}", path.display());
+        let (origin, base_path) = net::parse_url(&url).expect("fixture url");
+        let page = shell::render::render_with_base(
+            &html,
+            WIDTH,
+            MAX_HEIGHT,
+            &mut fonts,
+            Some((&origin, &base_path)),
+        );
         let actual = page.pixmap.encode_png().expect("encode png");
         let baseline = baselines.join(format!("{name}.png"));
 

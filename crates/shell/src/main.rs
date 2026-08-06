@@ -121,7 +121,13 @@ fn run_render(args: &[String]) -> Result<String, String> {
     let resource = load(&input)?;
 
     let mut fonts = FontStore::new();
-    let page = render::render(&resource.body, width, height, &mut fonts);
+    let page = render::render_with_base(
+        &resource.body,
+        width,
+        height,
+        &mut fonts,
+        Some((&resource.origin, &resource.path)),
+    );
     page.pixmap
         .save_png(&output)
         .map_err(|e| format!("{output}: {e}"))?;
@@ -131,6 +137,9 @@ fn run_render(args: &[String]) -> Result<String, String> {
         page.pixmap.width(),
         page.pixmap.height()
     );
+    if page.images_loaded > 0 {
+        message.push_str(&format!(", {} image(s)", page.images_loaded));
+    }
     if page.content_height.ceil() as u32 > page.pixmap.height() {
         message.push_str(&format!(
             "\nnote: page is {}px tall; output was clipped to --height",

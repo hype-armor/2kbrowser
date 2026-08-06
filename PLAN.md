@@ -261,7 +261,8 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    borders, fixed layout, `border-spacing` parsing
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
-5. Images, links, scrolling, hit testing
+5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
+   dimensions, floatable. Links, scrolling, and hit testing remain
 6. Positioned layout, then **quirks mode**, then **framesets**
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of

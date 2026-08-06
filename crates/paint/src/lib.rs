@@ -4,6 +4,8 @@
 //! and combined with bundled fonts it makes output identical on every platform,
 //! so one set of reference baselines covers all three.
 
+pub mod images;
+
 use css::value::Color;
 use layout::{Layout, LayoutBox, Rect, line_offset};
 use text::FontStore;
@@ -11,6 +13,7 @@ use tiny_skia::{FillRule, Paint, PathBuilder, PixmapPaint, Transform};
 
 // Re-exported so consumers do not need their own tiny-skia dependency, and so
 // the rasteriser choice stays an implementation detail of this crate.
+pub use images::{DecodedImage, ImageStore, decode};
 pub use tiny_skia::Pixmap;
 
 /// One paint operation.
@@ -26,6 +29,13 @@ pub enum DisplayItem {
         rect: Rect,
         /// Fill colour.
         color: Color,
+    },
+    /// A decoded image drawn into a rectangle.
+    Image {
+        /// The element the image belongs to, used to look it up at raster time.
+        node: dom::NodeId,
+        /// Destination rectangle; the image is scaled to fill it.
+        rect: Rect,
     },
     /// A single positioned glyph.
     Glyph {
@@ -82,6 +92,18 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
     }
 
     paint_borders(box_, x, y, list);
+
+    if let Some(node) = box_.replaced {
+        list.items.push(DisplayItem::Image {
+            node,
+            rect: Rect {
+                x: x + box_.content_origin.0,
+                y: y + box_.content_origin.1,
+                width: box_.content_width,
+                height: (box_.rect.height - box_.content_origin.1 * 2.0).max(0.0),
+            },
+        });
+    }
 
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
@@ -183,6 +205,7 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
 pub fn rasterise(
     list: &DisplayList,
     fonts: &mut FontStore,
+    images: &ImageStore,
     width: u32,
     height: u32,
 ) -> Option<Pixmap> {
@@ -192,6 +215,11 @@ pub fn rasterise(
     for item in &list.items {
         match item {
             DisplayItem::Rect { rect, color } => fill_rect(&mut pixmap, rect, *color),
+            DisplayItem::Image { node, rect } => {
+                if let Some(image) = images.get(node) {
+                    draw_image(&mut pixmap, image, rect);
+                }
+            }
             DisplayItem::Glyph {
                 glyph,
                 origin_x,
@@ -203,6 +231,30 @@ pub fn rasterise(
         }
     }
     Some(pixmap)
+}
+
+/// Draws an image scaled into `rect`.
+fn draw_image(pixmap: &mut Pixmap, image: &DecodedImage, rect: &Rect) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let scale_x = rect.width / image.width().max(1.0);
+    let scale_y = rect.height / image.height().max(1.0);
+    // Bilinear rather than nearest: the era's pages routinely scaled images
+    // with width/height attributes, and nearest-neighbour makes that look
+    // broken rather than merely resized.
+    let paint = PixmapPaint {
+        quality: tiny_skia::FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    pixmap.draw_pixmap(
+        0,
+        0,
+        image.pixmap.as_ref(),
+        &paint,
+        Transform::from_translate(rect.x / scale_x, rect.y / scale_y).post_scale(scale_x, scale_y),
+        None,
+    );
 }
 
 fn fill_rect(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
@@ -282,10 +334,12 @@ mod tests {
         let sheets = [Stylesheet::parse(css_text)];
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, width as f32);
+        let sizes = layout::IntrinsicSizes::new();
+        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
         let list = build_display_list(&layout);
         let height = layout.height.ceil().max(1.0) as u32;
-        rasterise(&list, &mut fonts, width, height).expect("pixmap")
+        let images = ImageStore::new();
+        rasterise(&list, &mut fonts, &images, width, height).expect("pixmap")
     }
 
     fn count_non_white(pixmap: &Pixmap) -> usize {

@@ -5,8 +5,9 @@
 //! rather than the only way to produce output.
 
 use css::Stylesheet;
-use layout::RenderMode;
-use paint::{Pixmap, build_display_list, rasterise};
+use layout::{IntrinsicSizes, RenderMode};
+use net::{Fetcher, Origin, RequestKind};
+use paint::{ImageStore, Pixmap, build_display_list, rasterise};
 use text::FontStore;
 
 /// A rendered page.
@@ -17,6 +18,8 @@ pub struct Page {
     pub mode: RenderMode,
     /// Full content height in CSS pixels, which may exceed the canvas.
     pub content_height: f32,
+    /// How many images were fetched and decoded.
+    pub images_loaded: usize,
 }
 
 /// Renders HTML at a given viewport width.
@@ -24,6 +27,20 @@ pub struct Page {
 /// `max_height` bounds the canvas so that a pathological page cannot allocate
 /// an unbounded pixmap.
 pub fn render(html: &str, width: u32, max_height: u32, fonts: &mut FontStore) -> Page {
+    render_with_base(html, width, max_height, fonts, None)
+}
+
+/// Renders HTML, resolving subresources against the document's own URL.
+///
+/// Without a base there is nothing to resolve relative URLs against, so images
+/// are simply not loaded — which is the right outcome for a bare HTML string.
+pub fn render_with_base(
+    html: &str,
+    width: u32,
+    max_height: u32,
+    fonts: &mut FontStore,
+    base: Option<(&Origin, &str)>,
+) -> Page {
     let doc = dom::parse(html);
     let author_sheets = collect_stylesheets(&doc);
     let styles = css::cascade::cascade(&doc, &author_sheets);
@@ -43,17 +60,69 @@ pub fn render(html: &str, width: u32, max_height: u32, fonts: &mut FontStore) ->
         }
     };
 
-    let laid_out = layout::layout(&doc, &styles, fonts, width as f32);
+    // Images are only loaded for the authored path: the document fallback
+    // discards the author's layout, and pulling in its images with it would
+    // spend requests on decoration nobody is going to see.
+    let images = match (&mode, base) {
+        (RenderMode::Authored, Some((origin, path))) => load_images(&doc, origin, path),
+        _ => ImageStore::new(),
+    };
+    let intrinsic: IntrinsicSizes = images
+        .iter()
+        .map(|(node, image)| (*node, (image.width(), image.height())))
+        .collect();
+
+    let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
     let height = (laid_out.height.ceil().max(1.0) as u32).min(max_height);
-    let pixmap = rasterise(&list, fonts, width, height)
+    let pixmap = rasterise(&list, fonts, &images, width, height)
         .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
     Page {
         pixmap,
         mode,
         content_height: laid_out.height,
+        images_loaded: images.len(),
     }
+}
+
+/// Fetches and decodes every `<img>` the policy allows.
+///
+/// Failures are silent by design: a missing or corrupt image is an ordinary
+/// thing to find on the web, and the element simply lays out at its declared
+/// size with nothing drawn in it.
+fn load_images(doc: &dom::Document, origin: &Origin, path: &str) -> ImageStore {
+    let fetcher = Fetcher::default();
+    let mut store = ImageStore::new();
+    let mut cache: std::collections::HashMap<String, Option<paint::DecodedImage>> =
+        std::collections::HashMap::new();
+
+    for node in doc.descendants(doc.root()) {
+        let Some(element) = doc.element(node) else {
+            continue;
+        };
+        if element.local_name() != "img" {
+            continue;
+        }
+        let Some(src) = element.attr("src") else {
+            continue;
+        };
+        let url = net::resolve(origin, path, src);
+
+        // The same image often appears many times on a page; fetching it once
+        // matters more here than usual, since every fetch is synchronous.
+        let decoded = cache.entry(url.clone()).or_insert_with(|| {
+            // Subresource, so ADR-0006's third-party rule applies.
+            let bytes = fetcher
+                .fetch_bytes(&url, Some(origin), RequestKind::Subresource)
+                .ok()?;
+            paint::decode(&bytes)
+        });
+        if let Some(image) = decoded {
+            store.insert(node, image.clone());
+        }
+    }
+    store
 }
 
 /// Extracts the contents of every `<style>` element, in document order.
