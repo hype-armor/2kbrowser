@@ -293,6 +293,35 @@ impl FontStore {
         layout
     }
 
+    /// Minimum and maximum content widths of a set of runs.
+    ///
+    /// Table column sizing needs both: the maximum is the width at which the
+    /// content would not wrap at all, the minimum is the widest single
+    /// unbreakable piece. CSS 2.1's automatic table layout interpolates between
+    /// them when the available width falls in between.
+    pub fn intrinsic_widths(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+    ) -> (f32, f32) {
+        let max = self.layout_runs(runs, default_style, f32::MAX).width;
+
+        // The minimum is the widest word, measured in the style of the run it
+        // came from — measuring everything in the default style would
+        // under-report a bold or larger span and let its column collapse.
+        let mut min: f32 = 0.0;
+        for run in runs {
+            for word in run.text.split_whitespace() {
+                let single = [InlineRun {
+                    text: word.to_owned(),
+                    style: run.style.clone(),
+                }];
+                min = min.max(self.layout_runs(&single, default_style, f32::MAX).width);
+            }
+        }
+        (min, max.max(min))
+    }
+
     /// Measures text without keeping the glyphs.
     pub fn measure(&mut self, text: &str, style: &ComputedStyle, max_width: f32) -> (f32, f32) {
         let layout = self.layout(text, style, max_width);

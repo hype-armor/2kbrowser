@@ -19,8 +19,14 @@ pub enum Display {
     InlineBlock,
     /// A list item; laid out as a block for now.
     ListItem,
-    /// Table display types, collapsed into one variant until M2 implements them.
+    /// A table box.
     Table,
+    /// A table row.
+    TableRow,
+    /// A row group: `thead`, `tbody`, or `tfoot`.
+    TableRowGroup,
+    /// A table cell. A block container in its own right.
+    TableCell,
     /// Generates no box at all.
     None,
     /// `flex` or `inline-flex` — recognised, not implemented (ADR-0004).
@@ -44,6 +50,15 @@ impl Display {
         matches!(self, Display::Inline | Display::InlineBlock)
     }
 
+    /// Whether the box is internal table structure, laid out by the table
+    /// rather than by normal block flow.
+    pub fn is_table_internal(self) -> bool {
+        matches!(
+            self,
+            Display::TableRow | Display::TableRowGroup | Display::TableCell
+        )
+    }
+
     fn parse(name: &str) -> Option<Self> {
         let display = match name {
             "block" => Display::Block,
@@ -53,7 +68,15 @@ impl Display {
             "none" => Display::None,
             "flex" | "inline-flex" => Display::Flex,
             "grid" | "inline-grid" => Display::Grid,
-            name if name.starts_with("table") || name == "inline-table" => Display::Table,
+            "table" | "inline-table" => Display::Table,
+            "table-row" => Display::TableRow,
+            "table-row-group" | "table-header-group" | "table-footer-group" => {
+                Display::TableRowGroup
+            }
+            "table-cell" => Display::TableCell,
+            // Column and caption boxes are not implemented; treating them as
+            // blocks keeps their content visible rather than dropping it.
+            name if name.starts_with("table") => Display::Block,
             _ => return None,
         };
         Some(display)

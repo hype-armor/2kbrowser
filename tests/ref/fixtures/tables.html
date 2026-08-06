@@ -1,0 +1,24 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; }
+  table { margin-bottom: 14px; }
+  th, td { border: 1px solid #888888; padding: 4px; }
+  th { background-color: #eeeeee; }
+  .full { width: 100%; }
+  .layout td { border: 0; padding: 0; }
+</style></head><body>
+<table>
+  <thead><tr><th>Element</th><th>Purpose</th><th>Year</th></tr></thead>
+  <tbody>
+    <tr><td>table</td><td>Tabular data, and most of the era's page layout</td><td>1995</td></tr>
+    <tr><td>td</td><td>A cell</td><td>1995</td></tr>
+    <tr><td colspan="3">A cell spanning all three columns</td></tr>
+  </tbody>
+</table>
+<table class="full">
+  <tr><th>Full width</th><th>Second column</th></tr>
+  <tr><td>Stretches to fill its container, as width="100%" did.</td><td>Right.</td></tr>
+</table>
+<table class="layout">
+  <tr><td>Borderless cells, the way pages of the era built columns.</td><td>Sidebar.</td></tr>
+</table>
+</body></html>

@@ -6,6 +6,7 @@
 //! (ADR-0004).
 
 pub mod classify;
+pub mod table;
 
 use css::cascade::StyleMap;
 use css::style::{ComputedStyle, Display, TextAlign, WhiteSpace};
@@ -170,12 +171,36 @@ fn layout_block(
         box_.text = Some(layout);
     }
 
+    if style.display == Display::Table {
+        let table_height = layout_table(
+            doc,
+            styles,
+            fonts,
+            node,
+            style,
+            padding_left + border_left,
+            padding_top + border_top,
+            content_width,
+            &mut box_,
+        );
+        box_.rect.height = padding_top + border_top + table_height + padding_bottom + border_bottom;
+        let outer = box_.outer_height(font_size);
+        parent.children.push(box_);
+        return outer;
+    }
+
     let mut cursor_y = padding_top + border_top + content_height;
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
             continue;
         };
-        if child_style.display == Display::None || child_style.display.is_inline() {
+        // Table-internal boxes are positioned by their table, not by block
+        // flow. A stray one outside a table falls through to block layout so
+        // its content is still shown.
+        if child_style.display == Display::None
+            || child_style.display.is_inline()
+            || child_style.display.is_table_internal()
+        {
             continue;
         }
         let consumed = layout_block(
@@ -207,6 +232,143 @@ fn layout_block(
     let outer = box_.outer_height(font_size);
     parent.children.push(box_);
     outer
+}
+
+/// Lays out a table's rows and cells, appending them to `parent`.
+///
+/// Returns the height consumed. Column widths come from cell content
+/// (`table::distribute_widths`); each cell is then laid out as an ordinary
+/// block at its column's width, and a row is as tall as its tallest cell.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn layout_table(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    style: &ComputedStyle,
+    x: f32,
+    y: f32,
+    available_width: f32,
+    parent: &mut LayoutBox,
+) -> f32 {
+    let grid = table::build_grid(doc, styles, node);
+    if grid.columns == 0 {
+        return 0.0;
+    }
+
+    // Intrinsic widths per column, from the cells that span exactly one.
+    let mut mins = vec![0.0f32; grid.columns];
+    let mut maxes = vec![0.0f32; grid.columns];
+    let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
+
+    for row in &grid.rows {
+        for cell in row {
+            let runs = collect_inline_runs(doc, styles, cell.node, &cell.style);
+            let (mut min, mut max) = fonts.intrinsic_widths(&runs, &cell.style);
+            // A cell's own padding and borders are part of what it needs.
+            let surround = cell.style.padding.left.to_px(cell.style.font_size, 0.0)
+                + cell.style.padding.right.to_px(cell.style.font_size, 0.0)
+                + cell.style.border.left.used_width(cell.style.font_size)
+                + cell.style.border.right.used_width(cell.style.font_size);
+            min += surround;
+            max += surround;
+
+            if cell.colspan == 1 {
+                if let (Some(column_min), Some(column_max)) =
+                    (mins.get_mut(cell.column), maxes.get_mut(cell.column))
+                {
+                    *column_min = column_min.max(min);
+                    *column_max = column_max.max(max);
+                }
+            } else {
+                // Spanning cells are applied after the single-column cells have
+                // set a baseline, so they only ever widen columns.
+                spans.push((cell.column, cell.colspan, min, max));
+            }
+        }
+    }
+    for (column, colspan, min, max) in spans {
+        table::apply_span(&mut mins, column, colspan, min);
+        table::apply_span(&mut maxes, column, colspan, max);
+    }
+
+    let spacing_total = table::BORDER_SPACING * (grid.columns + 1) as f32;
+    let usable = (available_width - spacing_total).max(0.0);
+    let mut widths = table::distribute_widths(&mins, &maxes, Some(usable));
+
+    // A table with no declared width shrinks to fit its content. One with a
+    // declared width fills it, which is exactly what `<table width="100%">`
+    // meant on the era's pages and why so many of them used it.
+    if style.width != Length::Auto {
+        let total: f32 = widths.iter().sum();
+        if total > 0.0 && usable > total {
+            let scale = usable / total;
+            for width in &mut widths {
+                *width *= scale;
+            }
+        }
+    }
+
+    let mut cursor_y = y + table::BORDER_SPACING;
+    for row in &grid.rows {
+        let mut row_height = 0.0f32;
+        let mut cell_boxes = Vec::new();
+
+        for cell in row {
+            let end = (cell.column + cell.colspan).min(widths.len());
+            if cell.column >= end {
+                continue;
+            }
+            let width: f32 = widths[cell.column..end].iter().sum::<f32>()
+                + table::BORDER_SPACING * (end - cell.column - 1) as f32;
+            let cell_x = x
+                + table::BORDER_SPACING
+                + widths[..cell.column].iter().sum::<f32>()
+                + table::BORDER_SPACING * cell.column as f32;
+
+            // Each cell is an ordinary block in a box of its column's width.
+            let mut holder = LayoutBox {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height: 0.0,
+                },
+                style: cell.style.clone(),
+                text: None,
+                content_origin: (0.0, 0.0),
+                content_width: width,
+                children: Vec::new(),
+            };
+            let consumed = layout_block(
+                doc,
+                styles,
+                fonts,
+                cell.node,
+                &cell.style,
+                cell_x,
+                cursor_y,
+                width,
+                &mut holder,
+            );
+            row_height = row_height.max(consumed);
+            if let Some(cell_box) = holder.children.pop() {
+                cell_boxes.push(cell_box);
+            }
+        }
+
+        // Cells stretch to the row's height so backgrounds and borders line up.
+        for mut cell_box in cell_boxes {
+            cell_box.rect.height = cell_box.rect.height.max(row_height);
+            parent.children.push(cell_box);
+        }
+        cursor_y += row_height + table::BORDER_SPACING;
+    }
+
+    cursor_y - y
 }
 
 /// Collects a block's inline content as styled runs, stopping at block children
@@ -526,6 +688,126 @@ mod tests {
         assert_eq!(
             a.layout.height, b.layout.height,
             "indentation changed the layout"
+        );
+    }
+
+    #[test]
+    fn table_cells_are_laid_out_side_by_side() {
+        let rendered = run(
+            "<body><table><tr><td>one</td><td>two</td></tr></table></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert_eq!(cells.len(), 2);
+        assert!(
+            cells[1].rect.x > cells[0].rect.x,
+            "second cell must sit to the right"
+        );
+        // Same row, so the same top edge.
+        assert!((cells[0].rect.y - cells[1].rect.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn table_rows_stack_downwards() {
+        let rendered = run(
+            "<body><table><tr><td>one</td></tr><tr><td>two</td></tr></table></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert_eq!(cells.len(), 2);
+        assert!(
+            cells[1].rect.y > cells[0].rect.y,
+            "second row must sit below"
+        );
+        assert!(
+            (cells[0].rect.x - cells[1].rect.x).abs() < 0.01,
+            "same column, same x"
+        );
+    }
+
+    #[test]
+    fn a_narrow_table_shrinks_to_fit_rather_than_stretching() {
+        let rendered = run(
+            "<body><table><tr><td>a</td><td>b</td></tr></table></body>",
+            "body { margin: 0 }",
+            800.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        let total: f32 = cells.iter().map(|c| c.rect.width).sum();
+        assert!(
+            total < 200.0,
+            "two one-letter cells should not fill 800px, got {total}"
+        );
+    }
+
+    #[test]
+    fn a_wide_column_gets_more_room_than_a_narrow_one() {
+        let rendered = run(
+            "<body><table><tr><td>x</td>\
+             <td>a considerably longer piece of cell content here</td></tr></table></body>",
+            "body { margin: 0 }",
+            400.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert!(
+            cells[1].rect.width > cells[0].rect.width * 3.0,
+            "column sizing ignored content: {} vs {}",
+            cells[0].rect.width,
+            cells[1].rect.width
+        );
+    }
+
+    #[test]
+    fn a_full_width_table_fills_its_container() {
+        // `<table width="100%">` was ubiquitous on the era's pages.
+        let rendered = run(
+            "<body><table><tr><td>a</td><td>b</td></tr></table></body>",
+            "body { margin: 0 } table { width: 100% }",
+            500.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        let total: f32 = cells.iter().map(|c| c.rect.width).sum();
+        assert!(
+            total > 450.0,
+            "declared width should fill the container, got {total}"
+        );
+    }
+
+    #[test]
+    fn a_spanning_cell_covers_the_columns_below_it() {
+        let rendered = run(
+            r#"<body><table><tr><td colspan="2">wide header</td></tr>
+               <tr><td>a</td><td>b</td></tr></table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert_eq!(cells.len(), 3);
+        let spanning = cells[0].rect.width;
+        let below = cells[1].rect.width + cells[2].rect.width;
+        assert!(
+            spanning >= below - 5.0,
+            "span {spanning} should cover both columns {below}"
         );
     }
 

@@ -256,7 +256,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
    size, and collapse whitespace across run boundaries.
-3. **Tables** — the era's dominant layout mechanism, so this comes early
+3. **Tables** — *mostly done.* Automatic column sizing from cell content,
+   `colspan`, row groups, and declared widths. Missing: `rowspan`, collapsed
+   borders, fixed layout, `border-spacing` parsing
 4. **Floats** — the other one
 5. Images, links, scrolling, hit testing
 6. Positioned layout, then **quirks mode**, then **framesets**

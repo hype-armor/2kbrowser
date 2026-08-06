@@ -44,7 +44,11 @@ center { text-align: center; }
 hr { margin: 0.5em 0; }
 
 table { display: table; }
-th, td { padding: 1px; }
+thead, tbody, tfoot { display: table-row-group; }
+tr { display: table-row; }
+th, td { display: table-cell; padding: 1px; }
+th { text-align: center; }
+caption { display: block; text-align: center; }
 
 big { font-size: 1.17em; }
 small, sub, sup { font-size: 0.83em; }
