@@ -157,23 +157,54 @@ fn main() {
         },
     ];
 
+    // Tab strips, drawn below the bars.
+    let strips: Vec<(Vec<&str>, usize)> = vec![
+        (vec!["The Node & Nib", "Archive"], 0),
+        (
+            vec!["The Node & Nib", "Archive", "A page with a very long title"],
+            2,
+        ),
+        (
+            vec![
+                "one", "two", "three", "four", "five", "six", "seven", "eight",
+            ],
+            4,
+        ),
+    ];
+
     let gap = 6u32;
-    let height = cases.len() as u32 * (chrome::HEIGHT + gap);
+    let height = cases.len() as u32 * (chrome::HEIGHT + gap)
+        + strips.len() as u32 * (chrome::TAB_HEIGHT + gap);
     let mut sheet = paint::Pixmap::new(width, height).expect("sheet");
     sheet.fill(paint::RasterColor::from_rgba8(0x60, 0x60, 0x60, 0xff));
 
     let mut fonts = text::FontStore::new();
-    for (index, state) in cases.iter().enumerate() {
-        let bar = chrome::render(state, width, &mut fonts);
+    let mut y = 0i32;
+    let place = |sheet: &mut paint::Pixmap, image: &paint::Pixmap, y: &mut i32| {
         sheet.draw_pixmap(
             0,
-            (index as u32 * (chrome::HEIGHT + gap)) as i32,
-            bar.as_ref(),
+            *y,
+            image.as_ref(),
             &paint::PixmapPaint::default(),
             paint::Transform::identity(),
             None,
         );
+        *y += image.height() as i32 + gap as i32;
+    };
+
+    for state in &cases {
+        let bar = chrome::render(state, width, &mut fonts);
+        place(&mut sheet, &bar, &mut y);
     }
+    for (labels, active) in &strips {
+        let strip = chrome::render_tabs(labels, *active, width, &mut fonts);
+        place(&mut sheet, &strip, &mut y);
+    }
+
     sheet.save_png(&output).expect("write");
-    println!("wrote {output} with {} states", cases.len());
+    println!(
+        "wrote {output} with {} bar states and {} strips",
+        cases.len(),
+        strips.len()
+    );
 }

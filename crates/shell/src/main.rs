@@ -31,8 +31,8 @@ are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
 In a window: click a link to follow it. Alt+Left and Alt+Right, or Backspace,
 go back and forward. Ctrl+L focuses the URL bar and Ctrl+F searches the page;
-Enter goes, Escape gives up. Arrows and PageUp/PageDown scroll, Home/End jump,
-Esc or q quits.";
+Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
+switches. Arrows and PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

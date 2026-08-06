@@ -19,8 +19,21 @@ use text::FontStore;
 use css::style::{ComputedStyle, FontStack, GenericFamily};
 use css::value::Color;
 
-/// Height of the bar, in pixels.
+/// Height of the URL bar, in pixels.
 pub const HEIGHT: u32 = 34;
+
+/// Height of the tab strip, shown only when there is more than one tab.
+///
+/// A strip above a single tab is a row of chrome that says nothing — the URL
+/// bar already names the page — so it is not drawn until it has something to
+/// distinguish.
+pub const TAB_HEIGHT: u32 = 28;
+
+/// Widest a tab may be. Beyond this they stop growing and the strip has room
+/// for more of them.
+const TAB_MAX_WIDTH: f32 = 200.0;
+/// Narrowest a tab may be before its label is pointless.
+const TAB_MIN_WIDTH: f32 = 70.0;
 
 /// Width of the back and forward buttons.
 const BUTTON: f32 = 30.0;
@@ -40,6 +53,104 @@ const NOTICE: Color = Color::rgb(0x8a, 0x5a, 0x10);
 const SELECTION: Color = Color::rgb(0xb4, 0xd0, 0xf0);
 /// The focused field's surround, so it is obvious where the typing goes.
 const FOCUS: Color = Color::rgb(0x3a, 0x6e, 0xa5);
+/// A tab that is not the one being shown.
+const INACTIVE_TAB: Color = Color::rgb(0xdf, 0xdf, 0xdb);
+
+/// Total height of the chrome, given how many tabs there are.
+pub fn total_height(tab_count: usize) -> u32 {
+    HEIGHT + if tab_count > 1 { TAB_HEIGHT } else { 0 }
+}
+
+/// Where each tab sits in the strip.
+pub fn tab_rects(tab_count: usize, width: f32) -> Vec<Rect> {
+    if tab_count <= 1 {
+        return Vec::new();
+    }
+    let each = (width / tab_count as f32).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
+    (0..tab_count)
+        .map(|index| Rect {
+            x: index as f32 * each,
+            y: 0.0,
+            width: each,
+            height: TAB_HEIGHT as f32,
+        })
+        .collect()
+}
+
+/// The tab at a point in the strip's own coordinates, and whether the point is
+/// on its close button.
+pub fn tab_at(tab_count: usize, width: f32, x: f32, y: f32) -> Option<(usize, bool)> {
+    tab_rects(tab_count, width)
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, rect)| {
+            let inside =
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
+            // The close button is the right-hand end of the tab.
+            inside.then_some((index, x > rect.x + rect.width - CLOSE_WIDTH))
+        })
+}
+
+/// Width of a tab's close button.
+const CLOSE_WIDTH: f32 = 22.0;
+
+/// Draws the tab strip. Empty when there is only one tab.
+pub fn render_tabs(labels: &[&str], active: usize, width: u32, fonts: &mut FontStore) -> Pixmap {
+    let mut list = DisplayList {
+        canvas: RULE,
+        ..DisplayList::default()
+    };
+    let style = ui_style(12.0);
+
+    for (index, rect) in tab_rects(labels.len(), width as f32)
+        .into_iter()
+        .enumerate()
+    {
+        // The active tab is the colour of the bar below it, so the two read as
+        // one surface and the tab looks attached to what it shows.
+        let background = if index == active { BAR } else { INACTIVE_TAB };
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width - 1.0,
+                height: rect.height,
+            },
+            color: background,
+        });
+
+        let label = labels.get(index).copied().unwrap_or_default();
+        draw_text(
+            &mut list,
+            fonts,
+            label,
+            &style,
+            rect.x + PADDING,
+            TAB_HEIGHT as f32 / 2.0 - 8.0,
+            if index == active { INK } else { DIM },
+            rect.width - PADDING * 2.0 - CLOSE_WIDTH,
+        );
+        draw_text(
+            &mut list,
+            fonts,
+            "\u{00d7}",
+            &ui_style(14.0),
+            rect.x + rect.width - CLOSE_WIDTH + 5.0,
+            TAB_HEIGHT as f32 / 2.0 - 9.0,
+            DIM,
+            CLOSE_WIDTH,
+        );
+    }
+
+    rasterise(
+        &list,
+        fonts,
+        &paint::ImageStore::new(),
+        width.max(1),
+        TAB_HEIGHT,
+    )
+    .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"))
+}
 
 /// What the bar has to show.
 pub struct State<'a> {
@@ -792,5 +903,83 @@ mod tests {
             warned.data(),
             "the http warning was composed but never drawn"
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_strip_tests {
+    use super::*;
+
+    #[test]
+    fn a_single_tab_gets_no_strip() {
+        // A strip above one tab is a row of chrome that says nothing: the URL
+        // bar already names the page.
+        assert!(tab_rects(1, 800.0).is_empty());
+        assert_eq!(total_height(1), HEIGHT);
+        assert_eq!(tab_at(1, 800.0, 10.0, 5.0), None);
+    }
+
+    #[test]
+    fn the_strip_appears_with_a_second_tab() {
+        assert_eq!(tab_rects(2, 800.0).len(), 2);
+        assert_eq!(total_height(2), HEIGHT + TAB_HEIGHT);
+    }
+
+    #[test]
+    fn tabs_stop_growing_rather_than_filling_the_window() {
+        // Two tabs across a wide window should not be half a screen each.
+        let wide = tab_rects(2, 2000.0);
+        assert!(wide[0].width <= TAB_MAX_WIDTH);
+        assert_eq!(wide[1].x, wide[0].width, "and they still sit side by side");
+    }
+
+    #[test]
+    fn tabs_stop_shrinking_rather_than_vanishing() {
+        let many = tab_rects(40, 800.0);
+        assert!(many[0].width >= TAB_MIN_WIDTH);
+    }
+
+    #[test]
+    fn a_click_finds_the_tab_under_it() {
+        let rects = tab_rects(3, 800.0);
+        for (index, rect) in rects.iter().enumerate() {
+            assert_eq!(
+                tab_at(3, 800.0, rect.x + 4.0, 5.0),
+                Some((index, false)),
+                "tab {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_right_hand_end_of_a_tab_closes_it() {
+        let rects = tab_rects(3, 800.0);
+        let rect = rects[1];
+        assert_eq!(
+            tab_at(3, 800.0, rect.x + rect.width - 4.0, 5.0),
+            Some((1, true))
+        );
+        assert_eq!(
+            tab_at(3, 800.0, rect.x + 4.0, 5.0),
+            Some((1, false)),
+            "and the rest of it selects"
+        );
+    }
+
+    #[test]
+    fn a_click_past_the_last_tab_hits_nothing() {
+        let rects = tab_rects(2, 800.0);
+        let past = rects[1].x + rects[1].width + 10.0;
+        assert_eq!(tab_at(2, 800.0, past, 5.0), None);
+    }
+
+    #[test]
+    fn the_active_tab_is_drawn_differently() {
+        let mut fonts = FontStore::new();
+        let labels = ["First page", "Second page"];
+        let first = render_tabs(&labels, 0, 600, &mut fonts);
+        let second = render_tabs(&labels, 1, 600, &mut fonts);
+        assert_ne!(first.data(), second.data());
+        assert_eq!((first.width(), first.height()), (600, TAB_HEIGHT));
     }
 }

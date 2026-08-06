@@ -66,7 +66,13 @@ through them (Shift to go back), and the bar counts them. A match already on
 screen is not scrolled to — moving the page under someone who can see what
 they were looking for is disorienting.
 
-Still to come in M3: tabs and bookmarks.
+Tabs work: Ctrl+T opens one beside the current tab, Ctrl+W closes it,
+Ctrl+Tab and Ctrl+1..9 switch, middle-click opens a link in a new one. The
+strip only appears once there is a second tab — above a single tab it would be
+a row of chrome that says nothing the URL bar has not already said. A tab is
+named by the page's `<title>`, or by its URL when it has none.
+
+Still to come in M3: bookmarks.
 See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and

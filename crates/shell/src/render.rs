@@ -41,6 +41,12 @@ pub struct Page {
     pub images_loaded: usize,
     /// The documents on this canvas, in paint order.
     pub frames: Vec<Frame>,
+    /// The page's `<title>`, collapsed and trimmed.
+    ///
+    /// `None` when the document has none, which is common on the era's pages
+    /// and on anything hand-written — the caller falls back to the URL rather
+    /// than showing an empty tab.
+    pub title: Option<String>,
 }
 
 impl Page {
@@ -268,6 +274,7 @@ fn render_sized(
     // The whole canvas is one document. `base` is what a link inside it
     // resolves against; without one there is nothing to resolve against and
     // nothing to navigate to, so the frame carries no link geometry.
+    let title = document_title(&doc);
     let content_height = laid_out.height;
     let frames = match base {
         Some((origin, path)) => vec![Frame {
@@ -294,8 +301,21 @@ fn render_sized(
         mode,
         content_height,
         images_loaded: images.len(),
+        title,
         frames,
     }
+}
+
+/// Reads a document's `<title>`.
+///
+/// Collapsed and trimmed because the markup's line breaks and indentation are
+/// not part of the title, and a title with a newline in it makes a mess of
+/// every place one is shown.
+fn document_title(doc: &dom::Document) -> Option<String> {
+    let node = doc.find_element("title")?;
+    let text = layout::collapse_whitespace(&doc.text_content(node));
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// How deeply framesets may nest before we stop following them.
@@ -426,6 +446,9 @@ fn render_frameset(
         mode: RenderMode::Authored,
         content_height: height as f32,
         images_loaded: loaded,
+        // The frameset document's own title, not any frame's: a frame is a
+        // part of the page, and its title is not the page's.
+        title: document_title(doc),
         frames,
     }
 }
@@ -834,5 +857,52 @@ mod link_geometry_tests {
         assert!(page.frames.is_empty());
         assert!(page.links().is_empty());
         assert_eq!(page.link_at(5.0, 5.0), None);
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    fn title_of(html: &str) -> Option<String> {
+        let mut fonts = FontStore::new();
+        render(html, 300, 300, &mut fonts).title
+    }
+
+    #[test]
+    fn a_title_is_read() {
+        assert_eq!(
+            title_of("<html><head><title>A Page</title></head><body>x</body></html>"),
+            Some("A Page".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_title_is_collapsed_and_trimmed() {
+        // Markup indentation is not part of the title, and a title with a
+        // newline in it makes a mess of every place one is shown.
+        assert_eq!(
+            title_of("<html><head><title>\n   The Node\n   & Nib\n  </title></head></html>"),
+            Some("The Node & Nib".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_title_has_none() {
+        // Common on the era's pages, and on anything hand-written.
+        assert_eq!(title_of("<html><body>x</body></html>"), None);
+        assert_eq!(
+            title_of("<html><head><title>   </title></head></html>"),
+            None,
+            "a title of only whitespace is no title"
+        );
+    }
+
+    #[test]
+    fn entities_in_a_title_are_decoded() {
+        assert_eq!(
+            title_of("<html><head><title>Node &amp; Nib &#8212; 1998</title></head></html>"),
+            Some("Node & Nib — 1998".to_owned())
+        );
     }
 }

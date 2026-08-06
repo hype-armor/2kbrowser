@@ -7,4 +7,5 @@ pub mod chrome;
 pub mod field;
 pub mod history;
 pub mod render;
+pub mod tabs;
 pub mod window;

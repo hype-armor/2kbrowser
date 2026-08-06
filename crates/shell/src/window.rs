@@ -88,36 +88,23 @@ struct Loaded {
     path: String,
 }
 
-/// Everything the event loop needs between frames.
-struct App {
+/// One tab: a document, where it came from, and how far down it you are.
+///
+/// Everything here describes a page. What is *not* here — the window, the
+/// fonts, the pointer — belongs to the browser rather than to any page in it.
+struct Tab {
     loaded: Loaded,
     history: crate::history::History,
-    fetcher: net::Fetcher,
-    fonts: FontStore,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     page: Option<crate::render::Page>,
     scroll: f32,
-    size: (u32, u32),
-    /// Last known pointer position, in window coordinates.
-    pointer: (f32, f32),
-    /// Whether the pointer is over a link, so the cursor can say so.
-    over_link: bool,
-    /// What went wrong with the last navigation, shown in the title.
+    /// What went wrong with the last navigation in this tab.
     error: Option<String>,
-    /// Held because a key event does not carry the modifier state with it.
-    modifiers: winit::event::Modifiers,
-    /// The chrome bar, redrawn whenever what it says changes.
-    chrome: paint::Pixmap,
-    /// Whether the reader has overruled the document fallback (ADR-0009).
-    /// Reset on navigation: it is a decision about this page, not a setting.
+    /// Whether the reader has overruled the document fallback here (ADR-0009).
+    /// Reset on navigation: it is a decision about a page, not a setting.
     forcing_authored: bool,
     /// Whether this page had a fallback decision to overrule.
     can_toggle_layout: bool,
-    /// The URL bar when it has focus. `None` means it is showing where you
-    /// are rather than accepting where you want to go.
-    editing: Option<crate::field::Field>,
-    /// The find field when find-in-page is open.
+    /// The find field when find-in-page is open in this tab.
     finding: Option<crate::field::Field>,
     /// Where the current query matches, in canvas coordinates.
     matches: Vec<layout::Rect>,
@@ -125,7 +112,65 @@ struct App {
     current_match: usize,
 }
 
+impl Tab {
+    fn new(loaded: Loaded, url: String) -> Self {
+        Self {
+            loaded,
+            history: crate::history::History::new(url),
+            page: None,
+            scroll: 0.0,
+            error: None,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            finding: None,
+            matches: Vec::new(),
+            current_match: 0,
+        }
+    }
+
+    /// What to call this tab: the page's title, or failing that its URL.
+    fn label(&self) -> &str {
+        match self.page.as_ref().and_then(|page| page.title.as_deref()) {
+            Some(title) => title,
+            None => self.history.current(),
+        }
+    }
+}
+
+/// Everything the event loop needs between frames.
+struct App {
+    tabs: crate::tabs::Tabs<Tab>,
+    fetcher: net::Fetcher,
+    fonts: FontStore,
+    window: Option<Rc<Window>>,
+    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    size: (u32, u32),
+    /// Last known pointer position, in window coordinates.
+    pointer: (f32, f32),
+    /// Whether the pointer is over a link, so the cursor can say so.
+    over_link: bool,
+    /// Held because a key event does not carry the modifier state with it.
+    modifiers: winit::event::Modifiers,
+    /// The chrome bar, redrawn whenever what it says changes.
+    chrome: paint::Pixmap,
+    /// The tab strip. Empty when there is only one tab.
+    strip: paint::Pixmap,
+    /// The URL bar when it has focus. `None` means it is showing where you
+    /// are rather than accepting where you want to go.
+    editing: Option<crate::field::Field>,
+}
+
 impl App {
+    /// The tab being shown.
+    fn tab(&self) -> &Tab {
+        self.tabs.active()
+    }
+
+    /// The tab being shown, mutably.
+    fn tab_mut(&mut self) -> &mut Tab {
+        self.tabs.active_mut()
+    }
+
     /// Re-renders at the current width. Called on open and on resize, because
     /// layout depends on viewport width and nothing else here does.
     fn rerender(&mut self) {
@@ -133,71 +178,51 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
+        let viewport = self.viewport_height();
+
+        // Destructured so the borrows are disjoint: rendering needs the font
+        // store mutably while reading the tab, and going through a method on
+        // `self` would borrow the whole of it.
+        let App { tabs, fonts, .. } = self;
+        let tab = tabs.active_mut();
+
         // The canvas is the full document height, not the viewport height:
         // scrolling then costs a blit offset rather than a re-layout.
-        let base = Some((&self.loaded.origin, self.loaded.path.as_str()));
-        let page = if self.forcing_authored {
-            crate::render::render_as_authored(
-                &self.loaded.html,
-                width,
-                u32::MAX,
-                &mut self.fonts,
-                base,
-            )
+        let base = Some((&tab.loaded.origin, tab.loaded.path.as_str()));
+        let page = if tab.forcing_authored {
+            crate::render::render_as_authored(&tab.loaded.html, width, u32::MAX, fonts, base)
         } else {
-            crate::render::render_with_base(
-                &self.loaded.html,
-                width,
-                u32::MAX,
-                &mut self.fonts,
-                base,
-            )
+            crate::render::render_with_base(&tab.loaded.html, width, u32::MAX, fonts, base)
         };
+
         // Whether there is anything to overrule. Once overruling, the answer is
         // yes by construction — the reader has to be able to get back.
-        self.can_toggle_layout =
-            self.forcing_authored || !matches!(page.mode, layout::RenderMode::Authored);
-        if let Some(window) = &self.window {
-            window.set_title(&title_for(
-                self.history.current(),
-                &page.mode,
-                self.error.as_deref(),
-            ));
-        }
-        // The old matches point at the old layout.
-        if self.finding.is_some() {
-            let query = self
-                .finding
-                .as_ref()
-                .map(|field| field.text().to_owned())
-                .unwrap_or_default();
-            self.matches = match (&self.page, query.is_empty()) {
+        tab.can_toggle_layout =
+            tab.forcing_authored || !matches!(page.mode, layout::RenderMode::Authored);
+        tab.scroll = clamp_scroll(tab.scroll, page.content_height, viewport);
+        tab.page = Some(page);
+
+        // The old matches pointed at the old layout.
+        if let Some(query) = tab.finding.as_ref().map(|field| field.text().to_owned()) {
+            tab.matches = match (&tab.page, query.trim().is_empty()) {
                 (Some(page), false) => page.find(&query),
                 _ => Vec::new(),
             };
-            self.current_match = self.current_match.min(self.matches.len().saturating_sub(1));
+            tab.current_match = tab.current_match.min(tab.matches.len().saturating_sub(1));
         }
-        self.chrome = crate::chrome::render(
-            &crate::chrome::State {
-                url: self.history.current(),
-                mode: &page.mode,
-                error: self.error.as_deref(),
-                can_go_back: self.history.can_go_back(),
-                can_go_forward: self.history.can_go_forward(),
-                forcing_authored: self.forcing_authored,
-                can_toggle_layout: self.can_toggle_layout,
-                editing: self.editing.as_ref(),
-                finding: self
-                    .finding
-                    .as_ref()
-                    .map(|field| (field, self.current_match, self.matches.len())),
-            },
-            width,
-            &mut self.fonts,
-        );
-        let _ = height;
-        self.scroll = clamp_scroll(self.scroll, page.content_height, self.viewport_height());
-        self.page = Some(page);
+
+        if let Some(window) = &self.window {
+            // The page's own title, falling back to the URL: a titled page is
+            // named by its author, and an untitled one has only its address.
+            let tab = self.tabs.active();
+            let mode = tab.page.as_ref().map(|page| page.mode.clone());
+            window.set_title(&title_for(
+                tab.label(),
+                &mode.unwrap_or(layout::RenderMode::Authored),
+                tab.error.as_deref(),
+            ));
+        }
+        self.refresh_chrome();
     }
 
     /// Fetches `url` and shows it, without touching history.
@@ -207,20 +232,20 @@ impl App {
     fn show(&mut self, url: &str) {
         match self.fetcher.fetch(url, None, net::RequestKind::Navigation) {
             Ok(resource) => {
-                self.loaded = Loaded {
+                self.tab_mut().loaded = Loaded {
                     html: resource.body,
                     origin: resource.origin,
                     path: resource.path,
                 };
-                self.error = None;
-                self.scroll = 0.0;
+                self.tab_mut().error = None;
+                self.tab_mut().scroll = 0.0;
                 // A decision about the previous page, not a setting.
-                self.forcing_authored = false;
+                self.tab_mut().forcing_authored = false;
             }
             // The page that failed stays on screen rather than being replaced
             // with a blank one: what was there is more useful than nothing, and
             // the title says what happened.
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => self.tab_mut().error = Some(error.to_string()),
         }
         self.rerender();
         if let Some(window) = &self.window {
@@ -230,19 +255,19 @@ impl App {
 
     /// Follows a link.
     fn navigate(&mut self, url: String) {
-        self.history.visit(url);
-        let target = self.history.current().to_owned();
+        self.tab_mut().history.visit(url);
+        let target = self.tab().history.current().to_owned();
         self.show(&target);
     }
 
     fn go_back(&mut self) {
-        if let Some(url) = self.history.back().map(str::to_owned) {
+        if let Some(url) = self.tab_mut().history.back().map(str::to_owned) {
             self.show(&url);
         }
     }
 
     fn go_forward(&mut self) {
-        if let Some(url) = self.history.forward().map(str::to_owned) {
+        if let Some(url) = self.tab_mut().history.forward().map(str::to_owned) {
             self.show(&url);
         }
     }
@@ -253,29 +278,52 @@ impl App {
     /// difference between a field that feels instant and one that stutters on
     /// every character of a long document.
     fn refresh_chrome(&mut self) {
-        let mode = self
+        // Destructured for disjoint borrows: the bar is drawn with the font
+        // store while reading the tab it describes.
+        let App {
+            tabs,
+            fonts,
+            chrome,
+            editing,
+            size,
+            ..
+        } = self;
+        let tab = tabs.active();
+        let mode = tab
             .page
             .as_ref()
             .map(|page| page.mode.clone())
             .unwrap_or(layout::RenderMode::Authored);
-        self.chrome = crate::chrome::render(
+        *chrome = crate::chrome::render(
             &crate::chrome::State {
-                url: self.history.current(),
+                url: tab.history.current(),
                 mode: &mode,
-                error: self.error.as_deref(),
-                can_go_back: self.history.can_go_back(),
-                can_go_forward: self.history.can_go_forward(),
-                forcing_authored: self.forcing_authored,
-                can_toggle_layout: self.can_toggle_layout,
-                editing: self.editing.as_ref(),
-                finding: self
+                error: tab.error.as_deref(),
+                can_go_back: tab.history.can_go_back(),
+                can_go_forward: tab.history.can_go_forward(),
+                forcing_authored: tab.forcing_authored,
+                can_toggle_layout: tab.can_toggle_layout,
+                editing: editing.as_ref(),
+                finding: tab
                     .finding
                     .as_ref()
-                    .map(|field| (field, self.current_match, self.matches.len())),
+                    .map(|field| (field, tab.current_match, tab.matches.len())),
             },
-            self.size.0,
-            &mut self.fonts,
+            size.0,
+            fonts,
         );
+        // The strip only exists with more than one tab, and its labels change
+        // as pages load, so it is rebuilt with the bar.
+        let App {
+            tabs,
+            fonts,
+            strip,
+            size,
+            ..
+        } = self;
+        let labels: Vec<&str> = tabs.iter().map(Tab::label).collect();
+        *strip = crate::chrome::render_tabs(&labels, tabs.active_index(), size.0, fonts);
+
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -284,7 +332,7 @@ impl App {
     /// Gives the URL bar focus, with the current URL selected.
     fn focus_url(&mut self) {
         self.editing = Some(crate::field::Field::with_all_selected(
-            self.history.current(),
+            self.tab().history.current(),
         ));
         self.refresh_chrome();
     }
@@ -296,22 +344,74 @@ impl App {
         }
     }
 
+    /// Opens a new tab showing `url`, beside the current one.
+    fn open_tab(&mut self, url: &str) {
+        match self.fetcher.fetch(url, None, net::RequestKind::Navigation) {
+            Ok(resource) => {
+                let loaded = Loaded {
+                    html: resource.body,
+                    origin: resource.origin,
+                    path: resource.path,
+                };
+                self.tabs.open(Tab::new(loaded, url.to_owned()));
+            }
+            Err(error) => {
+                // A tab that failed still opens, showing nothing and saying
+                // why. Silently not opening one looks like a broken click.
+                let mut tab = Tab::new(
+                    Loaded {
+                        html: String::new(),
+                        origin: self.tab().loaded.origin.clone(),
+                        path: self.tab().loaded.path.clone(),
+                    },
+                    url.to_owned(),
+                );
+                tab.error = Some(error.to_string());
+                self.tabs.open(tab);
+            }
+        }
+        self.editing = None;
+        self.rerender();
+    }
+
+    /// Closes a tab. The last one cannot be closed.
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.close(index).is_some() {
+            self.editing = None;
+            self.rerender();
+        }
+    }
+
+    /// Switches tabs, which is a change of page and so of everything the
+    /// chrome describes.
+    fn select_tab(&mut self, index: usize) {
+        if index == self.tabs.active_index() {
+            return;
+        }
+        self.tabs.select(index);
+        self.editing = None;
+        // The new tab may never have been rendered, or was rendered at another
+        // width, so it is laid out rather than merely redrawn.
+        self.rerender();
+    }
+
     /// Opens find-in-page, or refocuses it if it is already open.
     fn open_find(&mut self) {
         let existing = self
+            .tab()
             .finding
             .as_ref()
             .map(|field| field.text().to_owned())
             .unwrap_or_default();
-        self.finding = Some(crate::field::Field::with_all_selected(existing));
+        self.tab_mut().finding = Some(crate::field::Field::with_all_selected(existing));
         self.refresh_matches();
     }
 
     /// Closes find, clearing the highlights.
     fn close_find(&mut self) {
-        if self.finding.take().is_some() {
-            self.matches.clear();
-            self.current_match = 0;
+        if self.tab_mut().finding.take().is_some() {
+            self.tab_mut().matches.clear();
+            self.tab_mut().current_match = 0;
             self.refresh_chrome();
         }
     }
@@ -319,29 +419,30 @@ impl App {
     /// Re-runs the search after the query or the page changed.
     fn refresh_matches(&mut self) {
         let query = self
+            .tab()
             .finding
             .as_ref()
             .map(|field| field.text().to_owned())
             .unwrap_or_default();
-        self.matches = match (&self.page, query.is_empty()) {
+        self.tab_mut().matches = match (&self.tab().page, query.is_empty()) {
             (Some(page), false) => page.find(&query),
             _ => Vec::new(),
         };
-        self.current_match = 0;
+        self.tab_mut().current_match = 0;
         self.scroll_to_current_match();
         self.refresh_chrome();
     }
 
     /// Steps to the next or previous match, wrapping around.
     fn step_match(&mut self, forward: bool) {
-        if self.matches.is_empty() {
+        if self.tab().matches.is_empty() {
             return;
         }
-        let count = self.matches.len();
-        self.current_match = if forward {
-            (self.current_match + 1) % count
+        let count = self.tab().matches.len();
+        self.tab_mut().current_match = if forward {
+            (self.tab().current_match + 1) % count
         } else {
-            (self.current_match + count - 1) % count
+            (self.tab().current_match + count - 1) % count
         };
         self.scroll_to_current_match();
         self.refresh_chrome();
@@ -353,26 +454,26 @@ impl App {
     /// it is, because scrolling the page under someone who can see what they
     /// were looking for is disorienting.
     fn scroll_to_current_match(&mut self) {
-        let Some(rect) = self.matches.get(self.current_match).copied() else {
+        let Some(rect) = self.tab().matches.get(self.tab().current_match).copied() else {
             return;
         };
-        let Some(page) = &self.page else { return };
+        let Some(page) = &self.tab().page else { return };
         let viewport = self.viewport_height();
-        let (top, bottom) = (self.scroll, self.scroll + viewport);
+        let (top, bottom) = (self.tab().scroll, self.tab().scroll + viewport);
         if rect.y >= top && rect.y + rect.height <= bottom {
             return;
         }
         // A third of the way down, which leaves the match in context rather
         // than jammed against the top edge.
         let target = rect.y - viewport / 3.0;
-        self.scroll = clamp_scroll(target, page.content_height, viewport);
+        self.tab_mut().scroll = clamp_scroll(target, page.content_height, viewport);
     }
 
     /// Handles a key while find is open.
     ///
     /// Returns whether the key was consumed.
     fn find_key(&mut self, key: &Key, alt: bool, ctrl: bool, shift: bool) -> bool {
-        let Some(field) = &mut self.finding else {
+        let Some(field) = &mut self.tab_mut().finding else {
             return false;
         };
         let by_word = ctrl || alt;
@@ -462,26 +563,30 @@ impl App {
 
     /// The chrome control under the pointer, if any.
     fn control_under_pointer(&self) -> Option<crate::chrome::Control> {
-        let mode = self.page.as_ref().map(|page| page.mode.clone());
+        let mode = self.tab().page.as_ref().map(|page| page.mode.clone());
         let mode = mode.unwrap_or(layout::RenderMode::Authored);
         crate::chrome::control_at(
             &crate::chrome::State {
-                url: self.history.current(),
+                url: self.tab().history.current(),
                 mode: &mode,
-                error: self.error.as_deref(),
-                can_go_back: self.history.can_go_back(),
-                can_go_forward: self.history.can_go_forward(),
-                forcing_authored: self.forcing_authored,
-                can_toggle_layout: self.can_toggle_layout,
+                error: self.tab().error.as_deref(),
+                can_go_back: self.tab().history.can_go_back(),
+                can_go_forward: self.tab().history.can_go_forward(),
+                forcing_authored: self.tab().forcing_authored,
+                can_toggle_layout: self.tab().can_toggle_layout,
                 editing: self.editing.as_ref(),
                 finding: self
+                    .tab()
                     .finding
                     .as_ref()
-                    .map(|field| (field, self.current_match, self.matches.len())),
+                    .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
             },
             self.size.0 as f32,
             self.pointer.0,
-            self.pointer.1,
+            // The bar's own coordinates: with a strip above it, the window's
+            // y is not the bar's y, and a click would land on the row above
+            // whatever it looked like it was on.
+            self.pointer.1 - (self.chrome_height() - crate::chrome::HEIGHT) as f32,
         )
     }
 
@@ -490,28 +595,33 @@ impl App {
     /// The pointer is in window coordinates; the page starts below the bar and
     /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
-        let page = self.page.as_ref()?;
-        let y = self.pointer.1 - crate::chrome::HEIGHT as f32;
+        let page = self.tab().page.as_ref()?;
+        let y = self.pointer.1 - self.chrome_height() as f32;
         if y < 0.0 {
             return None;
         }
-        page.link_at(self.pointer.0, y + self.scroll)
+        page.link_at(self.pointer.0, y + self.tab().scroll)
+    }
+
+    /// Total chrome height: the URL bar, plus the tab strip when there is one.
+    fn chrome_height(&self) -> u32 {
+        crate::chrome::total_height(self.tabs.len())
     }
 
     /// Height of the page area, which is the window less the chrome.
     fn viewport_height(&self) -> f32 {
-        (self.size.1.saturating_sub(crate::chrome::HEIGHT)) as f32
+        (self.size.1.saturating_sub(self.chrome_height())) as f32
     }
 
     fn scroll_by(&mut self, delta: f32) {
-        let Some(page) = &self.page else { return };
-        let before = self.scroll;
-        self.scroll = clamp_scroll(
-            self.scroll + delta,
+        let Some(page) = &self.tab().page else { return };
+        let before = self.tab().scroll;
+        self.tab_mut().scroll = clamp_scroll(
+            self.tab().scroll + delta,
             page.content_height,
             self.viewport_height(),
         );
-        if self.scroll != before
+        if self.tab().scroll != before
             && let Some(window) = &self.window
         {
             window.request_redraw();
@@ -520,12 +630,21 @@ impl App {
 
     /// Copies the rendered page into the window surface at the current scroll.
     fn draw(&mut self) {
-        let (Some(surface), Some(page)) = (&mut self.surface, &self.page) else {
+        // Destructured for disjoint borrows: the surface is written while the
+        // page and the chrome are read.
+        let App {
+            tabs,
+            surface,
+            chrome,
+            strip,
+            size,
+            ..
+        } = self;
+        let tab = tabs.active();
+        let (Some(surface), Some(page)) = (surface.as_mut(), tab.page.as_ref()) else {
             return;
         };
-        let (Some(width), Some(height)) =
-            (NonZeroU32::new(self.size.0), NonZeroU32::new(self.size.1))
-        else {
+        let (Some(width), Some(height)) = (NonZeroU32::new(size.0), NonZeroU32::new(size.1)) else {
             return;
         };
         if surface.resize(width, height).is_err() {
@@ -536,22 +655,30 @@ impl App {
         };
 
         let pixmap = &page.pixmap;
-        let offset = self.scroll as u32;
+        let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
-        let bar_height = crate::chrome::HEIGHT.min(height.get());
+        let strip_height = if tabs.len() > 1 {
+            crate::chrome::TAB_HEIGHT.min(height.get())
+        } else {
+            0
+        };
+        let bar_height = (strip_height + crate::chrome::HEIGHT).min(height.get());
 
-        // The bar first, across the top.
-        let bar = &self.chrome;
-        for row in 0..bar_height {
-            let start = row as usize * viewport_width;
-            let source_start = row as usize * bar.width() as usize;
-            for column in 0..viewport_width {
-                buffer[start + column] = match bar.pixels().get(source_start + column) {
-                    Some(pixel) => pack(pixel),
-                    None => 0x00ff_ffff,
-                };
+        // The strip, then the bar, across the top.
+        let blit = |buffer: &mut [u32], source: &paint::Pixmap, from: u32, rows: u32| {
+            for row in 0..rows {
+                let start = (from + row) as usize * viewport_width;
+                let source_start = row as usize * source.width() as usize;
+                for column in 0..viewport_width {
+                    buffer[start + column] = match source.pixels().get(source_start + column) {
+                        Some(pixel) => pack(pixel),
+                        None => 0x00ff_ffff,
+                    };
+                }
             }
-        }
+        };
+        blit(&mut buffer, strip, 0, strip_height);
+        blit(&mut buffer, chrome, strip_height, bar_height - strip_height);
 
         for row in bar_height..height.get() {
             let source_row = row - bar_height + offset;
@@ -573,9 +700,9 @@ impl App {
 
         highlight_matches(
             &mut buffer,
-            &self.matches,
-            self.current_match,
-            self.scroll,
+            &tab.matches,
+            tab.current_match,
+            tab.scroll,
             (width.get(), height.get()),
             bar_height,
         );
@@ -635,7 +762,7 @@ fn highlight_matches(
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes()
-            .with_title(self.history.current())
+            .with_title(self.tab().history.current())
             .with_inner_size(winit::dpi::LogicalSize::new(self.size.0, self.size.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
@@ -707,12 +834,30 @@ impl ApplicationHandler for App {
                 MouseButton::Left => {
                     // The bar owns the top of the window, so it gets first
                     // refusal on a click there.
-                    if self.pointer.1 < crate::chrome::HEIGHT as f32 {
+                    let strip_height = if self.tabs.len() > 1 {
+                        crate::chrome::TAB_HEIGHT as f32
+                    } else {
+                        0.0
+                    };
+                    if self.pointer.1 < strip_height {
+                        if let Some((index, on_close)) = crate::chrome::tab_at(
+                            self.tabs.len(),
+                            self.size.0 as f32,
+                            self.pointer.0,
+                            self.pointer.1,
+                        ) {
+                            if on_close {
+                                self.close_tab(index);
+                            } else {
+                                self.select_tab(index);
+                            }
+                        }
+                    } else if self.pointer.1 < self.chrome_height() as f32 {
                         match self.control_under_pointer() {
                             Some(crate::chrome::Control::Back) => self.go_back(),
                             Some(crate::chrome::Control::Forward) => self.go_forward(),
                             Some(crate::chrome::Control::ToggleLayout) => {
-                                self.forcing_authored = !self.forcing_authored;
+                                self.tab_mut().forcing_authored = !self.tab().forcing_authored;
                                 self.rerender();
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
@@ -729,6 +874,13 @@ impl ApplicationHandler for App {
                         if let Some(url) = self.link_under_pointer() {
                             self.navigate(url);
                         }
+                    }
+                }
+                // Middle-click opens a link in a new tab, which is how most
+                // people open most tabs.
+                MouseButton::Middle => {
+                    if let Some(url) = self.link_under_pointer() {
+                        self.open_tab(&url);
                     }
                 }
                 // The mouse's own back and forward buttons, which people who
@@ -751,13 +903,56 @@ impl ApplicationHandler for App {
                     self.edit_key(&event.logical_key, alt, ctrl, shift);
                     return;
                 }
-                if self.finding.is_some() {
+                if self.tab().finding.is_some() {
                     self.find_key(&event.logical_key, alt, ctrl, shift);
                     return;
                 }
                 if ctrl && matches!(&event.logical_key, Key::Character(c) if c == "f") {
                     self.open_find();
                     return;
+                }
+                if ctrl {
+                    match &event.logical_key {
+                        // A new tab shows the page you are on, which is the
+                        // only thing this browser could put there: there is no
+                        // home page and no new-tab page to fill with tiles.
+                        Key::Character(c) if c == "t" => {
+                            let url = self.tab().history.current().to_owned();
+                            self.open_tab(&url);
+                            return;
+                        }
+                        Key::Character(c) if c == "w" => {
+                            self.close_tab(self.tabs.active_index());
+                            return;
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            if shift {
+                                self.tabs.previous();
+                            } else {
+                                self.tabs.next();
+                            }
+                            self.editing = None;
+                            self.rerender();
+                            return;
+                        }
+                        // Ctrl+1..9 jumps to a tab, and Ctrl+9 is the last one
+                        // however many there are — which is the convention
+                        // everywhere and is more useful than a ninth tab.
+                        Key::Character(c) if c.len() == 1 => {
+                            if let Some(digit) = c.chars().next().and_then(|c| c.to_digit(10))
+                                && digit > 0
+                            {
+                                let index = if digit == 9 {
+                                    self.tabs.len() - 1
+                                } else {
+                                    digit as usize - 1
+                                };
+                                self.select_tab(index);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 // F3 steps through matches without reopening the field, which
                 // is how someone reads a page while searching it.
@@ -830,26 +1025,18 @@ pub fn open(
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App {
-        loaded: Loaded { html, origin, path },
-        history: crate::history::History::new(url),
+        tabs: crate::tabs::Tabs::new(Tab::new(Loaded { html, origin, path }, url)),
         fetcher: net::Fetcher::default(),
         fonts: FontStore::new(),
         window: None,
         surface: None,
-        page: None,
-        scroll: 0.0,
         size: (width.max(1), height.max(1)),
         pointer: (0.0, 0.0),
         over_link: false,
-        error: None,
         modifiers: winit::event::Modifiers::default(),
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
-        forcing_authored: false,
-        can_toggle_layout: false,
+        strip: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         editing: None,
-        finding: None,
-        matches: Vec::new(),
-        current_match: 0,
     };
     event_loop
         .run_app(&mut app)
