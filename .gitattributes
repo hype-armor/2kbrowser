@@ -1,0 +1,20 @@
+# Reference tests compare rendered pixels byte for byte across Linux, macOS,
+# and Windows against one shared baseline set (ADR-0005). That only means
+# anything if every platform checks out the same bytes, so nothing here is left
+# to the local `core.autocrlf`.
+
+# Text files keep LF in the working tree on every platform. A fixture checked
+# out with CRLF is a different document: it is longer, which shifts the
+# `<meta charset>` prescan window, and its line breaks reach the segmenter.
+* text=auto eol=lf
+
+# Baselines are compared byte for byte and must never be touched.
+*.png binary
+
+# Fonts are hashed and embedded (ADR-0008, ADR-0010).
+*.ttf binary
+*.otf binary
+
+# Deliberately not UTF-8: this fixture exists to prove a windows-1252 page
+# renders, so git must leave its bytes exactly as they are.
+tests/ref/fixtures/legacy-encoding.html binary
