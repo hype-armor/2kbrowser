@@ -141,6 +141,29 @@ impl Document {
         &self.nodes[id.0]
     }
 
+    /// The node's ancestors, nearest first.
+    pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        std::iter::successors(self.nodes[id.0].parent, |&node| self.nodes[node.0].parent)
+    }
+
+    /// The nearest `<a href>` at or above `id`.
+    ///
+    /// A click lands on the text, and the text belongs to whatever `<b>` or
+    /// `<font>` happens to wrap it; the href is further up. An `<a>` without an
+    /// href is a named destination, not something to follow.
+    pub fn enclosing_link(&self, id: NodeId) -> Option<(NodeId, &str)> {
+        std::iter::once(id)
+            .chain(self.ancestors(id))
+            .find_map(|node| {
+                let element = self.element(node)?;
+                if element.local_name() != "a" {
+                    return None;
+                }
+                let href = element.attr("href")?.trim();
+                (!href.is_empty()).then_some((node, href))
+            })
+    }
+
     /// Children of a node, in document order.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id.0].children

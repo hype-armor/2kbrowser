@@ -241,6 +241,104 @@ pub struct Layout {
     pub canvas_background: css::Color,
 }
 
+impl Layout {
+    /// The element at a point, in canvas coordinates.
+    ///
+    /// Later boxes win, which is paint order: whatever was drawn last is what
+    /// a person sees at that point and therefore what they mean to click.
+    ///
+    /// A point over text resolves to the element that *wrapped* the text, not
+    /// to the block containing it. That is the whole difficulty — an inline
+    /// element has no box, so a link only has a rectangle once the line breaker
+    /// has said where its glyphs went.
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        hit_test_box(&self.root, x, y, 0.0, 0.0)
+    }
+
+    /// Every rectangle belonging to `node`, in canvas coordinates.
+    ///
+    /// A link wrapping onto three lines has three, which is what drawing a
+    /// focus ring around it needs — one bounding box would swallow the text
+    /// either side of it on the first and last lines.
+    pub fn rects_for(&self, node: NodeId) -> Vec<Rect> {
+        let mut out = Vec::new();
+        collect_rects(&self.root, node, 0.0, 0.0, &mut out);
+        out
+    }
+}
+
+/// Depth-first, last match wins.
+fn hit_test_box(box_: &LayoutBox, x: f32, y: f32, offset_x: f32, offset_y: f32) -> Option<NodeId> {
+    let left = offset_x + box_.rect.x;
+    let top = offset_y + box_.rect.y;
+
+    // Children first and in reverse, so the last-painted match is found first.
+    for child in box_.children.iter().rev() {
+        if let Some(hit) = hit_test_box(child, x, y, left, top) {
+            return Some(hit);
+        }
+    }
+
+    if let Some(text) = &box_.text {
+        let content_x = left + box_.content_origin.0;
+        let content_y = top + box_.content_origin.1;
+        for line in &text.lines {
+            let dx = line_offset(box_.style.text_align, line.width, box_.content_width);
+            for span in &line.spans {
+                let span_x = content_x + dx + span.x;
+                let span_y = content_y + span.y;
+                if x >= span_x && x < span_x + span.width && y >= span_y && y < span_y + span.height
+                {
+                    return Some(NodeId(span.source));
+                }
+            }
+        }
+    }
+
+    // The box's own area, last: a child or a span inside it is the more
+    // specific answer and has already had its chance.
+    let inside = x >= left && x < left + box_.rect.width && y >= top && y < top + box_.rect.height;
+    if inside { box_.node } else { None }
+}
+
+fn collect_rects(
+    box_: &LayoutBox,
+    node: NodeId,
+    offset_x: f32,
+    offset_y: f32,
+    out: &mut Vec<Rect>,
+) {
+    let left = offset_x + box_.rect.x;
+    let top = offset_y + box_.rect.y;
+
+    if box_.node == Some(node) {
+        out.push(Rect {
+            x: left,
+            y: top,
+            width: box_.rect.width,
+            height: box_.rect.height,
+        });
+    }
+    if let Some(text) = &box_.text {
+        let content_x = left + box_.content_origin.0;
+        let content_y = top + box_.content_origin.1;
+        for line in &text.lines {
+            let dx = line_offset(box_.style.text_align, line.width, box_.content_width);
+            for span in line.spans.iter().filter(|span| span.source == node.0) {
+                out.push(Rect {
+                    x: content_x + dx + span.x,
+                    y: content_y + span.y,
+                    width: span.width,
+                    height: span.height,
+                });
+            }
+        }
+    }
+    for child in &box_.children {
+        collect_rects(child, node, left, top, out);
+    }
+}
+
 /// Lays out a styled document at a given viewport width.
 pub fn layout(
     doc: &Document,
@@ -686,6 +784,7 @@ fn flush_inline(
     styles: &StyleMap,
     fonts: &mut FontStore,
     pending: &mut Vec<NodeId>,
+    holder: NodeId,
     style: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
     at: (f32, f32),
@@ -698,7 +797,15 @@ fn flush_inline(
         return 0.0;
     }
     let children = std::mem::take(pending);
-    let runs = inline_runs_for(doc, styles, &children, style, intrinsic, content_width);
+    let runs = inline_runs_for(
+        doc,
+        styles,
+        &children,
+        style,
+        holder,
+        intrinsic,
+        content_width,
+    );
     if !runs
         .iter()
         .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
@@ -1068,6 +1175,7 @@ fn layout_block(
             styles,
             fonts,
             &mut pending,
+            node,
             style,
             intrinsic,
             (padding_left + border_left, cursor_y),
@@ -1126,6 +1234,7 @@ fn layout_block(
         styles,
         fonts,
         &mut pending,
+        node,
         style,
         intrinsic,
         (padding_left + border_left, cursor_y),
@@ -1682,6 +1791,7 @@ fn collect_inline_runs(
         styles,
         doc.children(node),
         inherited,
+        node,
         intrinsic,
         available_width,
     )
@@ -1697,6 +1807,7 @@ fn inline_runs_for(
     styles: &StyleMap,
     children: &[NodeId],
     inherited: &ComputedStyle,
+    holder: NodeId,
     intrinsic: &IntrinsicSizes,
     available_width: f32,
 ) -> Vec<InlineRun> {
@@ -1707,6 +1818,7 @@ fn inline_runs_for(
             styles,
             child,
             inherited,
+            holder,
             intrinsic,
             available_width,
             &mut runs,
@@ -1737,17 +1849,24 @@ fn inline_runs_for(
     runs
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
 fn gather_one(
     doc: &Document,
     styles: &StyleMap,
     child: NodeId,
     inherited: &ComputedStyle,
+    holder: NodeId,
     intrinsic: &IntrinsicSizes,
     available_width: f32,
     out: &mut Vec<InlineRun>,
 ) {
     if let Some(text) = doc.text(child) {
-        out.push(InlineRun::text(text, inherited.clone()));
+        // Text belongs to the nearest element that wraps it, not to the text
+        // node: `<a>go</a>` must hit the anchor, which is what has the href.
+        out.push(InlineRun::text(text, inherited.clone()).from_element(holder.0));
         return;
     }
     let Some(style) = styles.get(child) else {
@@ -1764,13 +1883,16 @@ fn gather_one(
         .element(child)
         .is_some_and(|element| element.local_name() == "br")
     {
-        out.push(InlineRun::text(
-            "\n",
-            ComputedStyle {
-                white_space: WhiteSpace::Pre,
-                ..style.clone()
-            },
-        ));
+        out.push(
+            InlineRun::text(
+                "\n",
+                ComputedStyle {
+                    white_space: WhiteSpace::Pre,
+                    ..style.clone()
+                },
+            )
+            .from_element(child.0),
+        );
         return;
     }
 
@@ -1815,6 +1937,7 @@ fn gather_one(
             styles,
             grandchild,
             style,
+            child,
             intrinsic,
             available_width,
             out,
@@ -3289,5 +3412,153 @@ mod tests {
         assert_eq!(line_offset(TextAlign::Right, 100.0, 500.0), 400.0);
         // A line wider than its box never produces a negative offset.
         assert_eq!(line_offset(TextAlign::Center, 700.0, 500.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    struct Page {
+        doc: Document,
+        layout: Layout,
+    }
+
+    fn page(html: &str, css_text: &str) -> Page {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let layout = layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 600.0);
+        Page { doc, layout }
+    }
+
+    /// The first rectangle belonging to the element with this tag.
+    fn rect_of(page: &Page, tag: &str) -> Rect {
+        let node = page.doc.find_element(tag).expect("element present");
+        *page
+            .layout
+            .rects_for(node)
+            .first()
+            .unwrap_or_else(|| panic!("<{tag}> has no rectangle"))
+    }
+
+    #[test]
+    fn a_point_over_a_link_finds_the_link() {
+        // The point lands on text, and that text belongs to the anchor — not
+        // to the paragraph containing it. Without spans there is nothing to
+        // hit at all: an inline element has no box.
+        let page = page(
+            r#"<body><p>before <a href="x.html">the link</a> after</p></body>"#,
+            "body { margin: 0 }",
+        );
+        let link = page.doc.find_element("a").expect("an anchor");
+        let rect = rect_of(&page, "a");
+        let hit = page
+            .layout
+            .hit_test(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        assert_eq!(hit, Some(link));
+    }
+
+    #[test]
+    fn a_point_beside_a_link_does_not() {
+        let page = page(
+            r#"<body><p>before <a href="x.html">link</a> after</p></body>"#,
+            "body { margin: 0 }",
+        );
+        let link = page.doc.find_element("a").expect("an anchor");
+        let rect = rect_of(&page, "a");
+        // Just past its right edge, still on the same line.
+        let hit = page
+            .layout
+            .hit_test(rect.x + rect.width + 6.0, rect.y + rect.height / 2.0);
+        assert_ne!(hit, Some(link));
+    }
+
+    #[test]
+    fn a_hit_inside_a_link_resolves_to_the_link_itself() {
+        // The text belongs to the `<b>`, and the href is on the `<a>` above it.
+        let page = page(
+            r#"<body><p><a href="x.html"><b>bold link</b></a></p></body>"#,
+            "body { margin: 0 }",
+        );
+        let rect = rect_of(&page, "b");
+        let hit = page
+            .layout
+            .hit_test(rect.x + 2.0, rect.y + rect.height / 2.0)
+            .expect("something under the point");
+        let (link, href) = page
+            .doc
+            .enclosing_link(hit)
+            .expect("a link encloses the hit");
+        assert_eq!(link, page.doc.find_element("a").expect("an anchor"));
+        assert_eq!(href, "x.html");
+    }
+
+    #[test]
+    fn a_named_anchor_is_not_a_link() {
+        // It is a destination. Reporting it as clickable invites a click that
+        // does nothing.
+        let page = page(
+            r#"<body><p><a name="here">destination</a></p></body>"#,
+            "body { margin: 0 }",
+        );
+        let anchor = page.doc.find_element("a").expect("an anchor");
+        assert!(page.doc.enclosing_link(anchor).is_none());
+    }
+
+    #[test]
+    fn a_wrapped_link_has_a_rectangle_per_line() {
+        // One bounding box would swallow the text either side of it on the
+        // first and last lines, which is wrong to click and wrong to draw.
+        let page = page(
+            r#"<body><p>lead in <a href="x.html">a link long enough that it has to
+               wrap across more than one line of this paragraph</a> and out</p></body>"#,
+            "body { margin: 0 } p { width: 200px }",
+        );
+        let link = page.doc.find_element("a").expect("an anchor");
+        let rects = page.layout.rects_for(link);
+        assert!(rects.len() > 1, "got {} rectangles", rects.len());
+        // Every one of them is a live target.
+        for rect in &rects {
+            let hit = page
+                .layout
+                .hit_test(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            assert_eq!(hit, Some(link), "missed the fragment at {rect:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_is_hit_where_it_is_drawn() {
+        let mut sizes = IntrinsicSizes::new();
+        let doc = dom::parse(r#"<body><p>text <a href="x.html"><img src="i.png"></a></p></body>"#);
+        let image = doc.find_element("img").expect("img");
+        sizes.insert(image, (40.0, 40.0));
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
+        let mut fonts = FontStore::new();
+        let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 600.0);
+
+        let rect = *laid_out
+            .rects_for(image)
+            .first()
+            .expect("the image has a rectangle");
+        let hit = laid_out
+            .hit_test(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+            .expect("something under the image");
+        assert_eq!(
+            doc.enclosing_link(hit).map(|(node, _)| node),
+            doc.find_element("a"),
+            "an image inside a link is part of the link"
+        );
+    }
+
+    #[test]
+    fn a_point_past_the_content_hits_nothing_clickable() {
+        let page = page(
+            r#"<body><p><a href="x.html">link</a></p></body>"#,
+            "body { margin: 0 }",
+        );
+        let hit = page.layout.hit_test(590.0, 2000.0);
+        assert!(hit.is_none() || page.doc.enclosing_link(hit.expect("hit")).is_none());
     }
 }

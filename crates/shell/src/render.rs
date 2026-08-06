@@ -10,6 +10,25 @@ use net::{Fetcher, Origin, RequestKind};
 use paint::{ImageStore, Pixmap, build_display_list, rasterise};
 use text::FontStore;
 
+/// One document occupying a rectangle of the canvas.
+///
+/// An ordinary page has exactly one, covering the whole canvas. A frameset has
+/// one per frame, and they are genuinely separate documents — a link in a frame
+/// resolves against *that* frame's URL, not the frameset's, which is why the
+/// origin and path travel with it rather than sitting on the page.
+pub struct Frame {
+    /// Where this document sits on the canvas.
+    pub rect: layout::Rect,
+    /// The parsed document.
+    pub doc: dom::Document,
+    /// Its layout, in the frame's own coordinates.
+    pub layout: layout::Layout,
+    /// Origin it was fetched from, for resolving links inside it.
+    pub origin: Origin,
+    /// Path it was fetched from.
+    pub path: String,
+}
+
 /// A rendered page.
 pub struct Page {
     /// The rasterised canvas.
@@ -20,6 +39,61 @@ pub struct Page {
     pub content_height: f32,
     /// How many images were fetched and decoded.
     pub images_loaded: usize,
+    /// The documents on this canvas, in paint order.
+    pub frames: Vec<Frame>,
+}
+
+impl Page {
+    /// The absolute URL of the link at a point, in canvas coordinates.
+    ///
+    /// Resolved here rather than handed back raw because the answer depends on
+    /// which frame was hit, and the caller has no way to know that.
+    pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
+        // Reverse order: later frames are painted over earlier ones.
+        for frame in self.frames.iter().rev() {
+            if x < frame.rect.x
+                || x >= frame.rect.x + frame.rect.width
+                || y < frame.rect.y
+                || y >= frame.rect.y + frame.rect.height
+            {
+                continue;
+            }
+            let hit = frame.layout.hit_test(x - frame.rect.x, y - frame.rect.y)?;
+            let (_, href) = frame.doc.enclosing_link(hit)?;
+            // A fragment alone is a destination within this document, not a
+            // navigation; there is nothing to fetch.
+            if href.starts_with('#') {
+                return None;
+            }
+            return Some(net::resolve(&frame.origin, &frame.path, href));
+        }
+        None
+    }
+
+    /// Every link rectangle on the canvas, with the URL it leads to.
+    ///
+    /// What a keyboard-first browser needs: something to number, highlight, and
+    /// jump between without a pointer ever being involved.
+    pub fn links(&self) -> Vec<(layout::Rect, String)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                let Some((link, href)) = frame.doc.enclosing_link(node) else {
+                    continue;
+                };
+                if link != node || href.starts_with('#') {
+                    continue;
+                }
+                let url = net::resolve(&frame.origin, &frame.path, href);
+                for mut rect in frame.layout.rects_for(node) {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((rect, url.clone()));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Renders HTML at a given viewport width.
@@ -123,11 +197,36 @@ fn render_sized(
     let pixmap = rasterise(&list, fonts, &images, width, height)
         .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
+    // The whole canvas is one document. `base` is what a link inside it
+    // resolves against; without one there is nothing to resolve against and
+    // nothing to navigate to, so the frame carries no link geometry.
+    let content_height = laid_out.height;
+    let frames = match base {
+        Some((origin, path)) => vec![Frame {
+            rect: layout::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                // The whole canvas, and the whole content if that is taller:
+                // a frame shorter than its cell must still be clickable to the
+                // bottom of the cell, and a page taller than its canvas must
+                // still be clickable once scrolled.
+                height: content_height.max(height as f32),
+            },
+            doc,
+            layout: laid_out,
+            origin: origin.clone(),
+            path: path.to_owned(),
+        }],
+        None => Vec::new(),
+    };
+
     Page {
         pixmap,
         mode,
-        content_height: laid_out.height,
+        content_height,
         images_loaded: images.len(),
+        frames,
     }
 }
 
@@ -187,6 +286,7 @@ fn render_frameset(
 
     let fetcher = Fetcher::default();
     let mut loaded = 0usize;
+    let mut frames: Vec<Frame> = Vec::new();
 
     for (child, cell) in children.iter().zip(cells) {
         let (x, y, cell_width, cell_height) = cell;
@@ -242,6 +342,15 @@ fn render_frameset(
             paint::Transform::identity(),
             None,
         );
+
+        // The sub-page's frames move into this one's coordinates. A nested
+        // frameset arrives with several of its own, already flattened, so the
+        // depth of the nesting does not reach the caller.
+        frames.extend(sub.frames.into_iter().map(|mut frame| {
+            frame.rect.x += x;
+            frame.rect.y += y;
+            frame
+        }));
     }
 
     Page {
@@ -249,6 +358,7 @@ fn render_frameset(
         mode: RenderMode::Authored,
         content_height: height as f32,
         images_loaded: loaded,
+        frames,
     }
 }
 

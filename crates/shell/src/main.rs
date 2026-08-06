@@ -16,11 +16,15 @@ const USAGE: &str = "\
 USAGE:
     2kbrowser open   <url-or-file> [--width <px>] [--height <px>]
     2kbrowser render <url-or-file> [--out <file.png>] [--width <px>] [--height <px>]
+    2kbrowser links  <url-or-file> [--width <px>]
 
 OPTIONS:
     --out <path>     Where to write the PNG (render only; default: page.png)
     --width <px>     Viewport width (default: 800)
     --height <px>    Window height, or maximum canvas height for render
+
+`links` lists every link on the page with the rectangle you would click to
+follow it — the same geometry the window uses, printed instead of drawn.
 
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
@@ -31,6 +35,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("render") => report(run_render(&args[1..])),
+        Some("links") => report(run_links(&args[1..])),
         Some("open") => report(run_open(&args[1..])),
         Some("--help" | "-h" | "help") | None => {
             println!("{USAGE}");
@@ -110,6 +115,42 @@ impl Options {
         }
         Ok(options)
     }
+}
+
+/// Lists the page's links and where each one is.
+///
+/// The window will draw these; printing them is how the geometry gets tested
+/// without a display, and how you check that a link on a real page is where it
+/// looks like it is.
+fn run_links(args: &[String]) -> Result<String, String> {
+    let options = Options::parse(args)?;
+    let input = options.input.ok_or("no input given")?;
+    let resource = load(&input)?;
+
+    let mut fonts = FontStore::new();
+    let page = render::render_with_base(
+        &resource.body,
+        options.width,
+        options.height,
+        &mut fonts,
+        Some((&resource.origin, &resource.path)),
+    );
+
+    let links = page.links();
+    if links.is_empty() {
+        return Ok("no links on this page".to_owned());
+    }
+    let mut message = format!("{} link rectangle(s):", links.len());
+    for (rect, url) in links {
+        message.push_str(&format!(
+            "\n  {:>5},{:<5} {:>4}x{:<4}  {url}",
+            rect.x.round(),
+            rect.y.round(),
+            rect.width.round(),
+            rect.height.round(),
+        ));
+    }
+    Ok(message)
 }
 
 fn run_render(args: &[String]) -> Result<String, String> {

@@ -1803,6 +1803,7 @@ dependencies = [
  "paint",
  "softbuffer",
  "text",
+ "tiny-skia",
  "winit",
 ]
 

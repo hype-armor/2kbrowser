@@ -154,6 +154,27 @@ impl Policy {
     }
 }
 
+/// Whether a URL reference names its own scheme, and so is already absolute.
+///
+/// Not a test for `://`: `mailto:` and `tel:` have no authority, and treating
+/// them as relative paths glues them onto the document's directory and produces
+/// nonsense like `file:///pages/mailto:someone@example.com`.
+///
+/// RFC 3986's rule, which means a relative path whose first segment contains a
+/// colon really is read as a scheme — that is why such a path has to be written
+/// `./odd:name.html`, and browsers agree.
+pub fn has_scheme(reference: &str) -> bool {
+    let Some(colon) = reference.find(':') else {
+        return false;
+    };
+    let scheme = &reference[..colon];
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// Converts a URL path into a filesystem path.
 ///
 /// The canonical `file:` URL for a Windows path carries a leading slash before
@@ -253,7 +274,7 @@ pub fn parse_url(url: &str) -> Result<(Origin, String), Refusal> {
 /// wrong resource, so the cases it does handle are tested.
 pub fn resolve(base: &Origin, base_path: &str, relative: &str) -> String {
     let relative = relative.trim();
-    if relative.contains("://") {
+    if has_scheme(relative) {
         return relative.to_owned();
     }
     let scheme = match base.scheme {
@@ -679,5 +700,59 @@ mod windows_path_tests {
             resolve(&origin, &path, "../images/x.png"),
             "file:///D:/site/images/x.png"
         );
+    }
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    use super::*;
+
+    fn resolve_from(base_url: &str, reference: &str) -> String {
+        let (origin, path) = parse_url(base_url).expect("parses");
+        resolve(&origin, &path, reference)
+    }
+
+    #[test]
+    fn a_scheme_without_an_authority_is_still_absolute() {
+        // `mailto:` has no `//`, so testing for `://` reads it as a relative
+        // path and glues it onto the document's directory.
+        for reference in [
+            "mailto:someone@example.com",
+            "tel:+15551234",
+            "data:text/plain,hi",
+            "javascript:void(0)",
+        ] {
+            assert_eq!(
+                resolve_from("https://example.com/pages/a.html", reference),
+                reference,
+                "mangled {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_relative_references_are_still_relative() {
+        assert_eq!(
+            resolve_from("https://example.com/pages/a.html", "b.html"),
+            "https://example.com/pages/b.html"
+        );
+        assert_eq!(
+            resolve_from("https://example.com/pages/a.html", "/c.html"),
+            "https://example.com/c.html"
+        );
+        assert_eq!(
+            resolve_from("https://example.com/pages/a.html", "../d.html"),
+            "https://example.com/d.html"
+        );
+    }
+
+    #[test]
+    fn a_scheme_must_look_like_one() {
+        assert!(has_scheme("https://example.com"));
+        assert!(has_scheme("mailto:x@y"));
+        assert!(!has_scheme("no-colon-here.html"));
+        // A scheme cannot start with a digit, and this is a port, not a scheme.
+        assert!(!has_scheme("8080:something"));
+        assert!(!has_scheme(":leading-colon"));
     }
 }

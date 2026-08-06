@@ -16,7 +16,15 @@ use tiny_skia::{FillRule, Paint, PathBuilder};
 pub use images::{DecodedImage, ImageKey, ImageSlot, ImageStore, decode};
 // Re-exported for consumers that composite pixmaps of their own, such as the
 // frameset renderer.
-pub use tiny_skia::{Color as RasterColor, Pixmap, PixmapPaint, Transform};
+pub use tiny_skia::{
+    Color as RasterColor, Pixmap, PixmapPaint, PremultipliedColorU8 as PremultipliedColor,
+    Transform,
+};
+
+/// An opaque magenta, for debugging overlays: nothing on a real page is this.
+pub fn magenta() -> PremultipliedColor {
+    PremultipliedColor::from_rgba(255, 0, 255, 255).expect("opaque magenta is valid")
+}
 
 /// One paint operation.
 ///

@@ -133,6 +133,26 @@ pub struct PlacedReplaced {
     pub height: f32,
 }
 
+/// A stretch of one line that came from a single element.
+///
+/// What turns a point into the thing under it. An inline element has no box of
+/// its own — its text lives in the containing block's line boxes — so without
+/// this there is nothing to hit: a link is not a rectangle anywhere until the
+/// line breaker says where its glyphs ended up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InlineSpan {
+    /// The caller's identifier for the element this came from.
+    pub source: usize,
+    /// Left edge, relative to the text origin.
+    pub x: f32,
+    /// Width of the stretch.
+    pub width: f32,
+    /// Top edge, relative to the text origin.
+    pub y: f32,
+    /// Height of the line it sits on.
+    pub height: f32,
+}
+
 /// A run of text with its own style, within a block's inline content.
 #[derive(Debug, Clone)]
 pub struct InlineRun {
@@ -143,6 +163,8 @@ pub struct InlineRun {
     /// Set when this run is an atomic inline box rather than text, in which
     /// case `text` is ignored.
     pub replaced: Option<ReplacedInline>,
+    /// The element this run's text came from, for hit testing.
+    pub source: Option<usize>,
 }
 
 impl InlineRun {
@@ -152,7 +174,15 @@ impl InlineRun {
             text: text.into(),
             style,
             replaced: None,
+            source: None,
         }
+    }
+
+    /// Names the element this run came from, so a point can be traced back to
+    /// it later.
+    pub fn from_element(mut self, source: usize) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// A run that is one atomic inline box.
@@ -163,6 +193,7 @@ impl InlineRun {
             text: String::new(),
             style,
             replaced: Some(box_),
+            source: Some(box_.id),
         }
     }
 }
@@ -193,6 +224,8 @@ pub struct Line {
     pub glyphs: Vec<PositionedGlyph>,
     /// Atomic inline boxes sitting on this line.
     pub replaced: Vec<PlacedReplaced>,
+    /// Which element each stretch of this line came from.
+    pub spans: Vec<InlineSpan>,
     /// Rules under, over, and through this line's text.
     pub decorations: Vec<DecorationRun>,
     /// Width of the line's inked content.
@@ -229,6 +262,8 @@ struct Segment {
     shaped: Shaped,
     /// Set when this segment is an atomic inline box rather than text.
     replaced: Option<ReplacedInline>,
+    /// The element this segment's text came from.
+    source: Option<usize>,
     /// Width of collapsed whitespace following this segment.
     trailing_space: f32,
     /// Whether a line break is required after this segment.
@@ -439,7 +474,7 @@ impl FontStore {
             let fits = current.is_empty() || x + segment.shaped.width <= available;
             if !fits {
                 let (offset, _) = constraints(y, line_height);
-                Self::push_line(&mut layout, &mut current, offset, y, ascent);
+                Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
                 line_height = default_style.line_height;
@@ -460,7 +495,7 @@ impl FontStore {
             // line regardless of how much room is left.
             if forced {
                 let (offset, _) = constraints(y, line_height);
-                Self::push_line(&mut layout, &mut current, offset, y, ascent);
+                Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
                 line_height = default_style.line_height;
@@ -471,7 +506,7 @@ impl FontStore {
 
         if !current.is_empty() {
             let (offset, _) = constraints(y, line_height);
-            Self::push_line(&mut layout, &mut current, offset, y, ascent);
+            Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
             y += line_height;
         }
 
@@ -490,6 +525,7 @@ impl FontStore {
         offset: f32,
         line_y: f32,
         ascent: f32,
+        line_height: f32,
     ) {
         let mut glyphs = Vec::new();
         let mut width = 0.0f32;
@@ -511,11 +547,45 @@ impl FontStore {
         layout.lines.push(Line {
             glyphs,
             replaced: Self::replaced_for(current, offset, line_y, ascent),
+            spans: Self::spans_for(current, offset, line_y, line_height),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
             width,
             baseline: ascent,
         });
         current.clear();
+    }
+
+    /// Merges the line's segments into one span per element.
+    ///
+    /// Adjacent segments from the same element become one stretch, so a link
+    /// of several words is one target rather than one per word — and so the
+    /// space between those words is inside it, which is where a pointer
+    /// travelling along a link spends much of its time.
+    fn spans_for(
+        segments: &[Segment],
+        offset: f32,
+        line_y: f32,
+        line_height: f32,
+    ) -> Vec<InlineSpan> {
+        let mut out: Vec<InlineSpan> = Vec::new();
+        for segment in segments {
+            let Some(source) = segment.source else {
+                continue;
+            };
+            let left = segment.x + offset;
+            let right = left + segment.shaped.width;
+            match out.last_mut() {
+                Some(last) if last.source == source => last.width = right - last.x,
+                _ => out.push(InlineSpan {
+                    source,
+                    x: left,
+                    width: right - left,
+                    y: line_y,
+                    height: line_height,
+                }),
+            }
+        }
+        out
     }
 
     /// Places one line's atomic inline boxes.
@@ -651,6 +721,7 @@ impl FontStore {
                     mandatory_break: false,
                     x: 0.0,
                     replaced: Some(box_),
+                    source: run.source,
                     decoration: run.style.text_decoration,
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
@@ -717,6 +788,7 @@ impl FontStore {
                             mandatory_break: true,
                             x: 0.0,
                             replaced: None,
+                            source: run.source,
                             decoration: run.style.text_decoration,
                             font_size: run.style.font_size,
                             color: span_color(&run.style),
@@ -732,6 +804,7 @@ impl FontStore {
                     mandatory_break: mandatory,
                     x: 0.0,
                     replaced: None,
+                    source: run.source,
                     decoration: run.style.text_decoration,
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
