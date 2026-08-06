@@ -37,16 +37,38 @@ const WHEEL_LINE_HEIGHT: f32 = 40.0;
 /// a scheme is left alone, and anything that looks like a path is treated as
 /// one.
 fn entered_url(typed: &str) -> String {
+    // The drive check comes first, because `C:` satisfies every rule for a
+    // scheme and is not one.
+    if net::policy::is_drive_path(typed) || typed.starts_with('/') {
+        return net::file_url(std::path::Path::new(typed));
+    }
+    // A relative path is relative to *something*, and a `file:` URL has no
+    // notion of a working directory — so it is made absolute here rather than
+    // pasted into a URL that would then be read from the filesystem root.
+    if typed.starts_with('.') {
+        return net::file_url(&absolute_from_cwd(typed));
+    }
     if net::policy::has_scheme(typed) {
         return typed.to_owned();
-    }
-    if typed.starts_with('/') || typed.starts_with('.') {
-        return format!("file://{typed}");
     }
     // https, not http: the browser should not quietly downgrade what it
     // reaches for, even though it will happily show a page that is only
     // available over http when a link leads there (ADR-0006).
     format!("https://{typed}")
+}
+
+/// Resolves a relative path against the process's working directory.
+///
+/// `./a.html` next to `a.html` is the same file, and the leading `./` is noise
+/// in a URL; `../` is not, and is left for the filesystem to walk.
+fn absolute_from_cwd(typed: &str) -> std::path::PathBuf {
+    let trimmed = typed.trim_start_matches("./");
+    match std::env::current_dir() {
+        Ok(dir) => dir.join(trimmed),
+        // Nothing to resolve against. The path stands as it is, which is what
+        // it would have meant anyway.
+        Err(_) => std::path::PathBuf::from(typed),
+    }
 }
 
 /// Packs a rendered pixel for softbuffer.
@@ -563,7 +585,7 @@ impl App {
             .unwrap_or(Ok(()))
             .and_then(|()| std::fs::write(&path, html));
         match written {
-            Ok(()) => self.open_tab(&format!("file://{}", path.display())),
+            Ok(()) => self.open_tab(&net::file_url(&path)),
             Err(error) => {
                 self.tab_mut().error = Some(format!("could not write the saved list: {error}"));
                 self.refresh_chrome();
@@ -1383,7 +1405,39 @@ mod entered_url_tests {
     #[test]
     fn a_path_becomes_a_file_url() {
         assert_eq!(entered_url("/home/user/a.html"), "file:///home/user/a.html");
-        assert_eq!(entered_url("./a.html"), "file://./a.html");
+    }
+
+    #[test]
+    fn a_relative_path_is_made_absolute() {
+        // A `file:` URL has no working directory. Pasting `./a.html` into one
+        // gives `file:///./a.html`, which is read from the filesystem root —
+        // it looks right and finds nothing.
+        let here = std::env::current_dir().expect("a working directory");
+        let expected = net::file_url(&here.join("a.html"));
+        assert_eq!(entered_url("./a.html"), expected);
+        assert_eq!(entered_url("./a.html"), entered_url("./././a.html"));
+
+        // `..` is a real step and is left for the filesystem to walk.
+        assert_eq!(
+            entered_url("../a.html"),
+            net::file_url(&here.join("../a.html"))
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_is_not_a_scheme() {
+        // `C:` looks enough like one to be treated as one, and the result —
+        // `https://C:\dir\a.html` — is not a host, is not reachable, and gives
+        // no clue why.
+        assert_eq!(
+            entered_url(r"C:\Users\reader\a.html"),
+            "file:///C:/Users/reader/a.html"
+        );
+        assert_eq!(entered_url("D:/site/a.html"), "file:///D:/site/a.html");
+        // A real scheme is still a real scheme, and a bare host is still a
+        // host: neither has a drive letter's shape.
+        assert_eq!(entered_url("https://example.com/"), "https://example.com/");
+        assert_eq!(entered_url("example.com"), "https://example.com");
     }
 }
 

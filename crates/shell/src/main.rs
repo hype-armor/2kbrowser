@@ -263,7 +263,10 @@ fn load_from(input: &str) -> Result<(net::Resource, String), String> {
 /// A bare path is taken as a file, which is what someone typing a filename
 /// means; anything naming a scheme is left alone.
 fn absolute_url(input: &str) -> Result<String, String> {
-    if net::policy::has_scheme(input) {
+    // Before the scheme test: `C:` satisfies every rule for a scheme, so a
+    // Windows path given on the command line would otherwise be handed
+    // straight to the URL parser, which wants a `://` it does not have.
+    if !net::policy::is_drive_path(input) && net::policy::has_scheme(input) {
         return Ok(input.to_owned());
     }
     let path = std::path::Path::new(input);
@@ -274,7 +277,7 @@ fn absolute_url(input: &str) -> Result<String, String> {
             .map_err(|e| e.to_string())?
             .join(path)
     };
-    Ok(format!("file://{}", absolute.display()))
+    Ok(net::file_url(&absolute))
 }
 
 fn take(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {

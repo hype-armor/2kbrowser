@@ -7,7 +7,9 @@
 pub mod encoding;
 pub mod policy;
 
-pub use policy::{Origin, Policy, Refusal, RequestKind, Scheme, parse_url, resolve};
+pub use policy::{
+    Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path, parse_url, resolve,
+};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

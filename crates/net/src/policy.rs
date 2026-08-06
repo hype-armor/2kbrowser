@@ -193,6 +193,40 @@ pub fn to_file_path(url_path: &str) -> &str {
     }
 }
 
+/// Whether this is a Windows path beginning with a drive letter.
+///
+/// A drive letter is not a scheme, however exactly `C:` fits the definition of
+/// one — [`has_scheme`] says yes to it, correctly by RFC 3986 and uselessly in
+/// practice. Anything deciding "is this a URL or a path?" has to ask this
+/// first, or a Windows path becomes a URL with a one-letter scheme and fails
+/// somewhere further on with nothing to explain it.
+///
+/// One letter, deliberately: `http:` is not a drive and never was.
+pub fn is_drive_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+/// The canonical `file:` URL for a filesystem path.
+///
+/// `format!("file://{}", path.display())` is the obvious thing to write and is
+/// wrong on Windows twice over: the separators are backslashes, and the drive
+/// letter lands where the authority goes, so the URL has two slashes where the
+/// canonical form has three. Both are invisible on Unix, where the leading `/`
+/// of an absolute path supplies the third slash and there are no backslashes to
+/// convert — which is exactly why this kept being written by hand and kept
+/// being wrong on one platform.
+///
+/// The result round-trips: [`parse_url`] then [`to_file_path`] gives back a
+/// path that opens.
+pub fn file_url(path: &std::path::Path) -> String {
+    let separated = path.display().to_string().replace('\\', "/");
+    format!("file:///{}", separated.trim_start_matches('/'))
+}
+
 /// Parses a URL into an origin plus its path.
 ///
 /// A deliberately small parser covering the schemes we support, rather than a
@@ -691,6 +725,47 @@ mod windows_path_tests {
             resolve(&origin, &path, "assets/logo.png"),
             "file:///home/user/pages/assets/logo.png"
         );
+    }
+
+    #[test]
+    fn a_drive_letter_is_not_a_scheme() {
+        // `has_scheme` says yes to `C:`, correctly by RFC 3986 and uselessly in
+        // practice — so anything deciding "URL or path?" has to ask this first.
+        assert!(has_scheme(r"C:\Users\reader\a.html"), "the trap");
+        assert!(is_drive_path(r"C:\Users\reader\a.html"));
+        assert!(is_drive_path("D:/site/a.html"));
+
+        // One letter only: these are schemes, not drives.
+        assert!(!is_drive_path("http://example.com/"));
+        assert!(!is_drive_path("file:///a.html"));
+        // And these are not either.
+        assert!(!is_drive_path("/home/user/a.html"));
+        assert!(!is_drive_path("example.com"));
+        assert!(!is_drive_path("C:"), "a drive with no path is not one");
+    }
+
+    #[test]
+    fn a_path_becomes_a_url_that_resolves_against_itself() {
+        // The check that matters: whatever `file_url` produces has to be
+        // something `parse_url` and `resolve` agree with, on both shapes of
+        // path. Anything else and a link beside the document lands elsewhere.
+        for (path, expected) in [
+            (r"C:\site\pages\a.html", "file:///C:/site/pages/a.html"),
+            ("/home/user/pages/a.html", "file:///home/user/pages/a.html"),
+        ] {
+            let url = file_url(std::path::Path::new(path));
+            assert_eq!(url, expected);
+
+            let (origin, at) = parse_url(&url).expect("parses");
+            let sibling = resolve(&origin, &at, "b.html");
+            assert_eq!(sibling, expected.replace("a.html", "b.html"));
+            // And what comes back opens: the drive letter loses its URL slash,
+            // the Unix path keeps its own.
+            assert_eq!(
+                to_file_path(&parse_url(&sibling).expect("parses").1),
+                path.replace('\\', "/").replace("a.html", "b.html")
+            );
+        }
     }
 
     #[test]

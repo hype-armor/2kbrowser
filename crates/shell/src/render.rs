@@ -842,7 +842,12 @@ mod link_geometry_tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join(name);
         std::fs::write(&path, html).expect("write");
-        let url = format!("file://{}", path.display());
+        // Through `net::file_url` rather than pasting the OS path after
+        // `file://`. On Windows a path is `C:\dir\a.html`, and splitting that
+        // on `/` to get the document's directory finds the second slash of
+        // `file://` and yields `file:/` — so the value this test compares
+        // against was nonsense on one platform and right on the other two.
+        let url = net::file_url(&path);
         let (origin, path) = net::parse_url(&url).expect("parses");
 
         let mut fonts = FontStore::new();
