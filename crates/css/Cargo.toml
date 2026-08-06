@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+cssparser = "0.37"
+dom = { path = "../dom" }
+
 [lints]
 workspace = true
