@@ -1,0 +1,15 @@
+# Architecture decision records
+
+Short, numbered, immutable records of decisions that constrain future work. See
+[ADR-0001](0001-record-architecture-decisions.md) for the format and the rule
+that ADRs are superseded rather than edited.
+
+| # | Decision | Status |
+| --- | --- | --- |
+| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | accepted |
+| [0002](0002-rust-and-no-unsafe.md) | Rust, with `unsafe` forbidden in our own code | accepted |
+| [0003](0003-no-javascript.md) | No JavaScript | accepted |
+| [0004](0004-css-21-scope-boundary.md) | CSS 2.1 is the scope boundary | accepted |
+| [0005](0005-deterministic-rendering.md) | CPU rasterisation and bundled fonts | accepted |
+| [0006](0006-network-policy-defaults.md) | Network policy defaults | accepted |
+| [0007](0007-dependency-posture.md) | Dependency posture | accepted |

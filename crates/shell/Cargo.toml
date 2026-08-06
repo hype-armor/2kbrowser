@@ -1,0 +1,13 @@
+[package]
+name = "shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "2kbrowser"
+path = "src/main.rs"
+
+[lints]
+workspace = true

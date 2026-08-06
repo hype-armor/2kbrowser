@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Linux, macOS, and Windows are all first-class from M1 (ADR-0005), so the
+  # matrix is not "Linux plus two afterthoughts" — a failure on any of the three
+  # is a failure. No third-party actions: rustup honours rust-toolchain.toml and
+  # installs the pinned components on its own.
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # Budgets run on every platform: binary size is platform-dependent, and a
+      # regression on one target is still a regression.
+      - name: Budgets
+        run: cargo run --release -p budgets

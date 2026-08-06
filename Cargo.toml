@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests/budgets"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+# Applied to every workspace crate via `[lints] workspace = true`.
+#
+# `unsafe_code = "forbid"` is deliberate and load-bearing: this program's entire
+# job is parsing hostile bytes from the open internet. `forbid` cannot be
+# overridden by an `#[allow]` in source, so relaxing it requires editing this
+# file — a reviewable diff rather than a quiet local exception. See ADR-0002.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Size is a tracked budget (see tests/budgets), so the release profile is tuned
+# for it rather than left at defaults.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
