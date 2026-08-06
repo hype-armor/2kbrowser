@@ -326,22 +326,25 @@ decides; the browser explains its reasoning.
 
 ## 9. Open questions
 
-Resolved: the meaning of "2k" (§2), the JavaScript decision (§1), and platform
-priority (§3). Remaining:
+Resolved: the meaning of "2k" (§2), the JavaScript decision (§1), platform
+priority (§3), and which fonts to bundle (§3, ADR-0008).
 
-1. **How period-authentic should the chrome be?** §2 settles the engine's era;
-   it does not settle whether M3's UI should *look* like 2000 (beveled buttons,
-   throbber, status bar) or be a clean modern shell around a period engine.
-   Affects M3 only, but affects all of it.
-2. **Reader mode earlier than M5?** Per the second risk in §8, it may be the
-   thing that makes the browser usable on the modern web at all, which would
-   argue for M3.
-3. **Legacy TLS.** Old sites that are still up often support only outdated TLS
-   that `rustls` will refuse by default. Do we allow a marked, opt-in downgrade
-   for them, or accept that those sites are unreachable?
-4. **Dependency posture.** §3 takes a pragmatic line. A stricter
-   near-zero-dependency stance is defensible but roughly doubles M1 and M2 and
-   moves shaping and TLS in-house, which is not recommended.
+Everything still open is tracked as a GitHub issue rather than listed here, so
+that it has one home and can be closed:
+
+| # | Question | Blocks |
+| --- | --- | --- |
+| [1](https://github.com/hype-armor/2kbrowser/issues/1) | Period-authentic chrome, or a modern shell? | M3 |
+| [2](https://github.com/hype-armor/2kbrowser/issues/2) | Move reader mode earlier than M5? | M3 |
+| [3](https://github.com/hype-armor/2kbrowser/issues/3) | Legacy TLS: marked downgrade, or unreachable? | M4 |
+| [4](https://github.com/hype-armor/2kbrowser/issues/4) | Revisit dependency posture? | nothing |
+| [5](https://github.com/hype-armor/2kbrowser/issues/5) | No metric-compatible clone for Verdana/Tahoma | nothing |
+| [6](https://github.com/hype-armor/2kbrowser/issues/6) | `cursive`/`fantasy` resolve to sans-serif | nothing |
+| [7](https://github.com/hype-armor/2kbrowser/issues/7) | Vendor fonts in git, or fetch with pinned checksums? | M1 |
+| [8](https://github.com/hype-armor/2kbrowser/issues/8) | Per-script optional font payloads | release |
+
+None of these block starting M1 except #7, which only needs answering when the
+text stack lands rather than at the start of the milestone.
 
 ---
 
