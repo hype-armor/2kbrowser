@@ -732,7 +732,7 @@ fn layout_block(
     }
 
     if style.display == Display::Table {
-        let table_height = layout_table(
+        let (table_width, table_height) = layout_table(
             doc,
             styles,
             fonts,
@@ -745,6 +745,12 @@ fn layout_block(
             &mut box_,
         );
         box_.rect.height = padding_top + border_top + table_height + padding_bottom + border_bottom;
+        // A table with no declared width shrinks to fit its columns, and so
+        // must its box: left at the container's width, its border and
+        // background stretch across the page while the cells huddle at one end.
+        if style.width == Length::Auto {
+            box_.rect.width = (table_width + surround).min(outer_width);
+        }
         let outer = box_.outer_height(font_size);
         parent.children.push(box_);
         return outer;
@@ -1009,11 +1015,17 @@ fn layout_table(
     y: f32,
     available_width: f32,
     parent: &mut LayoutBox,
-) -> f32 {
+) -> (f32, f32) {
     let grid = table::build_grid(doc, styles, node);
     if grid.columns == 0 {
-        return 0.0;
+        return (0.0, 0.0);
     }
+    // `border-spacing` is the table's own, not a constant: `cellspacing="0"`
+    // is how a table used for page layout closed the seams between its cells.
+    let spacing = style
+        .border_spacing
+        .to_px(style.font_size, available_width)
+        .max(0.0);
 
     // Intrinsic widths per column, from the cells that span exactly one.
     let mut mins = vec![0.0f32; grid.columns];
@@ -1054,11 +1066,11 @@ fn layout_table(
         }
     }
     for (column, colspan, min, max) in spans {
-        table::apply_span(&mut mins, column, colspan, min);
-        table::apply_span(&mut maxes, column, colspan, max);
+        table::apply_span(&mut mins, column, colspan, min, spacing);
+        table::apply_span(&mut maxes, column, colspan, max, spacing);
     }
 
-    let spacing_total = table::BORDER_SPACING * (grid.columns + 1) as f32;
+    let spacing_total = spacing * (grid.columns + 1) as f32;
     let usable = (available_width - spacing_total).max(0.0);
     let mut widths = table::distribute_widths(&mins, &maxes, Some(usable));
 
@@ -1075,22 +1087,29 @@ fn layout_table(
         }
     }
 
-    let mut cursor_y = y + table::BORDER_SPACING;
-    for row in &grid.rows {
-        let mut row_height = 0.0f32;
-        let mut cell_boxes = Vec::new();
+    // Lay every cell out first, then decide row heights, then place them.
+    // A cell spanning rows cannot be positioned until the heights of all the
+    // rows it covers are known, and those heights depend on the other cells.
+    struct Placed {
+        box_: LayoutBox,
+        row: usize,
+        rowspan: usize,
+        height: f32,
+    }
 
+    let mut placed: Vec<Placed> = Vec::new();
+    for (index, row) in grid.rows.iter().enumerate() {
         for cell in &row.cells {
             let end = (cell.column + cell.colspan).min(widths.len());
             if cell.column >= end {
                 continue;
             }
             let width: f32 = widths[cell.column..end].iter().sum::<f32>()
-                + table::BORDER_SPACING * (end - cell.column - 1) as f32;
+                + spacing * (end - cell.column - 1) as f32;
             let cell_x = x
-                + table::BORDER_SPACING
+                + spacing
                 + widths[..cell.column].iter().sum::<f32>()
-                + table::BORDER_SPACING * cell.column as f32;
+                + spacing * cell.column as f32;
 
             // Each cell is an ordinary block in a box of its column's width.
             let mut holder = LayoutBox {
@@ -1118,30 +1137,69 @@ fn layout_table(
                 &cell.style,
                 intrinsic,
                 cell_x,
-                cursor_y,
+                // Placed on the second pass; only the height matters here.
+                0.0,
                 width,
                 FloatContext::new(width),
                 ContainingBlock::viewport(width, width),
                 &mut holder,
             );
-            row_height = row_height.max(consumed);
-            if let Some(cell_box) = holder.children.pop() {
-                cell_boxes.push(cell_box);
+            if let Some(box_) = holder.children.pop() {
+                placed.push(Placed {
+                    box_,
+                    row: index,
+                    rowspan: cell.rowspan,
+                    height: consumed,
+                });
             }
         }
+    }
 
-        // The row's own box goes in first so its background paints behind the
-        // cells rather than over them. It spans the full row including the
-        // spacing on either side, which is where a striped table's colour is
-        // expected to reach.
-        let row_width: f32 = widths.iter().sum::<f32>()
-            + table::BORDER_SPACING * (widths.len().saturating_sub(1)) as f32;
+    // A row is as tall as the tallest cell that ends in it. Cells spanning
+    // several rows are applied afterwards, so they can only grow a row.
+    let mut heights = vec![0.0f32; grid.rows.len()];
+    for cell in &placed {
+        if cell.rowspan == 1
+            && let Some(height) = heights.get_mut(cell.row)
+        {
+            *height = height.max(cell.height);
+        }
+    }
+    for cell in &placed {
+        if cell.rowspan == 1 {
+            continue;
+        }
+        let end = (cell.row + cell.rowspan).min(heights.len());
+        if cell.row >= end {
+            continue;
+        }
+        let covered: f32 =
+            heights[cell.row..end].iter().sum::<f32>() + spacing * (end - cell.row - 1) as f32;
+        if covered < cell.height {
+            // The shortfall goes on the last row it covers. Spreading it evenly
+            // would push apart rows whose own content already fits, which reads
+            // as the table having gaps in it.
+            heights[end - 1] += cell.height - covered;
+        }
+    }
+
+    let mut tops = Vec::with_capacity(heights.len());
+    let mut cursor_y = y + spacing;
+    for height in &heights {
+        tops.push(cursor_y);
+        cursor_y += height + spacing;
+    }
+
+    // Row boxes first, so their backgrounds paint behind the cells.
+    let row_width: f32 =
+        widths.iter().sum::<f32>() + spacing * (widths.len().saturating_sub(1)) as f32;
+    for (index, row) in grid.rows.iter().enumerate() {
         parent.children.push(LayoutBox {
             rect: Rect {
-                x: x + table::BORDER_SPACING,
-                y: cursor_y,
+                x: x + spacing,
+                y: tops[index],
                 width: row_width,
-                height: row_height,
+                height: heights[index],
             },
             style: row.style.clone(),
             text: None,
@@ -1151,16 +1209,23 @@ fn layout_table(
             replaced: None,
             node: Some(row.node),
         });
-
-        // Cells stretch to the row's height so backgrounds and borders line up.
-        for mut cell_box in cell_boxes {
-            cell_box.rect.height = cell_box.rect.height.max(row_height);
-            parent.children.push(cell_box);
-        }
-        cursor_y += row_height + table::BORDER_SPACING;
     }
 
-    cursor_y - y
+    // Cells stretch to fill every row they cover, so backgrounds and borders
+    // line up and a spanning cell reaches the bottom of its last row.
+    for mut cell in placed {
+        let end = (cell.row + cell.rowspan).min(heights.len());
+        let spanned: f32 =
+            heights[cell.row..end].iter().sum::<f32>() + spacing * (end - cell.row - 1) as f32;
+        cell.box_.rect.y = tops[cell.row];
+        cell.box_.rect.height = cell.box_.rect.height.max(spanned);
+        parent.children.push(cell.box_);
+    }
+
+    // The table's own width: its columns, the gaps between them, and the gap
+    // outside the first and last.
+    let width = widths.iter().sum::<f32>() + spacing * (grid.columns + 1) as f32;
+    (width, cursor_y - y)
 }
 
 /// Lays out a floated child and places it in `context`.
@@ -1962,6 +2027,184 @@ mod tests {
             row.rect
         );
         assert!(row.rect.height > 0.0, "a row with cells has height");
+    }
+
+    #[test]
+    fn cellspacing_sets_the_gap_between_cells() {
+        // `cellspacing="0"` is how a table used for page layout closed the
+        // seams between its cells. Leaving the 2px initial value in place puts
+        // a visible line through the layout.
+        let gap = |css: &str| {
+            let rendered = run(
+                "<body><table><tr><td>a</td><td>b</td></tr></table></body>",
+                css,
+                600.0,
+            );
+            let cells: Vec<Rect> = content_boxes(&rendered)
+                .into_iter()
+                .filter(|b| b.text.is_some())
+                .map(|b| b.rect)
+                .collect();
+            assert_eq!(cells.len(), 2);
+            cells[1].x - (cells[0].x + cells[0].width)
+        };
+
+        assert_eq!(gap("body { margin: 0 }"), 2.0, "the CSS 2.1 initial value");
+        assert_eq!(gap("body { margin: 0 } table { border-spacing: 0 }"), 0.0);
+        assert_eq!(
+            gap("body { margin: 0 } table { border-spacing: 12px }"),
+            12.0
+        );
+    }
+
+    #[test]
+    fn the_cellspacing_attribute_is_border_spacing() {
+        let rendered = run(
+            r#"<body><table cellspacing="0"><tr><td>a</td><td>b</td></tr></table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let cells: Vec<Rect> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(cells[1].x - (cells[0].x + cells[0].width), 0.0);
+    }
+
+    #[test]
+    fn a_table_box_shrinks_to_fit_its_columns() {
+        // Otherwise its border and background stretch across the container
+        // while the cells huddle at one end.
+        let rendered = run(
+            "<body><table><tr><td>a</td></tr></table></body>",
+            "body { margin: 0 } table { border: 1px solid red }",
+            600.0,
+        );
+        let table = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("a table box");
+        assert!(
+            table.rect.width < 200.0,
+            "table box is {} wide in a 600px container",
+            table.rect.width
+        );
+    }
+
+    #[test]
+    fn a_declared_width_still_fills_it() {
+        let rendered = run(
+            "<body><table><tr><td>a</td></tr></table></body>",
+            "body { margin: 0 } table { width: 100% }",
+            600.0,
+        );
+        let table = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("a table box");
+        assert_eq!(table.rect.width, 600.0);
+    }
+
+    #[test]
+    fn a_rowspan_cell_holds_its_column_in_the_rows_below() {
+        // Without occupancy tracking the second row's only cell takes column 0
+        // — the one the spanning cell is still in — and every row below the
+        // span shifts left by a column.
+        let doc = dom::parse(
+            r#"<body><table>
+                 <tr><td rowspan="2">span</td><td>a</td></tr>
+                 <tr><td>b</td></tr>
+               </table></body>"#,
+        );
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
+        let grid = table::build_grid(&doc, &styles, doc.find_element("table").expect("table"));
+
+        assert_eq!(grid.columns, 2);
+        assert_eq!(grid.rows[0].cells[0].rowspan, 2);
+        assert_eq!(grid.rows[0].cells[1].column, 1);
+        assert_eq!(
+            grid.rows[1].cells[0].column, 1,
+            "the second row's cell sits beside the span, not under it"
+        );
+    }
+
+    #[test]
+    fn a_rowspan_cell_reaches_the_bottom_of_its_last_row() {
+        let rendered = run(
+            r#"<body><table>
+                 <tr><td rowspan="2">tall</td><td>a</td></tr>
+                 <tr><td>b</td></tr>
+               </table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let cells: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert_eq!(cells.len(), 3);
+
+        let spanning = &cells[0];
+        let last = cells
+            .iter()
+            .max_by(|a, b| {
+                (a.rect.y + a.rect.height)
+                    .partial_cmp(&(b.rect.y + b.rect.height))
+                    .expect("finite")
+            })
+            .expect("a cell");
+        assert!(
+            spanning.rect.height >= last.rect.y + last.rect.height - spanning.rect.y - 0.01,
+            "spanning cell {:?} stops short of the last row {:?}",
+            spanning.rect,
+            last.rect
+        );
+    }
+
+    #[test]
+    fn a_tall_rowspan_cell_grows_the_rows_it_covers() {
+        // Its content has to fit somewhere: if the rows it spans are shorter
+        // than it is, one of them has to give.
+        let short = run(
+            r#"<body><table><tr><td>a</td><td>b</td></tr>
+               <tr><td>c</td><td>d</td></tr></table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let tall = run(
+            r#"<body><table>
+                 <tr><td rowspan="2" style="height: 200px">tall</td><td>b</td></tr>
+                 <tr><td>d</td></tr>
+               </table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let height = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .map(|b| b.rect.y + b.rect.height)
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            height(&tall) > height(&short) + 100.0,
+            "the table did not grow for its spanning cell"
+        );
+    }
+
+    #[test]
+    fn an_absurd_span_does_not_size_an_allocation() {
+        // The attribute is unbounded in the markup, and this one is a plausible
+        // typo as well as a plausible attack.
+        let rendered = run(
+            r#"<body><table><tr><td rowspan="99999999" colspan="99999999">x</td></tr></table></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            content_boxes(&rendered).iter().any(|b| b.text.is_some()),
+            "the cell still renders"
+        );
     }
 
     #[test]

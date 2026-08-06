@@ -11,11 +11,12 @@
 use css::style::{ComputedStyle, Display};
 use dom::{Document, NodeId};
 
-/// Space between cell borders, per `border-spacing`.
+/// Largest span honoured on a `colspan` or `rowspan` attribute.
 ///
-/// Hard-coded to the CSS 2.1 initial value until `border-spacing` is parsed;
-/// getting it wrong by 2px per edge is visible on a dense table.
-pub const BORDER_SPACING: f32 = 2.0;
+/// The attributes are unbounded in the markup and a mistyped one — or a
+/// deliberately hostile `rowspan="99999999"` — would otherwise size an
+/// allocation from untrusted input.
+const MAX_SPAN: usize = 1000;
 
 /// One cell in the grid.
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct Cell {
     pub style: ComputedStyle,
     /// Columns spanned, at least 1.
     pub colspan: usize,
+    /// Rows spanned, at least 1.
+    pub rowspan: usize,
     /// Index of the first column this cell occupies.
     pub column: usize,
 }
@@ -47,12 +50,6 @@ pub struct Row {
 }
 
 /// A table flattened into rows of cells.
-///
-/// Row spanning is not modelled: a `rowspan` cell occupies only its first row,
-/// so a table using it renders with the later rows shifted left rather than
-/// with the cell extended down. That is wrong, but wrong in a way that still
-/// shows every cell's content, which is the right failure mode for a document
-/// reader. Tracked for the rest of M2.
 #[derive(Debug, Clone, Default)]
 pub struct Grid {
     /// Rows in document order.
@@ -68,17 +65,30 @@ pub struct Grid {
 /// children of the table.
 pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId) -> Grid {
     let mut grid = Grid::default();
-    collect_rows(doc, styles, table, &mut grid);
+    // How many further rows each column is still occupied by a cell spanning
+    // down from above. Without this a `rowspan` cell's column is handed to the
+    // next row's first cell, and every row below it shifts left.
+    let mut occupied: Vec<usize> = Vec::new();
+    collect_rows(doc, styles, table, &mut occupied, &mut grid);
+    // The rightmost column any cell reaches, not the widest row: with row
+    // spanning a row's own cells no longer cover every column.
     grid.columns = grid
         .rows
         .iter()
-        .map(|row| row.cells.iter().map(|cell| cell.colspan).sum::<usize>())
+        .flat_map(|row| row.cells.iter())
+        .map(|cell| cell.column + cell.colspan)
         .max()
         .unwrap_or(0);
     grid
 }
 
-fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, grid: &mut Grid) {
+fn collect_rows(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    node: NodeId,
+    occupied: &mut Vec<usize>,
+    grid: &mut Grid,
+) {
     for &child in doc.children(node) {
         let Some(element) = doc.element(child) else {
             continue;
@@ -94,6 +104,10 @@ fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, g
                 let mut cells = Vec::new();
                 let mut column = 0;
                 for &cell_node in doc.children(child) {
+                    // Step over columns a cell from an earlier row still holds.
+                    while occupied.get(column).is_some_and(|rows| *rows > 0) {
+                        column += 1;
+                    }
                     let Some(cell_element) = doc.element(cell_node) else {
                         continue;
                     };
@@ -106,18 +120,39 @@ fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, g
                     if cell_style.display == Display::None {
                         continue;
                     }
-                    let colspan = cell_element
-                        .attr("colspan")
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or(1)
-                        .clamp(1, 1000);
+                    let span = |name: &str| {
+                        cell_element
+                            .attr(name)
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .clamp(1, MAX_SPAN)
+                    };
+                    let colspan = span("colspan");
+                    let rowspan = span("rowspan");
+
+                    if occupied.len() < column + colspan {
+                        occupied.resize(column + colspan, 0);
+                    }
+                    for slot in &mut occupied[column..column + colspan] {
+                        // This row included, so a rowspan of 1 leaves nothing
+                        // behind once the row is done.
+                        *slot = rowspan;
+                    }
+
                     cells.push(Cell {
                         node: cell_node,
                         style: cell_style.clone(),
                         colspan,
+                        rowspan,
                         column,
                     });
                     column += colspan;
+                }
+
+                // The row is finished, so every occupancy count owes one fewer
+                // row from here on.
+                for slot in occupied.iter_mut() {
+                    *slot = slot.saturating_sub(1);
                 }
                 if !cells.is_empty() {
                     grid.rows.push(Row {
@@ -128,7 +163,7 @@ fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, g
                 }
             }
             // Row groups, and any other wrapper, are descended through.
-            _ => collect_rows(doc, styles, child, grid),
+            _ => collect_rows(doc, styles, child, occupied, grid),
         }
     }
 }
@@ -178,17 +213,17 @@ pub fn distribute_widths(mins: &[f32], maxes: &[f32], available: Option<f32>) ->
 /// its full width to each column would inflate every one of them; ignoring it
 /// entirely lets a wide spanning cell overflow. Splitting the shortfall evenly
 /// is the standard compromise.
-pub fn apply_span(widths: &mut [f32], column: usize, colspan: usize, wanted: f32) {
+pub fn apply_span(widths: &mut [f32], column: usize, colspan: usize, wanted: f32, spacing: f32) {
     let end = (column + colspan).min(widths.len());
     if column >= end {
         return;
     }
     let covered: f32 = widths[column..end].iter().sum();
-    let spacing = BORDER_SPACING * (end - column - 1) as f32;
-    if covered + spacing >= wanted {
+    let between = spacing * (end - column - 1) as f32;
+    if covered + between >= wanted {
         return;
     }
-    let shortfall = (wanted - covered - spacing) / (end - column) as f32;
+    let shortfall = (wanted - covered - between) / (end - column) as f32;
     for width in &mut widths[column..end] {
         *width += shortfall;
     }
@@ -248,7 +283,7 @@ mod tests {
     #[test]
     fn a_spanning_cell_widens_every_column_it_covers() {
         let mut widths = vec![20.0, 20.0, 100.0];
-        apply_span(&mut widths, 0, 2, 100.0);
+        apply_span(&mut widths, 0, 2, 100.0, css::style::DEFAULT_BORDER_SPACING);
         // Wanted 100 across two 20px columns with 2px spacing between them:
         // the 58px shortfall splits evenly.
         assert!((widths[0] - 49.0).abs() < 0.01, "got {widths:?}");
@@ -259,14 +294,14 @@ mod tests {
     #[test]
     fn a_spanning_cell_that_already_fits_changes_nothing() {
         let mut widths = vec![80.0, 80.0];
-        apply_span(&mut widths, 0, 2, 100.0);
+        apply_span(&mut widths, 0, 2, 100.0, css::style::DEFAULT_BORDER_SPACING);
         assert_eq!(widths, vec![80.0, 80.0]);
     }
 
     #[test]
     fn a_span_running_past_the_last_column_is_clamped() {
         let mut widths = vec![10.0, 10.0];
-        apply_span(&mut widths, 1, 5, 100.0);
+        apply_span(&mut widths, 1, 5, 100.0, css::style::DEFAULT_BORDER_SPACING);
         assert_eq!(widths[0], 10.0);
         assert!(widths[1] > 10.0);
     }

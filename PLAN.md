@@ -267,9 +267,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
    size, and collapse whitespace across run boundaries.
-3. **Tables** — *mostly done.* Automatic column sizing from cell content,
-   `colspan`, row groups, and declared widths. Missing: `rowspan`, collapsed
-   borders, fixed layout, `border-spacing` parsing
+3. **Tables** — *done.* Automatic column sizing from cell content, `colspan`
+   and `rowspan`, row groups, declared widths, shrink-to-fit boxes, row
+   backgrounds, and `border-spacing` including the `cellspacing` attribute.
+   Missing: collapsed borders and fixed layout
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
@@ -291,10 +292,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    `background` shorthand and its reset, `<body background>`, and canvas
    propagation
 
-Known-wrong and recorded rather than hidden: `rowspan` (a spanning cell
-occupies only its first row), collapsed borders, fixed table layout,
-`border-spacing`/`cellspacing` parsing, dashed and dotted borders painting
-solid, and `background-position`.
+Known-wrong and recorded rather than hidden: collapsed borders, fixed table
+layout, dashed and dotted borders painting solid, `background-position`, and
+`@media`/`@import`.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes

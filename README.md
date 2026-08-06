@@ -22,7 +22,8 @@ shaped against bundled Liberation faces, and rasterised on the CPU.
 
 Working: the cascade with selectors, specificity, and inheritance; the box
 model with borders and backgrounds; inline layout with per-span styles and
-Unicode line breaking; floats; tables with automatic column sizing; images,
+Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`, and
+`cellspacing`; images,
 including ones sitting in a line; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
@@ -39,9 +40,8 @@ The window has been verified by hand on Linux. CI has no display, so its event
 handling and blitting are not covered by automated tests — only its scroll
 arithmetic is.
 
-Known to be missing or wrong, rather than hidden: `rowspan` (a spanning cell
-occupies only its first row), collapsed borders, fixed table layout,
-`cellspacing`, dashed and dotted borders painting solid, `background-position`,
+Known to be missing or wrong, rather than hidden: collapsed borders, fixed
+table layout, dashed and dotted borders painting solid, `background-position`,
 and `@media`/`@import`. Links are styled but not clickable — hit testing and
 navigation are M3, along with the rest of the browser chrome.
 See [PLAN.md](PLAN.md).

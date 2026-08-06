@@ -21,4 +21,33 @@
 <table class="layout">
   <tr><td>Borderless cells, the way pages of the era built columns.</td><td>Sidebar.</td></tr>
 </table>
+
+<h3>Row spanning</h3>
+<table>
+  <tr>
+    <td rowspan="3">A cell spanning three rows. Every row below it has to
+    leave this column alone, or the whole table shifts left.</td>
+    <td>first</td><td>a</td>
+  </tr>
+  <tr><td>second</td><td>b</td></tr>
+  <tr><td>third</td><td>c</td></tr>
+</table>
+
+<h3>Spanning both ways at once</h3>
+<table>
+  <tr><th>&nbsp;</th><th>Mon</th><th>Tue</th></tr>
+  <tr><td>09:00</td><td rowspan="2" colspan="2">A block covering two rows and
+    two columns, which is the shape a timetable actually has</td></tr>
+  <tr><td>10:00</td></tr>
+  <tr><td>11:00</td><td>free</td><td>free</td></tr>
+</table>
+
+<h3>cellspacing</h3>
+<table cellspacing="0" border="1">
+  <tr><td>No gap</td><td>between</td><td>these cells</td></tr>
+  <tr><td>which is</td><td>how a layout</td><td>table closed its seams</td></tr>
+</table>
+<table cellspacing="10" border="1">
+  <tr><td>A wide</td><td>gap</td><td>instead</td></tr>
+</table>
 </body></html>

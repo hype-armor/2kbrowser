@@ -345,6 +345,14 @@ fn apply(
                 style.list_style_type = kind;
             }
         }
+        // Two values are allowed — horizontal then vertical — but a table
+        // using different ones is vanishingly rare, so the first is used for
+        // both rather than modelling an axis that nothing sets.
+        "border-spacing" => {
+            if let Some(length) = parse_length(first) {
+                style.border_spacing = length;
+            }
+        }
         "white-space" => {
             if let Raw::Ident(name) = first {
                 style.white_space = match name.as_str() {
@@ -637,6 +645,15 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
         && let Some(width) = table_border_width(element)
     {
         push("border", &format!("{width}px solid"));
+    }
+    // `cellspacing` is `border-spacing` by another name, and the attribute is
+    // what the era's markup used. `cellspacing="0"` in particular is how a
+    // table used for page layout closed the gaps between its cells — leaving
+    // the 2px initial value there puts a visible seam through the layout.
+    if tag == "table"
+        && let Some(spacing) = element.attr("cellspacing")
+    {
+        push("border-spacing", &attr_length(spacing));
     }
     out
 }

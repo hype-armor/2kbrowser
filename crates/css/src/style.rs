@@ -624,6 +624,11 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     /// `background-repeat`.
     pub background_repeat: BackgroundRepeat,
+    /// `border-spacing`, the gap between cell borders in the separated model.
+    ///
+    /// On a table only. Kept as a length rather than pixels because it is
+    /// resolved against the table's own font size, like any other length.
+    pub border_spacing: Length,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -662,6 +667,12 @@ pub struct ComputedStyle {
     pub height: Length,
 }
 
+/// The CSS 2.1 initial value of `border-spacing`.
+///
+/// Two pixels, and it matters: getting it wrong by 2px per edge is plainly
+/// visible on a dense table, which the era's pages are full of.
+pub const DEFAULT_BORDER_SPACING: f32 = 2.0;
+
 /// The initial font size, and the basis for `em` at the root.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
@@ -676,6 +687,7 @@ impl Default for ComputedStyle {
             background_color: Color::TRANSPARENT,
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
+            border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
