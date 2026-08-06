@@ -70,6 +70,23 @@ impl Page {
         None
     }
 
+    /// Every rectangle where `query` appears, in canvas coordinates.
+    ///
+    /// Across every frame, because a frameset's content is as much the page as
+    /// an ordinary document's is — a reader searching a framed site does not
+    /// care which cell the words are in.
+    pub fn find(&self, query: &str) -> Vec<layout::Rect> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            out.extend(frame.layout.find(query).into_iter().map(|mut rect| {
+                rect.x += frame.rect.x;
+                rect.y += frame.rect.y;
+                rect
+            }));
+        }
+        out
+    }
+
     /// Every link rectangle on the canvas, with the URL it leads to.
     ///
     /// What a keyboard-first browser needs: something to number, highlight, and

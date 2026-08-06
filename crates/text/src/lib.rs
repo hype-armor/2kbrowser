@@ -94,6 +94,15 @@ pub struct PositionedGlyph {
     /// single line can contain spans of different colours, and the paint stage
     /// has no way to recover which span a glyph belonged to.
     pub color: Option<(u8, u8, u8, u8)>,
+    /// Byte range this glyph covers in its line's text.
+    ///
+    /// What lets a match in the text become a rectangle on the screen. Shaping
+    /// is not one glyph per character — ligatures and complex scripts both
+    /// break that — so the mapping has to come from the shaper rather than
+    /// being counted afterwards.
+    pub start: usize,
+    /// End of that range, exclusive.
+    pub end: usize,
 }
 
 /// The colour a span's glyphs and rules take, as stored on a glyph.
@@ -228,6 +237,11 @@ pub struct Line {
     pub spans: Vec<InlineSpan>,
     /// Rules under, over, and through this line's text.
     pub decorations: Vec<DecorationRun>,
+    /// The line's text, with glyph offsets pointing into it.
+    ///
+    /// After whitespace collapsing, so it is what the reader sees rather than
+    /// what the source said — which is what a search has to match against.
+    pub text: String,
     /// Width of the line's inked content.
     pub width: f32,
     /// Distance from the line box top to the baseline.
@@ -249,6 +263,9 @@ pub struct TextLayout {
 #[derive(Debug, Clone, Default)]
 struct Shaped {
     glyphs: Vec<PositionedGlyph>,
+    /// The text these glyphs came from, so a line can be reassembled from its
+    /// segments and searched.
+    text: String,
     width: f32,
     /// Distance from the line top to the baseline.
     ascent: f32,
@@ -401,7 +418,10 @@ impl FontStore {
         buffer.set_rich_text([(text, attrs.clone())], &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(false);
 
-        let mut shaped = Shaped::default();
+        let mut shaped = Shaped {
+            text: text.to_owned(),
+            ..Shaped::default()
+        };
         if let Some(run) = buffer.layout_runs().next() {
             shaped.width = run.line_w;
             shaped.ascent = run.line_y - run.line_top;
@@ -416,6 +436,8 @@ impl FontStore {
                     y: 0.0,
                     font_size: glyph.font_size,
                     color: glyph.color_opt.map(|c| (c.r(), c.g(), c.b(), c.a())),
+                    start: glyph.start,
+                    end: glyph.end,
                 })
                 .collect();
         }
@@ -528,8 +550,13 @@ impl FontStore {
         line_height: f32,
     ) {
         let mut glyphs = Vec::new();
+        let mut text = String::new();
         let mut width = 0.0f32;
         for segment in current.iter() {
+            // Glyph offsets are relative to their own segment; the line's text
+            // is the segments joined, so they shift by however much came first.
+            let base = text.len();
+            text.push_str(&segment.shaped.text);
             for glyph in &segment.shaped.glyphs {
                 glyphs.push(PositionedGlyph {
                     x: glyph.x + segment.x + offset,
@@ -537,11 +564,18 @@ impl FontStore {
                     // plus the shared ascent. Using the ascent alone would
                     // stack every line at the same y.
                     y: line_y + ascent,
+                    start: base + glyph.start,
+                    end: base + glyph.end,
                     ..*glyph
                 });
             }
-            // Trailing spaces are excluded: a line's width is its inked extent,
-            // which is what centring and right alignment must measure.
+            // The space between two segments is real text even though it has
+            // no glyphs: a search for "one two" has to find it.
+            if segment.trailing_space > 0.0 {
+                text.push(' ');
+            }
+            // Trailing spaces are excluded from the *width*: a line's width is
+            // its inked extent, which is what centring must measure.
             width = width.max(segment.x + segment.shaped.width);
         }
         layout.lines.push(Line {
@@ -549,6 +583,7 @@ impl FontStore {
             replaced: Self::replaced_for(current, offset, line_y, ascent),
             spans: Self::spans_for(current, offset, line_y, line_height),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
+            text,
             width,
             baseline: ascent,
         });
@@ -713,6 +748,7 @@ impl FontStore {
                 out.push(Segment {
                     shaped: Shaped {
                         glyphs: Vec::new(),
+                        text: String::new(),
                         width: box_.width,
                         ascent: box_.height,
                         height: box_.height,

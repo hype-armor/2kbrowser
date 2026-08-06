@@ -60,6 +60,8 @@ pub struct State<'a> {
     /// The URL bar's editing state, when it has focus. `None` means the bar is
     /// showing where you are rather than where you are going.
     pub editing: Option<&'a crate::field::Field>,
+    /// The find field, with which match is current and how many there are.
+    pub finding: Option<(&'a crate::field::Field, usize, usize)>,
 }
 
 /// A control in the bar.
@@ -103,7 +105,7 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
     // Not while editing: the bar gives its right-hand side over to the field,
     // so the toggle is not drawn — and a control that is not drawn must not
     // still be catching clicks.
-    if state.can_toggle_layout && state.editing.is_none() {
+    if state.can_toggle_layout && state.editing.is_none() && state.finding.is_none() {
         out.push((Control::ToggleLayout, button(-TOGGLE, TOGGLE)));
     }
     out
@@ -200,7 +202,14 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     });
 
     let mut toggle_left = width_f - PADDING;
-    for (control, rect) in placed_controls(state, width_f) {
+    // Find takes the whole bar: its label sits where the back button would be,
+    // and drawing both puts one on top of the other.
+    let nav_controls = if state.finding.is_some() {
+        Vec::new()
+    } else {
+        placed_controls(state, width_f)
+    };
+    for (control, rect) in nav_controls {
         match control {
             Control::Back | Control::Forward => {
                 let enabled = if control == Control::Back {
@@ -249,6 +258,66 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     }
 
     let url_x = PADDING * 2.0 + BUTTON * 2.0;
+
+    // Find takes the bar over while it is open, the same way editing does, and
+    // for the same reason: what you are doing is more important than where you
+    // are.
+    if let Some((field, current, total)) = state.finding {
+        let style = ui_style(14.0);
+        let count = if total == 0 {
+            if field.text().is_empty() {
+                String::new()
+            } else {
+                "no matches".to_owned()
+            }
+        } else {
+            format!("{} of {total}", current + 1)
+        };
+        let count_width = measure(fonts, &count, &ui_style(13.0));
+        let label_style = ui_style(13.0);
+        let label_width = measure(fonts, "Find:", &label_style) + PADDING;
+        let field_x = PADDING + label_width;
+        let box_ = Rect {
+            x: field_x,
+            y: 4.0,
+            width: (width_f - field_x - count_width - PADDING * 2.0).max(0.0),
+            height: HEIGHT as f32 - 9.0,
+        };
+        draw_text(
+            &mut list,
+            fonts,
+            "Find:",
+            &label_style,
+            PADDING,
+            baseline(),
+            DIM,
+            label_width,
+        );
+        draw_field(&mut list, fonts, field, &style, &box_);
+        draw_text(
+            &mut list,
+            fonts,
+            &count,
+            &ui_style(13.0),
+            width_f - count_width - PADDING,
+            baseline(),
+            if total == 0 && !field.text().is_empty() {
+                NOTICE
+            } else {
+                DIM
+            },
+            count_width,
+        );
+        return rasterise(
+            &list,
+            fonts,
+            &paint::ImageStore::new(),
+            width.max(1),
+            HEIGHT,
+        )
+        .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
+    }
+
     // While editing, the bar is a field and nothing else: the status describes
     // the page you are on, and you are in the middle of leaving it.
     if let Some(field) = state.editing {
@@ -507,6 +576,7 @@ mod tests {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: None,
+            finding: None,
         }
     }
 

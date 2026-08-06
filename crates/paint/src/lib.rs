@@ -26,6 +26,11 @@ pub fn magenta() -> PremultipliedColor {
     PremultipliedColor::from_rgba(255, 0, 255, 255).expect("opaque magenta is valid")
 }
 
+/// A second debugging colour, for when one overlay is not enough.
+pub fn cyan() -> PremultipliedColor {
+    PremultipliedColor::from_rgba(0, 190, 210, 255).expect("opaque cyan is valid")
+}
+
 /// One paint operation.
 ///
 /// Building a display list before rasterising keeps geometry decisions separate

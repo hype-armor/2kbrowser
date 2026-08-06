@@ -61,7 +61,12 @@ The URL bar is editable: Ctrl+L (or F6, or clicking it) focuses it with the
 URL selected, Enter navigates, Escape gives up. A bare host gets `https://`,
 because that is what typing `example.com` means.
 
-Still to come in M3: tabs, bookmarks, and find-in-page.
+Find-in-page is on Ctrl+F: matches highlight as you type, Enter and F3 step
+through them (Shift to go back), and the bar counts them. A match already on
+screen is not scrolled to — moving the page under someone who can see what
+they were looking for is disorienting.
+
+Still to come in M3: tabs and bookmarks.
 See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and

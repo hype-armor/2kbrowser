@@ -255,6 +255,31 @@ impl Layout {
         hit_test_box(&self.root, x, y, 0.0, 0.0)
     }
 
+    /// Every rectangle where `query` appears, in canvas coordinates and in
+    /// reading order.
+    ///
+    /// Matched case-insensitively, which is what a reader means by "find".
+    /// Matching is per line: a phrase broken across a line break is not found,
+    /// because the two halves are not one run of text on the screen and there
+    /// would be no single rectangle to show for it.
+    pub fn find(&self, query: &str) -> Vec<Rect> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let needle = query.to_lowercase();
+        let mut out = Vec::new();
+        collect_matches(&self.root, &needle, 0.0, 0.0, &mut out);
+        // Reading order: down the page, then across. Tree order is nearly this
+        // but not exactly — a float is laid out before the text beside it.
+        out.sort_by(|a, b| {
+            a.y.partial_cmp(&b.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        out
+    }
+
     /// Every rectangle belonging to `node`, in canvas coordinates.
     ///
     /// A link wrapping onto three lines has three, which is what drawing a
@@ -299,6 +324,87 @@ fn hit_test_box(box_: &LayoutBox, x: f32, y: f32, offset_x: f32, offset_y: f32) 
     // specific answer and has already had its chance.
     let inside = x >= left && x < left + box_.rect.width && y >= top && y < top + box_.rect.height;
     if inside { box_.node } else { None }
+}
+
+fn collect_matches(
+    box_: &LayoutBox,
+    needle: &str,
+    offset_x: f32,
+    offset_y: f32,
+    out: &mut Vec<Rect>,
+) {
+    let left = offset_x + box_.rect.x;
+    let top = offset_y + box_.rect.y;
+
+    if let Some(text) = &box_.text {
+        let content_x = left + box_.content_origin.0;
+        let content_y = top + box_.content_origin.1;
+        for line in &text.lines {
+            if line.glyphs.is_empty() {
+                continue;
+            }
+            let dx = line_offset(box_.style.text_align, line.width, box_.content_width);
+            let lowered = line.text.to_lowercase();
+            // Lowercasing can change a string's length — `İ` becomes two chars
+            // — so an offset into the lowered text is not an offset into the
+            // original, and the glyph offsets index the original. Only trust
+            // them when the two agree.
+            if lowered.len() != line.text.len() {
+                continue;
+            }
+            let mut from = 0usize;
+            while let Some(found) = lowered[from..].find(needle) {
+                let start = from + found;
+                let end = start + needle.len();
+                if let Some(rect) = span_rect(line, start, end, content_x + dx, content_y) {
+                    out.push(rect);
+                }
+                // Overlapping matches are not what anyone means by "next".
+                from = end.max(start + 1);
+            }
+        }
+    }
+
+    for child in &box_.children {
+        collect_matches(child, needle, left, top, out);
+    }
+}
+
+/// The rectangle covering a byte range of a line's text.
+fn span_rect(
+    line: &text::Line,
+    start: usize,
+    end: usize,
+    origin_x: f32,
+    origin_y: f32,
+) -> Option<Rect> {
+    // A glyph covers a byte range; the match covers one too, and the glyphs
+    // that matter are the ones that overlap it.
+    let mut left = f32::MAX;
+    let mut right = f32::MIN;
+    for (index, glyph) in line.glyphs.iter().enumerate() {
+        if glyph.end <= start || glyph.start >= end {
+            continue;
+        }
+        left = left.min(glyph.x);
+        // A glyph carries no advance; the next one's origin is where it ends,
+        // and for the last, the line's width is.
+        let glyph_right = line
+            .glyphs
+            .get(index + 1)
+            .map(|next| next.x)
+            .unwrap_or(line.width);
+        right = right.max(glyph_right);
+    }
+    if left > right {
+        return None;
+    }
+    Some(Rect {
+        x: origin_x + left,
+        y: origin_y + line.glyphs.first()?.y - line.baseline,
+        width: right - left,
+        height: line.baseline * 1.25,
+    })
 }
 
 fn collect_rects(
@@ -3560,5 +3666,130 @@ mod hit_tests {
         );
         let hit = page.layout.hit_test(590.0, 2000.0);
         assert!(hit.is_none() || page.doc.enclosing_link(hit.expect("hit")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    fn find_in(html: &str, css_text: &str, query: &str) -> Vec<Rect> {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 600.0).find(query)
+    }
+
+    #[test]
+    fn a_word_is_found_where_it_is_drawn() {
+        let rects = find_in(
+            "<body><p>the quick brown fox</p></body>",
+            "body { margin: 0 }",
+            "brown",
+        );
+        assert_eq!(rects.len(), 1);
+        // Past "the quick " and narrower than the whole line.
+        assert!(rects[0].x > 20.0, "at {:?}", rects[0]);
+        assert!(
+            rects[0].width > 5.0 && rects[0].width < 120.0,
+            "{:?}",
+            rects[0]
+        );
+    }
+
+    #[test]
+    fn matching_ignores_case() {
+        let rects = find_in(
+            "<body><p>The Quick Brown Fox</p></body>",
+            "body { margin: 0 }",
+            "brown",
+        );
+        assert_eq!(rects.len(), 1);
+    }
+
+    #[test]
+    fn every_occurrence_is_found_in_reading_order() {
+        let rects = find_in(
+            "<body><p>one</p><p>two one three</p><p>one</p></body>",
+            "body { margin: 0 }",
+            "one",
+        );
+        assert_eq!(rects.len(), 3);
+        for pair in rects.windows(2) {
+            assert!(
+                pair[0].y < pair[1].y || (pair[0].y == pair[1].y && pair[0].x <= pair[1].x),
+                "out of order: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_phrase_spanning_a_space_between_spans_is_found() {
+        // The space between two inline elements has no glyphs, so it only
+        // exists in the line's text if the line assembles it deliberately.
+        let rects = find_in(
+            "<body><p><b>hello</b> <i>world</i></p></body>",
+            "body { margin: 0 }",
+            "hello world",
+        );
+        assert_eq!(rects.len(), 1, "the space between the spans was lost");
+    }
+
+    #[test]
+    fn a_match_is_found_across_a_style_change_without_a_space() {
+        let rects = find_in(
+            "<body><p>un<b>break</b>able</p></body>",
+            "body { margin: 0 }",
+            "unbreakable",
+        );
+        assert_eq!(rects.len(), 1);
+    }
+
+    #[test]
+    fn a_phrase_broken_by_a_line_break_is_not_found() {
+        // The two halves are not one run of text on the screen, and there is no
+        // single rectangle that would show the match. Reporting it would mean
+        // scrolling somewhere and highlighting nothing.
+        let rects = find_in(
+            "<body><p>alpha<br>beta</p></body>",
+            "body { margin: 0 }",
+            "alpha beta",
+        );
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn an_empty_query_finds_nothing() {
+        // Otherwise every position in the document matches.
+        assert!(find_in("<body><p>text</p></body>", "", "").is_empty());
+        assert!(find_in("<body><p>text</p></body>", "", "   ").is_empty());
+    }
+
+    #[test]
+    fn a_query_that_is_not_there_finds_nothing() {
+        assert!(find_in("<body><p>text</p></body>", "", "absent").is_empty());
+    }
+
+    #[test]
+    fn overlapping_occurrences_are_counted_once_each() {
+        // "aa" in "aaaa" is two matches, not three: the reader stepping
+        // through them expects to move past what was just highlighted.
+        let rects = find_in("<body><p>aaaa</p></body>", "body { margin: 0 }", "aa");
+        assert_eq!(rects.len(), 2);
+    }
+
+    #[test]
+    fn text_inside_a_table_is_searchable() {
+        // Cells are laid out through a different path from ordinary blocks, so
+        // it is worth checking they are reached at all.
+        let rects = find_in(
+            "<body><table><tr><td>needle</td><td>other</td></tr></table></body>",
+            "body { margin: 0 }",
+            "needle",
+        );
+        assert_eq!(rects.len(), 1);
     }
 }

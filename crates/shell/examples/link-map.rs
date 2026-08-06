@@ -32,21 +32,37 @@ fn main() {
     let mut pixmap = page.pixmap.clone();
     let links = page.links();
     for (rect, _) in &links {
-        outline(&mut pixmap, rect);
+        outline(&mut pixmap, rect, paint::magenta());
     }
+
+    // A third argument searches the page and outlines the matches, so find and
+    // link geometry can be eyeballed the same way.
+    let query = args.next();
+    let matches = query
+        .as_deref()
+        .map(|query| page.find(query))
+        .unwrap_or_default();
+    for rect in &matches {
+        outline(&mut pixmap, rect, paint::cyan());
+    }
+
     pixmap.save_png(&output).expect("write");
-    println!("wrote {output} with {} link rectangle(s)", links.len());
+    println!(
+        "wrote {output} with {} link rectangle(s) and {} match(es)",
+        links.len(),
+        matches.len()
+    );
 }
 
-/// Draws a one-pixel magenta outline, which nothing on a real page will be.
-fn outline(pixmap: &mut paint::Pixmap, rect: &layout::Rect) {
+/// Draws a one-pixel outline in a colour nothing on a real page will be.
+fn outline(pixmap: &mut paint::Pixmap, rect: &layout::Rect, color: paint::PremultipliedColor) {
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
     let set = |pixels: &mut [paint::PremultipliedColor], x: i32, y: i32| {
         if x < 0 || y < 0 || x >= width || y >= height {
             return;
         }
-        pixels[(y * width + x) as usize] = paint::magenta();
+        pixels[(y * width + x) as usize] = color;
     };
     let (x0, y0) = (rect.x.round() as i32, rect.y.round() as i32);
     let (x1, y1) = (

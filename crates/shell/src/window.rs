@@ -117,6 +117,12 @@ struct App {
     /// The URL bar when it has focus. `None` means it is showing where you
     /// are rather than accepting where you want to go.
     editing: Option<crate::field::Field>,
+    /// The find field when find-in-page is open.
+    finding: Option<crate::field::Field>,
+    /// Where the current query matches, in canvas coordinates.
+    matches: Vec<layout::Rect>,
+    /// Which match the reader is on.
+    current_match: usize,
 }
 
 impl App {
@@ -158,6 +164,19 @@ impl App {
                 self.error.as_deref(),
             ));
         }
+        // The old matches point at the old layout.
+        if self.finding.is_some() {
+            let query = self
+                .finding
+                .as_ref()
+                .map(|field| field.text().to_owned())
+                .unwrap_or_default();
+            self.matches = match (&self.page, query.is_empty()) {
+                (Some(page), false) => page.find(&query),
+                _ => Vec::new(),
+            };
+            self.current_match = self.current_match.min(self.matches.len().saturating_sub(1));
+        }
         self.chrome = crate::chrome::render(
             &crate::chrome::State {
                 url: self.history.current(),
@@ -168,6 +187,10 @@ impl App {
                 forcing_authored: self.forcing_authored,
                 can_toggle_layout: self.can_toggle_layout,
                 editing: self.editing.as_ref(),
+                finding: self
+                    .finding
+                    .as_ref()
+                    .map(|field| (field, self.current_match, self.matches.len())),
             },
             width,
             &mut self.fonts,
@@ -245,6 +268,10 @@ impl App {
                 forcing_authored: self.forcing_authored,
                 can_toggle_layout: self.can_toggle_layout,
                 editing: self.editing.as_ref(),
+                finding: self
+                    .finding
+                    .as_ref()
+                    .map(|field| (field, self.current_match, self.matches.len())),
             },
             self.size.0,
             &mut self.fonts,
@@ -267,6 +294,119 @@ impl App {
         if self.editing.take().is_some() {
             self.refresh_chrome();
         }
+    }
+
+    /// Opens find-in-page, or refocuses it if it is already open.
+    fn open_find(&mut self) {
+        let existing = self
+            .finding
+            .as_ref()
+            .map(|field| field.text().to_owned())
+            .unwrap_or_default();
+        self.finding = Some(crate::field::Field::with_all_selected(existing));
+        self.refresh_matches();
+    }
+
+    /// Closes find, clearing the highlights.
+    fn close_find(&mut self) {
+        if self.finding.take().is_some() {
+            self.matches.clear();
+            self.current_match = 0;
+            self.refresh_chrome();
+        }
+    }
+
+    /// Re-runs the search after the query or the page changed.
+    fn refresh_matches(&mut self) {
+        let query = self
+            .finding
+            .as_ref()
+            .map(|field| field.text().to_owned())
+            .unwrap_or_default();
+        self.matches = match (&self.page, query.is_empty()) {
+            (Some(page), false) => page.find(&query),
+            _ => Vec::new(),
+        };
+        self.current_match = 0;
+        self.scroll_to_current_match();
+        self.refresh_chrome();
+    }
+
+    /// Steps to the next or previous match, wrapping around.
+    fn step_match(&mut self, forward: bool) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let count = self.matches.len();
+        self.current_match = if forward {
+            (self.current_match + 1) % count
+        } else {
+            (self.current_match + count - 1) % count
+        };
+        self.scroll_to_current_match();
+        self.refresh_chrome();
+    }
+
+    /// Brings the current match into view, if it is not already.
+    ///
+    /// Only when it is off screen: a match already visible should stay where
+    /// it is, because scrolling the page under someone who can see what they
+    /// were looking for is disorienting.
+    fn scroll_to_current_match(&mut self) {
+        let Some(rect) = self.matches.get(self.current_match).copied() else {
+            return;
+        };
+        let Some(page) = &self.page else { return };
+        let viewport = self.viewport_height();
+        let (top, bottom) = (self.scroll, self.scroll + viewport);
+        if rect.y >= top && rect.y + rect.height <= bottom {
+            return;
+        }
+        // A third of the way down, which leaves the match in context rather
+        // than jammed against the top edge.
+        let target = rect.y - viewport / 3.0;
+        self.scroll = clamp_scroll(target, page.content_height, viewport);
+    }
+
+    /// Handles a key while find is open.
+    ///
+    /// Returns whether the key was consumed.
+    fn find_key(&mut self, key: &Key, alt: bool, ctrl: bool, shift: bool) -> bool {
+        let Some(field) = &mut self.finding else {
+            return false;
+        };
+        let by_word = ctrl || alt;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_find();
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.step_match(!shift);
+                return true;
+            }
+            Key::Named(NamedKey::Backspace) => field.backspace(),
+            Key::Named(NamedKey::Delete) => field.delete(),
+            Key::Named(NamedKey::ArrowLeft) if by_word => field.word_left(shift),
+            Key::Named(NamedKey::ArrowRight) if by_word => field.word_right(shift),
+            Key::Named(NamedKey::ArrowLeft) => field.left(shift),
+            Key::Named(NamedKey::ArrowRight) => field.right(shift),
+            Key::Named(NamedKey::Home) => field.home(shift),
+            Key::Named(NamedKey::End) => field.end(shift),
+            Key::Named(NamedKey::Space) => field.insert(" "),
+            Key::Character(text) if ctrl => {
+                if text.as_str() == "a" {
+                    field.select_all();
+                    self.refresh_chrome();
+                }
+                return true;
+            }
+            Key::Character(text) => field.insert(text.as_str()),
+            _ => return true,
+        }
+        // Anything that changed the query re-runs the search.
+        self.refresh_matches();
+        true
     }
 
     /// Handles a key while the URL bar has focus.
@@ -334,6 +474,10 @@ impl App {
                 forcing_authored: self.forcing_authored,
                 can_toggle_layout: self.can_toggle_layout,
                 editing: self.editing.as_ref(),
+                finding: self
+                    .finding
+                    .as_ref()
+                    .map(|field| (field, self.current_match, self.matches.len())),
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -427,7 +571,64 @@ impl App {
             }
         }
 
+        highlight_matches(
+            &mut buffer,
+            &self.matches,
+            self.current_match,
+            self.scroll,
+            (width.get(), height.get()),
+            bar_height,
+        );
         let _ = buffer.present();
+    }
+}
+
+/// Tints the find matches in the window buffer.
+///
+/// Drawn here rather than into the page so that searching does not re-render
+/// anything: the page is expensive and unchanged, and the highlights move every
+/// time the reader steps to the next match.
+fn highlight_matches(
+    buffer: &mut [u32],
+    matches: &[layout::Rect],
+    current: usize,
+    scroll: f32,
+    size: (u32, u32),
+    bar_height: u32,
+) {
+    let (width, height) = size;
+    for (index, rect) in matches.iter().enumerate() {
+        // The current match is stronger, because "which one am I on" is the
+        // question the reader is actually asking.
+        let tint = if index == current {
+            (255u32, 185u32, 50u32)
+        } else {
+            (255, 240, 150)
+        };
+        let top = rect.y - scroll + bar_height as f32;
+        let (x0, x1) = (
+            rect.x.max(0.0) as u32,
+            (rect.x + rect.width).max(0.0) as u32,
+        );
+        let (y0, y1) = (
+            top.max(bar_height as f32) as u32,
+            (top + rect.height).max(0.0) as u32,
+        );
+
+        for y in y0..y1.min(height) {
+            for x in x0..x1.min(width) {
+                let Some(pixel) = buffer.get_mut((y * width + x) as usize) else {
+                    continue;
+                };
+                // Multiplied rather than replaced, so the text stays legible
+                // through the highlight instead of being painted over.
+                let blend = |shift: u32, tint: u32| {
+                    let channel = (*pixel >> shift) & 0xff;
+                    ((channel * tint) / 255) << shift
+                };
+                *pixel = blend(16, tint.0) | blend(8, tint.1) | blend(0, tint.2);
+            }
+        }
     }
 }
 
@@ -544,9 +745,24 @@ impl ApplicationHandler for App {
                 let state = self.modifiers.state();
                 let (alt, ctrl, shift) = (state.alt_key(), state.control_key(), state.shift_key());
 
-                // The URL bar takes every key while it has focus.
+                // A focused field takes every key, so a keystroke meant for it
+                // never also scrolls the page underneath.
                 if self.editing.is_some() {
                     self.edit_key(&event.logical_key, alt, ctrl, shift);
+                    return;
+                }
+                if self.finding.is_some() {
+                    self.find_key(&event.logical_key, alt, ctrl, shift);
+                    return;
+                }
+                if ctrl && matches!(&event.logical_key, Key::Character(c) if c == "f") {
+                    self.open_find();
+                    return;
+                }
+                // F3 steps through matches without reopening the field, which
+                // is how someone reads a page while searching it.
+                if matches!(event.logical_key, Key::Named(NamedKey::F3)) {
+                    self.step_match(!shift);
                     return;
                 }
                 // Ctrl+L is the URL bar everywhere; F6 and Alt+D are the other
@@ -631,6 +847,9 @@ pub fn open(
         forcing_authored: false,
         can_toggle_layout: false,
         editing: None,
+        finding: None,
+        matches: Vec::new(),
+        current_match: 0,
     };
     event_loop
         .run_app(&mut app)
@@ -720,5 +939,126 @@ mod entered_url_tests {
     fn a_path_becomes_a_file_url() {
         assert_eq!(entered_url("/home/user/a.html"), "file:///home/user/a.html");
         assert_eq!(entered_url("./a.html"), "file://./a.html");
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::highlight_matches;
+    use layout::Rect;
+
+    /// A 4x4 white buffer with no chrome, for arithmetic that is easier to
+    /// read than to reason about.
+    fn buffer() -> Vec<u32> {
+        vec![0x00ff_ffff; 16]
+    }
+
+    fn tinted(buffer: &[u32]) -> usize {
+        buffer.iter().filter(|p| **p != 0x00ff_ffff).count()
+    }
+
+    #[test]
+    fn a_match_tints_exactly_its_rectangle() {
+        let mut buffer = buffer();
+        highlight_matches(
+            &mut buffer,
+            &[Rect {
+                x: 1.0,
+                y: 1.0,
+                width: 2.0,
+                height: 2.0,
+            }],
+            0,
+            0.0,
+            (4, 4),
+            0,
+        );
+        assert_eq!(tinted(&buffer), 4);
+        assert_eq!(buffer[0], 0x00ff_ffff, "the corner is untouched");
+    }
+
+    #[test]
+    fn the_current_match_is_tinted_differently_from_the_rest() {
+        // "Which one am I on" is the question the reader is actually asking.
+        let rects = [
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            Rect {
+                x: 2.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        ];
+        let mut buffer = buffer();
+        highlight_matches(&mut buffer, &rects, 1, 0.0, (4, 4), 0);
+        assert_ne!(buffer[0], buffer[2]);
+    }
+
+    #[test]
+    fn scrolling_moves_the_highlight_with_the_page() {
+        let rect = Rect {
+            x: 0.0,
+            y: 2.0,
+            width: 4.0,
+            height: 1.0,
+        };
+        let mut at_top = buffer();
+        highlight_matches(&mut at_top, &[rect], 0, 0.0, (4, 4), 0);
+        let mut scrolled = buffer();
+        highlight_matches(&mut scrolled, &[rect], 0, 2.0, (4, 4), 0);
+        assert_ne!(at_top, scrolled);
+        assert_eq!(tinted(&scrolled), 4, "still one row, higher up");
+    }
+
+    #[test]
+    fn a_match_scrolled_off_the_top_does_not_bleed_into_the_chrome() {
+        // The bar is not part of the page and must never be tinted by it.
+        let mut buffer = buffer();
+        highlight_matches(
+            &mut buffer,
+            &[Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 4.0,
+                height: 4.0,
+            }],
+            0,
+            3.0,
+            (4, 4),
+            2,
+        );
+        assert_eq!(buffer[0], 0x00ff_ffff, "chrome row untouched");
+        assert_eq!(buffer[4], 0x00ff_ffff, "chrome row untouched");
+    }
+
+    #[test]
+    fn a_match_past_the_edges_is_clipped_rather_than_panicking() {
+        let mut buffer = buffer();
+        highlight_matches(
+            &mut buffer,
+            &[Rect {
+                x: -10.0,
+                y: -10.0,
+                width: 100.0,
+                height: 100.0,
+            }],
+            0,
+            0.0,
+            (4, 4),
+            0,
+        );
+        assert_eq!(tinted(&buffer), 16);
+    }
+
+    #[test]
+    fn no_matches_leaves_the_buffer_alone() {
+        let mut buffer = buffer();
+        highlight_matches(&mut buffer, &[], 0, 0.0, (4, 4), 0);
+        assert_eq!(tinted(&buffer), 0);
     }
 }

@@ -28,6 +28,11 @@ fn main() {
     partial.end(false);
     partial.word_left(true);
 
+    let mut searching = shell::field::Field::with_all_selected("");
+    searching.insert("tables");
+    let mut fruitless = shell::field::Field::with_all_selected("");
+    fruitless.insert("nothing here");
+
     let cases: Vec<chrome::State> = vec![
         chrome::State {
             url: "https://example.com/a-perfectly-ordinary-page.html",
@@ -38,6 +43,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: None,
+            finding: None,
         },
         chrome::State {
             url: "http://example.org/an-old-page.html",
@@ -48,6 +54,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: None,
+            finding: None,
         },
         chrome::State {
             url: "file:///home/user/pages/index.html",
@@ -58,6 +65,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: None,
+            finding: None,
         },
         chrome::State {
             url: "https://example.com/something-modern",
@@ -68,6 +76,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: true,
             editing: None,
+            finding: None,
         },
         chrome::State {
             url: "https://example.com/app",
@@ -78,6 +87,7 @@ fn main() {
             forcing_authored: true,
             can_toggle_layout: true,
             editing: None,
+            finding: None,
         },
         chrome::State {
             url: "https://example.com/gone.html",
@@ -88,6 +98,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: None,
+            finding: None,
         },
         chrome::State {
             url: "https://example.com/a-page.html",
@@ -98,6 +109,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: Some(&selected),
+            finding: None,
         },
         chrome::State {
             url: "https://example.com/",
@@ -108,6 +120,7 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: Some(&typing),
+            finding: None,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -118,6 +131,29 @@ fn main() {
             forcing_authored: false,
             can_toggle_layout: false,
             editing: Some(&partial),
+            finding: None,
+        },
+        chrome::State {
+            url: "https://example.com/index.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: Some((&searching, 2, 7)),
+        },
+        chrome::State {
+            url: "https://example.com/index.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: Some((&fruitless, 0, 0)),
         },
     ];
 
