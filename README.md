@@ -26,7 +26,10 @@ Unicode line breaking; floats; tables with automatic column sizing; images,
 including ones sitting in a line; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
-text decorations; tiled background images; and external stylesheets.
+text decorations; tiled background images; external stylesheets; and legacy
+character encodings, which most of the surviving old web needs — a page in
+windows-1252 read as UTF-8 is replacement characters where every accented
+letter and curly quote should be.
 
 Rendering is deterministic across Linux, macOS, and Windows, checked by
 reference tests against one shared baseline set — verified, not assumed: all
@@ -39,9 +42,7 @@ arithmetic is.
 Known to be missing or wrong, rather than hidden: `rowspan` (a spanning cell
 occupies only its first row), collapsed borders, fixed table layout,
 `cellspacing`, dashed and dotted borders painting solid, `background-position`,
-`@media`/`@import`, and legacy character-encoding detection — pages of this
-era declare the wrong encoding or none at all often enough that this is real
-work, not a footnote. Links are styled but not clickable — hit testing and
+and `@media`/`@import`. Links are styled but not clickable — hit testing and
 navigation are M3, along with the rest of the browser chrome.
 See [PLAN.md](PLAN.md).
 

@@ -42,7 +42,11 @@ fn fixtures_match_their_baselines() {
             .expect("stem")
             .to_string_lossy()
             .to_string();
-        let html = std::fs::read_to_string(path).expect("fixture readable");
+        // Read as bytes and decoded the way a fetched page is, so a fixture
+        // may be in a legacy encoding — which is the only way to test that
+        // path end to end.
+        let bytes = std::fs::read(path).expect("fixture readable");
+        let (html, _, _) = net::encoding::decode_document(&bytes, None);
         // Render with the fixture's own location as the base, so relative
         // subresource URLs resolve and image fixtures actually exercise images.
         let url = format!("file://{}", path.display());

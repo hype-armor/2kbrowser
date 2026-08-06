@@ -4,9 +4,52 @@
 //! interesting part of this crate is [`policy`], which is where "without the
 //! slop" stops being a slogan and becomes a rule.
 
+pub mod encoding;
 pub mod policy;
 
 pub use policy::{Origin, Policy, Refusal, RequestKind, Scheme, parse_url, resolve};
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Count of third-party subresource requests that reached the network.
+///
+/// ADR-0006's rule is that there are none unless the user has allowed a host,
+/// and the budget harness asserts exactly that. Counted here, at the point a
+/// request is actually issued, rather than inside `Policy::check`: a bug that
+/// stopped the policy refusing would still be counted, which is the only
+/// version of this number worth having.
+///
+/// A request that is issued and then *fails* still counts. That distinction is
+/// the whole reason this exists — a page full of unreachable ad hosts loads no
+/// images whether the policy works or not, so success counts prove nothing.
+static THIRD_PARTY_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many third-party subresource requests have been issued this process.
+pub fn third_party_request_count() -> usize {
+    THIRD_PARTY_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// Resets the count. For tests and the budget harness.
+pub fn reset_third_party_request_count() {
+    THIRD_PARTY_REQUESTS.store(0, Ordering::Relaxed);
+}
+
+/// Records a request that the policy let through, if it left the origin.
+fn count_if_third_party(document: Option<&Origin>, target: &Origin, kind: RequestKind) {
+    if kind != RequestKind::Subresource {
+        return;
+    }
+    let Some(document) = document else { return };
+    // A file: subresource never leaves the machine, so it is not what this
+    // counts — but a *network* request from a file: document does leave, and
+    // has no origin to be first-party to.
+    if target.scheme == Scheme::File {
+        return;
+    }
+    if document.scheme == Scheme::File || !document.is_same_site(target) {
+        THIRD_PARTY_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Anything that can go wrong fetching a resource.
 #[derive(Debug)]
@@ -61,6 +104,10 @@ pub struct Resource {
     /// Path it was fetched from, which relative subresource URLs resolve
     /// against.
     pub path: String,
+    /// Name of the encoding the body was decoded from.
+    pub encoding: &'static str,
+    /// How that encoding was decided.
+    pub encoding_source: encoding::EncodingSource,
 }
 
 impl Resource {
@@ -95,19 +142,26 @@ impl Fetcher {
             .check(document, &origin, kind)
             .map_err(FetchError::Refused)?;
 
-        let bytes = match origin.scheme {
-            Scheme::File => read_file(&path)?,
+        count_if_third_party(document, &origin, kind);
+
+        let (bytes, content_type) = match origin.scheme {
+            // A file has no transport, so its encoding comes from the document
+            // or the default.
+            Scheme::File => (read_file(&path)?, None),
             Scheme::Http | Scheme::Https => fetch_http(url)?,
         };
-        // Lossy rather than strict: a page served with a broken encoding
-        // declaration should still render, which is the whole reason
-        // encoding sniffing exists (ADR-0004).
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        // Not UTF-8 by assumption: most of the surviving old web is not, and
+        // guessing wrong turns every accented letter into a replacement
+        // character (ADR-0004).
+        let (body, encoding, encoding_source) =
+            encoding::decode_document(&bytes, content_type.as_deref());
         Ok(Resource {
             body,
             bytes,
             origin,
             path,
+            encoding: encoding.name(),
+            encoding_source,
         })
     }
 
@@ -122,9 +176,13 @@ impl Fetcher {
         self.policy
             .check(document, &origin, kind)
             .map_err(FetchError::Refused)?;
+        count_if_third_party(document, &origin, kind);
+
         match origin.scheme {
             Scheme::File => read_file(&path),
-            Scheme::Http | Scheme::Https => fetch_http(url),
+            // The content type is irrelevant here: bytes fetched as bytes are
+            // images, and an image's encoding is its own format's business.
+            Scheme::Http | Scheme::Https => fetch_http(url).map(|(bytes, _)| bytes),
         }
     }
 }
@@ -137,7 +195,10 @@ fn read_file(path: &str) -> Result<Vec<u8>, FetchError> {
     std::fs::read(path).map_err(FetchError::Io)
 }
 
-fn fetch_http(url: &str) -> Result<Vec<u8>, FetchError> {
+/// Fetches over HTTP, returning the body and the `Content-Type` it was served
+/// with — the header being what decides the encoding when the page itself does
+/// not say.
+fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>), FetchError> {
     // No custom User-Agent games: this browser does not run scripts, and
     // pretending otherwise to get the script path served would produce exactly
     // the silent breakage ADR-0003 rejects.
@@ -146,12 +207,19 @@ fn fetch_http(url: &str) -> Result<Vec<u8>, FetchError> {
         other => FetchError::Transport(other.to_string()),
     })?;
 
-    response
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let bytes = response
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()
-        .map_err(|error| FetchError::Transport(error.to_string()))
+        .map_err(|error| FetchError::Transport(error.to_string()))?;
+    Ok((bytes, content_type))
 }
 
 #[cfg(test)]

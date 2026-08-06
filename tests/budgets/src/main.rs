@@ -77,20 +77,96 @@ fn main() -> ExitCode {
                 blocked_on: "memory instrumentation; rendering itself now works",
             },
         },
-        Check {
-            name: "third-party network requests",
-            limit: "0".to_owned(),
-            outcome: Outcome::Pending {
-                // The policy exists and is unit-tested in `net`. What is missing
-                // is subresource loading: nothing yet follows <link> or <img>,
-                // so there is no end-to-end request count to assert against.
-                blocked_on: "subresource loading; the policy itself is tested in net",
-            },
-        },
+        third_party_requests(),
         font_payload(),
     ];
 
     report(&checks)
+}
+
+/// Renders a page whose every subresource is third-party, and checks that none
+/// of them loaded.
+///
+/// The claim in PLAN.md is that one policy rule removes essentially all
+/// advertising and tracking without filter lists (ADR-0006). That claim is
+/// about the whole pipeline, not about `Policy::check` — which is separately
+/// unit-tested — so it is measured here, end to end, with the real renderer.
+///
+/// What is counted is requests *issued*, not requests that succeeded. Success
+/// counts prove nothing here: a page full of unreachable ad hosts loads no
+/// images whether the policy works or not — which this check reported as a
+/// pass until the counter replaced it.
+///
+/// A second page with a same-origin image is rendered as a control, because a
+/// loader that had silently stopped working would also issue no requests. Zero
+/// third-party and one same-origin is the only passing combination.
+///
+/// No network is touched: the third-party requests never leave the policy.
+fn third_party_requests() -> Check {
+    let name = "third-party network requests";
+    let limit = "0".to_owned();
+    let fail = |measured: String, reason: String| Check {
+        name,
+        limit: "0".to_owned(),
+        outcome: Outcome::Fail { measured, reason },
+    };
+
+    // A real image from the reference fixtures, so the control genuinely
+    // decodes rather than merely being requested.
+    let logo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../ref/fixtures/assets/logo.png")
+        .canonicalize();
+    let Ok(logo) = logo else {
+        return fail(
+            "-".to_owned(),
+            "the reference fixture assets are missing".to_owned(),
+        );
+    };
+    let document = logo.with_file_name("budget-page.html");
+    let url = format!("file://{}", document.display());
+    let Ok((origin, path)) = net::parse_url(&url) else {
+        return fail(
+            "-".to_owned(),
+            "could not parse the document URL".to_owned(),
+        );
+    };
+
+    let page = r#"<!doctype html><html><head>
+        <link rel="stylesheet" href="https://tracker.example.net/style.css">
+        </head><body>
+        <img src="https://ads.example.net/banner.gif" width="10" height="10">
+        <img src="https://beacon.example.org/pixel.png" width="1" height="1">
+        <p>Text that must survive.</p>
+        </body></html>"#;
+    let control = r#"<!doctype html><html><body>
+        <img src="logo.png"><p>Text that must survive.</p>
+        </body></html>"#;
+
+    let mut fonts = text::FontStore::new();
+    net::reset_third_party_request_count();
+    shell::render::render_with_base(page, 400, 400, &mut fonts, Some((&origin, &path)));
+    let third_party = net::third_party_request_count();
+    let same_origin =
+        shell::render::render_with_base(control, 400, 400, &mut fonts, Some((&origin, &path)))
+            .images_loaded;
+
+    match (third_party, same_origin) {
+        (0, 1) => Check {
+            name,
+            limit,
+            outcome: Outcome::Pass {
+                measured: "0 of 3 third-party issued, 1 of 1 same-origin loaded".to_owned(),
+            },
+        },
+        (0, _) => fail(
+            format!("{same_origin} of 1 same-origin"),
+            "the same-origin control did not load, so the zero above proves nothing".to_owned(),
+        ),
+        _ => fail(
+            format!("{third_party} of 3 third-party issued"),
+            "a third-party subresource request left the origin (ADR-0006)".to_owned(),
+        ),
+    }
 }
 
 /// Measures the release binary and compares it against the size budget.

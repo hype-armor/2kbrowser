@@ -63,6 +63,11 @@ pub enum Refusal {
         /// The scheme as written.
         scheme: String,
     },
+    /// A page from the network asked to read a local file.
+    LocalFile {
+        /// The path that was asked for.
+        path: String,
+    },
     /// The URL could not be parsed.
     Malformed,
 }
@@ -72,6 +77,9 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::ThirdParty { host } => {
                 write!(f, "blocked third-party request to {host} (ADR-0006)")
+            }
+            Refusal::LocalFile { path } => {
+                write!(f, "blocked a network page from reading {path} (ADR-0006)")
             }
             Refusal::UnsupportedScheme { scheme } => write!(f, "unsupported scheme `{scheme}:`"),
             Refusal::Malformed => write!(f, "malformed URL"),
@@ -113,16 +121,29 @@ impl Policy {
         if kind == RequestKind::Navigation {
             return Ok(());
         }
-        // A file: document has no host, so every subresource beside it is
-        // first-party by construction.
         let Some(document) = document else {
             return Ok(());
         };
-        if document.scheme == Scheme::File || target.scheme == Scheme::File {
-            return Ok(());
-        }
-        if document.is_same_site(target) {
-            return Ok(());
+
+        match (document.scheme, target.scheme) {
+            // A file: document has no host, so a file: subresource beside it
+            // is first-party by construction.
+            (Scheme::File, Scheme::File) => return Ok(()),
+            // A page from the network must never read the disk. There is no
+            // origin such a request could be first-party to, and allowing it
+            // turns every page into a local file reader.
+            (Scheme::Http | Scheme::Https, Scheme::File) => {
+                return Err(Refusal::LocalFile {
+                    path: target.host.clone(),
+                });
+            }
+            // A local document reaching out to the network is third-party by
+            // the same argument: it has no host, so nothing it asks the
+            // network for can be first-party. Falls through to the allow-list
+            // below, so an explicitly permitted host still works.
+            (Scheme::File, _) => {}
+            _ if document.is_same_site(target) => return Ok(()),
+            _ => {}
         }
         if self
             .allowed_third_parties
@@ -472,5 +493,103 @@ mod tests {
         assert!(Scheme::Https.is_authenticated());
         assert!(!Scheme::Http.is_authenticated());
         assert!(!Scheme::File.is_authenticated());
+    }
+}
+
+#[cfg(test)]
+mod scheme_boundary_tests {
+    use super::*;
+
+    fn origin(url: &str) -> Origin {
+        parse_url(url).expect("parses").0
+    }
+
+    fn check(document: &str, target: &str) -> Result<(), Refusal> {
+        Policy::default().check(
+            Some(&origin(document)),
+            &origin(target),
+            RequestKind::Subresource,
+        )
+    }
+
+    #[test]
+    fn a_local_file_may_load_its_neighbours() {
+        assert!(check("file:///pages/index.html", "file:///pages/logo.png").is_ok());
+    }
+
+    #[test]
+    fn a_local_file_may_not_reach_the_network() {
+        // A saved page full of tracking pixels is exactly the case: it has no
+        // host, so nothing it asks the network for can be first-party, and
+        // treating "no host" as "everything is first-party" turns every local
+        // file into an unrestricted beacon.
+        let refusal = check(
+            "file:///pages/index.html",
+            "https://tracker.example.net/p.gif",
+        );
+        assert!(
+            matches!(refusal, Err(Refusal::ThirdParty { .. })),
+            "got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn an_allowed_host_still_works_from_a_local_file() {
+        // The rule is a default, not a prohibition (ADR-0006).
+        let policy = Policy {
+            allowed_third_parties: vec!["cdn.example.net".to_owned()],
+        };
+        assert!(
+            policy
+                .check(
+                    Some(&origin("file:///pages/index.html")),
+                    &origin("https://cdn.example.net/x.png"),
+                    RequestKind::Subresource,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_network_page_may_not_read_the_disk() {
+        // Not a third-party question — there is no host to allow-list. A page
+        // fetched over the network has no business reading local files at all.
+        let refusal = check("https://example.com/page.html", "file:///etc/passwd");
+        assert!(
+            matches!(refusal, Err(Refusal::LocalFile { .. })),
+            "got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn an_allow_list_does_not_open_the_disk() {
+        let policy = Policy {
+            allowed_third_parties: vec!["etc".to_owned(), String::new(), "localhost".to_owned()],
+        };
+        assert!(
+            policy
+                .check(
+                    Some(&origin("https://example.com/page.html")),
+                    &origin("file:///etc/passwd"),
+                    RequestKind::Subresource,
+                )
+                .is_err(),
+            "the allow-list is for third-party hosts, not for local files"
+        );
+    }
+
+    #[test]
+    fn navigation_is_not_subject_to_any_of_this() {
+        // Following a link off-site, or opening a local file, is what a
+        // browser is for. The rule is about subresources.
+        assert!(
+            Policy::default()
+                .check(
+                    Some(&origin("https://example.com/a.html")),
+                    &origin("file:///pages/b.html"),
+                    RequestKind::Navigation,
+                )
+                .is_ok()
+        );
     }
 }

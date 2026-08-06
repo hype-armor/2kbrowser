@@ -9,5 +9,10 @@ publish = false
 name = "budgets"
 path = "src/main.rs"
 
+[dependencies]
+net = { path = "../../crates/net" }
+shell = { path = "../../crates/shell" }
+text = { path = "../../crates/text" }
+
 [lints]
 workspace = true
