@@ -1,8 +1,9 @@
 //! Box tree construction and block layout.
 //!
-//! M1 covers block boxes stacked vertically, each laying its inline content out
-//! as wrapped lines. Proper inline layout with mixed inline elements, floats,
-//! tables, and positioning are M2 (ADR-0004).
+//! Block boxes stack vertically, each laying its inline content out as an
+//! inline formatting context: differently-styled spans share line boxes and
+//! break as one paragraph. Floats, tables, and positioning are the rest of M2
+//! (ADR-0004).
 
 pub mod classify;
 
@@ -10,7 +11,7 @@ use css::cascade::StyleMap;
 use css::style::{ComputedStyle, Display, TextAlign, WhiteSpace};
 use css::value::Length;
 use dom::{Document, NodeId};
-use text::{FontStore, TextLayout};
+use text::{FontStore, InlineRun, TextLayout};
 
 pub use classify::{RenderMode, classify};
 
@@ -143,18 +144,14 @@ fn layout_block(
         children: Vec::new(),
     };
 
-    // Inline children are gathered into one text run. Real inline layout, where
-    // spans carry their own styles and share line boxes, is M2 — until then a
-    // block's inline content is shaped as a single styled run.
-    let raw_text = collect_inline_text(doc, styles, node);
-    let inline_text = match style.white_space {
-        WhiteSpace::Pre => raw_text,
-        _ => collapse_whitespace(&raw_text),
-    };
+    // Inline children become styled runs shaped as one paragraph, so a <b> or
+    // <code> inside this block keeps its own style while still breaking lines
+    // with the text around it.
+    let runs = collect_inline_runs(doc, styles, node, style);
     let mut content_height = 0.0;
 
-    if !inline_text.trim().is_empty() {
-        let layout = fonts.layout(inline_text.trim(), style, content_width);
+    if runs.iter().any(|run| !run.text.trim().is_empty()) {
+        let layout = fonts.layout_runs(&runs, style, content_width);
         content_height = layout.height;
         box_.text = Some(layout);
     }
@@ -192,23 +189,65 @@ fn layout_block(
     outer
 }
 
-/// Concatenates the text of a node's inline descendants, stopping at block
-/// children so their text is not counted twice.
-fn collect_inline_text(doc: &Document, styles: &StyleMap, node: NodeId) -> String {
-    let mut out = String::new();
+/// Collects a block's inline content as styled runs, stopping at block children
+/// so their text is not counted twice.
+///
+/// Each inline element contributes its own run carrying its own computed style,
+/// which is what lets `<b>` and `<code>` inside a paragraph render differently
+/// from the text around them.
+fn collect_inline_runs(
+    doc: &Document,
+    styles: &StyleMap,
+    node: NodeId,
+    inherited: &ComputedStyle,
+) -> Vec<InlineRun> {
+    let mut runs = Vec::new();
+    gather_runs(doc, styles, node, inherited, &mut runs);
+
+    // Whitespace collapsing spans run boundaries: `<b>bold</b> <i>italic</i>`
+    // must not lose the space between the runs, and `a <b> b</b>` must not keep
+    // two. Collapsing each run in isolation would get both wrong, so the runs
+    // are collapsed as one stream with the boundary state carried across.
+    let mut previous_ended_in_space = true;
+    for run in &mut runs {
+        if run.style.white_space == WhiteSpace::Pre {
+            previous_ended_in_space = run.text.ends_with(char::is_whitespace);
+            continue;
+        }
+        let collapsed = collapse_whitespace_from(&run.text, previous_ended_in_space);
+        previous_ended_in_space = collapsed.ends_with(' ');
+        run.text = collapsed;
+    }
+    // Leading and trailing whitespace of the whole block is dropped.
+    if let Some(first) = runs.first_mut() {
+        first.text = first.text.trim_start().to_owned();
+    }
+    if let Some(last) = runs.last_mut() {
+        last.text = last.text.trim_end().to_owned();
+    }
+    runs
+}
+
+fn gather_runs(
+    doc: &Document,
+    styles: &StyleMap,
+    node: NodeId,
+    inherited: &ComputedStyle,
+    out: &mut Vec<InlineRun>,
+) {
     for &child in doc.children(node) {
         if let Some(text) = doc.text(child) {
-            out.push_str(text);
+            out.push(InlineRun {
+                text: text.to_owned(),
+                style: inherited.clone(),
+            });
         } else if let Some(style) = styles.get(child) {
-            if style.display == Display::None {
+            if style.display == Display::None || !style.display.is_inline() {
                 continue;
             }
-            if style.display.is_inline() {
-                out.push_str(&collect_inline_text(doc, styles, child));
-            }
+            gather_runs(doc, styles, child, style, out);
         }
     }
-    out
 }
 
 /// Collapses whitespace per `white-space: normal`.
@@ -218,11 +257,21 @@ fn collect_inline_text(doc: &Document, styles: &StyleMap, node: NodeId) -> Strin
 /// wrapped line inherits the author's leading whitespace — visible as a ragged
 /// indent on continuation lines.
 pub fn collapse_whitespace(text: &str) -> String {
+    collapse_whitespace_from(text, true)
+}
+
+/// Collapses whitespace, treating the preceding text as already ending in a
+/// space when `after_space` is set.
+///
+/// The carried state is what makes collapsing correct across inline run
+/// boundaries: without it, the space between `</b>` and `<i>` either vanishes
+/// or doubles depending on which run it landed in.
+fn collapse_whitespace_from(text: &str, after_space: bool) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_whitespace = false;
+    let mut in_whitespace = after_space;
     for c in text.chars() {
         if c.is_whitespace() {
-            if !in_whitespace && !out.is_empty() {
+            if !in_whitespace {
                 out.push(' ');
             }
             in_whitespace = true;
@@ -405,6 +454,45 @@ mod tests {
         assert_eq!(
             a.layout.height, b.layout.height,
             "indentation changed the layout"
+        );
+    }
+
+    #[test]
+    fn whitespace_collapses_across_inline_run_boundaries() {
+        // The space between two inline elements lives in neither of them.
+        // Collapsing runs in isolation either loses it or doubles it, and both
+        // are visible on any page that emphasises a word.
+        let spaced = run("<body><p><b>one</b> <i>two</i></p></body>", "", 800.0);
+        let joined = run("<body><p><b>one</b><i>two</i></p></body>", "", 800.0);
+        let width = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .find_map(|b| b.text.as_ref().map(|t| t.width))
+                .expect("text")
+        };
+        assert!(
+            width(&spaced) > width(&joined),
+            "the inter-element space vanished: {} vs {}",
+            width(&spaced),
+            width(&joined)
+        );
+    }
+
+    #[test]
+    fn runs_of_whitespace_around_a_span_collapse_to_one() {
+        let single = run("<body><p>a <b>b</b></p></body>", "", 800.0);
+        let many = run("<body><p>a   <b>  b</b></p></body>", "", 800.0);
+        let width = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .find_map(|b| b.text.as_ref().map(|t| t.width))
+                .expect("text")
+        };
+        assert!(
+            (width(&single) - width(&many)).abs() < 0.01,
+            "extra whitespace was not collapsed: {} vs {}",
+            width(&single),
+            width(&many)
         );
     }
 

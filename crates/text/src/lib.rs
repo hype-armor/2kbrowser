@@ -88,6 +88,21 @@ pub struct PositionedGlyph {
     pub y: f32,
     /// Font size in pixels.
     pub font_size: f32,
+    /// Colour from the inline span this glyph came from.
+    ///
+    /// `None` means inherit the block's colour. Carried per glyph because a
+    /// single line can contain spans of different colours, and the paint stage
+    /// has no way to recover which span a glyph belonged to.
+    pub color: Option<(u8, u8, u8, u8)>,
+}
+
+/// A run of text with its own style, within a block's inline content.
+#[derive(Debug, Clone)]
+pub struct InlineRun {
+    /// The run's text.
+    pub text: String,
+    /// The style computed for the element the text came from.
+    pub style: ComputedStyle,
 }
 
 /// One laid-out line.
@@ -189,32 +204,68 @@ impl FontStore {
         }
     }
 
-    /// Shapes and wraps `text` to `max_width`, in the given style.
-    pub fn layout(&mut self, text: &str, style: &ComputedStyle, max_width: f32) -> TextLayout {
-        if text.is_empty() {
-            return TextLayout::default();
-        }
-
-        let metrics = Metrics::new(style.font_size, style.line_height);
-        let mut buffer = Buffer::new(&mut self.system, metrics);
-        let mut buffer = buffer.borrow_with(&mut self.system);
-        buffer.set_size(Some(max_width), None);
-
-        let attrs = Attrs::new()
+    /// Attributes for one inline span.
+    fn attrs_for(style: &ComputedStyle) -> Attrs<'static> {
+        Attrs::new()
             .family(Self::family_for(style))
             .weight(Weight(style.font_weight))
             .stretch(Stretch::Normal)
             .style(match style.font_style {
                 FontStyle::Italic => Style::Italic,
                 FontStyle::Normal => Style::Normal,
-            });
+            })
+            .metrics(Metrics::new(style.font_size, style.line_height))
+            .color(cosmic_text::Color::rgba(
+                style.color.r,
+                style.color.g,
+                style.color.b,
+                style.color.a,
+            ))
+    }
+
+    /// Shapes and wraps `text` to `max_width`, in a single style.
+    pub fn layout(&mut self, text: &str, style: &ComputedStyle, max_width: f32) -> TextLayout {
+        let runs = [InlineRun {
+            text: text.to_owned(),
+            style: style.clone(),
+        }];
+        self.layout_runs(&runs, style, max_width)
+    }
+
+    /// Shapes and wraps a sequence of differently-styled runs as one paragraph.
+    ///
+    /// Line breaking happens across the whole sequence rather than per run,
+    /// which is the difference between real inline layout and concatenating
+    /// separately-wrapped fragments: `<p>a <b>bold</b> word</p>` must break as
+    /// if it were one sentence, because it is one.
+    pub fn layout_runs(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        max_width: f32,
+    ) -> TextLayout {
+        if runs.iter().all(|run| run.text.is_empty()) {
+            return TextLayout::default();
+        }
+
+        let metrics = Metrics::new(default_style.font_size, default_style.line_height);
+        let mut buffer = Buffer::new(&mut self.system, metrics);
+        let mut buffer = buffer.borrow_with(&mut self.system);
+        buffer.set_size(Some(max_width), None);
+
+        let default_attrs = Self::attrs_for(default_style);
+        let spans: Vec<(&str, Attrs<'_>)> = runs
+            .iter()
+            .map(|run| (run.text.as_str(), Self::attrs_for(&run.style)))
+            .collect();
 
         // Advanced shaping: required for correctness on anything beyond plain
         // Latin, and the cost is irrelevant next to being wrong.
-        buffer.set_text(text, &attrs, Shaping::Advanced);
+        buffer.set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(false);
 
         let mut layout = TextLayout::default();
+        let mut height = 0.0f32;
         for run in buffer.layout_runs() {
             let glyphs = run
                 .glyphs
@@ -225,6 +276,7 @@ impl FontStore {
                     x: glyph.x,
                     y: run.line_y,
                     font_size: glyph.font_size,
+                    color: glyph.color_opt.map(|c| (c.r(), c.g(), c.b(), c.a())),
                 })
                 .collect();
             layout.width = layout.width.max(run.line_w);
@@ -233,8 +285,11 @@ impl FontStore {
                 width: run.line_w,
                 baseline: run.line_y - run.line_top,
             });
+            // Line heights vary when spans do, so accumulate rather than
+            // multiplying a count by one line height.
+            height = height.max(run.line_top + run.line_height);
         }
-        layout.height = layout.lines.len() as f32 * style.line_height;
+        layout.height = height;
         layout
     }
 
@@ -354,6 +409,112 @@ mod tests {
         let (data, _, _, width, height) = store.rasterise(&glyph).expect("bitmap");
         assert_eq!(data.len(), width * height);
         assert!(data.iter().any(|&a| a > 0), "glyph must have ink");
+    }
+
+    #[test]
+    fn a_bold_span_shapes_differently_from_its_surroundings() {
+        // The M1 gap this closes: <b> inside a paragraph must actually be bold.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let bold = ComputedStyle {
+            font_weight: 700,
+            ..style(16.0)
+        };
+
+        let runs = [
+            InlineRun {
+                text: "regular ".to_owned(),
+                style: plain.clone(),
+            },
+            InlineRun {
+                text: "heavy".to_owned(),
+                style: bold,
+            },
+        ];
+        let mixed = store.layout_runs(&runs, &plain, 1000.0);
+        let uniform = store.layout("regular heavy", &plain, 1000.0);
+
+        // Bold advances are wider, so the mixed line must be wider overall.
+        assert!(
+            mixed.width > uniform.width,
+            "bold run did not change shaping: {} vs {}",
+            mixed.width,
+            uniform.width
+        );
+    }
+
+    #[test]
+    fn runs_carry_their_own_colour() {
+        let mut store = FontStore::new();
+        let black = style(16.0);
+        let red = ComputedStyle {
+            color: css::value::Color::rgb(255, 0, 0),
+            ..style(16.0)
+        };
+        let runs = [
+            InlineRun {
+                text: "a".to_owned(),
+                style: black.clone(),
+            },
+            InlineRun {
+                text: "b".to_owned(),
+                style: red,
+            },
+        ];
+        let layout = store.layout_runs(&runs, &black, 1000.0);
+        let colors: Vec<_> = layout.lines[0].glyphs.iter().map(|g| g.color).collect();
+        assert_eq!(colors[0], Some((0, 0, 0, 255)));
+        assert_eq!(colors[1], Some((255, 0, 0, 255)));
+    }
+
+    #[test]
+    fn line_breaking_spans_run_boundaries() {
+        // Runs must wrap as one paragraph, not as separately-wrapped fragments.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let runs = [
+            InlineRun {
+                text: "the quick brown ".to_owned(),
+                style: plain.clone(),
+            },
+            InlineRun {
+                text: "fox jumps over the lazy dog".to_owned(),
+                style: plain.clone(),
+            },
+        ];
+        let split = store.layout_runs(&runs, &plain, 160.0);
+        let whole = store.layout("the quick brown fox jumps over the lazy dog", &plain, 160.0);
+        assert_eq!(split.lines.len(), whole.lines.len());
+        assert!((split.height - whole.height).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_larger_span_makes_its_line_taller() {
+        let mut store = FontStore::new();
+        let small = style(12.0);
+        let large = ComputedStyle {
+            font_size: 30.0,
+            line_height: 36.0,
+            ..style(30.0)
+        };
+        let uniform = store.layout("small text", &small, 1000.0);
+        let runs = [
+            InlineRun {
+                text: "small ".to_owned(),
+                style: small.clone(),
+            },
+            InlineRun {
+                text: "BIG".to_owned(),
+                style: large,
+            },
+        ];
+        let mixed = store.layout_runs(&runs, &small, 1000.0);
+        assert!(
+            mixed.height > uniform.height,
+            "a larger span must raise line height: {} vs {}",
+            mixed.height,
+            uniform.height
+        );
     }
 
     #[test]

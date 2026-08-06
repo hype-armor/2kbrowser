@@ -245,15 +245,16 @@ the three platforms produce identical pixels.
 page, the three platforms agree pixel for pixel in CI, and `2kbrowser open`
 shows it in a scrollable window (verified by hand; CI has no display).
 
-Known gap carried into M2: a block's inline content is shaped as one styled
-run, so `<b>` and `<code>` inside a paragraph do not yet carry their own
-styles. That is the first item below.
+The gap it carried into M2 — inline content shaped as a single styled run — is
+now closed: see M2 item 2 below.
 
 ### M2 — It renders the era's web
 The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 
 1. Real cascade and selector matching; full box model; backgrounds and borders
-2. Inline layout with correct line breaking
+2. **Inline layout with correct line breaking** — *done.* Differently-styled
+   spans share line boxes, break as one paragraph, carry their own colour and
+   size, and collapse whitespace across run boundaries.
 3. **Tables** — the era's dominant layout mechanism, so this comes early
 4. **Floats** — the other one
 5. Images, links, scrolling, hit testing

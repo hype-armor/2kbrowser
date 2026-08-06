@@ -88,11 +88,18 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
         for line in &layout.lines {
             let dx = line_offset(box_.style.text_align, line.width, content_width);
             for glyph in &line.glyphs {
+                // A glyph's own colour wins: one line can hold spans of
+                // different colours, and the block's colour is only the
+                // default for text that did not come from a styled span.
+                let color = glyph
+                    .color
+                    .map(|(r, g, b, a)| Color { r, g, b, a })
+                    .unwrap_or(box_.style.color);
                 list.items.push(DisplayItem::Glyph {
                     glyph: *glyph,
                     origin_x: content_x + dx,
                     origin_y: content_y,
-                    color: box_.style.color,
+                    color,
                 });
             }
         }
@@ -262,6 +269,54 @@ mod tests {
             .filter(|p| p.blue() > 100 && p.red() < 100)
             .count();
         assert!(blue > 10, "expected blue glyph pixels, got {blue}");
+    }
+
+    #[test]
+    fn an_inline_span_carries_its_own_colour_into_the_pixels() {
+        // End to end: cascade gives <b> a colour, the shaper carries it per
+        // glyph, and paint honours it rather than the block's colour.
+        let pixmap = render(
+            "<body><p>plain <b>red</b></p></body>",
+            "p { color: #000000 } b { color: #ff0000 }",
+            300,
+        );
+        let red = pixmap
+            .pixels()
+            .iter()
+            .filter(|p| p.red() > 150 && p.green() < 80 && p.blue() < 80)
+            .count();
+        assert!(
+            red > 5,
+            "expected red glyph pixels from the <b> span, got {red}"
+        );
+    }
+
+    #[test]
+    fn an_inline_span_can_change_the_font() {
+        // <code> should render monospace even inside a proportional paragraph.
+        let proportional = render("<body><p>iiiiiiiiii</p></body>", "", 400);
+        let monospaced = render("<body><p><code>iiiiiiiiii</code></p></body>", "", 400);
+        let ink_width = |pixmap: &Pixmap| -> u32 {
+            let width = pixmap.width();
+            let columns: Vec<u32> = pixmap
+                .pixels()
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.red() != 255 || p.green() != 255 || p.blue() != 255)
+                .map(|(i, _)| i as u32 % width)
+                .collect();
+            match (columns.iter().min(), columns.iter().max()) {
+                (Some(min), Some(max)) => max - min,
+                _ => 0,
+            }
+        };
+        // Monospace 'i' is much wider than proportional 'i'.
+        assert!(
+            ink_width(&monospaced) > ink_width(&proportional),
+            "code span did not switch to monospace: {} vs {}",
+            ink_width(&monospaced),
+            ink_width(&proportional)
+        );
     }
 
     #[test]
