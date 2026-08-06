@@ -13,7 +13,7 @@
 use cosmic_text::{
     Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache, Weight,
 };
-use css::style::{ComputedStyle, FontStyle, GenericFamily};
+use css::style::{ComputedStyle, FontStyle, GenericFamily, WhiteSpace};
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
 const SANS: &[(&str, &[u8])] = &[
@@ -127,6 +127,29 @@ pub struct TextLayout {
     pub width: f32,
 }
 
+/// A shaped, unbreakable piece of text.
+#[derive(Debug, Clone, Default)]
+struct Shaped {
+    glyphs: Vec<PositionedGlyph>,
+    width: f32,
+    /// Distance from the line top to the baseline.
+    ascent: f32,
+    /// The segment's own line height.
+    height: f32,
+}
+
+/// A segment placed on a line.
+#[derive(Debug, Clone)]
+struct Segment {
+    shaped: Shaped,
+    /// Width of collapsed whitespace following this segment.
+    trailing_space: f32,
+    /// Whether a line break is required after this segment.
+    mandatory_break: bool,
+    /// Horizontal position within the line, filled in during placement.
+    x: f32,
+}
+
 /// Owns the font database and the glyph raster cache.
 pub struct FontStore {
     system: FontSystem,
@@ -232,65 +255,254 @@ impl FontStore {
         self.layout_runs(&runs, style, max_width)
     }
 
-    /// Shapes and wraps a sequence of differently-styled runs as one paragraph.
+    /// Shapes a single unbreakable segment at its natural width.
     ///
-    /// Line breaking happens across the whole sequence rather than per run,
-    /// which is the difference between real inline layout and concatenating
-    /// separately-wrapped fragments: `<p>a <b>bold</b> word</p>` must break as
-    /// if it were one sentence, because it is one.
-    pub fn layout_runs(
-        &mut self,
-        runs: &[InlineRun],
-        default_style: &ComputedStyle,
-        max_width: f32,
-    ) -> TextLayout {
-        if runs.iter().all(|run| run.text.is_empty()) {
-            return TextLayout::default();
+    /// Shaping happens per segment rather than per character, so joining
+    /// scripts and ligatures within a segment stay correct; segments are cut
+    /// only at Unicode break opportunities, where shaping does not carry over.
+    fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Shaped {
+        if text.is_empty() {
+            return Shaped::default();
         }
-
-        let metrics = Metrics::new(default_style.font_size, default_style.line_height);
+        let metrics = Metrics::new(style.font_size, style.line_height);
         let mut buffer = Buffer::new(&mut self.system, metrics);
         let mut buffer = buffer.borrow_with(&mut self.system);
-        buffer.set_size(Some(max_width), None);
-
-        let default_attrs = Self::attrs_for(default_style);
-        let spans: Vec<(&str, Attrs<'_>)> = runs
-            .iter()
-            .map(|run| (run.text.as_str(), Self::attrs_for(&run.style)))
-            .collect();
-
+        // No width limit: a segment is by definition not broken further.
+        buffer.set_size(None, None);
+        let attrs = Self::attrs_for(style);
         // Advanced shaping: required for correctness on anything beyond plain
         // Latin, and the cost is irrelevant next to being wrong.
-        buffer.set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
+        buffer.set_rich_text([(text, attrs.clone())], &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(false);
 
-        let mut layout = TextLayout::default();
-        let mut height = 0.0f32;
-        for run in buffer.layout_runs() {
-            let glyphs = run
+        let mut shaped = Shaped::default();
+        if let Some(run) = buffer.layout_runs().next() {
+            shaped.width = run.line_w;
+            shaped.ascent = run.line_y - run.line_top;
+            shaped.height = run.line_height;
+            shaped.glyphs = run
                 .glyphs
                 .iter()
                 .map(|glyph| PositionedGlyph {
                     font_id: glyph.font_id,
                     glyph_id: glyph.glyph_id,
                     x: glyph.x,
-                    y: run.line_y,
+                    y: 0.0,
                     font_size: glyph.font_size,
                     color: glyph.color_opt.map(|c| (c.r(), c.g(), c.b(), c.a())),
                 })
                 .collect();
-            layout.width = layout.width.max(run.line_w);
-            layout.lines.push(Line {
-                glyphs,
-                width: run.line_w,
-                baseline: run.line_y - run.line_top,
-            });
-            // Line heights vary when spans do, so accumulate rather than
-            // multiplying a count by one line height.
-            height = height.max(run.line_top + run.line_height);
         }
-        layout.height = height;
+        shaped
+    }
+
+    /// Shapes and wraps runs as one paragraph at a fixed width.
+    pub fn layout_runs(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        max_width: f32,
+    ) -> TextLayout {
+        self.layout_runs_constrained(runs, default_style, |_, _| (0.0, max_width))
+    }
+
+    /// Shapes and wraps runs where the available width varies down the page.
+    ///
+    /// `constraints` is asked, for a line starting at `y` and `height` tall,
+    /// for the horizontal offset and width available to it. That is what makes
+    /// floats possible: text beside a float gets a narrower, offset line box,
+    /// and text below it gets the full width back.
+    ///
+    /// Line breaking happens across the whole run sequence rather than per run,
+    /// which is the difference between real inline layout and concatenating
+    /// separately-wrapped fragments: `<p>a <b>bold</b> word</p>` must break as
+    /// if it were one sentence, because it is one.
+    pub fn layout_runs_constrained<F>(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        constraints: F,
+    ) -> TextLayout
+    where
+        F: Fn(f32, f32) -> (f32, f32),
+    {
+        let segments = self.segment(runs);
+        if segments.is_empty() {
+            return TextLayout::default();
+        }
+
+        let mut layout = TextLayout::default();
+        let mut y = 0.0f32;
+        let mut current: Vec<Segment> = Vec::new();
+        let mut x = 0.0f32;
+        let mut line_height = default_style.line_height;
+        let mut ascent = default_style.font_size * 0.8;
+
+        // The available width depends on the line's height, and the height
+        // depends on what lands on the line. Query with the height so far and
+        // accept that a line which grows taller mid-fill keeps the width it
+        // started with — the alternative is re-flowing, which can oscillate.
+        let mut available = constraints(y, line_height).1;
+
+        for segment in segments {
+            let fits = current.is_empty() || x + segment.shaped.width <= available;
+            if !fits {
+                let (offset, _) = constraints(y, line_height);
+                Self::push_line(&mut layout, &mut current, offset, y, ascent);
+                y += line_height;
+                x = 0.0;
+                line_height = default_style.line_height;
+                ascent = default_style.font_size * 0.8;
+                available = constraints(y, line_height).1;
+            }
+
+            line_height = line_height.max(segment.shaped.height);
+            ascent = ascent.max(segment.shaped.ascent);
+            let advance = segment.shaped.width + segment.trailing_space;
+            let forced = segment.mandatory_break;
+            let mut placed = segment;
+            placed.x = x;
+            x += advance;
+            current.push(placed);
+
+            // A newline in `pre`, or any other mandatory opportunity, ends the
+            // line regardless of how much room is left.
+            if forced {
+                let (offset, _) = constraints(y, line_height);
+                Self::push_line(&mut layout, &mut current, offset, y, ascent);
+                y += line_height;
+                x = 0.0;
+                line_height = default_style.line_height;
+                ascent = default_style.font_size * 0.8;
+                available = constraints(y, line_height).1;
+            }
+        }
+
+        if !current.is_empty() {
+            let (offset, _) = constraints(y, line_height);
+            Self::push_line(&mut layout, &mut current, offset, y, ascent);
+            y += line_height;
+        }
+
+        layout.height = y;
+        layout.width = layout
+            .lines
+            .iter()
+            .fold(0.0f32, |acc, line| acc.max(line.width));
         layout
+    }
+
+    /// Emits one line from the segments gathered for it.
+    fn push_line(
+        layout: &mut TextLayout,
+        current: &mut Vec<Segment>,
+        offset: f32,
+        line_y: f32,
+        ascent: f32,
+    ) {
+        let mut glyphs = Vec::new();
+        let mut width = 0.0f32;
+        for segment in current.iter() {
+            for glyph in &segment.shaped.glyphs {
+                glyphs.push(PositionedGlyph {
+                    x: glyph.x + segment.x + offset,
+                    // Absolute baseline within the block: the line's own top
+                    // plus the shared ascent. Using the ascent alone would
+                    // stack every line at the same y.
+                    y: line_y + ascent,
+                    ..*glyph
+                });
+            }
+            // Trailing spaces are excluded: a line's width is its inked extent,
+            // which is what centring and right alignment must measure.
+            width = width.max(segment.x + segment.shaped.width);
+        }
+        layout.lines.push(Line {
+            glyphs,
+            width,
+            baseline: ascent,
+        });
+        current.clear();
+    }
+
+    /// Cuts runs into unbreakable segments at Unicode break opportunities.
+    ///
+    /// Uses the Unicode line breaking algorithm rather than splitting on
+    /// spaces. Scripts without spaces — CJK above all — break between
+    /// characters, and a space-splitting breaker would hand them one
+    /// unbreakable segment per paragraph that could never wrap.
+    fn segment(&mut self, runs: &[InlineRun]) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::new();
+        for run in runs {
+            if run.text.is_empty() {
+                continue;
+            }
+            let preserve = run.style.white_space == WhiteSpace::Pre;
+            let mut start = 0usize;
+            for (index, opportunity) in unicode_linebreak::linebreaks(&run.text) {
+                let piece = &run.text[start..index];
+                start = index;
+                // The algorithm reports Mandatory at end of text as well as at
+                // hard line breaks. Requiring an actual break character tells
+                // them apart — otherwise every run boundary would end a line,
+                // and `<b>one</b> <i>two</i>` would render on two.
+                let mandatory = opportunity == unicode_linebreak::BreakOpportunity::Mandatory
+                    && piece.contains(['\n', '\r', '\u{0b}', '\u{0c}', '\u{85}']);
+
+                let trimmed = piece.trim_end_matches([' ', '\t', '\n', '\r']);
+                let whitespace = &piece[trimmed.len()..];
+                // Newlines take no horizontal room; the break itself is the
+                // effect. Tabs and spaces do.
+                let spacing: String = whitespace
+                    .chars()
+                    .filter(|c| *c != '\n' && *c != '\r')
+                    .collect();
+                let space_width = if spacing.is_empty() {
+                    0.0
+                } else if preserve {
+                    self.shape_segment(&spacing, &run.style).width
+                } else {
+                    // Collapsed runs already hold at most one space.
+                    self.shape_segment(" ", &run.style).width
+                };
+
+                if trimmed.is_empty() {
+                    // Whitespace with no text of its own still advances the pen
+                    // and can still carry a mandatory break, so it must not be
+                    // dropped — a blank line in a <pre> is exactly this case.
+                    if let Some(last) = out.last_mut() {
+                        last.trailing_space += space_width;
+                        last.mandatory_break |= mandatory;
+                    } else if mandatory {
+                        out.push(Segment {
+                            shaped: Shaped {
+                                height: run.style.line_height,
+                                ascent: run.style.font_size * 0.8,
+                                ..Shaped::default()
+                            },
+                            trailing_space: space_width,
+                            mandatory_break: true,
+                            x: 0.0,
+                        });
+                    }
+                    continue;
+                }
+
+                let shaped = self.shape_segment(trimmed, &run.style);
+                out.push(Segment {
+                    shaped,
+                    trailing_space: space_width,
+                    mandatory_break: mandatory,
+                    x: 0.0,
+                });
+            }
+        }
+        // The algorithm reports a mandatory break at end of text; that is the
+        // end of the paragraph, not a blank line after it.
+        if let Some(last) = out.last_mut() {
+            last.mandatory_break = false;
+        }
+        out
     }
 
     /// Minimum and maximum content widths of a set of runs.
@@ -543,6 +755,102 @@ mod tests {
             "a larger span must raise line height: {} vs {}",
             mixed.height,
             uniform.height
+        );
+    }
+
+    #[test]
+    fn a_narrowed_band_wraps_sooner_and_is_offset() {
+        // The float case: the first band is narrow and pushed right, the rest
+        // of the page is full width. Text must respect both.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let runs = [InlineRun {
+            text: "the quick brown fox jumps over the lazy dog and keeps on running".to_owned(),
+            style: plain.clone(),
+        }];
+        // The band is one line tall at 16px/1.2, so only the first line is
+        // narrowed and everything after it gets the full width back.
+        let layout = store.layout_runs_constrained(&runs, &plain, |y, _| {
+            if y < 19.0 {
+                (120.0, 180.0)
+            } else {
+                (0.0, 500.0)
+            }
+        });
+
+        let unconstrained = store.layout_runs(&runs, &plain, 500.0);
+        assert!(
+            layout.lines.len() > unconstrained.lines.len(),
+            "the narrow band must force a wrap the full width does not: {} vs {}",
+            layout.lines.len(),
+            unconstrained.lines.len()
+        );
+        let first_line_x = layout.lines[0]
+            .glyphs
+            .first()
+            .map(|g| g.x)
+            .expect("glyphs on the first line");
+        assert!(
+            first_line_x >= 120.0,
+            "first line must be offset past the float, got {first_line_x}"
+        );
+        assert!(
+            layout.lines[0].width <= 180.0 + 120.0,
+            "first line must fit the narrow band"
+        );
+
+        let last = layout.lines.last().expect("a last line");
+        let last_x = last.glyphs.first().map(|g| g.x).expect("glyphs");
+        assert!(
+            last_x < 120.0,
+            "lines below the float start at the left edge, got {last_x}"
+        );
+    }
+
+    #[test]
+    fn a_single_unbreakable_word_overflows_rather_than_being_split() {
+        // CSS breaks lines at opportunities; a long word with none simply
+        // overflows. Splitting it mid-word would be worse than overflowing.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let runs = [InlineRun {
+            text: "supercalifragilistic".to_owned(),
+            style: plain.clone(),
+        }];
+        let layout = store.layout_runs(&runs, &plain, 20.0);
+        assert_eq!(
+            layout.lines.len(),
+            1,
+            "a word with no break opportunity stays whole"
+        );
+        assert!(layout.width > 20.0, "and overflows its container");
+    }
+
+    #[test]
+    fn glyphs_on_a_line_share_one_baseline() {
+        // Mixed sizes must sit on a common baseline, not each at its own top.
+        let mut store = FontStore::new();
+        let small = style(12.0);
+        let large = ComputedStyle {
+            font_size: 28.0,
+            line_height: 34.0,
+            ..style(28.0)
+        };
+        let runs = [
+            InlineRun {
+                text: "small".to_owned(),
+                style: small.clone(),
+            },
+            InlineRun {
+                text: "BIG".to_owned(),
+                style: large,
+            },
+        ];
+        let layout = store.layout_runs(&runs, &small, 1000.0);
+        let ys: Vec<f32> = layout.lines[0].glyphs.iter().map(|g| g.y).collect();
+        assert!(
+            ys.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+            "baselines differ: {ys:?}"
         );
     }
 

@@ -1933,6 +1933,7 @@ version = "0.0.0"
 dependencies = [
  "cosmic-text",
  "css",
+ "unicode-linebreak",
 ]
 
 [[package]]
