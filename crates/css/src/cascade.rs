@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use dom::{Document, NodeId};
+use dom::{Document, ElementData, NodeId};
 
 use crate::style::{
     BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack,
@@ -19,6 +19,9 @@ use crate::{Declaration, Specificity, Stylesheet};
 pub enum Origin {
     /// The user-agent stylesheet.
     UserAgent,
+    /// Attributes like `bgcolor` and `<font color>`, which the era's markup
+    /// used in place of CSS. Below author rules, above the UA sheet.
+    Presentational,
     /// Stylesheets supplied by the page.
     Author,
     /// A `style` attribute on the element itself, which outranks every rule.
@@ -127,6 +130,23 @@ fn compute(
                 }
             }
         }
+    }
+
+    // Presentational attributes, which carry most of the era's styling. They
+    // sit below author CSS so a stylesheet can always override them, and above
+    // the UA sheet so they actually take effect.
+    let hints = presentational_hints(doc, node);
+    for declaration in &hints {
+        order += 1;
+        matched.push((
+            Precedence {
+                important: false,
+                origin: Origin::Presentational,
+                specificity: Specificity::default(),
+                order,
+            },
+            declaration,
+        ));
     }
 
     // A `style` attribute applies to this element alone and beats every rule.
@@ -424,6 +444,187 @@ fn parse_edges(values: &[Raw], quirks: bool) -> Edges {
         },
         _ => Edges::ZERO,
     }
+}
+
+/// Declarations implied by an element's presentational attributes.
+///
+/// The era's pages carry most of their styling here rather than in CSS, so a
+/// browser that ignores these renders them as unstyled text. Values are parsed
+/// through the ordinary value machinery, and colours go through the quirky
+/// parser because `bgcolor="dfe8ff"` without a `#` is the common form.
+fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
+    let Some(element) = doc.element(node) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut push = |name: &str, value: &str| {
+        let mut input = cssparser::ParserInput::new(value);
+        let mut parser = cssparser::Parser::new(&mut input);
+        let components = crate::value::read_components(&mut parser);
+        if !components.is_empty() {
+            out.push(Declaration {
+                name: name.to_owned(),
+                value: components,
+                important: false,
+            });
+        }
+    };
+
+    let tag = element.local_name();
+    if let Some(color) = element.attr("bgcolor") {
+        push("background-color", &attr_color(color));
+    }
+    // `text` on <body> sets the document's foreground colour.
+    if tag == "body"
+        && let Some(color) = element.attr("text")
+    {
+        push("color", &attr_color(color));
+    }
+    if let Some(align) = element.attr("align") {
+        match align.trim().to_ascii_lowercase().as_str() {
+            // On an image or table, `align` floats it; elsewhere it aligns text.
+            "left" | "right" if matches!(tag, "img" | "table") => push("float", align),
+            "left" | "right" | "center" | "middle" | "justify" => {
+                let value = if align.eq_ignore_ascii_case("middle") {
+                    "center"
+                } else {
+                    align
+                };
+                push("text-align", value);
+            }
+            _ => {}
+        }
+    }
+    if let Some(color) = element.attr("color")
+        && tag == "font"
+    {
+        push("color", &attr_color(color));
+    }
+    if tag == "font"
+        && let Some(face) = element.attr("face")
+    {
+        push("font-family", face);
+    }
+    // <font size> is a 1-7 scale, or a relative "+2"/"-1".
+    if tag == "font"
+        && let Some(size) = element.attr("size")
+        && let Some(keyword) = font_size_keyword(size)
+    {
+        push("font-size", keyword);
+    }
+    // Table sizing attributes, which predate CSS entirely.
+    if matches!(tag, "table" | "td" | "th" | "col")
+        && let Some(width) = element.attr("width")
+    {
+        push("width", &attr_length(width));
+    }
+    if matches!(tag, "table" | "td" | "th" | "tr")
+        && let Some(height) = element.attr("height")
+    {
+        push("height", &attr_length(height));
+    }
+    // `cellpadding` and `border` are written on the table but describe its
+    // cells, so a cell has to look upwards to find them. `<table border="1">`
+    // in particular is the single most recognisable piece of the era's markup:
+    // it draws a rule around the table *and* around every cell.
+    if matches!(tag, "td" | "th")
+        && let Some(table) = enclosing_table(doc, node)
+    {
+        if let Some(padding) = table.attr("cellpadding") {
+            push("padding", &attr_length(padding));
+        }
+        if table_border_width(table).is_some() {
+            // The cell rule is always 1px however thick the table's own is,
+            // which is what the attribute meant.
+            push("border", "1px solid");
+        }
+    }
+    if tag == "table"
+        && let Some(width) = table_border_width(element)
+    {
+        push("border", &format!("{width}px solid"));
+    }
+    out
+}
+
+/// The `table` element enclosing a cell, skipping the row and row group.
+fn enclosing_table(doc: &Document, node: NodeId) -> Option<&ElementData> {
+    let mut current = doc.node(node).parent;
+    while let Some(id) = current {
+        let element = doc.element(id)?;
+        if element.local_name() == "table" {
+            return Some(element);
+        }
+        current = doc.node(id).parent;
+    }
+    None
+}
+
+/// The width `<table border>` asks for, or `None` when it asks for no border.
+///
+/// `border="0"` is the era's idiom for a table used purely as a layout grid,
+/// and it must not draw anything.
+fn table_border_width(element: &ElementData) -> Option<f32> {
+    let value = element.attr("border")?.trim();
+    // A valueless `border` attribute means 1px.
+    let width: f32 = if value.is_empty() {
+        1.0
+    } else {
+        value.parse().ok()?
+    };
+    (width > 0.0).then_some(width)
+}
+
+/// Normalises a colour attribute into CSS syntax.
+///
+/// `bgcolor="dfe8ff"` is the common form and is not CSS: the attribute has its
+/// own grammar, so a bare hex string is valid here whatever mode the document
+/// is in. Adding the `#` lets the ordinary colour parser take it from there.
+fn attr_color(value: &str) -> String {
+    let trimmed = value.trim();
+    if matches!(trimmed.len(), 3 | 6) && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("#{trimmed}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Normalises a length attribute into CSS syntax.
+///
+/// `width="300"` means 300 pixels regardless of document mode, for the same
+/// reason: the attribute is not a CSS declaration and never had CSS's units.
+fn attr_length(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.ends_with('%') {
+        return trimmed.to_owned();
+    }
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        format!("{trimmed}px")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Maps a `<font size>` value onto a CSS absolute-size keyword.
+fn font_size_keyword(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    // Relative forms are resolved against size 3, the default.
+    let level: i32 = if let Some(rest) = value.strip_prefix('+') {
+        3 + rest.parse::<i32>().ok()?
+    } else if let Some(rest) = value.strip_prefix('-') {
+        3 - rest.parse::<i32>().ok()?
+    } else {
+        value.parse().ok()?
+    };
+    Some(match level.clamp(1, 7) {
+        1 => "x-small",
+        2 => "small",
+        3 => "medium",
+        4 => "large",
+        5 => "x-large",
+        6 => "xx-large",
+        _ => "xx-large",
+    })
 }
 
 /// The four border sides in CSS shorthand order.
@@ -845,6 +1046,194 @@ mod tests {
         // gain permissive parsing.
         let strict = standards_style_of("<p>x</p>", "p { padding: 5 }", "p");
         assert_eq!(strict.padding.top, Length::Px(0.0));
+    }
+
+    #[test]
+    fn bgcolor_sets_a_background() {
+        // Hash-less is the common form, so it has to work in both modes: the
+        // attribute value is not CSS and is not subject to CSS strictness.
+        let style = standards_style_of(r##"<body bgcolor="#ff0000">x</body>"##, "", "body");
+        assert_eq!(style.background_color, crate::Color::rgb(255, 0, 0));
+
+        let hashless = standards_style_of(r#"<body bgcolor="00ff00">x</body>"#, "", "body");
+        assert_eq!(hashless.background_color, crate::Color::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn author_css_overrides_a_presentational_attribute() {
+        // The ordering that matters: attributes sit below author rules so a
+        // stylesheet can always win, and above the UA sheet so they take
+        // effect at all.
+        let style = standards_style_of(
+            r##"<body bgcolor="#ff0000">x</body>"##,
+            "body { background-color: #0000ff }",
+            "body",
+        );
+        assert_eq!(style.background_color, crate::Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn a_style_attribute_beats_an_author_rule() {
+        let style = standards_style_of(
+            r#"<p id="a" style="color: lime">x</p>"#,
+            "#a { color: red }",
+            "p",
+        );
+        assert_eq!(style.color, crate::Color::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn body_text_attribute_sets_the_foreground_colour() {
+        let style = standards_style_of(r##"<body text="#0000ff">x</body>"##, "", "body");
+        assert_eq!(style.color, crate::Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn align_becomes_text_align_but_floats_an_image() {
+        let paragraph = standards_style_of(r#"<p align="center">x</p>"#, "", "p");
+        assert_eq!(paragraph.text_align, TextAlign::Center);
+
+        // On an image the same attribute means float, not text alignment.
+        let image = standards_style_of(r#"<body><img align="right"></body>"#, "", "img");
+        assert_eq!(image.float, crate::style::Float::Right);
+    }
+
+    #[test]
+    fn font_size_maps_the_one_to_seven_scale() {
+        let big = standards_style_of(r#"<font size="6">x</font>"#, "", "font");
+        let small = standards_style_of(r#"<font size="1">x</font>"#, "", "font");
+        let default = standards_style_of(r#"<font size="3">x</font>"#, "", "font");
+        assert!(big.font_size > default.font_size);
+        assert!(small.font_size < default.font_size);
+        assert_eq!(default.font_size, 16.0, "size 3 is the default size");
+    }
+
+    #[test]
+    fn a_relative_font_size_resolves_against_the_default() {
+        let plus = standards_style_of(r#"<font size="+2">x</font>"#, "", "font");
+        let explicit = standards_style_of(r#"<font size="5">x</font>"#, "", "font");
+        assert_eq!(plus.font_size, explicit.font_size, "+2 is size 5");
+    }
+
+    #[test]
+    fn font_color_and_face_apply() {
+        let style = standards_style_of(
+            r##"<font color="#ff00ff" face="Courier">x</font>"##,
+            "",
+            "font",
+        );
+        assert_eq!(style.color, crate::Color::rgb(255, 0, 255));
+        // Identifiers are lowercased by the tokenizer; family matching is
+        // case-insensitive, so this is the stored form.
+        assert_eq!(style.font_family.families, vec!["courier".to_owned()]);
+    }
+
+    #[test]
+    fn table_width_attribute_sizes_the_table() {
+        let style = standards_style_of(
+            r#"<table width="300"><tr><td>x</td></tr></table>"#,
+            "",
+            "table",
+        );
+        // Attribute values are not CSS, so a bare number is a length here even
+        // in standards mode.
+        assert_eq!(style.width, Length::Px(300.0));
+    }
+
+    #[test]
+    fn cellpadding_pads_the_cells_not_the_table() {
+        // The attribute is written on the table but describes its cells. Put it
+        // on the table itself and the whole grid shifts inwards while the text
+        // stays jammed against the cell edges — the opposite of what it means.
+        let html = r#"<table cellpadding="6"><tr><td>x</td></tr></table>"#;
+        let cell = standards_style_of(html, "", "td");
+        assert_eq!(cell.padding.left, Length::Px(6.0));
+        assert_eq!(cell.padding.top, Length::Px(6.0));
+
+        let table = standards_style_of(html, "", "table");
+        assert_eq!(
+            table.padding.left,
+            Length::Px(0.0),
+            "the table is not padded"
+        );
+    }
+
+    #[test]
+    fn table_border_attribute_rules_the_table_and_its_cells() {
+        // `<table border="1">` draws a rule around the table and around every
+        // cell, which is why the era's tables look the way they do.
+        let html = r#"<table border="1"><tr><td>x</td></tr></table>"#;
+        let table = standards_style_of(html, "", "table");
+        assert_eq!(table.border.left.used_width(table.font_size), 1.0);
+
+        let cell = standards_style_of(html, "", "td");
+        assert_eq!(
+            cell.border.top.used_width(cell.font_size),
+            1.0,
+            "every cell is ruled too"
+        );
+
+        // A thicker table border still gives cells a 1px rule.
+        let thick = r#"<table border="4"><tr><td>x</td></tr></table>"#;
+        assert_eq!(
+            standards_style_of(thick, "", "table")
+                .border
+                .left
+                .used_width(16.0),
+            4.0
+        );
+        assert_eq!(
+            standards_style_of(thick, "", "td")
+                .border
+                .left
+                .used_width(16.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn border_zero_draws_nothing() {
+        // `border="0"` is how a table used purely for page layout said "do not
+        // draw me". Getting this wrong puts a grid over the whole page.
+        let html = r#"<table border="0"><tr><td>x</td></tr></table>"#;
+        assert_eq!(
+            standards_style_of(html, "", "table")
+                .border
+                .left
+                .used_width(16.0),
+            0.0
+        );
+        assert_eq!(
+            standards_style_of(html, "", "td")
+                .border
+                .left
+                .used_width(16.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_row_can_carry_its_own_background() {
+        // Striped tables put the colour on `<tr>`.
+        let style = standards_style_of(
+            r##"<table><tr bgcolor="#c0c0c0"><td>x</td></tr></table>"##,
+            "",
+            "tr",
+        );
+        assert_eq!(style.background_color, crate::Color::rgb(192, 192, 192));
+    }
+
+    #[test]
+    fn align_floats_an_image_but_aligns_text() {
+        // The same attribute means two different things depending on what it is
+        // written on, which is a genuine quirk of the era's HTML rather than an
+        // inconsistency we could tidy away.
+        let image = standards_style_of(r#"<img align="right" src="x.png">"#, "", "img");
+        assert_eq!(image.float, crate::style::Float::Right);
+
+        let paragraph = standards_style_of(r#"<p align="right">x</p>"#, "", "p");
+        assert_eq!(paragraph.float, crate::style::Float::None);
+        assert_eq!(paragraph.text_align, TextAlign::Right);
     }
 
     #[test]

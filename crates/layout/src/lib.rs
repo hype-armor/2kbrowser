@@ -663,7 +663,7 @@ fn layout_table(
     let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
 
     for row in &grid.rows {
-        for cell in row {
+        for cell in &row.cells {
             let runs = collect_inline_runs(doc, styles, cell.node, &cell.style);
             let (mut min, mut max) = fonts.intrinsic_widths(&runs, &cell.style);
             // A cell's own padding and borders are part of what it needs.
@@ -715,7 +715,7 @@ fn layout_table(
         let mut row_height = 0.0f32;
         let mut cell_boxes = Vec::new();
 
-        for cell in row {
+        for cell in &row.cells {
             let end = (cell.column + cell.colspan).min(widths.len());
             if cell.column >= end {
                 continue;
@@ -763,6 +763,27 @@ fn layout_table(
                 cell_boxes.push(cell_box);
             }
         }
+
+        // The row's own box goes in first so its background paints behind the
+        // cells rather than over them. It spans the full row including the
+        // spacing on either side, which is where a striped table's colour is
+        // expected to reach.
+        let row_width: f32 = widths.iter().sum::<f32>()
+            + table::BORDER_SPACING * (widths.len().saturating_sub(1)) as f32;
+        parent.children.push(LayoutBox {
+            rect: Rect {
+                x: x + table::BORDER_SPACING,
+                y: cursor_y,
+                width: row_width,
+                height: row_height,
+            },
+            style: row.style.clone(),
+            text: None,
+            content_origin: (0.0, 0.0),
+            content_width: row_width,
+            children: Vec::new(),
+            replaced: None,
+        });
 
         // Cells stretch to the row's height so backgrounds and borders line up.
         for mut cell_box in cell_boxes {
@@ -1239,6 +1260,36 @@ mod tests {
             (cells[0].rect.x - cells[1].rect.x).abs() < 0.01,
             "same column, same x"
         );
+    }
+
+    #[test]
+    fn a_row_gets_a_box_spanning_its_cells() {
+        // Striped tables put the colour on `<tr>`, so the row needs a box of
+        // its own: without one there is nothing for that background to paint
+        // on and the stripes vanish.
+        let rendered = run(
+            "<body><table><tr><td>one</td><td>two</td></tr></table></body>",
+            "body { margin: 0 } tr { background: #ff0000 }",
+            600.0,
+        );
+        let all = content_boxes(&rendered);
+        let cells: Vec<_> = all.iter().filter(|b| b.text.is_some()).collect();
+        let row = all
+            .iter()
+            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0))
+            .expect("a box carries the row background");
+
+        let left = cells.iter().map(|c| c.rect.x).fold(f32::MAX, f32::min);
+        let right = cells
+            .iter()
+            .map(|c| c.rect.x + c.rect.width)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            row.rect.x <= left && row.rect.x + row.rect.width >= right,
+            "row {:?} must span its cells {left}..{right}",
+            row.rect
+        );
+        assert!(row.rect.height > 0.0, "a row with cells has height");
     }
 
     #[test]

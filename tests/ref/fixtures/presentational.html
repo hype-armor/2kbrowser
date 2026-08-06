@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Presentational attributes</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 12px }
+    /* An author rule that must beat the `color` attribute on the very same
+       element: the cascade only ever competes within one element, so this is
+       the only arrangement that tests the origin ordering at all. */
+    font.authored { color: #004400 }
+  </style>
+</head>
+<body bgcolor="dfe8ff" text="#202020">
+  <h1 align="center">Styling before stylesheets</h1>
+
+  <p>The era's markup carries most of its styling in attributes rather than
+  CSS, so a browser that only reads stylesheets renders these pages as
+  unstyled text.</p>
+
+  <p align="right">This paragraph is aligned by an <code>align</code>
+  attribute, with no CSS involved.</p>
+
+  <p><font color="#aa0000" face="Courier" size="4">A font element sets
+  colour, face, and size at once</font>, and the text around it is
+  unaffected.</p>
+
+  <p><font class="authored" color="#aa0000">An author rule beats a
+  presentational hint on the same element, so this line is green rather than
+  red.</font></p>
+
+  <table bgcolor="#ffffff" width="360" border="1" cellpadding="6">
+    <tr bgcolor="#c8d8f0">
+      <th>Attribute</th>
+      <th>Effect</th>
+    </tr>
+    <tr>
+      <td><code>bgcolor</code></td>
+      <td>background colour</td>
+    </tr>
+    <tr>
+      <td><code>align</code></td>
+      <td>text alignment</td>
+    </tr>
+    <tr>
+      <td><code>cellpadding</code></td>
+      <td>padding inside every cell</td>
+    </tr>
+    <tr>
+      <td><code>border</code></td>
+      <td>a rule around the table and each cell</td>
+    </tr>
+  </table>
+
+  <!-- The layout table: `border="0"` must draw nothing at all. -->
+  <table border="0" width="360" cellpadding="4">
+    <tr>
+      <td bgcolor="#ffffff">A table used for page layout, not for data,</td>
+      <td bgcolor="#e0e0e0">draws no rules.</td>
+    </tr>
+  </table>
+
+  <p><font size="1">size 1</font> <font size="2">size 2</font>
+  <font size="3">size 3</font> <font size="5">size 5</font>
+  <font size="7">size 7</font></p>
+</body>
+</html>

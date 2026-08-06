@@ -30,6 +30,22 @@ pub struct Cell {
     pub column: usize,
 }
 
+/// One row: the `tr` itself, plus its cells.
+///
+/// The row is kept rather than flattened away because it can carry a
+/// background of its own — `<tr bgcolor>` striping is how the era's tables
+/// were made readable — and that background paints behind the whole row, not
+/// behind each cell.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// The `tr` element.
+    pub node: NodeId,
+    /// Its computed style.
+    pub style: ComputedStyle,
+    /// Cells in document order.
+    pub cells: Vec<Cell>,
+}
+
 /// A table flattened into rows of cells.
 ///
 /// Row spanning is not modelled: a `rowspan` cell occupies only its first row,
@@ -40,7 +56,7 @@ pub struct Cell {
 #[derive(Debug, Clone, Default)]
 pub struct Grid {
     /// Rows in document order.
-    pub rows: Vec<Vec<Cell>>,
+    pub rows: Vec<Row>,
     /// Number of columns, accounting for spans.
     pub columns: usize,
 }
@@ -56,7 +72,7 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
     grid.columns = grid
         .rows
         .iter()
-        .map(|row| row.iter().map(|cell| cell.colspan).sum::<usize>())
+        .map(|row| row.cells.iter().map(|cell| cell.colspan).sum::<usize>())
         .max()
         .unwrap_or(0);
     grid
@@ -75,7 +91,7 @@ fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, g
         }
         match element.local_name() {
             "tr" => {
-                let mut row = Vec::new();
+                let mut cells = Vec::new();
                 let mut column = 0;
                 for &cell_node in doc.children(child) {
                     let Some(cell_element) = doc.element(cell_node) else {
@@ -95,7 +111,7 @@ fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, g
                         .and_then(|value| value.parse::<usize>().ok())
                         .unwrap_or(1)
                         .clamp(1, 1000);
-                    row.push(Cell {
+                    cells.push(Cell {
                         node: cell_node,
                         style: cell_style.clone(),
                         colspan,
@@ -103,8 +119,12 @@ fn collect_rows(doc: &Document, styles: &css::cascade::StyleMap, node: NodeId, g
                     });
                     column += colspan;
                 }
-                if !row.is_empty() {
-                    grid.rows.push(row);
+                if !cells.is_empty() {
+                    grid.rows.push(Row {
+                        node: child,
+                        style: style.clone(),
+                        cells,
+                    });
                 }
             }
             // Row groups, and any other wrapper, are descended through.
@@ -274,8 +294,8 @@ mod tests {
             r#"<table><tr><td colspan="3">wide</td></tr><tr><td>a</td><td>b</td></tr></table>"#,
         );
         assert_eq!(grid.columns, 3);
-        assert_eq!(grid.rows[0][0].colspan, 3);
-        assert_eq!(grid.rows[1][1].column, 1);
+        assert_eq!(grid.rows[0].cells[0].colspan, 3);
+        assert_eq!(grid.rows[1].cells[1].column, 1);
     }
 
     #[test]
