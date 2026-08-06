@@ -256,12 +256,19 @@ Internet Archive captures from ~2000 are pleasant to read. This milestone takes
 longer than all the others combined; expect the schedule to be dominated by
 items 2 and 3.
 
-### M3 — Browser chrome
+### M3 — Browser chrome, and the document fallback
 Tabs, URL bar, history, back/forward, bookmarks, find-in-page. Keyboard-first.
 This is where "without the slop" becomes visible as UX rather than as an
 absence — no sponsored tiles, no feed, no account, no onboarding. The HTTP
 transparency requirement from §4 lands here.
-*Done when:* it is the browser you reach for to read something.
+
+**Reader mode also lands here rather than in M5** (ADR-0009), because it is what
+makes the browser work on the modern web at all. When a page's layout depends on
+features we do not implement, the engine detects that during cascade and
+re-renders the page as a document instead of producing a layout it knows to be
+wrong — telling the user it did so, with a control to force the raw layout.
+*Done when:* it is the browser you reach for to read something, and modern pages
+are readable rather than jumbled.
 
 ### M4 — Hardening
 Process/sandbox model, continuous fuzzing of the HTML, CSS, and image-decode
@@ -270,8 +277,8 @@ paths, TLS configuration review, `AccessKit` integration for screen readers.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
 ### M5 — The slop layer
-Reader mode as a first-class view. Content-quality signals surfaced in the UI.
-Optional community blocklists for content farms.
+Content-quality signals surfaced in the UI. Optional community blocklists for
+content farms. (Reader mode moved to M3 — see ADR-0009.)
 
 ---
 
@@ -306,10 +313,13 @@ decides; the browser explains its reasoning.
   treadmill coming back. If the goal quietly becomes "render the modern web,"
   the project has failed and should be a Chromium shell instead. This is the
   risk most likely to actually kill the project, because it kills it pleasantly.
-- **Modern sites will look wrong, not just plain.** Without JS *and* without
-  flexbox or grid, many current pages will render as jumbled boxes rather than
-  as clean documents. Reader mode (M5) is what makes this tolerable, and there
-  is an argument for pulling it earlier than M5.
+- **Modern sites will look wrong, not just plain** — *mitigated by ADR-0009.*
+  Without JS and without flexbox or grid, many current pages would render as
+  jumbled boxes, which reads as a broken browser rather than a deliberate one.
+  The engine now detects that its layout would be wrong and re-renders the page
+  as a document instead. The residual risk is the detection threshold: pages
+  near it will flip between modes, so it needs a corpus behind it rather than a
+  guess, and the user needs the override.
 - **M2 is most of the work.** Inline text layout and table layout are where
   engine projects stall. Table layout in particular is far more intricate than
   it looks.
@@ -335,7 +345,7 @@ that it has one home and can be closed:
 | # | Question | Blocks |
 | --- | --- | --- |
 | [1](https://github.com/hype-armor/2kbrowser/issues/1) | Period-authentic chrome, or a modern shell? | M3 |
-| [2](https://github.com/hype-armor/2kbrowser/issues/2) | Move reader mode earlier than M5? | M3 |
+| ~~[2](https://github.com/hype-armor/2kbrowser/issues/2)~~ | ~~Move reader mode earlier than M5?~~ Resolved: yes, M3 (ADR-0009) | — |
 | [3](https://github.com/hype-armor/2kbrowser/issues/3) | Legacy TLS: marked downgrade, or unreachable? | M4 |
 | [4](https://github.com/hype-armor/2kbrowser/issues/4) | Revisit dependency posture? | nothing |
 | [5](https://github.com/hype-armor/2kbrowser/issues/5) | No metric-compatible clone for Verdana/Tahoma | nothing |

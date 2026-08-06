@@ -14,3 +14,4 @@ that ADRs are superseded rather than edited.
 | [0006](0006-network-policy-defaults.md) | Network policy defaults | accepted |
 | [0007](0007-dependency-posture.md) | Dependency posture | accepted |
 | [0008](0008-font-selection.md) | Font selection | accepted |
+| [0009](0009-automatic-document-fallback.md) | Re-render as a document when a page is too modern | accepted |
