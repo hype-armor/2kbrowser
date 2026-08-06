@@ -16,14 +16,18 @@ See [PLAN.md](PLAN.md) for the full rationale and roadmap, and
 
 ## Status
 
-**M1 in progress — it renders.** HTML is parsed into an arena DOM, cascaded
-through a CSS 2.1 subset, laid out as block boxes, shaped against bundled
-Liberation faces, and rasterised on the CPU. Rendering is deterministic across
-Linux, macOS, and Windows, checked by reference tests against one shared
-baseline set.
+**M1 — it renders.** HTML is fetched over HTTP(S) or read from disk, parsed into
+an arena DOM, cascaded through a CSS 2.1 subset, laid out as block boxes, shaped
+against bundled Liberation faces, and rasterised on the CPU. Rendering is
+deterministic across Linux, macOS, and Windows, checked by reference tests
+against one shared baseline set.
 
-Not built yet: networking (local files only), a window, and inline layout with
-per-span styles. See [PLAN.md](PLAN.md).
+> **The window (`open`) is UNVERIFIED.** It compiles and its logic is unit
+> tested, but it has never been run against a real display. `render` is fully
+> tested; prefer it until the window has been exercised.
+
+Not built yet: inline layout with per-span styles, subresource loading, and
+everything from M2 onward. See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
 > TLS review all land in M4. Until then this is a tool for its authors.
@@ -40,8 +44,15 @@ cargo test --workspace
 ## Rendering a page
 
 ```sh
-2kbrowser render page.html --out page.png --width 800
+2kbrowser render https://example.com --out page.png --width 800
+2kbrowser render page.html --out page.png
+2kbrowser open page.html            # window — unverified, see above
 ```
+
+Third-party requests are refused by default, so one policy rule removes
+essentially all advertising and tracking with no filter lists (ADR-0006). Plain
+HTTP is allowed, because much of the old web needs it, and is always marked as
+unauthenticated rather than presented as secure.
 
 When a page's layout depends on features this engine does not implement, it is
 re-rendered as a document and told so — never silently (ADR-0009):

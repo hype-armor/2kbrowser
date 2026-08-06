@@ -4,3 +4,4 @@
 //! pipeline the binary uses, rather than a reimplementation of it.
 
 pub mod render;
+pub mod window;

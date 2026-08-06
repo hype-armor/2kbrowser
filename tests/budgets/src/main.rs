@@ -81,7 +81,10 @@ fn main() -> ExitCode {
             name: "third-party network requests",
             limit: "0".to_owned(),
             outcome: Outcome::Pending {
-                blocked_on: "the net crate (ADR-0006)",
+                // The policy exists and is unit-tested in `net`. What is missing
+                // is subresource loading: nothing yet follows <link> or <img>,
+                // so there is no end-to-end request count to assert against.
+                blocked_on: "subresource loading; the policy itself is tested in net",
             },
         },
         font_payload(),

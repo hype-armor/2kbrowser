@@ -1,12 +1,12 @@
 //! The 2kbrowser command line.
 //!
-//! M1 ships the headless path only: `render` fetches a URL or file and writes a
-//! PNG. The window follows; this is the part reference tests and CI depend on,
-//! and it is what makes the rest a thin shell over a tested core.
+//! `render` fetches a URL or file and writes a PNG; `open` shows it in a
+//! window. The headless path is what reference tests and CI depend on, and it is
+//! what makes the window a thin shell over a tested core.
 
 use std::process::ExitCode;
 
-use shell::render;
+use shell::{render, window};
 
 use text::FontStore;
 
@@ -14,31 +14,27 @@ const USAGE: &str = "\
 2kbrowser — a web browser without the slop
 
 USAGE:
+    2kbrowser open   <url-or-file> [--width <px>] [--height <px>]
     2kbrowser render <url-or-file> [--out <file.png>] [--width <px>] [--height <px>]
 
 OPTIONS:
-    --out <path>     Where to write the PNG (default: page.png)
+    --out <path>     Where to write the PNG (render only; default: page.png)
     --width <px>     Viewport width (default: 800)
-    --height <px>    Maximum canvas height (default: 4000)
+    --height <px>    Window height, or maximum canvas height for render
 
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
-M1: there is no window yet — output is a PNG. See PLAN.md.";
+In a window: arrows and PageUp/PageDown scroll, Home/End jump, Esc or q quits.
+
+NOTE: `open` is UNVERIFIED — it has never been run against a real display. See
+crates/shell/src/window.rs. `render` is fully tested.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("render") => match run_render(&args[1..]) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("render") => report(run_render(&args[1..])),
+        Some("open") => report(run_open(&args[1..])),
         Some("--help" | "-h" | "help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -50,35 +46,81 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_render(args: &[String]) -> Result<String, String> {
-    let mut input = None;
-    let mut output = "page.png".to_owned();
-    let mut width = 800u32;
-    let mut height = 4000u32;
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--out" => {
-                output = take(args, &mut index, "--out")?;
+/// Prints a command's outcome and turns it into an exit code.
+fn report(outcome: Result<String, String>) -> ExitCode {
+    match outcome {
+        Ok(message) => {
+            if !message.is_empty() {
+                println!("{message}");
             }
-            "--width" => {
-                width = take(args, &mut index, "--width")?
-                    .parse()
-                    .map_err(|_| "--width must be a number".to_owned())?;
-            }
-            "--height" => {
-                height = take(args, &mut index, "--height")?
-                    .parse()
-                    .map_err(|_| "--height must be a number".to_owned())?;
-            }
-            other if input.is_none() => input = Some(other.to_owned()),
-            other => return Err(format!("unexpected argument `{other}`")),
+            ExitCode::SUCCESS
         }
-        index += 1;
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
     }
+}
 
-    let input = input.ok_or("no input given")?;
+/// Opens a window. See the caveat in `window.rs`: this path is unverified.
+fn run_open(args: &[String]) -> Result<String, String> {
+    let options = Options::parse(args)?;
+    let input = options.input.ok_or("no input given")?;
+    let resource = load(&input)?;
+    window::open(
+        resource.body,
+        input,
+        options.width,
+        options.height.min(2000),
+    )?;
+    Ok(String::new())
+}
+
+/// Options shared by both commands.
+struct Options {
+    input: Option<String>,
+    output: String,
+    width: u32,
+    height: u32,
+}
+
+impl Options {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Options {
+            input: None,
+            output: "page.png".to_owned(),
+            width: 800,
+            height: 4000,
+        };
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--out" => options.output = take(args, &mut index, "--out")?,
+                "--width" => {
+                    options.width = take(args, &mut index, "--width")?
+                        .parse()
+                        .map_err(|_| "--width must be a number".to_owned())?;
+                }
+                "--height" => {
+                    options.height = take(args, &mut index, "--height")?
+                        .parse()
+                        .map_err(|_| "--height must be a number".to_owned())?;
+                }
+                other if options.input.is_none() => options.input = Some(other.to_owned()),
+                other => return Err(format!("unexpected argument `{other}`")),
+            }
+            index += 1;
+        }
+        Ok(options)
+    }
+}
+
+fn run_render(args: &[String]) -> Result<String, String> {
+    let options = Options::parse(args)?;
+    let output = options.output;
+    let (width, height) = (options.width, options.height);
+
+    let input = options.input.ok_or("no input given")?;
     let resource = load(&input)?;
 
     let mut fonts = FontStore::new();

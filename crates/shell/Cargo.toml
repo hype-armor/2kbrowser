@@ -15,7 +15,9 @@ dom = { path = "../dom" }
 layout = { path = "../layout" }
 net = { path = "../net" }
 paint = { path = "../paint" }
+softbuffer = "0.4"
 text = { path = "../text" }
+winit = "0.30"
 
 [lints]
 workspace = true
