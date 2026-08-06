@@ -400,6 +400,143 @@ fn marker_box(
     })
 }
 
+/// Turns the line breaker's placements into real child boxes.
+///
+/// An inline image is still a box: it can carry a border, padding, and a
+/// background, and a broken one has to show its frame. Emitting boxes rather
+/// than painting the placements directly means all of that goes through the
+/// ordinary box-painting path instead of being special-cased.
+fn emit_replaced_boxes(
+    styles: &StyleMap,
+    layout: &TextLayout,
+    style: &ComputedStyle,
+    origin: (f32, f32),
+    content_width: f32,
+    parent: &mut LayoutBox,
+) {
+    for line in &layout.lines {
+        // The same shift paint applies to the line's glyphs, so a centred line
+        // carries its images along with its text.
+        let dx = line_offset(style.text_align, line.width, content_width);
+        for placed in &line.replaced {
+            let node = NodeId(placed.id);
+            let Some(child_style) = styles.get(node) else {
+                continue;
+            };
+            let font_size = child_style.font_size;
+            let left = child_style.border.left.used_width(font_size)
+                + child_style.padding.left.to_px(font_size, content_width);
+            let right = child_style.border.right.used_width(font_size)
+                + child_style.padding.right.to_px(font_size, content_width);
+            let top = child_style.border.top.used_width(font_size)
+                + child_style.padding.top.to_px(font_size, content_width);
+
+            parent.children.push(LayoutBox {
+                rect: Rect {
+                    x: origin.0 + dx + placed.x,
+                    y: origin.1 + placed.y,
+                    width: placed.width,
+                    height: placed.height,
+                },
+                style: child_style.clone(),
+                text: None,
+                content_origin: (left, top),
+                content_width: (placed.width - left - right).max(0.0),
+                children: Vec::new(),
+                replaced: Some(node),
+                node: Some(node),
+            });
+        }
+    }
+}
+
+/// Lays out a stretch of inline children as an anonymous block box.
+///
+/// CSS 2.1 §9.2.1.1: when a block container holds both inline and block
+/// children, each run of inline content is wrapped in an anonymous block. It
+/// matters because without it every scrap of inline content in the container
+/// is hoisted above every block one — `<img><p>caption</p><img>` puts both
+/// images at the top rather than one on each side of the caption.
+///
+/// Returns the height consumed. `pending` is emptied.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn flush_inline(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    pending: &mut Vec<NodeId>,
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    at: (f32, f32),
+    content_width: f32,
+    context: &FloatContext,
+    content_top: f32,
+    parent: &mut LayoutBox,
+) -> f32 {
+    if pending.is_empty() {
+        return 0.0;
+    }
+    let children = std::mem::take(pending);
+    let runs = inline_runs_for(doc, styles, &children, style, intrinsic, content_width);
+    if !runs
+        .iter()
+        .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
+    {
+        return 0.0;
+    }
+
+    // Floats are seen from where this stretch actually starts, so text after a
+    // block child still flows around a float that reaches down to it.
+    let local = context.translated(0.0, at.1 - content_top, content_width);
+    let layout = if local.is_empty() {
+        fonts.layout_runs(&runs, style, content_width)
+    } else {
+        fonts.layout_runs_constrained(&runs, style, |y, height| local.line_box(y, height))
+    };
+    let height = layout.height;
+
+    let mut anonymous = LayoutBox {
+        rect: Rect {
+            x: at.0,
+            y: at.1,
+            width: content_width,
+            height,
+        },
+        // The parent's style, less anything that would paint: an anonymous box
+        // is not an element and must not draw a second background or border.
+        style: ComputedStyle {
+            background_color: css::Color::TRANSPARENT,
+            background_image: None,
+            border: css::style::Borders::default(),
+            margin: css::style::Edges::ZERO,
+            padding: css::style::Edges::ZERO,
+            ..style.clone()
+        },
+        text: Some(layout),
+        content_origin: (0.0, 0.0),
+        content_width,
+        children: Vec::new(),
+        replaced: None,
+        node: None,
+    };
+    if let Some(laid_out) = &anonymous.text {
+        let laid_out = laid_out.clone();
+        emit_replaced_boxes(
+            styles,
+            &laid_out,
+            style,
+            (0.0, 0.0),
+            content_width,
+            &mut anonymous,
+        );
+    }
+    parent.children.push(anonymous);
+    height
+}
+
 /// Lays out `node` as a block box at `(x, y)` within `available_width`,
 /// appending it to `parent`. Returns the outer height consumed.
 #[expect(
@@ -489,7 +626,25 @@ fn layout_block(
     // Inline children become styled runs shaped as one paragraph, so a <b> or
     // <code> inside this block keeps its own style while still breaking lines
     // with the text around it.
-    let runs = collect_inline_runs(doc, styles, node, style);
+    //
+    // A container whose children are *all* inline — every paragraph, every
+    // heading, most cells — lays its text out directly on this box. One with a
+    // block child anywhere among them cannot: its inline stretches have to be
+    // laid out where they sit, which is what the anonymous boxes below do.
+    let all_inline = !doc.children(node).iter().any(|&child| {
+        styles.get(child).is_some_and(|child_style| {
+            child_style.display != Display::None
+                && !child_style.display.is_inline()
+                && !child_style.display.is_table_internal()
+                && child_style.float == Float::None
+                && !child_style.position.is_out_of_flow()
+        })
+    });
+    let runs = if all_inline {
+        collect_inline_runs(doc, styles, node, style, intrinsic, content_width)
+    } else {
+        Vec::new()
+    };
     let mut content_height = 0.0;
     // Floats declared by ancestors still apply here, shifted into this block's
     // coordinates; this block's own floats are added on top.
@@ -553,13 +708,26 @@ fn layout_block(
         box_.children.push(marker);
     }
 
-    if runs.iter().any(|run| !run.text.trim().is_empty()) {
+    // A line's worth of content is text *or* an atomic box: a paragraph
+    // holding nothing but an image still needs laying out.
+    if runs
+        .iter()
+        .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
+    {
         let layout = if context.is_empty() {
             fonts.layout_runs(&runs, style, content_width)
         } else {
             fonts.layout_runs_constrained(&runs, style, |y, height| context.line_box(y, height))
         };
         content_height = layout.height;
+        emit_replaced_boxes(
+            styles,
+            &layout,
+            style,
+            (padding_left + border_left, padding_top + border_top),
+            content_width,
+            &mut box_,
+        );
         box_.text = Some(layout);
     }
 
@@ -584,20 +752,26 @@ fn layout_block(
 
     let mut absolutes: Vec<(NodeId, ComputedStyle, f32)> = Vec::new();
     let mut cursor_y = padding_top + border_top + content_height;
+    // Inline children seen since the last block child. Flushed as an anonymous
+    // box when a block child arrives, and again at the end.
+    let mut pending: Vec<NodeId> = Vec::new();
+
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
+            // A text node has no style but is very much inline content.
+            if doc.text(child).is_some() && !all_inline {
+                pending.push(child);
+            }
             continue;
         };
         // Table-internal boxes are positioned by their table, not by block
         // flow. A stray one outside a table falls through to block layout so
         // its content is still shown.
-        // A replaced element is inline by default, but this engine has no way
-        // to put an image inside a line box — `TextLayout` holds glyphs only.
-        // Flowing it as a block keeps it visible and correctly sized; the cost
-        // is that an image amid running text breaks the line instead of sitting
-        // in it. Standalone and floated images, which is most of the era's
-        // usage, come out right.
-        let replaced = is_replaced(doc, child);
+        //
+        // An inline replaced element is *not* a block child: it was already
+        // placed on a line by `collect_inline_runs`. Only one given a
+        // block-level `display` reaches block flow.
+        let replaced = is_replaced(doc, child) && !child_style.display.is_inline();
         if child_style.position.is_out_of_flow() {
             // Laid out after the in-flow content, when this block's height —
             // and so its containing-block size — is finally known.
@@ -605,13 +779,33 @@ fn layout_block(
             continue;
         }
         if child_style.display == Display::None
-            || (child_style.display.is_inline() && !replaced)
             || child_style.display.is_table_internal()
             // Floated children were placed above, out of the normal flow.
             || child_style.float != Float::None
         {
             continue;
         }
+        if child_style.display.is_inline() && !replaced {
+            if !all_inline {
+                pending.push(child);
+            }
+            continue;
+        }
+
+        // A block child ends the run of inline content before it.
+        cursor_y += flush_inline(
+            doc,
+            styles,
+            fonts,
+            &mut pending,
+            style,
+            intrinsic,
+            (padding_left + border_left, cursor_y),
+            content_width,
+            &context,
+            padding_top + border_top,
+            &mut box_,
+        );
         // Place any float declared before this child, at the height reached so
         // far rather than at the top of the container.
         while let Some((float_node, float_style)) = late.first().cloned() {
@@ -655,6 +849,21 @@ fn layout_block(
         );
         cursor_y += consumed;
     }
+
+    // Trailing inline content, after the last block child.
+    cursor_y += flush_inline(
+        doc,
+        styles,
+        fonts,
+        &mut pending,
+        style,
+        intrinsic,
+        (padding_left + border_left, cursor_y),
+        content_width,
+        &context,
+        padding_top + border_top,
+        &mut box_,
+    );
 
     // A block must be tall enough to contain its own floats, or the next
     // block would start beside one and overlap it.
@@ -709,7 +918,8 @@ fn layout_block(
         let available = child_containing.size.0;
         let width_basis = match child_style.width {
             Length::Auto => {
-                let runs = collect_inline_runs(doc, styles, child, &child_style);
+                let runs =
+                    collect_inline_runs(doc, styles, child, &child_style, intrinsic, content_width);
                 let (min, max) = fonts.intrinsic_widths(&runs, &child_style);
                 let surround = child_style
                     .padding
@@ -812,7 +1022,14 @@ fn layout_table(
 
     for row in &grid.rows {
         for cell in &row.cells {
-            let runs = collect_inline_runs(doc, styles, cell.node, &cell.style);
+            let runs = collect_inline_runs(
+                doc,
+                styles,
+                cell.node,
+                &cell.style,
+                intrinsic,
+                available_width,
+            );
             let (mut min, mut max) = fonts.intrinsic_widths(&runs, &cell.style);
             // A cell's own padding and borders are part of what it needs.
             let surround = cell.style.padding.left.to_px(cell.style.font_size, 0.0)
@@ -993,7 +1210,7 @@ fn place_float(
         );
         (width + surround).min(content_width)
     } else {
-        let runs = collect_inline_runs(doc, styles, child, child_style);
+        let runs = collect_inline_runs(doc, styles, child, child_style, intrinsic, content_width);
         let (_, natural) = fonts.intrinsic_widths(&runs, child_style);
         match child_style.width {
             Length::Auto => (natural + surround).min(content_width),
@@ -1062,9 +1279,44 @@ fn collect_inline_runs(
     styles: &StyleMap,
     node: NodeId,
     inherited: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
+) -> Vec<InlineRun> {
+    inline_runs_for(
+        doc,
+        styles,
+        doc.children(node),
+        inherited,
+        intrinsic,
+        available_width,
+    )
+}
+
+/// Collects inline runs from a specific list of siblings.
+///
+/// Taking a slice rather than a parent is what lets a block container with
+/// mixed content lay out each stretch of inline children where it actually
+/// sits, instead of hoisting every one of them above the block children.
+fn inline_runs_for(
+    doc: &Document,
+    styles: &StyleMap,
+    children: &[NodeId],
+    inherited: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
 ) -> Vec<InlineRun> {
     let mut runs = Vec::new();
-    gather_runs(doc, styles, node, inherited, &mut runs);
+    for &child in children {
+        gather_one(
+            doc,
+            styles,
+            child,
+            inherited,
+            intrinsic,
+            available_width,
+            &mut runs,
+        );
+    }
 
     // Whitespace collapsing spans run boundaries: `<b>bold</b> <i>italic</i>`
     // must not lose the space between the runs, and `a <b> b</b>` must not keep
@@ -1090,41 +1342,88 @@ fn collect_inline_runs(
     runs
 }
 
-fn gather_runs(
+fn gather_one(
     doc: &Document,
     styles: &StyleMap,
-    node: NodeId,
+    child: NodeId,
     inherited: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
     out: &mut Vec<InlineRun>,
 ) {
-    for &child in doc.children(node) {
-        if let Some(text) = doc.text(child) {
-            out.push(InlineRun {
-                text: text.to_owned(),
-                style: inherited.clone(),
-            });
-        } else if let Some(style) = styles.get(child) {
-            if style.display == Display::None || !style.display.is_inline() {
-                continue;
-            }
-            // `<br>` is a forced break, not an element with content. Emitted as
-            // a newline the segmenter must honour, which means marking the run
-            // preformatted so collapsing does not turn it back into a space.
-            if doc
-                .element(child)
-                .is_some_and(|element| element.local_name() == "br")
-            {
-                out.push(InlineRun {
-                    text: "\n".to_owned(),
-                    style: ComputedStyle {
-                        white_space: WhiteSpace::Pre,
-                        ..style.clone()
-                    },
-                });
-                continue;
-            }
-            gather_runs(doc, styles, child, style, out);
-        }
+    if let Some(text) = doc.text(child) {
+        out.push(InlineRun::text(text, inherited.clone()));
+        return;
+    }
+    let Some(style) = styles.get(child) else {
+        return;
+    };
+    if style.display == Display::None || !style.display.is_inline() {
+        return;
+    }
+
+    // `<br>` is a forced break, not an element with content. Emitted as a
+    // newline the segmenter must honour, which means marking the run
+    // preformatted so collapsing does not turn it back into a space.
+    if doc
+        .element(child)
+        .is_some_and(|element| element.local_name() == "br")
+    {
+        out.push(InlineRun::text(
+            "\n",
+            ComputedStyle {
+                white_space: WhiteSpace::Pre,
+                ..style.clone()
+            },
+        ));
+        return;
+    }
+
+    // An inline replaced element sits *on* the line rather than interrupting
+    // it: an icon beside a link, a spacer between words. It becomes an atomic
+    // box the line breaker can place, keyed by node so paint can find the
+    // decoded image again.
+    if is_replaced(doc, child) {
+        let (width, height) = replaced_size(
+            style,
+            intrinsic.get(&child).copied(),
+            size_attr(doc, child, "width"),
+            size_attr(doc, child, "height"),
+            available_width,
+        );
+        // CSS `width` is the content width, so the box the line has to make
+        // room for is that plus the border and padding around it. Leaving them
+        // out lets a bordered image overlap the text beside it.
+        let font_size = style.font_size;
+        let horizontal = style.border.left.used_width(font_size)
+            + style.border.right.used_width(font_size)
+            + style.padding.left.to_px(font_size, available_width)
+            + style.padding.right.to_px(font_size, available_width);
+        let vertical = style.border.top.used_width(font_size)
+            + style.border.bottom.used_width(font_size)
+            + style.padding.top.to_px(font_size, available_width)
+            + style.padding.bottom.to_px(font_size, available_width);
+        out.push(InlineRun::replaced(
+            text::ReplacedInline {
+                id: child.0,
+                width: width + horizontal,
+                height: height + vertical,
+            },
+            style.clone(),
+        ));
+        return;
+    }
+
+    for &grandchild in doc.children(child) {
+        gather_one(
+            doc,
+            styles,
+            grandchild,
+            style,
+            intrinsic,
+            available_width,
+            out,
+        );
     }
 }
 
@@ -1427,6 +1726,135 @@ mod tests {
             (cells[0].rect.x - cells[1].rect.x).abs() < 0.01,
             "same column, same x"
         );
+    }
+
+    /// Boxes standing in for replaced elements, in document order.
+    fn replaced_boxes(rendered: &Rendered) -> Vec<&LayoutBox> {
+        content_boxes(rendered)
+            .into_iter()
+            .filter(|b| b.replaced.is_some())
+            .collect()
+    }
+
+    #[test]
+    fn an_inline_image_sits_on_the_line_rather_than_breaking_it() {
+        let mut sizes = IntrinsicSizes::new();
+        let html = r#"<body><p>before <img src="x.png"> after</p></body>"#;
+        let doc = dom::parse(html);
+        let image = doc.find_element("img").expect("img");
+        sizes.insert(image, (20.0, 20.0));
+
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
+        let mut fonts = FontStore::new();
+        let rendered = Rendered {
+            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+        };
+
+        let all = content_boxes(&rendered);
+        let paragraph = all
+            .iter()
+            .find(|b| b.text.is_some())
+            .expect("the paragraph's text");
+        assert_eq!(
+            paragraph.text.as_ref().expect("text").lines.len(),
+            1,
+            "text and image share one line"
+        );
+
+        let placed = &paragraph.text.as_ref().expect("text").lines[0].replaced;
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].id, image.0);
+        assert!(placed[0].x > 0.0, "the image follows the text before it");
+    }
+
+    #[test]
+    fn a_bordered_inline_image_reserves_room_for_its_border() {
+        // The line has to make room for the border box, not the content box,
+        // or a framed image overlaps the text beside it.
+        let mut sizes = IntrinsicSizes::new();
+        let html = r#"<body><p>x <img src="a.png"> y</p></body>"#;
+        let doc = dom::parse(html);
+        let image = doc.find_element("img").expect("img");
+        sizes.insert(image, (20.0, 20.0));
+
+        let mut fonts = FontStore::new();
+        let widths: Vec<f32> = ["img { border: 0 }", "img { border: 5px solid red }"]
+            .into_iter()
+            .map(|css| {
+                let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css)]);
+                let rendered = Rendered {
+                    layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+                };
+                content_boxes(&rendered)
+                    .into_iter()
+                    .find(|b| b.text.is_some())
+                    .and_then(|b| b.text.as_ref())
+                    .map(|text| text.lines[0].replaced[0].width)
+                    .expect("a placed image")
+            })
+            .collect();
+        assert_eq!(widths[1] - widths[0], 10.0, "5px of border on each side");
+    }
+
+    #[test]
+    fn inline_content_stays_between_the_blocks_it_sits_between() {
+        // CSS 2.1 §9.2.1.1. Without anonymous block boxes every scrap of
+        // inline content is hoisted above every block one, so this renders as
+        // "one two" followed by the paragraph.
+        let rendered = run(
+            "<body>one<p>middle</p>two</body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let texts: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert_eq!(texts.len(), 3, "two anonymous boxes and the paragraph");
+        for pair in texts.windows(2) {
+            assert!(
+                pair[1].rect.y >= pair[0].rect.y,
+                "content must stay in source order: {:?} then {:?}",
+                pair[0].rect,
+                pair[1].rect
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_of_only_inline_content_needs_no_anonymous_box() {
+        // The common case — every paragraph, every heading. Wrapping it would
+        // add a box per block for nothing.
+        let rendered = run("<body><p>just text</p></body>", "body { margin: 0 }", 600.0);
+        let paragraph = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the paragraph");
+        assert!(
+            paragraph.children.is_empty(),
+            "text laid out on the paragraph itself"
+        );
+    }
+
+    #[test]
+    fn a_block_level_image_still_flows_as_a_block() {
+        let mut sizes = IntrinsicSizes::new();
+        let doc = dom::parse(r#"<body><img src="x.png"><p>after</p></body>"#);
+        let image = doc.find_element("img").expect("img");
+        sizes.insert(image, (40.0, 40.0));
+        let styles = css::cascade::cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "body { margin: 0 } img { display: block }",
+            )],
+        );
+        let mut fonts = FontStore::new();
+        let rendered = Rendered {
+            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+        };
+        let boxes = replaced_boxes(&rendered);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].rect.height, 40.0);
     }
 
     #[test]

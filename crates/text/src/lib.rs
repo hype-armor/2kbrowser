@@ -102,6 +102,37 @@ fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
     Some((color.r, color.g, color.b, color.a))
 }
 
+/// An atomic inline box that takes up room on a line without contributing
+/// glyphs — an image, in practice.
+///
+/// Identified by an opaque id rather than a DOM node: line breaking has no
+/// business knowing what a document is, and the caller only needs the id
+/// handed back so it can find the box again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplacedInline {
+    /// The caller's identifier for this box.
+    pub id: usize,
+    /// Used width.
+    pub width: f32,
+    /// Used height.
+    pub height: f32,
+}
+
+/// A replaced box after line breaking has placed it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedReplaced {
+    /// The caller's identifier, as given.
+    pub id: usize,
+    /// Left edge, relative to the text origin.
+    pub x: f32,
+    /// Top edge, relative to the text origin.
+    pub y: f32,
+    /// Used width.
+    pub width: f32,
+    /// Used height.
+    pub height: f32,
+}
+
 /// A run of text with its own style, within a block's inline content.
 #[derive(Debug, Clone)]
 pub struct InlineRun {
@@ -109,6 +140,31 @@ pub struct InlineRun {
     pub text: String,
     /// The style computed for the element the text came from.
     pub style: ComputedStyle,
+    /// Set when this run is an atomic inline box rather than text, in which
+    /// case `text` is ignored.
+    pub replaced: Option<ReplacedInline>,
+}
+
+impl InlineRun {
+    /// A run of styled text.
+    pub fn text(text: impl Into<String>, style: ComputedStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            replaced: None,
+        }
+    }
+
+    /// A run that is one atomic inline box.
+    pub fn replaced(box_: ReplacedInline, style: ComputedStyle) -> Self {
+        Self {
+            // Empty rather than a placeholder: whitespace collapsing runs over
+            // these runs too, and any text here would be shaped and drawn.
+            text: String::new(),
+            style,
+            replaced: Some(box_),
+        }
+    }
 }
 
 /// A rule drawn under, over, or through a stretch of text.
@@ -135,6 +191,8 @@ pub struct DecorationRun {
 pub struct Line {
     /// Glyphs on this line.
     pub glyphs: Vec<PositionedGlyph>,
+    /// Atomic inline boxes sitting on this line.
+    pub replaced: Vec<PlacedReplaced>,
     /// Rules under, over, and through this line's text.
     pub decorations: Vec<DecorationRun>,
     /// Width of the line's inked content.
@@ -169,6 +227,8 @@ struct Shaped {
 #[derive(Debug, Clone)]
 struct Segment {
     shaped: Shaped,
+    /// Set when this segment is an atomic inline box rather than text.
+    replaced: Option<ReplacedInline>,
     /// Width of collapsed whitespace following this segment.
     trailing_space: f32,
     /// Whether a line break is required after this segment.
@@ -282,10 +342,7 @@ impl FontStore {
 
     /// Shapes and wraps `text` to `max_width`, in a single style.
     pub fn layout(&mut self, text: &str, style: &ComputedStyle, max_width: f32) -> TextLayout {
-        let runs = [InlineRun {
-            text: text.to_owned(),
-            style: style.clone(),
-        }];
+        let runs = [InlineRun::text(text, style.clone())];
         self.layout_runs(&runs, style, max_width)
     }
 
@@ -453,11 +510,37 @@ impl FontStore {
         }
         layout.lines.push(Line {
             glyphs,
+            replaced: Self::replaced_for(current, offset, line_y, ascent),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
             width,
             baseline: ascent,
         });
         current.clear();
+    }
+
+    /// Places one line's atomic inline boxes.
+    ///
+    /// Each sits with its bottom edge on the baseline, so an image amid running
+    /// text lines up with it rather than floating above or below.
+    fn replaced_for(
+        segments: &[Segment],
+        offset: f32,
+        line_y: f32,
+        ascent: f32,
+    ) -> Vec<PlacedReplaced> {
+        segments
+            .iter()
+            .filter_map(|segment| {
+                let box_ = segment.replaced?;
+                Some(PlacedReplaced {
+                    id: box_.id,
+                    x: segment.x + offset,
+                    y: line_y + ascent - box_.height,
+                    width: box_.width,
+                    height: box_.height,
+                })
+            })
+            .collect()
     }
 
     /// Builds the rules for one line's decorated spans.
@@ -552,6 +635,28 @@ impl FontStore {
     fn segment(&mut self, runs: &[InlineRun]) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::new();
         for run in runs {
+            // An atomic inline box is one unbreakable segment of its own size.
+            // Its baseline is its bottom edge, which is what `vertical-align:
+            // baseline` means for a replaced element and why an inline image
+            // sits on the text's baseline rather than centred on it.
+            if let Some(box_) = run.replaced {
+                out.push(Segment {
+                    shaped: Shaped {
+                        glyphs: Vec::new(),
+                        width: box_.width,
+                        ascent: box_.height,
+                        height: box_.height,
+                    },
+                    trailing_space: 0.0,
+                    mandatory_break: false,
+                    x: 0.0,
+                    replaced: Some(box_),
+                    decoration: run.style.text_decoration,
+                    font_size: run.style.font_size,
+                    color: span_color(&run.style),
+                });
+                continue;
+            }
             if run.text.is_empty() {
                 continue;
             }
@@ -611,6 +716,7 @@ impl FontStore {
                             trailing_space: space_width,
                             mandatory_break: true,
                             x: 0.0,
+                            replaced: None,
                             decoration: run.style.text_decoration,
                             font_size: run.style.font_size,
                             color: span_color(&run.style),
@@ -625,6 +731,7 @@ impl FontStore {
                     trailing_space: space_width,
                     mandatory_break: mandatory,
                     x: 0.0,
+                    replaced: None,
                     decoration: run.style.text_decoration,
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
@@ -658,10 +765,7 @@ impl FontStore {
         let mut min: f32 = 0.0;
         for run in runs {
             for word in run.text.split_whitespace() {
-                let single = [InlineRun {
-                    text: word.to_owned(),
-                    style: run.style.clone(),
-                }];
+                let single = [InlineRun::text(word, run.style.clone())];
                 min = min.max(self.layout_runs(&single, default_style, f32::MAX).width);
             }
         }
@@ -797,14 +901,8 @@ mod tests {
         };
 
         let runs = [
-            InlineRun {
-                text: "regular ".to_owned(),
-                style: plain.clone(),
-            },
-            InlineRun {
-                text: "heavy".to_owned(),
-                style: bold,
-            },
+            InlineRun::text("regular ", plain.clone()),
+            InlineRun::text("heavy", bold),
         ];
         let mixed = store.layout_runs(&runs, &plain, 1000.0);
         let uniform = store.layout("regular heavy", &plain, 1000.0);
@@ -827,14 +925,8 @@ mod tests {
             ..style(16.0)
         };
         let runs = [
-            InlineRun {
-                text: "a".to_owned(),
-                style: black.clone(),
-            },
-            InlineRun {
-                text: "b".to_owned(),
-                style: red,
-            },
+            InlineRun::text("a".to_owned(), black.clone()),
+            InlineRun::text("b".to_owned(), red),
         ];
         let layout = store.layout_runs(&runs, &black, 1000.0);
         let colors: Vec<_> = layout.lines[0].glyphs.iter().map(|g| g.color).collect();
@@ -848,14 +940,8 @@ mod tests {
         let mut store = FontStore::new();
         let plain = style(16.0);
         let runs = [
-            InlineRun {
-                text: "the quick brown ".to_owned(),
-                style: plain.clone(),
-            },
-            InlineRun {
-                text: "fox jumps over the lazy dog".to_owned(),
-                style: plain.clone(),
-            },
+            InlineRun::text("the quick brown ".to_owned(), plain.clone()),
+            InlineRun::text("fox jumps over the lazy dog".to_owned(), plain.clone()),
         ];
         let split = store.layout_runs(&runs, &plain, 160.0);
         let whole = store.layout("the quick brown fox jumps over the lazy dog", &plain, 160.0);
@@ -874,14 +960,8 @@ mod tests {
         };
         let uniform = store.layout("small text", &small, 1000.0);
         let runs = [
-            InlineRun {
-                text: "small ".to_owned(),
-                style: small.clone(),
-            },
-            InlineRun {
-                text: "BIG".to_owned(),
-                style: large,
-            },
+            InlineRun::text("small ".to_owned(), small.clone()),
+            InlineRun::text("BIG".to_owned(), large),
         ];
         let mixed = store.layout_runs(&runs, &small, 1000.0);
         assert!(
@@ -898,10 +978,10 @@ mod tests {
         // of the page is full width. Text must respect both.
         let mut store = FontStore::new();
         let plain = style(16.0);
-        let runs = [InlineRun {
-            text: "the quick brown fox jumps over the lazy dog and keeps on running".to_owned(),
-            style: plain.clone(),
-        }];
+        let runs = [InlineRun::text(
+            "the quick brown fox jumps over the lazy dog and keeps on running".to_owned(),
+            plain.clone(),
+        )];
         // The band is one line tall at 16px/1.2, so only the first line is
         // narrowed and everything after it gets the full width back.
         let layout = store.layout_runs_constrained(&runs, &plain, |y, _| {
@@ -947,10 +1027,10 @@ mod tests {
         // overflows. Splitting it mid-word would be worse than overflowing.
         let mut store = FontStore::new();
         let plain = style(16.0);
-        let runs = [InlineRun {
-            text: "supercalifragilistic".to_owned(),
-            style: plain.clone(),
-        }];
+        let runs = [InlineRun::text(
+            "supercalifragilistic".to_owned(),
+            plain.clone(),
+        )];
         let layout = store.layout_runs(&runs, &plain, 20.0);
         assert_eq!(
             layout.lines.len(),
@@ -971,14 +1051,8 @@ mod tests {
             ..style(28.0)
         };
         let runs = [
-            InlineRun {
-                text: "small".to_owned(),
-                style: small.clone(),
-            },
-            InlineRun {
-                text: "BIG".to_owned(),
-                style: large,
-            },
+            InlineRun::text("small".to_owned(), small.clone()),
+            InlineRun::text("BIG".to_owned(), large),
         ];
         let layout = store.layout_runs(&runs, &small, 1000.0);
         let ys: Vec<f32> = layout.lines[0].glyphs.iter().map(|g| g.y).collect();
@@ -1003,15 +1077,15 @@ mod decoration_tests {
     use css::style::TextDecoration;
 
     fn run(text: &str, decoration: TextDecoration) -> InlineRun {
-        InlineRun {
-            text: text.to_owned(),
-            style: ComputedStyle {
+        InlineRun::text(
+            text,
+            ComputedStyle {
                 font_size: 16.0,
                 line_height: 19.2,
                 text_decoration: decoration,
                 ..Default::default()
             },
-        }
+        )
     }
 
     const UNDERLINE: TextDecoration = TextDecoration {
@@ -1102,20 +1176,17 @@ mod break_tests {
     use super::*;
 
     fn pre(text: &str) -> InlineRun {
-        InlineRun {
-            text: text.to_owned(),
-            style: ComputedStyle {
+        InlineRun::text(
+            text,
+            ComputedStyle {
                 white_space: WhiteSpace::Pre,
                 ..Default::default()
             },
-        }
+        )
     }
 
     fn plain(text: &str) -> InlineRun {
-        InlineRun {
-            text: text.to_owned(),
-            style: ComputedStyle::default(),
-        }
+        InlineRun::text(text.to_owned(), ComputedStyle::default())
     }
 
     #[test]

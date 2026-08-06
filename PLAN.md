@@ -267,11 +267,28 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
-   dimensions, floatable. Links, scrolling, and hit testing remain
+   dimensions, floatable, and sitting *on* a line rather than interrupting it.
+   Links, scrolling, and hit testing remain
 6. **Positioned layout** — *done.* Relative shifts, absolute placement against
    the nearest positioned ancestor, `top`/`right`/`bottom`/`left`, shrink-to-fit
    widths. **Quirks mode** — *started;* unitless lengths and hash-less hex
    colours parse, other quirks outstanding. **Framesets** — *done*
+7. **Presentational attributes** — *done.* `bgcolor`, `text`, `align`,
+   `<font>`, `background`, and the table attributes, at their own cascade
+   origin between the UA sheet and author CSS. The era's markup keeps most of
+   its styling here rather than in CSS, so without this these pages render as
+   unstyled text
+8. **Lists, decorations, rules, and forced breaks** — *done.* Markers with
+   `<ol start>` and `<li value>`, `text-decoration` propagated per §16.3,
+   underlined links via attribute selectors, `<hr>`, and `<br>`
+9. **Tiled backgrounds** — *done.* `background-image`, `background-repeat`, the
+   `background` shorthand and its reset, `<body background>`, and canvas
+   propagation
+
+Known-wrong and recorded rather than hidden: `rowspan` (a spanning cell
+occupies only its first row), collapsed borders, fixed table layout,
+`border-spacing`/`cellspacing` parsing, dashed and dotted borders painting
+solid, and `background-position`.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes
