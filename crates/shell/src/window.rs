@@ -1,12 +1,11 @@
 //! The browser window.
 //!
-//! **UNVERIFIED.** This module compiles and is covered by unit tests for its
-//! pure logic, but it has never been run: the environment it was written in has
-//! no display server, so nobody has watched it open a window or draw a frame.
-//! Treat first-run behaviour as untested. Everything it depends on — parsing,
-//! cascade, layout, shaping, painting — *is* tested, and the pipeline it drives
-//! is the same one the reference tests exercise, so the untested surface is
-//! this file's event handling and blitting rather than the rendering itself.
+//! Manually verified once, on Linux: the window opens and draws correctly.
+//! Automated coverage is limited to the pure logic below — scroll clamping and
+//! the title string — because CI has no display server. Event handling and
+//! blitting are therefore exercised only by hand, and a regression in them
+//! would not be caught by `cargo test`. The pipeline underneath is the same one
+//! the reference tests cover on all three platforms.
 //!
 //! Deliberately thin. Tabs, a URL bar, history, and the mode banner are M3
 //! (ADR-0009); this is a viewport onto an already-rendered page.

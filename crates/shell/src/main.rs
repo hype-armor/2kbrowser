@@ -25,10 +25,7 @@ OPTIONS:
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
-In a window: arrows and PageUp/PageDown scroll, Home/End jump, Esc or q quits.
-
-NOTE: `open` is UNVERIFIED — it has never been run against a real display. See
-crates/shell/src/window.rs. `render` is fully tested.";
+In a window: arrows and PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

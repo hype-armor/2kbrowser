@@ -22,9 +22,9 @@ against bundled Liberation faces, and rasterised on the CPU. Rendering is
 deterministic across Linux, macOS, and Windows, checked by reference tests
 against one shared baseline set.
 
-> **The window (`open`) is UNVERIFIED.** It compiles and its logic is unit
-> tested, but it has never been run against a real display. `render` is fully
-> tested; prefer it until the window has been exercised.
+The window has been verified by hand on Linux. CI has no display, so its event
+handling and blitting are not covered by automated tests — only its scroll
+arithmetic is.
 
 Not built yet: inline layout with per-span styles, subresource loading, and
 everything from M2 onward. See [PLAN.md](PLAN.md).
@@ -46,7 +46,7 @@ cargo test --workspace
 ```sh
 2kbrowser render https://example.com --out page.png --width 800
 2kbrowser render page.html --out page.png
-2kbrowser open page.html            # window — unverified, see above
+2kbrowser open page.html            # window: arrows scroll, Esc quits
 ```
 
 Third-party requests are refused by default, so one policy rule removes

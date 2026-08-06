@@ -241,10 +241,13 @@ three platforms against a single shared baseline set.
 *Done when:* a hand-written HTML page and `example.com` render recognisably, and
 the three platforms produce identical pixels.
 
-**Status: mostly landed.** Parsing, cascade, block layout, shaping, painting,
-the document-fallback classifier, and the reference-test harness all work; the
-binary renders a local file to a PNG. Outstanding: the network stack (so
-`example.com` can be fetched at all) and the window.
+**Status: done.** `2kbrowser render https://example.com` produces a correct
+page, the three platforms agree pixel for pixel in CI, and `2kbrowser open`
+shows it in a scrollable window (verified by hand; CI has no display).
+
+Known gap carried into M2: a block's inline content is shaped as one styled
+run, so `<b>` and `<code>` inside a paragraph do not yet carry their own
+styles. That is the first item below.
 
 ### M2 — It renders the era's web
 The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
