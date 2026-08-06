@@ -43,8 +43,11 @@ arithmetic is.
 
 Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and
-`background-position`. Links are styled but not clickable — hit testing and
-navigation are M3, along with the rest of the browser chrome.
+`background-position`.
+
+Links have geometry — `2kbrowser links <page>` prints every link rectangle and
+where it leads, and `cargo run -p shell --example link-map` draws them over the
+page. Following one needs the chrome, which is the rest of M3.
 See [PLAN.md](PLAN.md).
 
 > **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
@@ -65,6 +68,7 @@ cargo test --workspace
 2kbrowser render https://example.com --out page.png --width 800
 2kbrowser render page.html --out page.png
 2kbrowser open page.html            # window: arrows scroll, Esc quits
+2kbrowser links page.html           # every link, and where you would click
 ```
 
 Third-party requests are refused by default, so one policy rule removes
