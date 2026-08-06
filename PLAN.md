@@ -153,10 +153,19 @@ system fonts, and will not look native — and it buys correctness testing on al
 three platforms for the price of one. For a document renderer that is the right
 trade. Recorded as ADR-0005.
 
-**This is now measured rather than argued.** As of `986e602` all three
-platforms rendered the shared baseline set byte for byte in CI, macOS included.
-That was the assumption the whole approach rested on and the one that would
-have been expensive to discover was false; it holds.
+**The rasterising half of this is measured rather than argued:** all three
+platforms produce byte-identical *glyphs* from the same input, macOS included.
+That was the assumption the whole approach rested on and the expensive one to
+discover false, and it holds.
+
+The other half — everything around the renderer — needed the same scrutiny and
+did not get it soon enough. Windows failed the image and frameset fixtures for
+several commits before anyone looked, because `file://D:\a\page.html` has no
+`/` in it and every relative subresource resolved to the root. Same input, a
+different page on one platform, which is exactly what these tests exist to
+catch. The lesson is that a green run is only evidence about the fixtures that
+existed when it ran: the run this claim was first written from predated the
+fixtures that load anything from disk.
 
 Which fonts to bundle is ADR-0008: metric-compatible substitutes for the faces
 pages actually name (Liberation Sans/Serif/Mono for Arial, Times New Roman, and

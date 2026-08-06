@@ -64,10 +64,7 @@ pub enum Refusal {
         scheme: String,
     },
     /// A page from the network asked to read a local file.
-    LocalFile {
-        /// The path that was asked for.
-        path: String,
-    },
+    LocalFile,
     /// The URL could not be parsed.
     Malformed,
 }
@@ -78,8 +75,11 @@ impl std::fmt::Display for Refusal {
             Refusal::ThirdParty { host } => {
                 write!(f, "blocked third-party request to {host} (ADR-0006)")
             }
-            Refusal::LocalFile { path } => {
-                write!(f, "blocked a network page from reading {path} (ADR-0006)")
+            Refusal::LocalFile => {
+                write!(
+                    f,
+                    "blocked a network page from reading a local file (ADR-0006)"
+                )
             }
             Refusal::UnsupportedScheme { scheme } => write!(f, "unsupported scheme `{scheme}:`"),
             Refusal::Malformed => write!(f, "malformed URL"),
@@ -132,11 +132,7 @@ impl Policy {
             // A page from the network must never read the disk. There is no
             // origin such a request could be first-party to, and allowing it
             // turns every page into a local file reader.
-            (Scheme::Http | Scheme::Https, Scheme::File) => {
-                return Err(Refusal::LocalFile {
-                    path: target.host.clone(),
-                });
-            }
+            (Scheme::Http | Scheme::Https, Scheme::File) => return Err(Refusal::LocalFile),
             // A local document reaching out to the network is third-party by
             // the same argument: it has no host, so nothing it asks the
             // network for can be first-party. Falls through to the allow-list
@@ -155,6 +151,24 @@ impl Policy {
         Err(Refusal::ThirdParty {
             host: target.host.clone(),
         })
+    }
+}
+
+/// Converts a URL path into a filesystem path.
+///
+/// The canonical `file:` URL for a Windows path carries a leading slash before
+/// the drive letter — `file:///D:/site/x.html` — and `D:/site/x.html` is what
+/// actually opens. Forward slashes are left alone: Windows accepts them.
+pub fn to_file_path(url_path: &str) -> &str {
+    let bytes = url_path.as_bytes();
+    let looks_like_a_drive = bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes[2] == b':' || (bytes.len() >= 4 && bytes[2] == b'|'));
+    if looks_like_a_drive {
+        &url_path[1..]
+    } else {
+        url_path
     }
 }
 
@@ -177,14 +191,24 @@ pub fn parse_url(url: &str) -> Result<(Origin, String), Refusal> {
     };
 
     if scheme == Scheme::File {
-        let path = if rest.is_empty() { "/" } else { rest };
+        // A URL's separator is `/`, whatever the filesystem underneath uses.
+        // Windows hands out `D:\\a\\page.html`, and leaving the backslashes in
+        // means relative resolution finds no directory at all and every
+        // subresource resolves to the root — so images and frames silently
+        // fail to load on one platform and not the others. Windows accepts
+        // forward slashes when opening the file, so this needs no undoing.
+        let path = if rest.is_empty() {
+            "/".to_owned()
+        } else {
+            rest.replace('\\', "/")
+        };
         return Ok((
             Origin {
                 scheme,
                 host: String::new(),
                 port: 0,
             },
-            path.to_owned(),
+            path,
         ));
     }
 
@@ -556,7 +580,7 @@ mod scheme_boundary_tests {
         // fetched over the network has no business reading local files at all.
         let refusal = check("https://example.com/page.html", "file:///etc/passwd");
         assert!(
-            matches!(refusal, Err(Refusal::LocalFile { .. })),
+            matches!(refusal, Err(Refusal::LocalFile)),
             "got {refusal:?}"
         );
     }
@@ -590,6 +614,70 @@ mod scheme_boundary_tests {
                     RequestKind::Navigation,
                 )
                 .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod windows_path_tests {
+    use super::*;
+
+    /// The form `format!("file://{}", path.display())` produces on Windows.
+    const WINDOWS_DOC: &str = r"file://D:\a\2kbrowser\tests\ref\fixtures\images.html";
+
+    #[test]
+    fn a_windows_file_url_parses_to_a_slash_separated_path() {
+        // A URL's separator is `/` whatever the filesystem uses. Leaving the
+        // backslashes in leaves the path with no directory to resolve against.
+        let (origin, path) = parse_url(WINDOWS_DOC).expect("parses");
+        assert_eq!(origin.scheme, Scheme::File);
+        assert_eq!(path, "D:/a/2kbrowser/tests/ref/fixtures/images.html");
+    }
+
+    #[test]
+    fn a_subresource_beside_a_windows_document_resolves_next_to_it() {
+        // This is the bug that made images and frames load on Linux and macOS
+        // and silently not on Windows — one platform rendering a different
+        // page from the same input, which is the whole thing ADR-0005 exists
+        // to prevent.
+        let (origin, path) = parse_url(WINDOWS_DOC).expect("parses");
+        assert_eq!(
+            resolve(&origin, &path, "assets/logo.png"),
+            "file:///D:/a/2kbrowser/tests/ref/fixtures/assets/logo.png"
+        );
+    }
+
+    #[test]
+    fn a_canonical_windows_file_url_round_trips_to_an_openable_path() {
+        // `file:///D:/x` is the canonical form and is what `resolve` emits;
+        // `D:/x` is what actually opens.
+        let (_, path) = parse_url("file:///D:/site/images/x.png").expect("parses");
+        assert_eq!(to_file_path(&path), "D:/site/images/x.png");
+    }
+
+    #[test]
+    fn a_unix_path_is_left_alone() {
+        // Its leading slash is part of the path, not a URL artefact.
+        assert_eq!(to_file_path("/home/user/x.png"), "/home/user/x.png");
+        assert_eq!(to_file_path("/a/b"), "/a/b");
+    }
+
+    #[test]
+    fn a_unix_file_url_is_unaffected() {
+        let (origin, path) = parse_url("file:///home/user/pages/index.html").expect("parses");
+        assert_eq!(path, "/home/user/pages/index.html");
+        assert_eq!(
+            resolve(&origin, &path, "assets/logo.png"),
+            "file:///home/user/pages/assets/logo.png"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_climbing_out_still_works_on_windows() {
+        let (origin, path) = parse_url(r"file://D:\site\pages\a.html").expect("parses");
+        assert_eq!(
+            resolve(&origin, &path, "../images/x.png"),
+            "file:///D:/site/images/x.png"
         );
     }
 }

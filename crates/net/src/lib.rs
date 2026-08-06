@@ -187,7 +187,8 @@ impl Fetcher {
     }
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>, FetchError> {
+fn read_file(url_path: &str) -> Result<Vec<u8>, FetchError> {
+    let path = policy::to_file_path(url_path);
     let metadata = std::fs::metadata(path).map_err(FetchError::Io)?;
     if metadata.len() > MAX_BODY_BYTES {
         return Err(FetchError::TooLarge);
