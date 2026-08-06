@@ -39,6 +39,11 @@ pub struct LayoutBox {
     pub text: Option<TextLayout>,
     /// Offset of the content box within `rect`.
     pub content_origin: (f32, f32),
+    /// Width of the content box.
+    ///
+    /// Stored rather than derived: with asymmetric borders and padding the
+    /// content width cannot be recovered from `rect` and `content_origin`.
+    pub content_width: f32,
     /// Child boxes.
     pub children: Vec<LayoutBox>,
 }
@@ -81,6 +86,7 @@ pub fn layout(
         style: body_style.clone(),
         text: None,
         content_origin: (0.0, 0.0),
+        content_width: viewport_width,
         children: Vec::new(),
     };
 
@@ -124,23 +130,31 @@ fn layout_block(
     let padding_right = style.padding.right.to_px(font_size, available_width);
     let padding_top = style.padding.top.to_px(font_size, available_width);
     let padding_bottom = style.padding.bottom.to_px(font_size, available_width);
+    let border_left = style.border.left.used_width(font_size);
+    let border_right = style.border.right.used_width(font_size);
+    let border_top = style.border.top.used_width(font_size);
+    let border_bottom = style.border.bottom.used_width(font_size);
 
-    let border_width = match style.width {
+    // CSS 2.1 `width` is the *content* width, so borders and padding grow the
+    // box outwards rather than being absorbed by it.
+    let surround = padding_left + padding_right + border_left + border_right;
+    let outer_width = match style.width {
         Length::Auto => (available_width - margin_left - margin_right).max(0.0),
-        length => length.to_px(font_size, available_width) + padding_left + padding_right,
+        length => length.to_px(font_size, available_width) + surround,
     };
-    let content_width = (border_width - padding_left - padding_right).max(0.0);
+    let content_width = (outer_width - surround).max(0.0);
 
     let mut box_ = LayoutBox {
         rect: Rect {
             x: x + margin_left,
             y: y + margin_top,
-            width: border_width,
+            width: outer_width,
             height: 0.0,
         },
         style: style.clone(),
         text: None,
-        content_origin: (padding_left, padding_top),
+        content_origin: (padding_left + border_left, padding_top + border_top),
+        content_width,
         children: Vec::new(),
     };
 
@@ -156,7 +170,7 @@ fn layout_block(
         box_.text = Some(layout);
     }
 
-    let mut cursor_y = padding_top + content_height;
+    let mut cursor_y = padding_top + border_top + content_height;
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
             continue;
@@ -170,7 +184,7 @@ fn layout_block(
             fonts,
             child,
             child_style,
-            padding_left,
+            padding_left + border_left,
             cursor_y,
             content_width,
             &mut box_,
@@ -178,10 +192,16 @@ fn layout_block(
         cursor_y += consumed;
     }
 
-    let content_end = cursor_y + padding_bottom;
+    let content_end = cursor_y + padding_bottom + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
-        length => length.to_px(font_size, available_width),
+        length => {
+            length.to_px(font_size, available_width)
+                + padding_top
+                + padding_bottom
+                + border_top
+                + border_bottom
+        }
     };
 
     let outer = box_.outer_height(font_size);
@@ -417,6 +437,58 @@ mod tests {
             heading.layout.height > paragraph.layout.height,
             "h1 at 2em should exceed a paragraph"
         );
+    }
+
+    #[test]
+    fn borders_grow_the_box_and_inset_its_content() {
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { border: 5px solid black; padding: 10px }",
+            400.0,
+        );
+        let div = content_boxes(&rendered)[0];
+        assert_eq!(
+            div.content_origin,
+            (15.0, 15.0),
+            "content sits inside border then padding"
+        );
+        assert_eq!(
+            div.rect.width, 400.0,
+            "an auto-width box still fills its container"
+        );
+        assert_eq!(
+            div.content_width, 370.0,
+            "content shrinks by both borders and paddings"
+        );
+    }
+
+    #[test]
+    fn an_explicit_width_is_the_content_width() {
+        // CSS 2.1 is content-box: borders and padding grow the box outwards.
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { width: 100px; border: 2px solid black; padding: 8px }",
+            400.0,
+        );
+        let div = content_boxes(&rendered)[0];
+        assert_eq!(div.content_width, 100.0);
+        assert_eq!(div.rect.width, 120.0, "100 + 2*8 padding + 2*2 border");
+    }
+
+    #[test]
+    fn a_border_without_a_style_occupies_no_space() {
+        let styled = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { border-width: 20px; border-style: solid }",
+            400.0,
+        );
+        let unstyled = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { border-width: 20px }",
+            400.0,
+        );
+        assert_eq!(content_boxes(&styled)[0].content_width, 360.0);
+        assert_eq!(content_boxes(&unstyled)[0].content_width, 400.0);
     }
 
     #[test]

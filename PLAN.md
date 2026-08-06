@@ -251,7 +251,8 @@ now closed: see M2 item 2 below.
 ### M2 — It renders the era's web
 The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 
-1. Real cascade and selector matching; full box model; backgrounds and borders
+1. Real cascade and selector matching; full box model; backgrounds and
+   **borders** — *done.*
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
    size, and collapse whitespace across run boundaries.

@@ -81,10 +81,12 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
         });
     }
 
+    paint_borders(box_, x, y, list);
+
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
         let content_y = y + box_.content_origin.1;
-        let content_width = box_.rect.width - box_.content_origin.0 * 2.0;
+        let content_width = box_.content_width;
         for line in &layout.lines {
             let dx = line_offset(box_.style.text_align, line.width, content_width);
             for glyph in &line.glyphs {
@@ -107,6 +109,71 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
 
     for child in &box_.children {
         paint_box(child, x, y, list);
+    }
+}
+
+/// Emits the four border edges of a box.
+///
+/// Corners are mitred by letting the top and bottom edges span the full width
+/// and insetting the side edges. That is exact for a uniform border and only
+/// visibly wrong where two edges of different colours meet, which CSS 2.1
+/// resolves with a diagonal join — worth doing when a page needs it, not before.
+fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
+    let font_size = box_.style.font_size;
+    let border = &box_.style.border;
+    let (width, height) = (box_.rect.width, box_.rect.height);
+
+    let top = border.top.used_width(font_size);
+    let right = border.right.used_width(font_size);
+    let bottom = border.bottom.used_width(font_size);
+    let left = border.left.used_width(font_size);
+
+    let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(box_.style.color);
+
+    if border.top.style.is_visible() && top > 0.0 {
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x,
+                y,
+                width,
+                height: top,
+            },
+            color: color_of(&border.top),
+        });
+    }
+    if border.bottom.style.is_visible() && bottom > 0.0 {
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x,
+                y: y + height - bottom,
+                width,
+                height: bottom,
+            },
+            color: color_of(&border.bottom),
+        });
+    }
+    let side_height = (height - top - bottom).max(0.0);
+    if border.left.style.is_visible() && left > 0.0 {
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x,
+                y: y + top,
+                width: left,
+                height: side_height,
+            },
+            color: color_of(&border.left),
+        });
+    }
+    if border.right.style.is_visible() && right > 0.0 {
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x: x + width - right,
+                y: y + top,
+                width: right,
+                height: side_height,
+            },
+            color: color_of(&border.right),
+        });
     }
 }
 
@@ -317,6 +384,63 @@ mod tests {
             ink_width(&monospaced),
             ink_width(&proportional)
         );
+    }
+
+    #[test]
+    fn borders_paint_on_all_four_edges() {
+        let pixmap = render(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { border: 4px solid #ff0000; height: 40px }",
+            60,
+        );
+        let width = pixmap.width();
+        let is_red = |x: u32, y: u32| {
+            let p = pixmap.pixels()[(y * width + x) as usize];
+            p.red() > 200 && p.green() < 60 && p.blue() < 60
+        };
+        assert!(is_red(30, 1), "top edge");
+        assert!(is_red(30, 46), "bottom edge");
+        assert!(is_red(1, 20), "left edge");
+        assert!(is_red(58, 20), "right edge");
+        assert!(!is_red(30, 20), "interior must not be filled");
+    }
+
+    #[test]
+    fn each_edge_can_have_its_own_colour() {
+        let pixmap = render(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { border: 4px solid; border-top-color: #ff0000; \
+             border-bottom-color: #0000ff; border-left-color: #00ff00; \
+             border-right-color: #000000; height: 40px }",
+            60,
+        );
+        let width = pixmap.width();
+        let at = |x: u32, y: u32| pixmap.pixels()[(y * width + x) as usize];
+        assert!(at(30, 1).red() > 200, "top is red");
+        assert!(at(30, 46).blue() > 200, "bottom is blue");
+        assert!(at(1, 20).green() > 200, "left is green");
+        let right = at(58, 20);
+        assert!(
+            right.red() < 60 && right.green() < 60 && right.blue() < 60,
+            "right is black"
+        );
+    }
+
+    #[test]
+    fn a_hidden_border_reserves_space_but_paints_nothing() {
+        let hidden = render(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { border: 6px hidden #ff0000; height: 20px }",
+            40,
+        );
+        let red = hidden
+            .pixels()
+            .iter()
+            .filter(|p| p.red() > 200 && p.green() < 60 && p.blue() < 60)
+            .count();
+        assert_eq!(red, 0, "hidden must not paint");
+        // But it still occupies space, so the box is taller than its content.
+        assert!(hidden.height() >= 32, "6px top + 20px content + 6px bottom");
     }
 
     #[test]

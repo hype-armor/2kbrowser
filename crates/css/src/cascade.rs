@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use dom::{Document, NodeId};
 
 use crate::style::{
-    ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily,
-    NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_display,
+    BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack,
+    FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
+    parse_border_style, parse_display,
 };
-use crate::value::{Length, Raw, parse_color, parse_length};
+use crate::value::{Color, Length, Raw, parse_color, parse_length};
 use crate::{Declaration, Specificity, Stylesheet};
 
 /// Where a stylesheet came from. Origin outranks specificity in the cascade.
@@ -219,11 +220,54 @@ fn apply(style: &mut ComputedStyle, declaration: &Declaration, parent: &Computed
                 style.height = length;
             }
         }
+        // `border: 1px solid red` sets width, style, and colour on all four
+        // sides from whichever components are present.
+        "border" => {
+            let parsed = parse_border_shorthand(values);
+            for side in border_sides(&mut style.border) {
+                apply_border_shorthand(side, &parsed);
+            }
+        }
+        "border-width" => {
+            let lengths: Vec<Length> = values.iter().filter_map(parse_length).collect();
+            let widths = expand_four(&lengths);
+            for (side, width) in border_sides(&mut style.border).into_iter().zip(widths) {
+                if let Some(width) = width {
+                    side.width = width;
+                }
+            }
+        }
+        "border-style" => {
+            let styles: Vec<BorderStyle> = values
+                .iter()
+                .filter_map(|raw| match raw {
+                    Raw::Ident(name) => parse_border_style(name),
+                    _ => None,
+                })
+                .collect();
+            let expanded = expand_four(&styles);
+            for (side, border_style) in border_sides(&mut style.border).into_iter().zip(expanded) {
+                if let Some(border_style) = border_style {
+                    side.style = border_style;
+                }
+            }
+        }
+        "border-color" => {
+            let colors: Vec<Color> = values.iter().filter_map(parse_color).collect();
+            let expanded = expand_four(&colors);
+            for (side, color) in border_sides(&mut style.border).into_iter().zip(expanded) {
+                if color.is_some() {
+                    side.color = color;
+                }
+            }
+        }
         name => {
             if let Some(side) = name.strip_prefix("margin-") {
                 set_edge(&mut style.margin, side, first);
             } else if let Some(side) = name.strip_prefix("padding-") {
                 set_edge(&mut style.padding, side, first);
+            } else if let Some(rest) = name.strip_prefix("border-") {
+                apply_border_longhand(&mut style.border, rest, values);
             }
         }
     }
@@ -300,6 +344,134 @@ fn parse_edges(values: &[Raw]) -> Edges {
             left: lengths[3],
         },
         _ => Edges::ZERO,
+    }
+}
+
+/// The four border sides in CSS shorthand order.
+fn border_sides(borders: &mut Borders) -> [&mut BorderSide; 4] {
+    [
+        &mut borders.top,
+        &mut borders.right,
+        &mut borders.bottom,
+        &mut borders.left,
+    ]
+}
+
+/// Expands a one-to-four value list to top, right, bottom, left.
+fn expand_four<T: Copy>(values: &[T]) -> [Option<T>; 4] {
+    match values.len() {
+        1 => [Some(values[0]); 4],
+        2 => [
+            Some(values[0]),
+            Some(values[1]),
+            Some(values[0]),
+            Some(values[1]),
+        ],
+        3 => [
+            Some(values[0]),
+            Some(values[1]),
+            Some(values[2]),
+            Some(values[1]),
+        ],
+        4 => [
+            Some(values[0]),
+            Some(values[1]),
+            Some(values[2]),
+            Some(values[3]),
+        ],
+        _ => [None; 4],
+    }
+}
+
+/// Components of a `border`-style shorthand, in any order.
+#[derive(Default)]
+struct BorderShorthand {
+    width: Option<Length>,
+    style: Option<BorderStyle>,
+    color: Option<Color>,
+}
+
+/// Reads `1px solid red` in any order, since CSS does not fix one.
+fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
+    let mut out = BorderShorthand::default();
+    for raw in values {
+        if let Raw::Ident(name) = raw {
+            // A keyword may be a style, a named width, or a colour, and the
+            // order matters: `solid` is a style, not a failed colour lookup.
+            if let Some(style) = parse_border_style(name) {
+                out.style = Some(style);
+                continue;
+            }
+            match name.as_str() {
+                "thin" => {
+                    out.width = Some(Length::Px(1.0));
+                    continue;
+                }
+                "medium" => {
+                    out.width = Some(Length::Px(MEDIUM_BORDER));
+                    continue;
+                }
+                "thick" => {
+                    out.width = Some(Length::Px(5.0));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let Some(color) = parse_color(raw) {
+            out.color = Some(color);
+        } else if let Some(length) = parse_length(raw) {
+            out.width = Some(length);
+        }
+    }
+    out
+}
+
+fn apply_border_shorthand(side: &mut BorderSide, parsed: &BorderShorthand) {
+    // The shorthand resets omitted components to their initial values, which is
+    // why `border: solid` produces a medium border rather than keeping whatever
+    // width an earlier rule set.
+    side.width = parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER));
+    side.style = parsed.style.unwrap_or_default();
+    side.color = parsed.color;
+}
+
+/// Handles `border-top`, `border-left-width`, and friends.
+fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
+    let (side_name, property) = match rest.split_once('-') {
+        Some((side, property)) => (side, Some(property)),
+        None => (rest, None),
+    };
+    let side = match side_name {
+        "top" => &mut borders.top,
+        "right" => &mut borders.right,
+        "bottom" => &mut borders.bottom,
+        "left" => &mut borders.left,
+        _ => return,
+    };
+    let Some(first) = values.first() else { return };
+
+    match property {
+        // `border-top: 1px solid red`
+        None => apply_border_shorthand(side, &parse_border_shorthand(values)),
+        Some("width") => {
+            if let Some(width) = parse_length(first) {
+                side.width = width;
+            }
+        }
+        Some("style") => {
+            if let Raw::Ident(name) = first
+                && let Some(style) = parse_border_style(name)
+            {
+                side.style = style;
+            }
+        }
+        Some("color") => {
+            if let Some(color) = parse_color(first) {
+                side.color = Some(color);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -427,6 +599,91 @@ mod tests {
         let style = style_of("<p>x</p>", "p { margin: 5px; margin-left: 9px }", "p");
         assert_eq!(style.margin.left, Length::Px(9.0));
         assert_eq!(style.margin.top, Length::Px(5.0));
+    }
+
+    #[test]
+    fn border_shorthand_sets_all_three_components() {
+        let style = style_of("<p>x</p>", "p { border: 2px solid red }", "p");
+        for side in [
+            style.border.top,
+            style.border.right,
+            style.border.bottom,
+            style.border.left,
+        ] {
+            assert_eq!(side.width, Length::Px(2.0));
+            assert_eq!(side.style, BorderStyle::Solid);
+            assert_eq!(side.color, Some(crate::Color::rgb(255, 0, 0)));
+        }
+    }
+
+    #[test]
+    fn border_shorthand_accepts_components_in_any_order() {
+        // CSS does not fix the order, and real sheets use all of them.
+        let a = style_of("<p>x</p>", "p { border: solid 3px blue }", "p");
+        let b = style_of("<p>x</p>", "p { border: blue solid 3px }", "p");
+        assert_eq!(a.border.top, b.border.top);
+        assert_eq!(a.border.top.style, BorderStyle::Solid);
+        assert_eq!(a.border.top.width, Length::Px(3.0));
+    }
+
+    #[test]
+    fn a_width_without_a_style_occupies_nothing() {
+        // The commonest border mistake: `border-width` alone draws nothing,
+        // because the initial `border-style` is none.
+        let style = style_of("<p>x</p>", "p { border-width: 10px }", "p");
+        assert_eq!(style.border.top.width, Length::Px(10.0));
+        assert_eq!(style.border.top.used_width(16.0), 0.0);
+
+        let with_style = style_of(
+            "<p>x</p>",
+            "p { border-width: 10px; border-style: solid }",
+            "p",
+        );
+        assert_eq!(with_style.border.top.used_width(16.0), 10.0);
+    }
+
+    #[test]
+    fn per_side_longhands_override_the_shorthand() {
+        let style = style_of(
+            "<p>x</p>",
+            "p { border: 1px solid black; border-left: 5px solid red }",
+            "p",
+        );
+        assert_eq!(style.border.left.width, Length::Px(5.0));
+        assert_eq!(style.border.left.color, Some(crate::Color::rgb(255, 0, 0)));
+        assert_eq!(style.border.top.width, Length::Px(1.0));
+    }
+
+    #[test]
+    fn border_longhand_components_are_settable_individually() {
+        let style = style_of(
+            "<p>x</p>",
+            "p { border-top-style: dashed; border-top-width: 4px; border-top-color: lime }",
+            "p",
+        );
+        assert_eq!(style.border.top.style, BorderStyle::Dashed);
+        assert_eq!(style.border.top.width, Length::Px(4.0));
+        assert_eq!(style.border.top.color, Some(crate::Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn hidden_reserves_space_without_painting() {
+        let style = style_of("<p>x</p>", "p { border: 4px hidden red }", "p");
+        assert_eq!(
+            style.border.top.used_width(16.0),
+            4.0,
+            "hidden still occupies space"
+        );
+        assert!(!style.border.top.style.is_visible(), "but paints nothing");
+    }
+
+    #[test]
+    fn border_style_expands_by_arity() {
+        let style = style_of("<p>x</p>", "p { border-style: solid dashed }", "p");
+        assert_eq!(style.border.top.style, BorderStyle::Solid);
+        assert_eq!(style.border.right.style, BorderStyle::Dashed);
+        assert_eq!(style.border.bottom.style, BorderStyle::Solid);
+        assert_eq!(style.border.left.style, BorderStyle::Dashed);
     }
 
     #[test]

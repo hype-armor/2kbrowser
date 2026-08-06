@@ -126,6 +126,123 @@ impl Default for FontStack {
     }
 }
 
+/// The `border-style` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    /// No border box is generated.
+    #[default]
+    None,
+    /// Generates space but paints nothing.
+    Hidden,
+    /// A solid line.
+    Solid,
+    /// Dotted. Painted solid for now — see `BorderStyle::is_visible`.
+    Dotted,
+    /// Dashed. Painted solid for now.
+    Dashed,
+    /// Two lines. Painted solid for now.
+    Double,
+    /// Carved. Painted solid for now.
+    Groove,
+    /// Embossed. Painted solid for now.
+    Ridge,
+    /// Inset. Painted solid for now.
+    Inset,
+    /// Outset. Painted solid for now.
+    Outset,
+}
+
+impl BorderStyle {
+    /// Whether this style paints anything.
+    ///
+    /// Every non-`none` style reserves space, but `hidden` deliberately paints
+    /// nothing. The decorative styles all currently paint as solid: their
+    /// *metrics* are right, which is what layout depends on, and drawing dots
+    /// and bevels is cosmetic work that would not change any box's position.
+    pub fn is_visible(self) -> bool {
+        !matches!(self, BorderStyle::None | BorderStyle::Hidden)
+    }
+
+    /// Whether this style reserves space, even if it paints nothing.
+    pub fn reserves_space(self) -> bool {
+        self != BorderStyle::None
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        let style = match name {
+            "none" => BorderStyle::None,
+            "hidden" => BorderStyle::Hidden,
+            "solid" => BorderStyle::Solid,
+            "dotted" => BorderStyle::Dotted,
+            "dashed" => BorderStyle::Dashed,
+            "double" => BorderStyle::Double,
+            "groove" => BorderStyle::Groove,
+            "ridge" => BorderStyle::Ridge,
+            "inset" => BorderStyle::Inset,
+            "outset" => BorderStyle::Outset,
+            _ => return None,
+        };
+        Some(style)
+    }
+}
+
+/// Parses a `border-style` keyword.
+pub fn parse_border_style(name: &str) -> Option<BorderStyle> {
+    BorderStyle::parse(name)
+}
+
+/// The `medium` border width, and the initial value.
+pub const MEDIUM_BORDER: f32 = 3.0;
+
+/// One edge of a border.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BorderSide {
+    /// Declared width, used only when the style reserves space.
+    pub width: Length,
+    /// Line style.
+    pub style: BorderStyle,
+    /// Line colour, or `None` to use the element's `color`.
+    pub color: Option<Color>,
+}
+
+impl Default for BorderSide {
+    fn default() -> Self {
+        Self {
+            width: Length::Px(MEDIUM_BORDER),
+            style: BorderStyle::None,
+            color: None,
+        }
+    }
+}
+
+impl BorderSide {
+    /// Width actually occupied, in pixels.
+    ///
+    /// `border-width` is ignored unless a style is set — the single most common
+    /// authoring mistake with borders is expecting `border-width: 1px` alone to
+    /// draw something.
+    pub fn used_width(&self, font_size: f32) -> f32 {
+        if self.style.reserves_space() {
+            self.width.to_px(font_size, 0.0).max(0.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// The four border edges.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Borders {
+    /// Top edge.
+    pub top: BorderSide,
+    /// Right edge.
+    pub right: BorderSide,
+    /// Bottom edge.
+    pub bottom: BorderSide,
+    /// Left edge.
+    pub left: BorderSide,
+}
+
 /// Lengths on the four sides of a box.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Edges {
@@ -181,6 +298,8 @@ pub struct ComputedStyle {
     pub margin: Edges,
     /// `padding`.
     pub padding: Edges,
+    /// `border`.
+    pub border: Borders,
     /// `width`.
     pub width: Length,
     /// `height`.
@@ -208,6 +327,7 @@ impl Default for ComputedStyle {
             white_space: WhiteSpace::Normal,
             margin: Edges::ZERO,
             padding: Edges::ZERO,
+            border: Borders::default(),
             width: Length::Auto,
             height: Length::Auto,
         }
