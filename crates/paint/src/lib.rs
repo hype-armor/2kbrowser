@@ -125,6 +125,22 @@ fn paint_box(box_: &LayoutBox, offset_x: f32, offset_y: f32, list: &mut DisplayL
         let content_width = box_.content_width;
         for line in &layout.lines {
             let dx = line_offset(box_.style.text_align, line.width, content_width);
+            // Rules go under the glyphs so an underline sitting close to a
+            // descender is crossed by it rather than cutting through it.
+            for rule in &line.decorations {
+                list.items.push(DisplayItem::Rect {
+                    rect: Rect {
+                        x: content_x + dx + rule.x,
+                        y: content_y + rule.y,
+                        width: rule.width,
+                        height: rule.thickness,
+                    },
+                    color: rule
+                        .color
+                        .map(|(r, g, b, a)| Color { r, g, b, a })
+                        .unwrap_or(box_.style.color),
+                });
+            }
             for glyph in &line.glyphs {
                 // A glyph's own colour wins: one line can hold spans of
                 // different colours, and the block's colour is only the

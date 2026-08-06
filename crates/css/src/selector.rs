@@ -1,9 +1,15 @@
 //! Selector parsing and matching.
 //!
-//! Scope is the CSS 2.1 subset M1 needs: type, class, id, and universal
+//! Scope is the CSS 2.1 subset: type, class, id, universal, and attribute
 //! selectors, combined into compounds and joined by descendant or child
-//! combinators. Attribute, pseudo-class, sibling, and pseudo-element selectors
-//! arrive with the rest of the cascade in M2.
+//! combinators. Pseudo-classes, sibling combinators, and pseudo-elements are
+//! not here; a selector using one is dropped whole rather than matched
+//! partially, since matching too broadly is the worse failure.
+//!
+//! Selectors are split on whitespace to find combinators, so an attribute test
+//! written with spaces around its operator (`[title = "x"]`) does not parse.
+//! That form is vanishingly rare, and it fails by dropping the rule rather
+//! than by mis-matching it.
 
 use dom::{Document, NodeId};
 
@@ -16,6 +22,49 @@ pub enum Combinator {
     Child,
 }
 
+/// An `[attribute]` test, per CSS 2.1 §5.8.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeTest {
+    /// Lowercased attribute name.
+    pub name: String,
+    /// What the value must satisfy.
+    pub match_: AttributeMatch,
+}
+
+/// The comparison an attribute selector performs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeMatch {
+    /// `[att]` — the attribute is present, whatever its value.
+    Present,
+    /// `[att=val]` — the value is exactly this.
+    Exact(String),
+    /// `[att~=val]` — this is one of the value's space-separated words.
+    Word(String),
+    /// `[att|=val]` — the value is this, or begins with this and a hyphen.
+    /// Meant for language subtags: `[lang|=en]` matches `en-GB`.
+    Prefix(String),
+}
+
+impl AttributeTest {
+    fn matches(&self, value: &str) -> bool {
+        match &self.match_ {
+            AttributeMatch::Present => true,
+            AttributeMatch::Exact(wanted) => value == wanted,
+            AttributeMatch::Word(wanted) => {
+                // An empty operand can never match a word, and would otherwise
+                // match the gap between two spaces.
+                !wanted.is_empty() && value.split_ascii_whitespace().any(|word| word == wanted)
+            }
+            AttributeMatch::Prefix(wanted) => {
+                value == wanted
+                    || (value.len() > wanted.len()
+                        && value.starts_with(wanted.as_str())
+                        && value.as_bytes()[wanted.len()] == b'-')
+            }
+        }
+    }
+}
+
 /// A sequence of simple selectors with no combinator between them, e.g.
 /// `div#main.wide`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -26,6 +75,8 @@ pub struct Compound {
     pub id: Option<String>,
     /// Every `.class` in the compound.
     pub classes: Vec<String>,
+    /// Every `[attribute]` test in the compound.
+    pub attributes: Vec<AttributeTest>,
 }
 
 impl Compound {
@@ -44,13 +95,23 @@ impl Compound {
         {
             return false;
         }
-        self.classes
+        if !self
+            .classes
             .iter()
             .all(|wanted| element.classes().any(|actual| actual == wanted))
+        {
+            return false;
+        }
+        self.attributes
+            .iter()
+            .all(|test| element.attr(&test.name).is_some_and(|v| test.matches(v)))
     }
 
     fn is_empty(&self) -> bool {
-        self.tag.is_none() && self.id.is_none() && self.classes.is_empty()
+        self.tag.is_none()
+            && self.id.is_none()
+            && self.classes.is_empty()
+            && self.attributes.is_empty()
     }
 }
 
@@ -80,7 +141,8 @@ impl Selector {
         let mut out = Specificity::default();
         for (_, compound) in &self.parts {
             out.ids += u32::from(compound.id.is_some());
-            out.classes += compound.classes.len() as u32;
+            // An attribute selector counts at the same level as a class.
+            out.classes += (compound.classes.len() + compound.attributes.len()) as u32;
             out.types += u32::from(compound.tag.is_some());
         }
         out
@@ -185,7 +247,7 @@ fn parse_compound(input: &str) -> Option<Compound> {
     // A leading type selector or `*`, if any.
     let mut tag = String::new();
     while let Some(&c) = chars.peek() {
-        if c == '.' || c == '#' {
+        if c == '.' || c == '#' || c == '[' {
             break;
         }
         chars.next();
@@ -202,9 +264,28 @@ fn parse_compound(input: &str) -> Option<Compound> {
     }
 
     while let Some(marker) = chars.next() {
+        if marker == '[' {
+            // An attribute test runs to its closing bracket, which may enclose
+            // a quoted value containing `.` or `#`.
+            let mut body = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == ']' {
+                    closed = true;
+                    break;
+                }
+                body.push(c);
+            }
+            if !closed {
+                return None;
+            }
+            compound.attributes.push(parse_attribute_test(&body)?);
+            continue;
+        }
+
         let mut name = String::new();
         while let Some(&c) = chars.peek() {
-            if c == '.' || c == '#' {
+            if c == '.' || c == '#' || c == '[' {
                 break;
             }
             chars.next();
@@ -216,8 +297,8 @@ fn parse_compound(input: &str) -> Option<Compound> {
         match marker {
             '.' => compound.classes.push(name),
             '#' => compound.id = Some(name),
-            // Pseudo-classes, attribute selectors, and anything else are out of
-            // scope; drop the whole selector rather than match too broadly.
+            // Pseudo-classes and anything else are out of scope; drop the whole
+            // selector rather than match too broadly.
             _ => return None,
         }
     }
@@ -226,6 +307,57 @@ fn parse_compound(input: &str) -> Option<Compound> {
         return None;
     }
     Some(compound)
+}
+
+/// Parses the inside of an `[…]`, without the brackets.
+fn parse_attribute_test(body: &str) -> Option<AttributeTest> {
+    let body = body.trim();
+    // Longest operator first: `~=` and `|=` both end in `=`, so testing for
+    // `=` before them would split them in the wrong place.
+    let split = ["~=", "|=", "="]
+        .into_iter()
+        .filter_map(|operator| body.find(operator).map(|at| (operator, at)))
+        .min_by_key(|(_, at)| *at);
+
+    let (name, match_) = match split {
+        None => (body, AttributeMatch::Present),
+        Some((operator, at)) => {
+            let value = unquote(body[at + operator.len()..].trim());
+            let match_ = match operator {
+                "~=" => AttributeMatch::Word(value),
+                "|=" => AttributeMatch::Prefix(value),
+                _ => AttributeMatch::Exact(value),
+            };
+            (&body[..at], match_)
+        }
+    };
+
+    let name = name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(AttributeTest {
+        // HTML attribute names are case-insensitive and the DOM stores them
+        // lowercased, so the selector's must be too.
+        name: name.to_ascii_lowercase(),
+        match_,
+    })
+}
+
+/// Strips one layer of matching quotes, which an attribute value may carry.
+fn unquote(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        return value[1..value.len() - 1].to_owned();
+    }
+    value.to_owned()
 }
 
 #[cfg(test)]

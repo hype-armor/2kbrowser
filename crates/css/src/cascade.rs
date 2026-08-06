@@ -7,7 +7,8 @@ use dom::{Document, ElementData, NodeId};
 use crate::style::{
     BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges, FontStack,
     FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
-    parse_border_style, parse_clear, parse_display, parse_float, parse_position,
+    parse_border_style, parse_clear, parse_display, parse_float, parse_list_style_type,
+    parse_position, parse_text_decoration,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -176,6 +177,15 @@ fn compute(
     for (_, declaration) in matched {
         apply(&mut style, declaration, parent, quirks);
     }
+
+    // §16.3: an ancestor's decoration is drawn across this element's text too,
+    // and this element cannot switch it off. Merged after the cascade rather
+    // than inherited before it, so that a `text-decoration: none` here still
+    // beats a rule that would otherwise underline *this* element.
+    style.text_decoration.underline |= parent.text_decoration.underline;
+    style.text_decoration.line_through |= parent.text_decoration.line_through;
+    style.text_decoration.overline |= parent.text_decoration.overline;
+
     style
 }
 
@@ -262,6 +272,30 @@ fn apply(
                     "justify" => TextAlign::Justify,
                     _ => TextAlign::Left,
                 };
+            }
+        }
+        // Replaces, like any other property: this is the ordinary cascade, and
+        // a `text-decoration: none` that lost to it would be unable to turn off
+        // the underline the UA sheet gives a link. An *ancestor's* decoration
+        // is a separate matter, merged in after the cascade has settled.
+        "text-decoration" => {
+            let words: Vec<String> = values
+                .iter()
+                .filter_map(|raw| match raw {
+                    Raw::Ident(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            style.text_decoration = parse_text_decoration(&words);
+        }
+        // `list-style` is a shorthand; only the type is modelled, so scan the
+        // whole value for a keyword we recognise rather than reading the first.
+        "list-style-type" | "list-style" => {
+            if let Some(kind) = values.iter().find_map(|raw| match raw {
+                Raw::Ident(name) => parse_list_style_type(name),
+                _ => None,
+            }) {
+                style.list_style_type = kind;
             }
         }
         "white-space" => {
@@ -771,7 +805,7 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::Display;
+    use crate::style::{Display, ListStyleType};
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
         let doc = dom::parse(html);
@@ -1209,6 +1243,109 @@ mod tests {
                 .left
                 .used_width(16.0),
             0.0
+        );
+    }
+
+    #[test]
+    fn only_an_anchor_with_an_href_is_styled_as_a_link() {
+        // `<a name="x">` was how in-page destinations were written. Painting
+        // one blue and underlined tells the reader to click something that
+        // does nothing.
+        let link = style_of(r#"<a href="x.html">x</a>"#, "", "a");
+        assert!(link.text_decoration.underline);
+        assert_eq!(link.color, crate::Color::rgb(0, 0, 238));
+
+        let anchor = style_of(r#"<a name="here">x</a>"#, "", "a");
+        assert!(!anchor.text_decoration.underline);
+        assert_eq!(anchor.color, crate::Color::BLACK);
+    }
+
+    #[test]
+    fn a_page_can_turn_off_the_default_underline() {
+        let style = style_of(
+            r#"<a href="x.html">x</a>"#,
+            "a { text-decoration: none }",
+            "a",
+        );
+        assert!(
+            !style.text_decoration.underline,
+            "an author rule must beat the UA sheet on the same element"
+        );
+    }
+
+    #[test]
+    fn a_decoration_reaches_descendants_and_cannot_be_removed_by_them() {
+        // §16.3: the rule belongs to the ancestor and is drawn across all of
+        // its inline content, so a link stays underlined through a <b> inside
+        // it — even one that asks for no decoration.
+        let doc = dom::parse(r#"<a href="x"><b>bold</b><i>italic</i></a>"#);
+        let sheets = [Stylesheet::parse("b { text-decoration: none }")];
+        let map = cascade(&doc, &sheets);
+        for tag in ["b", "i"] {
+            let node = doc.find_element(tag).expect("element present");
+            assert!(
+                map.get(node).expect("styled").text_decoration.underline,
+                "<{tag}> inside a link must stay underlined"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_selectors_match_by_presence_and_value() {
+        let html = r#"<p class="a b" lang="en-GB" title="x">t</p>"#;
+        let matched = |css: &str| style_of(html, css, "p").color == crate::Color::rgb(255, 0, 0);
+
+        assert!(matched("p[title] { color: red }"), "presence");
+        assert!(matched(r#"p[title="x"] { color: red }"#), "exact");
+        assert!(matched("p[class~=b] { color: red }"), "one of the words");
+        assert!(matched("p[lang|=en] { color: red }"), "language prefix");
+
+        assert!(!matched("p[href] { color: red }"), "absent attribute");
+        assert!(!matched(r#"p[title="y"] { color: red }"#), "wrong value");
+        assert!(!matched("p[class~=ab] { color: red }"), "not a whole word");
+        assert!(
+            !matched("p[lang|=e] { color: red }"),
+            "a prefix must end at a hyphen"
+        );
+    }
+
+    #[test]
+    fn an_attribute_selector_counts_as_a_class_for_specificity() {
+        let style = style_of(
+            r#"<p title="x">t</p>"#,
+            "p[title] { color: red } p { color: lime }",
+            "p",
+        );
+        assert_eq!(style.color, crate::Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn a_list_takes_its_marker_from_its_type_and_passes_it_down() {
+        let items = style_of("<ul><li>x</li></ul>", "", "li");
+        assert_eq!(items.list_style_type, ListStyleType::Disc);
+
+        let ordered = style_of("<ol><li>x</li></ol>", "", "li");
+        assert_eq!(ordered.list_style_type, ListStyleType::Decimal);
+
+        // Nesting steps through the bullets so the levels are tellable apart.
+        let doc = dom::parse("<ul><li><ul><li><ul><li>x</li></ul></li></ul></li></ul>");
+        let map = cascade(&doc, &[]);
+        let types: Vec<ListStyleType> = doc
+            .descendants(doc.root())
+            .into_iter()
+            .filter(|&node| {
+                doc.element(node)
+                    .is_some_and(|element| element.local_name() == "ul")
+            })
+            .filter_map(|node| map.get(node).map(|style| style.list_style_type))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                ListStyleType::Disc,
+                ListStyleType::Circle,
+                ListStyleType::Square
+            ]
         );
     }
 

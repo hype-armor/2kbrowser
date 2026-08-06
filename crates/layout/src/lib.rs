@@ -293,6 +293,90 @@ pub fn layout(
     }
 }
 
+/// Gap between a list marker and the item's content edge.
+const MARKER_GAP: f32 = 0.4;
+
+/// The number this list item counts as.
+///
+/// `<ol start>` moves where a list begins and `<li value>` restarts it
+/// mid-way; both were ordinary markup, used for lists split across pages and
+/// for numbered steps resumed after an aside.
+fn list_ordinal(doc: &Document, styles: &StyleMap, node: NodeId) -> usize {
+    let Some(parent) = doc.node(node).parent else {
+        return 1;
+    };
+    let mut ordinal: i64 = doc
+        .element(parent)
+        .and_then(|element| element.attr("start"))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(1);
+
+    for &sibling in doc.children(parent) {
+        if !styles
+            .get(sibling)
+            .is_some_and(|style| style.display == Display::ListItem)
+        {
+            continue;
+        }
+        if let Some(value) = doc
+            .element(sibling)
+            .and_then(|element| element.attr("value"))
+            .and_then(|value| value.trim().parse().ok())
+        {
+            ordinal = value;
+        }
+        if sibling == node {
+            break;
+        }
+        ordinal += 1;
+    }
+    ordinal.max(0) as usize
+}
+
+/// Builds the marker box for a list item, to sit in the list's left padding.
+///
+/// Returned as an ordinary box with text rather than drawn specially, so the
+/// marker picks up the item's font and colour the way it should — a red `<li>`
+/// has a red bullet.
+fn marker_box(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    style: &ComputedStyle,
+    content_origin: (f32, f32),
+) -> Option<LayoutBox> {
+    let ordinal = if style.list_style_type.is_ordered() {
+        list_ordinal(doc, styles, node)
+    } else {
+        1
+    };
+    let text = style.list_style_type.marker(ordinal);
+    if text.is_empty() {
+        return None;
+    }
+
+    // No wrapping: a marker is a few characters and must stay on one line.
+    let layout = fonts.layout(&text, style, f32::MAX);
+    let width = layout.width;
+    Some(LayoutBox {
+        rect: Rect {
+            // To the left of the content edge, which puts it in the list's own
+            // padding — where `ul { padding-left: 40px }` leaves room for it.
+            x: content_origin.0 - width - style.font_size * MARKER_GAP,
+            y: content_origin.1,
+            width,
+            height: layout.height,
+        },
+        style: style.clone(),
+        text: Some(layout),
+        content_origin: (0.0, 0.0),
+        content_width: width,
+        children: Vec::new(),
+        replaced: None,
+    })
+}
+
 /// Lays out `node` as a block box at `(x, y)` within `available_width`,
 /// appending it to `parent`. Returns the outer height consumed.
 #[expect(
@@ -429,6 +513,19 @@ fn layout_block(
             &mut context,
             &mut box_,
         );
+    }
+
+    if style.display == Display::ListItem
+        && let Some(marker) = marker_box(
+            doc,
+            styles,
+            fonts,
+            node,
+            style,
+            (padding_left + border_left, padding_top + border_top),
+        )
+    {
+        box_.children.push(marker);
     }
 
     if runs.iter().any(|run| !run.text.trim().is_empty()) {
@@ -1285,6 +1382,83 @@ mod tests {
             (cells[0].rect.x - cells[1].rect.x).abs() < 0.01,
             "same column, same x"
         );
+    }
+
+    #[test]
+    fn every_list_item_gets_a_marker_box() {
+        let rendered = run("<body><ul><li>one</li><li>two</li></ul></body>", "", 400.0);
+        let markers = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::ListItem)
+            .filter(|item| item.children.iter().any(|child| child.text.is_some()))
+            .count();
+        assert_eq!(markers, 2);
+    }
+
+    #[test]
+    fn a_marker_sits_left_of_its_item_and_inside_the_list() {
+        let rendered = run("<body><ul><li>one</li></ul></body>", "", 400.0);
+        let all = content_boxes(&rendered);
+        let item = all
+            .iter()
+            .find(|b| b.style.display == Display::ListItem)
+            .expect("a list item");
+        let list = all
+            .iter()
+            .find(|b| b.style.padding.left != css::Length::Px(0.0))
+            .expect("the list, which carries the indent");
+
+        let marker = item.children.first().expect("marker box");
+        assert!(
+            marker.rect.x < item.content_origin.0,
+            "marker at {} must sit left of the content edge at {}",
+            marker.rect.x,
+            item.content_origin.0
+        );
+        // The marker lives in the list's padding, not outside the list.
+        let marker_x = item.rect.x + marker.rect.x;
+        assert!(
+            marker_x > list.rect.x,
+            "marker at {marker_x} escaped the list starting at {}",
+            list.rect.x
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_marker_type_still_indents_but_draws_nothing() {
+        let rendered = run(
+            "<body><ul><li>one</li></ul></body>",
+            "ul { list-style-type: none }",
+            400.0,
+        );
+        let item = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::ListItem)
+            .expect("a list item");
+        assert!(item.children.is_empty(), "no marker box for `none`");
+    }
+
+    #[test]
+    fn item_values_and_list_starts_move_the_count() {
+        let doc = dom::parse(
+            r#"<body><ol start="5"><li>a</li><li value="9">b</li><li>c</li></ol></body>"#,
+        );
+        let styles = css::cascade::cascade(&doc, &[]);
+        let items: Vec<NodeId> = doc
+            .descendants(doc.root())
+            .into_iter()
+            .filter(|&node| {
+                doc.element(node)
+                    .is_some_and(|element| element.local_name() == "li")
+            })
+            .collect();
+        let ordinals: Vec<usize> = items
+            .iter()
+            .map(|&node| list_ordinal(&doc, &styles, node))
+            .collect();
+        // `start` sets the first, `value` restarts mid-list, and the count
+        // carries on from wherever it was last set.
+        assert_eq!(ordinals, vec![5, 9, 10]);
     }
 
     #[test]

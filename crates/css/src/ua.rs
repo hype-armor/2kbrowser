@@ -33,15 +33,36 @@ u, ins { text-decoration: underline; }
 pre, code, kbd, samp, tt { font-family: monospace; }
 pre { white-space: pre; margin: 1em 0; }
 
-a { color: #0000ee; }
+/* Only an `a` with an href is a link. An anchor without one is a named
+   destination, which was how in-page navigation worked and which must not be
+   painted as though it were clickable. */
+a[href] { color: #0000ee; text-decoration: underline; }
+
+del, s, strike { text-decoration: line-through; }
 
 ul, ol, dd { padding-left: 40px; }
 li { display: list-item; }
 
+/* A list nested inside a list item takes no vertical margin of its own. The
+   sample stylesheet omits this and every browser adds it: without it a
+   sublist floats away from the item it belongs to. */
+ul ul, ul ol, ol ul, ol ol { margin-top: 0; margin-bottom: 0; }
+
+ul { list-style-type: disc; }
+ol { list-style-type: decimal; }
+/* Nested unordered lists step through the three bullets, which is what makes
+   the levels of a deep list tellable apart. */
+ul ul { list-style-type: circle; }
+ul ul ul { list-style-type: square; }
+
 blockquote { padding-left: 40px; padding-right: 40px; }
 
 center { text-align: center; }
-hr { margin: 0.5em 0; }
+
+/* A rule is an empty block with a border, which is how every browser has
+   drawn it. Without one it is a zero-height box that draws nothing, and the
+   era's pages used it constantly as a section divider. */
+hr { margin: 0.5em 0; height: 0; border-top: 1px solid #999999; }
 
 table { display: table; }
 thead, tbody, tfoot { display: table-row-group; }

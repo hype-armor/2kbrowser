@@ -13,7 +13,7 @@
 use cosmic_text::{
     Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache, Weight,
 };
-use css::style::{ComputedStyle, FontStyle, GenericFamily, WhiteSpace};
+use css::style::{ComputedStyle, FontStyle, GenericFamily, TextDecoration, WhiteSpace};
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
 const SANS: &[(&str, &[u8])] = &[
@@ -96,6 +96,12 @@ pub struct PositionedGlyph {
     pub color: Option<(u8, u8, u8, u8)>,
 }
 
+/// The colour a span's glyphs and rules take, as stored on a glyph.
+fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
+    let color = style.color;
+    Some((color.r, color.g, color.b, color.a))
+}
+
 /// A run of text with its own style, within a block's inline content.
 #[derive(Debug, Clone)]
 pub struct InlineRun {
@@ -105,11 +111,32 @@ pub struct InlineRun {
     pub style: ComputedStyle,
 }
 
+/// A rule drawn under, over, or through a stretch of text.
+///
+/// Emitted here rather than derived at paint time because only the text layout
+/// knows how far a decorated span actually reaches: a glyph carries its origin
+/// but not its advance, so paint could only guess at where the last one ends.
+#[derive(Debug, Clone, Copy)]
+pub struct DecorationRun {
+    /// Left edge, relative to the text origin.
+    pub x: f32,
+    /// Length of the rule.
+    pub width: f32,
+    /// Top edge, relative to the text origin.
+    pub y: f32,
+    /// Rule thickness.
+    pub thickness: f32,
+    /// Colour of the span the rule belongs to, or `None` for the block's.
+    pub color: Option<(u8, u8, u8, u8)>,
+}
+
 /// One laid-out line.
 #[derive(Debug, Clone)]
 pub struct Line {
     /// Glyphs on this line.
     pub glyphs: Vec<PositionedGlyph>,
+    /// Rules under, over, and through this line's text.
+    pub decorations: Vec<DecorationRun>,
     /// Width of the line's inked content.
     pub width: f32,
     /// Distance from the line box top to the baseline.
@@ -148,6 +175,13 @@ struct Segment {
     mandatory_break: bool,
     /// Horizontal position within the line, filled in during placement.
     x: f32,
+    /// Decoration the segment's style asks for.
+    decoration: TextDecoration,
+    /// The segment's font size, which sets where its rules sit and how thick
+    /// they are.
+    font_size: f32,
+    /// Colour of the span this segment came from, for its rules to match.
+    color: Option<(u8, u8, u8, u8)>,
 }
 
 /// Owns the font database and the glyph raster cache.
@@ -419,10 +453,94 @@ impl FontStore {
         }
         layout.lines.push(Line {
             glyphs,
+            decorations: Self::decorations_for(current, offset, line_y + ascent),
             width,
             baseline: ascent,
         });
         current.clear();
+    }
+
+    /// Builds the rules for one line's decorated spans.
+    ///
+    /// Adjacent segments sharing a decoration are merged into a single rule
+    /// that runs through the space between them. Emitting one rule per segment
+    /// instead would leave a gap under every space, which is not how an
+    /// underline has ever looked.
+    fn decorations_for(segments: &[Segment], offset: f32, baseline: f32) -> Vec<DecorationRun> {
+        /// A decorated stretch being accumulated across segments.
+        struct Open {
+            left: f32,
+            right: f32,
+            decoration: TextDecoration,
+            font_size: f32,
+            color: Option<(u8, u8, u8, u8)>,
+        }
+
+        let mut out: Vec<DecorationRun> = Vec::new();
+        let mut open: Option<Open> = None;
+
+        let close = |open: Option<Open>, out: &mut Vec<DecorationRun>| {
+            let Some(run) = open else { return };
+            let width = run.right - run.left;
+            if width <= 0.0 {
+                return;
+            }
+            // Proportions taken from the CSS 2.1 sample rendering rather than
+            // from the font's own post table: with three bundled families the
+            // difference is invisible, and a fixed ratio keeps a rule under
+            // mixed spans of one size from stepping up and down.
+            let thickness = (run.font_size / 14.0).max(1.0).round();
+            let mut push = |y: f32| {
+                out.push(DecorationRun {
+                    x: run.left,
+                    width,
+                    y,
+                    thickness,
+                    color: run.color,
+                });
+            };
+            if run.decoration.underline {
+                push(baseline + run.font_size * 0.12);
+            }
+            if run.decoration.line_through {
+                push(baseline - run.font_size * 0.28);
+            }
+            if run.decoration.overline {
+                push(baseline - run.font_size * 0.85);
+            }
+        };
+
+        for segment in segments {
+            let left = segment.x + offset;
+            let right = left + segment.shaped.width;
+            if segment.decoration.is_none() {
+                close(open.take(), &mut out);
+                continue;
+            }
+            match &mut open {
+                // Same decoration as the run in progress: extend it, which
+                // carries the rule across the space that separated them.
+                Some(run)
+                    if run.decoration == segment.decoration
+                        && run.color == segment.color
+                        && run.font_size == segment.font_size =>
+                {
+                    run.right = right;
+                }
+                _ => {
+                    close(open.take(), &mut out);
+                    open = Some(Open {
+                        left,
+                        right,
+                        decoration: segment.decoration,
+                        font_size: segment.font_size,
+                        color: segment.color,
+                    });
+                }
+            }
+        }
+        close(open, &mut out);
+        out
     }
 
     /// Cuts runs into unbreakable segments at Unicode break opportunities.
@@ -483,6 +601,9 @@ impl FontStore {
                             trailing_space: space_width,
                             mandatory_break: true,
                             x: 0.0,
+                            decoration: run.style.text_decoration,
+                            font_size: run.style.font_size,
+                            color: span_color(&run.style),
                         });
                     }
                     continue;
@@ -494,6 +615,9 @@ impl FontStore {
                     trailing_space: space_width,
                     mandatory_break: mandatory,
                     x: 0.0,
+                    decoration: run.style.text_decoration,
+                    font_size: run.style.font_size,
+                    color: span_color(&run.style),
                 });
             }
         }
@@ -860,5 +984,105 @@ mod tests {
         let layout = store.layout("", &style(16.0), 100.0);
         assert!(layout.lines.is_empty());
         assert_eq!(layout.height, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::*;
+    use css::style::TextDecoration;
+
+    fn run(text: &str, decoration: TextDecoration) -> InlineRun {
+        InlineRun {
+            text: text.to_owned(),
+            style: ComputedStyle {
+                font_size: 16.0,
+                line_height: 19.2,
+                text_decoration: decoration,
+                ..Default::default()
+            },
+        }
+    }
+
+    const UNDERLINE: TextDecoration = TextDecoration {
+        underline: true,
+        line_through: false,
+        overline: false,
+    };
+
+    #[test]
+    fn undecorated_text_produces_no_rules() {
+        let mut store = FontStore::new();
+        let layout = store.layout("plain text", &ComputedStyle::default(), 1000.0);
+        assert!(layout.lines[0].decorations.is_empty());
+    }
+
+    #[test]
+    fn a_rule_spans_the_text_it_decorates() {
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(
+            &[run("underlined", UNDERLINE)],
+            &ComputedStyle::default(),
+            1000.0,
+        );
+        let rules = &layout.lines[0].decorations;
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].thickness >= 1.0);
+        assert!(
+            (rules[0].width - layout.lines[0].width).abs() < 1.0,
+            "rule {} should span the line's {}",
+            rules[0].width,
+            layout.lines[0].width
+        );
+        assert!(
+            rules[0].y > layout.lines[0].baseline,
+            "an underline sits below the baseline"
+        );
+    }
+
+    #[test]
+    fn a_rule_carries_across_the_space_between_two_decorated_runs() {
+        // Two spans of one link. Emitting a rule per run would leave a gap
+        // under the space between them, which is not how an underline looks.
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(
+            &[run("one ", UNDERLINE), run("two", UNDERLINE)],
+            &ComputedStyle::default(),
+            1000.0,
+        );
+        let rules = &layout.lines[0].decorations;
+        assert_eq!(rules.len(), 1, "the two runs share one rule");
+        assert!((rules[0].width - layout.lines[0].width).abs() < 1.0);
+    }
+
+    #[test]
+    fn an_undecorated_run_between_two_decorated_ones_breaks_the_rule() {
+        let mut store = FontStore::new();
+        let layout = store.layout_runs(
+            &[
+                run("one ", UNDERLINE),
+                run("two ", TextDecoration::default()),
+                run("three", UNDERLINE),
+            ],
+            &ComputedStyle::default(),
+            1000.0,
+        );
+        let rules = &layout.lines[0].decorations;
+        assert_eq!(rules.len(), 2);
+        assert!(
+            rules[0].x + rules[0].width < rules[1].x,
+            "the rules must not meet across the undecorated run"
+        );
+    }
+
+    #[test]
+    fn each_wrapped_line_gets_its_own_rule() {
+        let mut store = FontStore::new();
+        let text = "a fairly long stretch of underlined text that has to wrap";
+        let layout = store.layout_runs(&[run(text, UNDERLINE)], &ComputedStyle::default(), 120.0);
+        assert!(layout.lines.len() > 1, "the text must actually wrap");
+        for (index, line) in layout.lines.iter().enumerate() {
+            assert_eq!(line.decorations.len(), 1, "line {index} has no rule");
+        }
     }
 }

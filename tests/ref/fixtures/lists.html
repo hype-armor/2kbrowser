@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Lists, rules, and decorated text</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 16px }
+    .plain a { text-decoration: none }
+    ol.roman { list-style-type: upper-roman }
+    ul.none { list-style-type: none }
+  </style>
+</head>
+<body>
+  <h2>Markers</h2>
+
+  <ul>
+    <li>A disc, which is the default</li>
+    <li>Nested lists step through the bullets:
+      <ul>
+        <li>a circle at the second level
+          <ul>
+            <li>and a square at the third</li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+    <li>Back at the first level</li>
+  </ul>
+
+  <ol>
+    <li>Numbered from one</li>
+    <li>and counting</li>
+    <li value="7">until an item declares its own value</li>
+    <li>after which the count carries on from there</li>
+  </ol>
+
+  <ol class="roman" start="3">
+    <li>An ordered list may start anywhere</li>
+    <li>and number itself however it likes</li>
+  </ol>
+
+  <ul class="none">
+    <li>A list with no markers at all</li>
+    <li>still indented, still a list</li>
+  </ul>
+
+  <hr>
+
+  <h2>Rules through text</h2>
+
+  <p>A <a href="archive.html">link</a> is underlined and blue, but
+  <a name="here">a named anchor</a> is neither: it is a destination, not
+  something to click.</p>
+
+  <p>An underline runs through a <a href="x.html">link with <b>bold</b> and
+  <i>italic</i> inside it</a>, because the rule belongs to the link and is drawn
+  across everything within it.</p>
+
+  <p><del>Struck out</del>, <u>underlined</u>, and
+  <span style="text-decoration: overline">overlined</span>.</p>
+
+  <p class="plain">A page can turn the underline off:
+  <a href="y.html">this link has none</a>.</p>
+</body>
+</html>

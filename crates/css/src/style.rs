@@ -105,6 +105,170 @@ pub enum TextAlign {
     Justify,
 }
 
+/// The `text-decoration` property.
+///
+/// Not inherited in the usual sense: CSS 2.1 §16.3 says a decoration is drawn
+/// across the whole of the element's inline content including its descendants,
+/// which for our purposes amounts to propagating it downwards. The visible
+/// consequence is that a link is underlined all the way through any `<b>` or
+/// `<span>` inside it, which is how a link looked and how it was recognised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextDecoration {
+    /// A line along the text's baseline.
+    pub underline: bool,
+    /// A line through the middle of the text.
+    pub line_through: bool,
+    /// A line above the text.
+    pub overline: bool,
+}
+
+impl TextDecoration {
+    /// Whether anything would be drawn.
+    pub fn is_none(self) -> bool {
+        !self.underline && !self.line_through && !self.overline
+    }
+}
+
+/// Parses a `text-decoration` value, which is a space-separated list.
+///
+/// `none` clears everything, which is how a page turns off the underline the UA
+/// sheet gives its links.
+pub fn parse_text_decoration(words: &[String]) -> TextDecoration {
+    let mut out = TextDecoration::default();
+    for word in words {
+        match word.as_str() {
+            "underline" => out.underline = true,
+            "line-through" => out.line_through = true,
+            "overline" => out.overline = true,
+            "none" => return TextDecoration::default(),
+            // `blink` is recognised and deliberately ignored.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `list-style-type` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListStyleType {
+    /// A filled circle.
+    #[default]
+    Disc,
+    /// A hollow circle.
+    Circle,
+    /// A filled square.
+    Square,
+    /// 1, 2, 3.
+    Decimal,
+    /// a, b, c.
+    LowerAlpha,
+    /// A, B, C.
+    UpperAlpha,
+    /// i, ii, iii.
+    LowerRoman,
+    /// I, II, III.
+    UpperRoman,
+    /// No marker at all.
+    None,
+}
+
+impl ListStyleType {
+    /// Whether the marker counts items rather than repeating a glyph.
+    pub fn is_ordered(self) -> bool {
+        !matches!(
+            self,
+            ListStyleType::Disc
+                | ListStyleType::Circle
+                | ListStyleType::Square
+                | ListStyleType::None
+        )
+    }
+
+    /// The marker text for the item at `ordinal`, counting from one.
+    ///
+    /// Returns the text without its trailing separator; the caller adds the
+    /// `.` that ordered lists carry, since unordered markers take none.
+    pub fn marker(self, ordinal: usize) -> String {
+        match self {
+            ListStyleType::Disc => "\u{2022}".to_owned(),
+            ListStyleType::Circle => "\u{25e6}".to_owned(),
+            ListStyleType::Square => "\u{25aa}".to_owned(),
+            ListStyleType::None => String::new(),
+            ListStyleType::Decimal => format!("{ordinal}."),
+            ListStyleType::LowerAlpha => format!("{}.", alphabetic(ordinal, 'a')),
+            ListStyleType::UpperAlpha => format!("{}.", alphabetic(ordinal, 'A')),
+            ListStyleType::LowerRoman => format!("{}.", roman(ordinal).to_lowercase()),
+            ListStyleType::UpperRoman => format!("{}.", roman(ordinal)),
+        }
+    }
+}
+
+/// Parses a `list-style-type` keyword.
+pub fn parse_list_style_type(name: &str) -> Option<ListStyleType> {
+    let value = match name {
+        "disc" => ListStyleType::Disc,
+        "circle" => ListStyleType::Circle,
+        "square" => ListStyleType::Square,
+        "decimal" => ListStyleType::Decimal,
+        "lower-alpha" | "lower-latin" => ListStyleType::LowerAlpha,
+        "upper-alpha" | "upper-latin" => ListStyleType::UpperAlpha,
+        "lower-roman" => ListStyleType::LowerRoman,
+        "upper-roman" => ListStyleType::UpperRoman,
+        "none" => ListStyleType::None,
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// Bijective base-26: a, b, … z, aa, ab. Not ordinary base 26 — there is no
+/// digit for zero, so `z` is followed by `aa` rather than by `ba`.
+fn alphabetic(ordinal: usize, first: char) -> String {
+    if ordinal == 0 {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut n = ordinal;
+    while n > 0 {
+        let digit = (n - 1) % 26;
+        out.push((first as u8 + digit as u8) as char);
+        n = (n - 1) / 26;
+    }
+    out.iter().rev().collect()
+}
+
+/// Roman numerals, in the subtractive form.
+fn roman(ordinal: usize) -> String {
+    // Above this the numeral system has no agreed notation, and a list that
+    // long is not going to be read by its numbers anyway.
+    if ordinal == 0 || ordinal > 3999 {
+        return ordinal.to_string();
+    }
+    const TABLE: [(usize, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    let mut n = ordinal;
+    for (value, numeral) in TABLE {
+        while n >= value {
+            out.push_str(numeral);
+            n -= value;
+        }
+    }
+    out
+}
+
 /// The `white-space` property, restricted to the values that change layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhiteSpace {
@@ -426,6 +590,10 @@ pub struct ComputedStyle {
     pub text_align: TextAlign,
     /// `white-space`, inherited.
     pub white_space: WhiteSpace,
+    /// `text-decoration`, propagated to inline descendants (CSS 2.1 §16.3).
+    pub text_decoration: TextDecoration,
+    /// `list-style-type`, inherited so a list's items pick it up from the list.
+    pub list_style_type: ListStyleType,
     /// `margin`.
     pub margin: Edges,
     /// `padding`.
@@ -465,6 +633,8 @@ impl Default for ComputedStyle {
             line_height: DEFAULT_FONT_SIZE * NORMAL_LINE_HEIGHT,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
+            text_decoration: TextDecoration::default(),
+            list_style_type: ListStyleType::Disc,
             margin: Edges::ZERO,
             padding: Edges::ZERO,
             border: Borders::default(),
@@ -491,6 +661,7 @@ impl ComputedStyle {
             line_height: parent.line_height,
             text_align: parent.text_align,
             white_space: parent.white_space,
+            list_style_type: parent.list_style_type,
             ..Self::default()
         }
     }
@@ -504,4 +675,74 @@ impl ComputedStyle {
 /// Parses a `display` keyword.
 pub fn parse_display(name: &str) -> Option<Display> {
     Display::parse(name)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn unordered_markers_are_a_fixed_glyph() {
+        assert_eq!(ListStyleType::Disc.marker(1), "\u{2022}");
+        assert_eq!(ListStyleType::Disc.marker(9), "\u{2022}", "not a count");
+        assert_eq!(ListStyleType::None.marker(1), "");
+    }
+
+    #[test]
+    fn decimal_markers_count() {
+        assert_eq!(ListStyleType::Decimal.marker(1), "1.");
+        assert_eq!(ListStyleType::Decimal.marker(42), "42.");
+    }
+
+    #[test]
+    fn alphabetic_markers_are_bijective_base_26() {
+        // There is no digit for zero, so `z` is followed by `aa`, not `ba`.
+        // Ordinary base 26 gets this wrong from the 27th item onwards.
+        assert_eq!(ListStyleType::LowerAlpha.marker(1), "a.");
+        assert_eq!(ListStyleType::LowerAlpha.marker(26), "z.");
+        assert_eq!(ListStyleType::LowerAlpha.marker(27), "aa.");
+        assert_eq!(ListStyleType::LowerAlpha.marker(52), "az.");
+        assert_eq!(ListStyleType::LowerAlpha.marker(53), "ba.");
+        assert_eq!(ListStyleType::UpperAlpha.marker(28), "AB.");
+    }
+
+    #[test]
+    fn roman_markers_use_the_subtractive_forms() {
+        for (ordinal, expected) in [
+            (1, "I."),
+            (4, "IV."),
+            (9, "IX."),
+            (14, "XIV."),
+            (40, "XL."),
+            (1990, "MCMXC."),
+            (3999, "MMMCMXCIX."),
+        ] {
+            assert_eq!(ListStyleType::UpperRoman.marker(ordinal), expected);
+        }
+        assert_eq!(ListStyleType::LowerRoman.marker(4), "iv.");
+        // Past the point where the notation is agreed, fall back to digits
+        // rather than emitting a wall of Ms.
+        assert_eq!(ListStyleType::UpperRoman.marker(4000), "4000.");
+    }
+
+    #[test]
+    fn only_counting_markers_are_ordered() {
+        assert!(ListStyleType::Decimal.is_ordered());
+        assert!(ListStyleType::LowerRoman.is_ordered());
+        assert!(!ListStyleType::Disc.is_ordered());
+        assert!(!ListStyleType::None.is_ordered());
+    }
+
+    #[test]
+    fn text_decoration_parses_combinations_and_none() {
+        let parse =
+            |s: &str| parse_text_decoration(&s.split(' ').map(str::to_owned).collect::<Vec<_>>());
+        assert!(parse("underline").underline);
+        let both = parse("underline line-through");
+        assert!(both.underline && both.line_through);
+        assert!(parse("none").is_none());
+        // `none` anywhere in the list clears the lot.
+        assert!(parse("underline none").is_none());
+        assert!(parse("blink").is_none(), "blink is recognised and ignored");
+    }
 }
