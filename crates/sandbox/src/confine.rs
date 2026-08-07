@@ -16,6 +16,16 @@
 //! So: no sockets, no opening files, no starting processes, no attaching to
 //! them.
 //!
+//! Two of those need more than the obvious call named. A file descriptor can be
+//! got without `openat` — `open_by_handle_at` takes a handle rather than a path,
+//! and the mount API's `open_tree` and `fsopen` return descriptors of their own
+//! — so those are denied too. And **io_uring is denied outright**, which is the
+//! entry here that matters most: a ring performs opens, reads, writes, and
+//! network operations on the kernel side, so a filter watching syscalls sees
+//! `io_uring_enter` and nothing about what was queued into it. Every denial in
+//! this file is reachable around it. Nothing in a renderer that reads one pipe
+//! and computes has any use for it.
+//!
 //! # A denylist, and why
 //!
 //! An allowlist is stronger: anything not named is refused, so a syscall nobody
@@ -188,8 +198,10 @@ fn denied() -> Vec<i64> {
         libc::SYS_accept4,
         libc::SYS_sendto,
         libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
         libc::SYS_recvfrom,
         libc::SYS_recvmsg,
+        libc::SYS_recvmmsg,
         // Opening files. The fonts are in the binary and the pipes are already
         // open, so nothing legitimate opens anything.
         libc::SYS_openat,
@@ -198,13 +210,67 @@ fn denied() -> Vec<i64> {
         libc::SYS_unlinkat,
         libc::SYS_renameat2,
         libc::SYS_mkdirat,
+        // The other routes to a file descriptor. Denying `openat` and stopping
+        // there is the version of this that reads well and does not hold:
+        // `open_by_handle_at` opens a file from a handle rather than a path,
+        // and the mount API added `open_tree` and `fsopen`, which return
+        // descriptors without going anywhere near `open`.
+        libc::SYS_name_to_handle_at,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_open_tree,
+        libc::SYS_fsopen,
+        libc::SYS_fsmount,
+        libc::SYS_move_mount,
+        // Asynchronous I/O, which is the hole a syscall denylist is worst at.
+        // An io_uring ring performs opens, reads, writes, and network
+        // operations on the *kernel* side: the filter sees `io_uring_enter` and
+        // nothing about what was queued into it, so every denial above is
+        // reachable around. It is also, on the record of the last few years,
+        // the single richest source of kernel privilege escalations. Nothing
+        // here uses it — there is no async runtime in a renderer that reads one
+        // pipe and computes.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         // Starting or inspecting other processes. A renderer that has been
-        // taken over should not be able to run anything.
+        // taken over should not be able to run anything, and `pidfd_getfd`
+        // takes a descriptor *out* of another process, which would reach the
+        // parent's sockets without opening one.
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_getfd,
+        // Kernel surface the renderer has no use for and attackers do. These
+        // are not about what the renderer could reach directly — most need
+        // privileges it does not have — but about how much of the kernel a bug
+        // in this process can be pointed at. `userfaultfd` and
+        // `perf_event_open` in particular have carried a long run of local
+        // privilege escalations, and a user namespace is how an exploit gets
+        // the capabilities it was missing.
+        libc::SYS_bpf,
+        libc::SYS_userfaultfd,
+        libc::SYS_perf_event_open,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_kexec_load,
+        // Changing what the filesystem looks like, and reading the kernel log.
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_syslog,
+        // Creating filesystem entries. Nothing legitimate here writes anything.
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_mknodat,
     ];
 
     // The pre-`*at` calls, which the architectures designed after them never
@@ -223,6 +289,9 @@ fn denied() -> Vec<i64> {
         libc::SYS_unlink,
         libc::SYS_rename,
         libc::SYS_mkdir,
+        libc::SYS_symlink,
+        libc::SYS_link,
+        libc::SYS_mknod,
     ]);
     // `renameat` predates `renameat2` and survives on x86_64 and aarch64, but
     // not on riscv64, which only ever had the newer one.
@@ -475,6 +544,22 @@ mod tests {
         assert!(denied.contains(&libc::SYS_accept));
         #[cfg(target_arch = "x86_64")]
         assert!(denied.contains(&libc::SYS_open));
+
+        // io_uring, named specifically because it is the one entry whose
+        // absence would quietly undo the rest of the list: a ring does opens
+        // and network I/O on the kernel side, where a syscall filter cannot see
+        // them. Anyone tidying this list should have to delete this assertion
+        // on purpose.
+        for ring in [
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert!(denied.contains(&ring), "io_uring is reachable");
+        }
+        // The routes to a descriptor that are not `openat`.
+        assert!(denied.contains(&libc::SYS_open_by_handle_at));
+        assert!(denied.contains(&libc::SYS_open_tree));
     }
 
     #[cfg(target_os = "linux")]

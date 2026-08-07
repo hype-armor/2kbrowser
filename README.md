@@ -124,7 +124,10 @@ a dependency bump.
 The renderer is confined on Linux and Windows, by the two mechanisms those
 platforms actually have — which are not the same shape. On Linux the child
 installs a seccomp filter on itself before reading its first frame: no sockets,
-no opening files, no starting processes. On Windows the *parent* builds an
+no opening files, no starting processes — and no io_uring, which is the entry
+that matters most, because a ring does opens and network I/O on the kernel side
+where a syscall filter cannot see them, and would otherwise be a way around
+every other denial in the list. On Windows the *parent* builds an
 AppContainer with no capabilities at all and launches the child into it, because
 there is no call a running process can make to put itself in one. Capabilities
 are the holes deliberately left in a container, and this one has none, which
