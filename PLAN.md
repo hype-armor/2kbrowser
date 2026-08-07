@@ -431,6 +431,27 @@ rendered without, proven against the real binary rather than a stub, and the
 protocol is fuzzed like every other parser because a compromised renderer's last
 move is to send the parent something malformed.
 
+Also done since: **every subresource crosses the pipe** — images, stylesheets,
+`@import` chains, and frames are requests the parent decides on, so ADR-0006's
+policy is enforced where a compromised renderer cannot reach it. And **the
+window renders out of process**, holding a `Viewport` over a live child rather
+than a `Page`. A page rendered across the boundary is byte-identical to one
+rendered without: verified on the era fixture, 0 differing bytes of 2.5 MB.
+
+Two consequences worth recording rather than discovering later:
+
+- **A page taller than one frame is clipped.** The canvas covers the whole
+  document so scrolling costs a blit rather than a re-layout, and a frame is
+  bounded so a compromised child cannot make the parent allocate without limit.
+  At 800 pixels wide that allows roughly 20,000 rows. The honest fix is to
+  render a band around the scroll position instead of the whole document, which
+  changes how scrolling works and is not something to fold into the boundary.
+- **Find and resize keep the child alive.** One *page* per process, not one
+  message: a page's lifetime includes the questions asked of it while it is on
+  screen, and the text those questions search never crosses. The child is killed
+  when the page is replaced, which `Session`'s `Drop` makes a property of the
+  type rather than of every caller remembering.
+
 Not done, and the README must keep saying so:
 
 1. **The OS sandbox primitives are not applied.** seccomp-bpf with Landlock on
@@ -438,18 +459,13 @@ Not done, and the README must keep saying so:
    restricted token on Windows. ADR-0012 named Seatbelt; ADR-0013 supersedes
    that — `sandbox_init` has been deprecated since macOS 10.8, and "what
    Chromium does with twenty years of momentum" is a different question from
-   what a new program should adopt.
-   Until they are, a child is an ordinary process that happens to be separate —
-   an exploit inside it is contained only in that it cannot reach the parent's
-   memory.
-2. **Subresources still load in-process.** Images, stylesheets, and frames go
-   through the child's own fetcher rather than being asked for over the pipe.
-   The protocol and the parent's policy enforcement are both already there; what
-   remains is rewriting how `render_sized` loads them. Doing that in the same
-   change as the boundary would have made the diff unreviewable.
-3. **The window still renders in-process.** The boundary is exercised by tests
-   and available to callers; switching the browser over is the next step, and
-   wants the subresource work first so the switch does not lose images.
+   what a new program should adopt. Until they are, a child is an ordinary
+   process that happens to be separate — an exploit inside it is contained only
+   in that it cannot reach the parent's memory. **This is the only thing left
+   between the current state and what ADR-0012 claims.**
+2. **A legacy-TLS refusal is not legible.** ADR-0013 refuses TLS 1.0 and 1.1
+   outright, and the chrome shows that as an ordinary network error — so an
+   honest refusal reads as a bug.
 
 ### M5 — The slop layer
 Content-quality signals surfaced in the UI. Optional community blocklists for

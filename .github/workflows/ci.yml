@@ -54,3 +54,17 @@ jobs:
       # regression on one target is still a regression.
       - name: Budgets
         run: cargo run --release -p budgets
+
+      # The window is the one part with no automated coverage — CI has no
+      # display, so event handling and blitting have always been exercised by
+      # hand and by nothing else. Xvfb closes most of that gap. Linux only,
+      # because that is where a virtual display is one package; the script
+      # skips rather than fails if Xvfb is missing, since a check that cannot
+      # run must not look like a check that passed.
+      - name: Window smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libxkbcommon-x11-0
+          cargo build -p shell
+          ./scripts/smoke-window.sh

@@ -42,6 +42,27 @@ pub use wire::{MAX_FRAME, WireError};
 /// keep in step with the first.
 pub const CHILD_ARGUMENT: &str = "--render-child";
 
+/// Tallest canvas that still fits in a frame, at a given width.
+///
+/// A page is rendered to one canvas covering the whole document, so scrolling
+/// costs a blit offset rather than a re-layout. In one process that canvas was
+/// bounded only by memory. Across a pipe it also has to fit in a frame, and a
+/// frame is bounded so that a compromised child cannot make the parent allocate
+/// without limit.
+///
+/// At 800 pixels wide this allows roughly 20,000 rows, which is longer than
+/// almost any document. A page taller than that is **clipped**, and that is a
+/// real limitation rather than a theoretical one: the honest fix is to render a
+/// band around the scroll position instead of the whole document, which is a
+/// change to how scrolling works and not something to fold into the boundary.
+pub fn max_canvas_height(width: u32) -> u32 {
+    let row = u64::from(width.max(1)) * 4;
+    // Leave room for the rest of the message: the title, the link table, and
+    // the field headers all share the frame with the pixels.
+    let budget = (MAX_FRAME as u64).saturating_sub(1 << 20);
+    (budget / row).clamp(1, u32::MAX as u64) as u32
+}
+
 /// Anything that can go wrong talking across the boundary.
 #[derive(Debug)]
 pub enum Error {
@@ -135,6 +156,26 @@ pub fn read_frame(from: &mut impl Read) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_page_canvas_fits_in_a_frame() {
+        // The constraint the boundary adds: a canvas covering the whole
+        // document has to survive being sent.
+        for width in [320u32, 800, 1920, 3840] {
+            let height = max_canvas_height(width);
+            let bytes = u64::from(width) * u64::from(height) * 4;
+            assert!(
+                bytes <= MAX_FRAME as u64,
+                "{width}x{height} is {bytes} bytes"
+            );
+            assert!(height > 1000, "{width} allows only {height} rows");
+        }
+    }
+
+    #[test]
+    fn a_zero_width_still_gives_a_usable_height() {
+        assert!(max_canvas_height(0) > 0);
+    }
 
     #[test]
     fn a_frame_round_trips_through_a_pipe() {

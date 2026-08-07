@@ -168,6 +168,30 @@ impl Fetcher {
         })
     }
 
+    /// Fetches a URL without decoding it, keeping the `Content-Type`.
+    ///
+    /// What a navigation uses now that decoding happens in the renderer child
+    /// (ADR-0012): the parent must not turn a stranger's bytes into text, so it
+    /// hands over the bytes and the header that says how to read them.
+    pub fn fetch_raw(
+        &self,
+        url: &str,
+        document: Option<&Origin>,
+        kind: RequestKind,
+    ) -> Result<(Vec<u8>, Option<String>, Origin, String), FetchError> {
+        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
+        self.policy
+            .check(document, &origin, kind)
+            .map_err(FetchError::Refused)?;
+        count_if_third_party(document, &origin, kind);
+
+        let (bytes, content_type) = match origin.scheme {
+            Scheme::File => (read_file(&path)?, None),
+            Scheme::Http | Scheme::Https => fetch_http(url)?,
+        };
+        Ok((bytes, content_type, origin, path))
+    }
+
     /// Fetches a URL, keeping only the raw bytes.
     pub fn fetch_bytes(
         &self,

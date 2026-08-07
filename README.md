@@ -37,9 +37,10 @@ Rendering is deterministic across Linux, macOS, and Windows, checked by
 reference tests against one shared baseline set — verified, not assumed: all
 three platforms have rendered it byte for byte in CI.
 
-The window has been verified by hand on Linux. CI has no display, so its event
-handling and blitting are not covered by automated tests — only its scroll
-arithmetic is.
+The window opens on a virtual display in CI and is checked to survive
+(`scripts/smoke-window.sh`) — which catches a panic or a bad index, though not
+"does it look right". Everything with a testable shape lives outside the event
+loop, and the rendering it drives is covered by the reference tests.
 
 Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and
@@ -94,12 +95,19 @@ an ordinary stylesheet — `font-size: 0`, `font-size: 99999px`, and
 `margin: 1e40px` — each of which stopped the browser. All three are fixed, and
 each has a regression test where the bug was rather than where it surfaced.
 
-The process boundary M4 needs is built but not yet switched on. `crates/sandbox`
-runs the renderer in a child process — the parent keeps the chrome, the network,
-and the disk, and a page rendered across the boundary is byte-identical to one
-rendered without it (ADR-0012). Why bother, when `unsafe` is forbidden: the
-libraries that meet a hostile page *first* have roughly 460 `unsafe` sites
-between them. Forbidding it describes our discipline, not our attack surface.
+**The browser now renders in a separate process.** The parent keeps the chrome,
+the network, and the disk; a child parses, lays out, and rasterises, and asks
+for every image, stylesheet, and frame it wants rather than fetching them
+(ADR-0012). A page rendered across the boundary is byte-identical to one
+rendered without it — verified on the era fixture at 0 differing bytes of
+2.5 MB. Why bother, when `unsafe` is forbidden: the libraries that meet a
+hostile page *first* have roughly 460 `unsafe` sites between them. Forbidding it
+describes our discipline, not our attack surface.
+
+The network moving to the trusted side is the improvement worth naming: a
+renderer with no sockets cannot exfiltrate anything regardless of what it is
+tricked into computing, and the third-party rule is now enforced in a process a
+compromised renderer cannot reach.
 
 The engine is of its era; nothing protecting it is (ADR-0013). TLS 1.0 and 1.1
 are refused outright — not marked, not per-site, not behind a confirmation — so
@@ -112,10 +120,10 @@ a dependency bump.
 
 > **Not safe for browsing untrusted sites.** The OS sandbox primitives —
 > Landlock and seccomp, the App Sandbox, AppContainer — are not applied yet, so
-> a renderer child is an ordinary process that merely happens to be separate.
-> The window still renders in-process, and subresources still load inside the
-> child rather than being asked for over the pipe. Until that is done this is a
-> tool for its authors.
+> a renderer child is an ordinary process that merely happens to be separate: an
+> exploit inside it is contained only in that it cannot reach the parent's
+> memory. That is the last thing standing between the current state and what
+> ADR-0012 claims. Until it is done this is a tool for its authors.
 
 ## Building
 

@@ -92,7 +92,11 @@ fn run_open(args: &[String]) -> Result<String, String> {
     let input = options.input.ok_or("no input given")?;
     let (resource, url) = load_from(&input)?;
     window::open(
-        resource.body,
+        // The raw bytes, not the decoded text: the window renders in a child
+        // process, and the encoding sniffer lives there with every other parser
+        // (ADR-0012).
+        resource.bytes,
+        None,
         url,
         resource.origin,
         resource.path,

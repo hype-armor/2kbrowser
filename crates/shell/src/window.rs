@@ -1,18 +1,21 @@
 //! The browser window.
 //!
-//! Manually verified on Linux: the window opens and draws correctly. Automated
-//! coverage is limited to the pure logic below — scroll clamping, the title
-//! string, the find highlights and the focus outline — because CI has no
-//! display server. Event handling and blitting are therefore exercised only by
-//! hand, and a regression in them would not be caught by `cargo test`. The
-//! pipeline underneath is the same one the reference tests cover on all three
-//! platforms.
+//! The page is rendered in a child process (ADR-0012); this is a viewport onto
+//! the pixels that come back, and it never parses anything a stranger wrote.
+//!
+//! Coverage, stated precisely because this used to be the module with none.
+//! The pure logic below is unit-tested — scroll clamping, the title string, the
+//! find highlights, the focus outline. Everything about talking to a renderer
+//! is tested against a real child process in [`crate::viewport`] and
+//! `tests/isolation.rs`. What remains untested by `cargo test` is the event
+//! loop itself and the blit, and `scripts/smoke-window.sh` now opens a real
+//! window on a virtual display in CI and checks it survives — which catches a
+//! panic or a bad index, though not "does it look right".
 //!
 //! Kept as thin as it can be. Everything with a testable shape lives somewhere
 //! else — [`crate::history`], [`crate::tabs`], [`crate::field`],
-//! [`crate::chrome`], [`crate::bookmarks`] — precisely because this module is
-//! the part that cannot be tested. What is left here is the event loop, the
-//! blit, and the wiring between them.
+//! [`crate::chrome`], [`crate::bookmarks`], [`crate::viewport`] — precisely
+//! because this module is the hardest part to test.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -107,12 +110,12 @@ fn title_for(source: &str, mode: &RenderMode, error: Option<&str>) -> String {
     }
 }
 
-/// A document that has been fetched and is ready to render.
-struct Loaded {
-    html: String,
-    origin: net::Origin,
-    path: String,
-}
+/// The bytes a tab is showing, and where they came from.
+///
+/// Undecoded on purpose. The encoding sniffer lives with every other parser on
+/// the far side of the renderer boundary (ADR-0012), so the parent never turns
+/// a stranger's bytes into text.
+type Loaded = crate::viewport::Document;
 
 /// One tab: a document, where it came from, and how far down it you are.
 ///
@@ -121,7 +124,9 @@ struct Loaded {
 struct Tab {
     loaded: Loaded,
     history: crate::history::History,
-    page: Option<crate::render::Page>,
+    /// The page, held by a live renderer process. `None` when the last
+    /// navigation failed and there is nothing to show.
+    page: Option<crate::viewport::Viewport>,
     scroll: f32,
     /// What went wrong with the last navigation in this tab.
     error: Option<String>,
@@ -169,7 +174,11 @@ impl Tab {
 
     /// What to call this tab: the page's title, or failing that its URL.
     fn label(&self) -> &str {
-        match self.page.as_ref().and_then(|page| page.title.as_deref()) {
+        match self
+            .page
+            .as_ref()
+            .and_then(crate::viewport::Viewport::title)
+        {
             Some(title) => title,
             None => self.history.current(),
         }
@@ -180,6 +189,9 @@ impl Tab {
 struct App {
     tabs: crate::tabs::Tabs<Tab>,
     fetcher: net::Fetcher,
+    /// Spawns renderer children. One per page, killed when the page is
+    /// replaced (ADR-0012).
+    renderer: sandbox::Renderer,
     fonts: FontStore,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
@@ -223,34 +235,53 @@ impl App {
             return;
         }
         let viewport = self.viewport_height();
+        // The canvas is the full document height, not the viewport height:
+        // scrolling then costs a blit offset rather than a re-layout. Bounded
+        // by what fits in one frame across the boundary — a page taller than
+        // that is clipped, which `sandbox::max_canvas_height` states plainly.
+        let max_height = sandbox::max_canvas_height(width);
 
-        // Destructured so the borrows are disjoint: rendering needs the font
-        // store mutably while reading the tab, and going through a method on
-        // `self` would borrow the whole of it.
-        let App { tabs, fonts, .. } = self;
+        // Destructured so the borrows are disjoint: opening a page needs the
+        // renderer while the tab is held mutably.
+        let App { tabs, renderer, .. } = self;
         let tab = tabs.active_mut();
 
-        // The canvas is the full document height, not the viewport height:
-        // scrolling then costs a blit offset rather than a re-layout.
-        let base = Some((&tab.loaded.origin, tab.loaded.path.as_str()));
-        let page = if tab.forcing_authored {
-            crate::render::render_as_authored(&tab.loaded.html, width, u32::MAX, fonts, base)
-        } else {
-            crate::render::render_with_base(&tab.loaded.html, width, u32::MAX, fonts, base)
+        // Re-render in the child that already holds this document when there is
+        // one — a resize is not a fresh page, and re-opening would re-fetch
+        // every image on it.
+        let outcome = match tab.page.as_mut() {
+            Some(page) => page.resize(width, max_height),
+            None => match crate::viewport::Viewport::open(
+                renderer,
+                tab.loaded.clone(),
+                width,
+                max_height,
+                tab.forcing_authored,
+            ) {
+                Ok(page) => {
+                    tab.page = Some(page);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
         };
+        if let Err(error) = outcome {
+            // The renderer failed, so there is nothing to show and the chrome
+            // has to say why rather than leaving a blank window.
+            tab.error = Some(error.to_string());
+            tab.page = None;
+        }
 
-        // Whether there is anything to overrule. Once overruling, the answer is
-        // yes by construction — the reader has to be able to get back.
-        tab.can_toggle_layout =
-            tab.forcing_authored || !matches!(page.mode, layout::RenderMode::Authored);
-        tab.scroll = clamp_scroll(tab.scroll, page.content_height, viewport);
-        tab.page = Some(page);
+        if let Some(page) = tab.page.as_ref() {
+            tab.can_toggle_layout = page.can_toggle_layout();
+            tab.scroll = clamp_scroll(tab.scroll, page.content_height(), viewport);
+        }
 
         // The old matches pointed at the old layout.
         if let Some(query) = tab.finding.as_ref().map(|field| field.text().to_owned()) {
-            tab.matches = match (&tab.page, query.trim().is_empty()) {
-                (Some(page), false) => page.find(&query),
-                _ => Vec::new(),
+            tab.matches = match tab.page.as_mut() {
+                Some(page) => page.find(&query),
+                None => Vec::new(),
             };
             tab.current_match = tab.current_match.min(tab.matches.len().saturating_sub(1));
         }
@@ -262,7 +293,7 @@ impl App {
             // The page's own title, falling back to the URL: a titled page is
             // named by its author, and an untitled one has only its address.
             let tab = self.tabs.active();
-            let mode = tab.page.as_ref().map(|page| page.mode.clone());
+            let mode = tab.page.as_ref().map(crate::viewport::Viewport::mode);
             window.set_title(&title_for(
                 tab.label(),
                 &mode.unwrap_or(layout::RenderMode::Authored),
@@ -277,13 +308,23 @@ impl App {
     /// Used by back and forward as well as by following a link, so the history
     /// bookkeeping stays in one place rather than being repeated per caller.
     fn show(&mut self, url: &str) {
-        match self.fetcher.fetch(url, None, net::RequestKind::Navigation) {
-            Ok(resource) => {
+        // Raw, not decoded: the encoding sniffer lives with every other parser
+        // on the far side of the boundary, so the parent never turns a
+        // stranger's bytes into text (ADR-0012).
+        match self
+            .fetcher
+            .fetch_raw(url, None, net::RequestKind::Navigation)
+        {
+            Ok((body, content_type, origin, path)) => {
                 self.tab_mut().loaded = Loaded {
-                    html: resource.body,
-                    origin: resource.origin,
-                    path: resource.path,
+                    body,
+                    content_type,
+                    origin,
+                    path,
                 };
+                // A fresh document means a fresh renderer: the old child holds
+                // the page that just left, and dropping it kills that process.
+                self.tab_mut().page = None;
                 self.tab_mut().error = None;
                 self.tab_mut().scroll = 0.0;
                 // A decision about the previous page, not a setting.
@@ -343,7 +384,7 @@ impl App {
         let mode = tab
             .page
             .as_ref()
-            .map(|page| page.mode.clone())
+            .map(crate::viewport::Viewport::mode)
             .unwrap_or(layout::RenderMode::Authored);
         *chrome = crate::chrome::render(
             &crate::chrome::State {
@@ -398,12 +439,16 @@ impl App {
 
     /// Opens a new tab showing `url`, beside the current one.
     fn open_tab(&mut self, url: &str) {
-        match self.fetcher.fetch(url, None, net::RequestKind::Navigation) {
-            Ok(resource) => {
+        match self
+            .fetcher
+            .fetch_raw(url, None, net::RequestKind::Navigation)
+        {
+            Ok((body, content_type, origin, path)) => {
                 let loaded = Loaded {
-                    html: resource.body,
-                    origin: resource.origin,
-                    path: resource.path,
+                    body,
+                    content_type,
+                    origin,
+                    path,
                 };
                 self.tabs.open(Tab::new(loaded, url.to_owned()));
             }
@@ -412,7 +457,8 @@ impl App {
                 // why. Silently not opening one looks like a broken click.
                 let mut tab = Tab::new(
                     Loaded {
-                        html: String::new(),
+                        body: Vec::new(),
+                        content_type: None,
                         origin: self.tab().loaded.origin.clone(),
                         path: self.tab().loaded.path.clone(),
                     },
@@ -461,7 +507,7 @@ impl App {
             .tab()
             .page
             .as_ref()
-            .map(crate::render::Page::link_groups)
+            .map(crate::viewport::Viewport::links)
         else {
             return;
         };
@@ -504,9 +550,9 @@ impl App {
     }
 
     /// The focused link, looked up afresh.
-    fn focused(&self) -> Option<crate::render::Link> {
+    fn focused(&self) -> Option<crate::viewport::Link> {
         let at = self.tab().focused_link?;
-        self.tab().page.as_ref()?.link_groups().into_iter().nth(at)
+        self.tab().page.as_ref()?.links().into_iter().nth(at)
     }
 
     /// Re-derives where the focused link is after a re-layout.
@@ -536,7 +582,7 @@ impl App {
     /// wraps across a line break can be scrolled to and still be half off
     /// screen.
     fn scroll_into_view(&mut self, bounds: layout::Rect) {
-        let Some(height) = self.tab().page.as_ref().map(|page| page.content_height) else {
+        let Some(height) = self.tab().page.as_ref().map(|page| page.content_height()) else {
             return;
         };
         let viewport = self.viewport_height();
@@ -561,8 +607,9 @@ impl App {
             .tab()
             .page
             .as_ref()
-            .and_then(|page| page.title.clone())
-            .unwrap_or_default();
+            .and_then(crate::viewport::Viewport::title)
+            .unwrap_or_default()
+            .to_owned();
         self.bookmarks.toggle(&url, &title);
         // A failed write is reported where every other navigation failure is,
         // because silently not saving looks exactly like saving.
@@ -622,8 +669,10 @@ impl App {
             .as_ref()
             .map(|field| field.text().to_owned())
             .unwrap_or_default();
-        self.tab_mut().matches = match (&self.tab().page, query.is_empty()) {
-            (Some(page), false) => page.find(&query),
+        // Asked of the live child, which is the only thing holding the text
+        // and the box tree the query searches (ADR-0012).
+        self.tab_mut().matches = match self.tabs.active_mut().page.as_mut() {
+            Some(page) if !query.is_empty() => page.find(&query),
             _ => Vec::new(),
         };
         self.tab_mut().current_match = 0;
@@ -748,7 +797,11 @@ impl App {
 
     /// The chrome control under the pointer, if any.
     fn control_under_pointer(&self) -> Option<crate::chrome::Control> {
-        let mode = self.tab().page.as_ref().map(|page| page.mode.clone());
+        let mode = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::mode);
         let mode = mode.unwrap_or(layout::RenderMode::Authored);
         crate::chrome::control_at(
             &crate::chrome::State {
@@ -787,6 +840,7 @@ impl App {
             return None;
         }
         page.link_at(self.pointer.0, y + self.tab().scroll)
+            .map(str::to_owned)
     }
 
     /// Total chrome height: the URL bar, plus the tab strip when there is one.
@@ -804,7 +858,7 @@ impl App {
         let before = self.tab().scroll;
         self.tab_mut().scroll = clamp_scroll(
             self.tab().scroll + delta,
-            page.content_height,
+            page.content_height(),
             self.viewport_height(),
         );
         if self.tab().scroll != before
@@ -840,7 +894,8 @@ impl App {
             return;
         };
 
-        let pixmap = &page.pixmap;
+        let (page_width, page_height) = (page.width(), page.height());
+        let page_pixels = page.pixels();
         let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
         let strip_height = if tabs.len() > 1 {
@@ -869,16 +924,22 @@ impl App {
         for row in bar_height..height.get() {
             let source_row = row - bar_height + offset;
             let start = row as usize * viewport_width;
-            if source_row >= pixmap.height() {
+            if source_row >= page_height {
                 // Past the end of the document: white, not stale pixels.
                 buffer[start..start + viewport_width].fill(0x00ff_ffff);
                 continue;
             }
-            let pixels = pixmap.pixels();
-            let source_start = source_row as usize * pixmap.width() as usize;
+            let source_start = source_row as usize * page_width as usize * 4;
             for column in 0..viewport_width {
-                buffer[start + column] = match pixels.get(source_start + column) {
-                    Some(pixel) => pack(pixel),
+                // Premultiplied RGBA as it crossed the pipe, packed to the 0RGB
+                // softbuffer wants. Bounds-checked per pixel because the row
+                // may be narrower than the window after a resize the child has
+                // not caught up with.
+                let at = source_start + column * 4;
+                buffer[start + column] = match page_pixels.get(at..at + 3) {
+                    Some(rgb) => {
+                        (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2])
+                    }
                     None => 0x00ff_ffff,
                 };
             }
@@ -1288,7 +1349,8 @@ impl ApplicationHandler for App {
 /// report a failure before a window ever appears. Blocks for the lifetime of
 /// the window.
 pub fn open(
-    html: String,
+    body: Vec<u8>,
+    content_type: Option<String>,
     url: String,
     origin: net::Origin,
     path: String,
@@ -1303,8 +1365,17 @@ pub fn open(
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App {
-        tabs: crate::tabs::Tabs::new(Tab::new(Loaded { html, origin, path }, url)),
+        tabs: crate::tabs::Tabs::new(Tab::new(
+            Loaded {
+                body,
+                content_type,
+                origin,
+                path,
+            },
+            url,
+        )),
         fetcher: net::Fetcher::default(),
+        renderer: sandbox::Renderer::new().map_err(|error| error.to_string())?,
         fonts: FontStore::new(),
         window: None,
         surface: None,
