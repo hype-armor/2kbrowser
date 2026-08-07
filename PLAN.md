@@ -365,8 +365,17 @@ exercised by hand and a regression in them would not be caught by `cargo test`.
 
 ### M4 — Hardening
 Process/sandbox model, continuous fuzzing of the HTML, CSS, and image-decode
-paths, TLS configuration review, `AccessKit` integration for screen readers.
+paths, TLS configuration review.
 *Done when:* we are willing to tell a stranger to browse untrusted sites with it.
+
+Screen-reader support was originally listed here and is **deferred to after
+M4** — [issue #9](https://github.com/hype-armor/2kbrowser/issues/9). Not because
+it matters less: because ADR-0012 landed first and moved the semantic tree to
+the far side of a process boundary that deliberately carries only pixels.
+Getting it across is a security design of its own, and doing it while the
+boundary is still being built would mean doing it twice. It is also the only
+item in this milestone that is not itself security work, which is what made it
+the one to move.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
 **Fuzzing — done, and it found things.** `tests/fuzz` mutates the reference
@@ -493,8 +502,13 @@ decides; the browser explains its reasoning.
   bugs, not same-origin mistakes, not resource exhaustion. M4 is not optional
   before recommending this to anyone.
 - **Accessibility is a correctness requirement**, not a feature. A browser
-  without screen-reader support is not a browser. `AccessKit` from M4, and the
-  DOM should be designed so retrofitting it is not painful.
+  without screen-reader support is not a browser. It is now
+  [issue #9](https://github.com/hype-armor/2kbrowser/issues/9), deferred to
+  after M4 rather than dropped — ADR-0012 moved the semantic tree to the far
+  side of a process boundary that carries only pixels, so getting it across is
+  a security design of its own. The risk this bullet names is *exactly* the one
+  that materialised: a milestone moved and accessibility was the thing that
+  slipped. It is filed so that slipping again has to be a decision.
 - **Solo-maintainer risk.** Every dependency avoided is code we maintain
   forever. The "do not write these" list in §3 is the main defence.
 
@@ -518,6 +532,7 @@ that it has one home and can be closed:
 | ~~[6](https://github.com/hype-armor/2kbrowser/issues/6)~~ | ~~`cursive`/`fantasy` resolve to sans-serif~~ Resolved: fall back, do not chase it | — |
 | ~~[7](https://github.com/hype-armor/2kbrowser/issues/7)~~ | ~~Vendor fonts in git, or fetch with pinned checksums?~~ Resolved: fetch with pins (ADR-0010) | — |
 | [8](https://github.com/hype-armor/2kbrowser/issues/8) | Per-script optional font payloads | release |
+| [9](https://github.com/hype-armor/2kbrowser/issues/9) | Screen-reader support across the renderer boundary | after M4 |
 
 None of these block starting M1 except #7, which only needs answering when the
 text stack lands rather than at the start of the milestone.
