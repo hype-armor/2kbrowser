@@ -71,6 +71,41 @@ pub const PROFILE_NAME: &str = "2kbrowser.renderer";
 /// running.
 const READ_AND_EXECUTE: u32 = 0x0012_00A9;
 
+/// An error and everything under it, joined into one sentence.
+///
+/// `rappct`'s `Display` names the stage and a hint and stops there, so the
+/// actual Win32 error — the part that says *why* — is only reachable through
+/// `source`. A CI failure that says "Process launch failed at CreateProcessW"
+/// and nothing else costs a round trip to diagnose, and that round trip is ten
+/// minutes each time.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        text.push_str(&format!(": {cause}"));
+        next = cause.source();
+    }
+    text
+}
+
+/// The profile and capability set, prepared once for the whole process.
+///
+/// `CreateAppContainerProfile` writes to the registry and the ACL grant below
+/// rewrites the executable's DACL. Doing either more than once is waste; doing
+/// them *concurrently* is a bug, and it is the bug this exists to fix.
+///
+/// Granting is read the DACL, add an entry, write it back. Two threads doing
+/// that at once is a lost update: the second write can land without the first
+/// thread's entry, and then `CreateProcess` fails with access denied for a
+/// container that looked correctly built. It showed up as two tests out of
+/// seventeen failing on Windows CI at `CreateProcessW` while the others passed
+/// — the shape of a race, not of a broken feature.
+static PREPARED: std::sync::OnceLock<Result<SecurityCapabilities, String>> =
+    std::sync::OnceLock::new();
+
+/// Executables already granted access, so the DACL is rewritten once each.
+static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// A built AppContainer, ready to spawn renderers into.
 ///
 /// Built once per browser process rather than once per page: creating the
@@ -87,35 +122,59 @@ impl Container {
     /// The error is a sentence rather than a type because there is exactly one
     /// thing the caller does with it: say why the renderer is not confined.
     pub fn new(program: &Path) -> Result<Self, String> {
-        let profile = AppContainerProfile::ensure(
-            PROFILE_NAME,
-            "2kbrowser renderer",
-            Some("Parses and lays out web pages. No network, no filesystem."),
-        )
-        .map_err(|error| format!("could not create the AppContainer profile: {error}"))?;
+        let capabilities = PREPARED
+            .get_or_init(|| {
+                let profile = AppContainerProfile::ensure(
+                    PROFILE_NAME,
+                    "2kbrowser renderer",
+                    Some("Parses and lays out web pages. No network, no filesystem."),
+                )
+                .map_err(|error| {
+                    format!(
+                        "could not create the AppContainer profile: {}",
+                        chain(&error)
+                    )
+                })?;
+
+                let capabilities = SecurityCapabilitiesBuilder::new(&profile.sid)
+                    .build()
+                    .map_err(|error| {
+                        format!(
+                            "could not build the container's capabilities: {}",
+                            chain(&error)
+                        )
+                    })?;
+                debug_assert!(
+                    capabilities.caps.is_empty(),
+                    "the renderer container must have no capabilities"
+                );
+                Ok(capabilities)
+            })
+            .clone()?;
 
         // Without this the container cannot read the binary it is meant to run,
         // and `CreateProcess` fails with access denied — which is the single
         // most likely way this whole path breaks on a machine we have not seen.
-        rappct::acl::grant_to_package(
-            ResourcePath::File(program.to_path_buf()),
-            &profile.sid,
-            AccessMask(READ_AND_EXECUTE),
-        )
-        .map_err(|error| {
-            format!(
-                "could not grant the renderer container access to {}: {error}",
-                program.display()
+        //
+        // Under the lock, and once per executable: see `PREPARED` for what
+        // happens when two threads rewrite the same DACL at the same time.
+        let mut granted = GRANTED.lock().unwrap_or_else(|error| error.into_inner());
+        if !granted.iter().any(|done| done == program) {
+            rappct::acl::grant_to_package(
+                ResourcePath::File(program.to_path_buf()),
+                &capabilities.package,
+                AccessMask(READ_AND_EXECUTE),
             )
-        })?;
-
-        let capabilities = SecurityCapabilitiesBuilder::new(&profile.sid)
-            .build()
-            .map_err(|error| format!("could not build the container's capabilities: {error}"))?;
-        debug_assert!(
-            capabilities.caps.is_empty(),
-            "the renderer container must have no capabilities"
-        );
+            .map_err(|error| {
+                format!(
+                    "could not grant the renderer container access to {}: {}",
+                    program.display(),
+                    chain(&error)
+                )
+            })?;
+            granted.push(program.to_path_buf());
+        }
+        drop(granted);
 
         Ok(Self {
             capabilities,
@@ -152,7 +211,7 @@ impl Container {
         };
 
         let mut io = launch_in_container_with_io(&self.capabilities, &options)
-            .map_err(|error| format!("could not start a contained renderer: {error}"))?;
+            .map_err(|error| format!("could not start a contained renderer: {}", chain(&error)))?;
 
         // The child's stderr is a pipe rather than the parent's console, because
         // an AppContainer cannot be handed an arbitrary inherited console
