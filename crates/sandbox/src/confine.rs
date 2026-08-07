@@ -165,6 +165,16 @@ pub fn apply() -> Confinement {
     Confinement::Unavailable
 }
 
+/// Whether this platform has a sandbox implementation at all.
+///
+/// A compile-time fact, so the *parent* can say "this build cannot confine its
+/// renderers" once at startup instead of every child announcing it on spawn.
+/// That distinction matters: a warning printed twenty times in one test run is
+/// a warning people learn to scroll past.
+pub const fn available() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// Argument that makes the binary check its own confinement and report.
 ///
 /// The only honest way to test a sandbox is from inside it: a filter that
@@ -178,11 +188,24 @@ pub const SELFTEST_ARGUMENT: &str = "--confine-selftest";
 /// `TcpStream::connect` and `File::open` are what a compromised renderer would
 /// reach for, and they go through the same syscalls the filter names.
 pub fn selftest() -> String {
+    // The probe file is created *before* confinement, and by this process, so
+    // that afterwards it certainly exists and certainly is readable. Anything
+    // else and a refusal is indistinguishable from a wrong path.
+    //
+    // This was got wrong first time round: the probe was `/etc/hostname`, which
+    // does not exist on Windows, so the check reported `NotFound` there whether
+    // or not a sandbox was blocking it — a test that could not fail, on the one
+    // platform where the sandbox is not written yet. Found by someone running
+    // it on Windows.
+    let probe = std::env::temp_dir().join("2kbrowser-confine-probe");
+    let prepared = std::fs::write(&probe, b"probe");
+
     let confinement = apply();
     let mut lines = vec![format!("confinement={confinement:?}")];
 
-    // A socket to a host that does not need to exist: the filter should refuse
-    // before any connection is attempted.
+    // A socket to a port nothing listens on. `ConnectionRefused` means the
+    // syscall went through and the far end said no — the network was reachable.
+    // A confined process never gets that far.
     let socket = std::net::TcpStream::connect("127.0.0.1:9");
     lines.push(format!(
         "socket={}",
@@ -192,18 +215,21 @@ pub fn selftest() -> String {
         }
     ));
 
-    // A file that certainly exists, so a failure is the filter rather than a
-    // missing path.
-    let file = std::fs::File::open("/etc/hostname");
     lines.push(format!(
         "file={}",
-        match file {
-            Ok(_) => "OPENED".to_owned(),
-            Err(error) => format!("{:?}", error.kind()),
+        match (&prepared, std::fs::File::open(&probe)) {
+            // Nothing to conclude from a probe that was never written. Said
+            // outright rather than reported as a failure to open.
+            (Err(error), _) => format!("PROBE-UNWRITABLE({:?})", error.kind()),
+            (Ok(()), Ok(_)) => "OPENED".to_owned(),
+            (Ok(()), Err(error)) => format!("{:?}", error.kind()),
         }
     ));
+    lines.push(format!("probe={}", probe.display()));
 
-    // Something harmless, to prove the filter did not simply break everything.
+    // Something harmless, to prove the filter did not simply break everything —
+    // two `PermissionDenied` lines are also what a filter that killed the whole
+    // process would produce if it somehow got this far.
     lines.push(format!("compute={}", (1..=10).sum::<u32>()));
 
     lines.join("\n")
@@ -212,6 +238,18 @@ pub fn selftest() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn availability_matches_the_platform_that_has_an_implementation() {
+        // The parent reports this without asking a child, so it has to agree
+        // with what `apply` would actually do.
+        assert_eq!(available(), cfg!(target_os = "linux"));
+        if available() {
+            assert_ne!(apply(), Confinement::Unavailable);
+        } else {
+            assert_eq!(apply(), Confinement::Unavailable);
+        }
+    }
 
     #[test]
     fn the_description_says_plainly_whether_it_is_confined() {

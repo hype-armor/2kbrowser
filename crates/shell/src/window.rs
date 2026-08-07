@@ -1357,6 +1357,17 @@ pub fn open(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
+    // Said once, here, rather than by every renderer child on spawn. Whether
+    // this build can confine anything is a property of the build, and someone
+    // deciding whether to point this at a strange page should be told plainly.
+    if !sandbox::confine::available() {
+        eprintln!(
+            "2kbrowser: {} — pages are rendered in a separate process, but an \
+             unconfined one",
+            sandbox::Confinement::Unavailable.describe()
+        );
+    }
+
     let event_loop = EventLoop::new().map_err(|error| {
         format!("could not start the event loop ({error}); is a display available?")
     })?;

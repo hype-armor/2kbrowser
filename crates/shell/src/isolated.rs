@@ -184,10 +184,16 @@ pub fn run_child() -> Result<(), Error> {
     // data (ADR-0010), and building it under the filter is the check that it
     // really does not touch the filesystem.
     let confinement = sandbox::confine::apply();
-    if !confinement.is_confined() {
-        // stderr, never stdout: stdout is the protocol. Worth saying every time
-        // rather than only in the README, because an unconfined renderer is a
-        // fact about the process that is running, not about the build.
+    // Only when the platform *has* a sandbox and it failed anyway — a kernel
+    // too old, or a container that forbids installing a filter. That is a fact
+    // about this machine and worth a line every time.
+    //
+    // A platform with no implementation is a fact about the *build*, and saying
+    // it here meant every spawned child said it: twenty lines in one test run,
+    // which is how a warning becomes something people scroll past. The parent
+    // says that one once, at startup.
+    if confinement == sandbox::Confinement::Failed {
+        // stderr, never stdout: stdout is the protocol.
         eprintln!("2kbrowser renderer: {}", confinement.describe());
     }
 

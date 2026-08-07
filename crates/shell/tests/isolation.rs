@@ -405,11 +405,17 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
 }
 
 #[test]
-fn a_confined_renderer_still_renders_a_page_with_subresources() {
-    // The risk with any syscall filter is that it stops the thing working. This
-    // is the era fixture, which has images, a tiled background, and nested
-    // tables — rendered by a child that cannot open a file or a socket, so
-    // every one of those arrived over the pipe.
+fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
+    // Named for what it checks on *every* platform. It used to be called
+    // `a_confined_renderer_...`, which on Windows was a green test asserting
+    // confinement that does not exist there — a name that reads as
+    // confirmation of something untrue.
+    //
+    // What it does check everywhere: the era fixture, which has images, a tiled
+    // background, and nested tables, rendered by a child that fetches nothing
+    // itself, so every one of those arrived over the pipe. On Linux the child
+    // is additionally confined, which makes this the check that the syscall
+    // filter did not break the thing it protects.
     let path = std::path::Path::new("../../tests/ref/fixtures/era-page.html")
         .canonicalize()
         .expect("the era fixture");
