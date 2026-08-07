@@ -147,6 +147,16 @@ pub enum ToChild {
         /// Whether it was retrieved at all.
         ok: bool,
     },
+    /// Asks where `query` appears on the page most recently rendered.
+    ///
+    /// Find has to be a *question asked of a live child* rather than something
+    /// the parent works out. The text and the box tree it searches never cross
+    /// the boundary — that restraint is the point of ADR-0012 — so the only
+    /// thing that can answer is the process holding them.
+    Find {
+        /// What to look for.
+        query: String,
+    },
 }
 
 impl ToChild {
@@ -177,6 +187,10 @@ impl ToChild {
                 }
                 writer.str(path);
                 writer.some(*force_authored);
+            }
+            ToChild::Find { query } => {
+                writer.tag(2);
+                writer.str(query);
             }
             ToChild::Resource {
                 body,
@@ -236,6 +250,9 @@ impl ToChild {
                     ok: reader.some()?,
                 }
             }
+            2 => ToChild::Find {
+                query: reader.str()?,
+            },
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;
@@ -264,6 +281,11 @@ pub enum ToParent {
     Failed {
         /// What went wrong, for the chrome to show.
         message: String,
+    },
+    /// Where a [`ToChild::Find`] query appears, in canvas coordinates.
+    Matches {
+        /// One rectangle per match, in document order.
+        rects: Vec<Rect>,
     },
 }
 
@@ -326,6 +348,13 @@ impl ToParent {
             ToParent::Failed { message } => {
                 writer.tag(2);
                 writer.str(message);
+            }
+            ToParent::Matches { rects } => {
+                writer.tag(3);
+                writer.u32(rects.len() as u32);
+                for rect in rects {
+                    write_rect(&mut writer, rect);
+                }
             }
         }
         writer.finish()
@@ -391,6 +420,16 @@ impl ToParent {
             2 => ToParent::Failed {
                 message: reader.str()?,
             },
+            3 => {
+                // A count, so a claim of four billion matches cannot reserve
+                // for four billion matches.
+                let count = reader.count()?;
+                let mut rects = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    rects.push(read_rect(&mut reader)?);
+                }
+                ToParent::Matches { rects }
+            }
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;

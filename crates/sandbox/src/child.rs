@@ -41,34 +41,69 @@ pub trait Render {
         request: &ToChild,
         fetch: &mut dyn FnMut(&str, net::RequestKind) -> Fetched,
     ) -> Result<Rendered, String>;
+
+    /// Where `query` appears on the page most recently rendered.
+    ///
+    /// A question rather than something the parent works out: the text and the
+    /// box tree it searches never cross the boundary, so the only thing that
+    /// can answer is the process holding them.
+    fn find(&mut self, query: &str) -> Vec<layout::Rect>;
 }
 
-/// Runs the child's side of the conversation to completion.
+/// Runs the child's side of the conversation until the parent goes away.
 ///
-/// One page per process. A renderer that has answered has nothing left to do,
-/// and reusing one across pages would mean a page's leftovers — caches, font
-/// state, whatever an exploit managed to leave behind — outliving it.
+/// One *page* per process, not one message. A page's lifetime includes the
+/// questions asked of it while it is on screen — find, and re-rendering at a
+/// new width — and those need the document and the box tree, which never cross
+/// the boundary. Answering them means staying alive.
+///
+/// The security property is unchanged and is worth naming precisely: a child is
+/// killed when the page it holds is replaced, so a page's leftovers — caches,
+/// font state, whatever an exploit managed to leave behind — never outlive the
+/// page. Reuse *across* pages is what would be dangerous, and that is what the
+/// parent does not do.
 pub fn serve(
     input: &mut impl Read,
     output: &mut impl Write,
     renderer: &mut impl Render,
 ) -> Result<(), Error> {
-    let frame = read_frame(input)?;
-    let request = ToChild::decode(&frame)?;
-
-    let ToChild::Render { .. } = &request else {
-        // A `Resource` with nothing outstanding means the parent is not what we
-        // think it is. Refusing beats guessing.
-        write_frame(
-            output,
-            &ToParent::Failed {
-                message: "expected a render request".to_owned(),
+    loop {
+        // A closed pipe is the parent exiting, which is how this ends.
+        let frame = match read_frame(input) {
+            Ok(frame) => frame,
+            Err(Error::Died) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let request = ToChild::decode(&frame)?;
+        match &request {
+            ToChild::Render { .. } => serve_render(input, output, renderer, request)?,
+            ToChild::Find { query } => {
+                let rects = renderer.find(query);
+                write_frame(output, &ToParent::Matches { rects }.encode())?;
             }
-            .encode(),
-        )?;
-        return Ok(());
-    };
+            // A `Resource` with nothing outstanding means the parent is not
+            // what we think it is. Refusing beats guessing.
+            ToChild::Resource { .. } => {
+                write_frame(
+                    output,
+                    &ToParent::Failed {
+                        message: "expected a render request".to_owned(),
+                    }
+                    .encode(),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+}
 
+/// Renders one page, answering the child's own resource requests along the way.
+fn serve_render(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    renderer: &mut impl Render,
+    request: ToChild,
+) -> Result<(), Error> {
     // Errors inside the fetch closure are recorded rather than returned,
     // because the closure's signature belongs to the renderer and a broken pipe
     // is not something it can do anything about. The first failure stops
@@ -131,6 +166,29 @@ mod tests {
         wants: Vec<String>,
         got: Vec<Fetched>,
         fail: bool,
+        /// Queries this stub was asked to find, so the loop can be checked.
+        queried: Vec<String>,
+    }
+
+    impl Stub {
+        fn new() -> Self {
+            Self {
+                wants: Vec::new(),
+                got: Vec::new(),
+                fail: false,
+                queried: Vec::new(),
+            }
+        }
+
+        fn wanting(mut self, urls: &[&str]) -> Self {
+            self.wants = urls.iter().map(|url| (*url).to_owned()).collect();
+            self
+        }
+
+        fn failing(mut self) -> Self {
+            self.fail = true;
+            self
+        }
     }
 
     impl Render for Stub {
@@ -155,6 +213,16 @@ mod tests {
                 links: Vec::new(),
                 can_toggle_layout: false,
             })
+        }
+
+        fn find(&mut self, query: &str) -> Vec<layout::Rect> {
+            self.queried.push(query.to_owned());
+            vec![layout::Rect {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            }]
         }
     }
 
@@ -183,11 +251,7 @@ mod tests {
     fn a_page_with_no_subresources_answers_immediately() {
         let input = pipe(&[request()]);
         let mut output = Vec::new();
-        let mut stub = Stub {
-            wants: Vec::new(),
-            got: Vec::new(),
-            fail: false,
-        };
+        let mut stub = Stub::new();
         serve(&mut input.as_slice(), &mut output, &mut stub).expect("serves");
 
         let frame = read_frame(&mut output.as_slice()).expect("reads");
@@ -209,11 +273,7 @@ mod tests {
             .encode(),
         ]);
         let mut output = Vec::new();
-        let mut stub = Stub {
-            wants: vec!["https://example.com/x.png".to_owned()],
-            got: Vec::new(),
-            fail: false,
-        };
+        let mut stub = Stub::new().wanting(&["https://example.com/x.png"]);
         serve(&mut input.as_slice(), &mut output, &mut stub).expect("serves");
         assert_eq!(
             stub.got,
@@ -243,11 +303,7 @@ mod tests {
             .encode(),
         ]);
         let mut output = Vec::new();
-        let mut stub = Stub {
-            wants: vec!["https://tracker.example.net/pixel.gif".to_owned()],
-            got: Vec::new(),
-            fail: false,
-        };
+        let mut stub = Stub::new().wanting(&["https://tracker.example.net/pixel.gif"]);
         serve(&mut input.as_slice(), &mut output, &mut stub).expect("serves");
         assert_eq!(stub.got, vec![None]);
     }
@@ -256,11 +312,7 @@ mod tests {
     fn a_render_failure_becomes_a_message_rather_than_a_dead_child() {
         let input = pipe(&[request()]);
         let mut output = Vec::new();
-        let mut stub = Stub {
-            wants: Vec::new(),
-            got: Vec::new(),
-            fail: true,
-        };
+        let mut stub = Stub::new().failing();
         serve(&mut input.as_slice(), &mut output, &mut stub).expect("serves");
 
         let frame = read_frame(&mut output.as_slice()).expect("reads");
@@ -281,11 +333,7 @@ mod tests {
         }
         .encode()]);
         let mut output = Vec::new();
-        let mut stub = Stub {
-            wants: Vec::new(),
-            got: Vec::new(),
-            fail: false,
-        };
+        let mut stub = Stub::new();
         serve(&mut input.as_slice(), &mut output, &mut stub).expect("serves");
 
         let frame = read_frame(&mut output.as_slice()).expect("reads");
@@ -301,11 +349,7 @@ mod tests {
         // rather than spin asking into a closed pipe.
         let input = pipe(&[request()]);
         let mut output = Vec::new();
-        let mut stub = Stub {
-            wants: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
-            got: Vec::new(),
-            fail: false,
-        };
+        let mut stub = Stub::new().wanting(&["a", "b", "c"]);
         let outcome = serve(&mut input.as_slice(), &mut output, &mut stub);
         assert!(outcome.is_err(), "{outcome:?}");
         assert_eq!(

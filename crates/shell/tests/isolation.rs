@@ -156,3 +156,101 @@ fn the_child_never_writes_anything_but_frames_to_stdout() {
     // refuses trailing bytes, and `read_frame` took exactly one frame.
     assert!(page.width > 0 && page.height > 0);
 }
+
+/// A live session against the real binary, with a file so subresources resolve.
+fn session(html: &str, width: u32) -> (sandbox::Session, sandbox::Rendered) {
+    let dir = std::env::temp_dir().join("2kbrowser-session-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("page.html");
+    std::fs::write(&path, html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")))
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            width,
+            2000,
+            Some(origin),
+            at,
+            false,
+        )
+        .expect("the renderer opens the page")
+}
+
+#[test]
+fn a_live_child_answers_find_from_the_page_it_is_holding() {
+    // The text and the box tree never cross the boundary, so the only thing
+    // that can answer a find query is the process holding them. This is that
+    // question being asked and answered across a real pipe.
+    let (mut session, _) = session(
+        "<body><p>the quick brown fox</p><p>and another fox here</p></body>",
+        400,
+    );
+
+    let matches = session.find("fox").expect("the child answers");
+    assert_eq!(matches.len(), 2, "{matches:?}");
+    assert!(matches.iter().all(|rect| rect.width > 0.0));
+
+    // A second query on the same child, which is the point of it staying alive.
+    let none = session.find("aardvark").expect("the child answers");
+    assert!(none.is_empty());
+}
+
+#[test]
+fn an_empty_query_matches_nothing_rather_than_everything() {
+    let (mut session, _) = session("<body><p>text</p></body>", 300);
+    assert!(session.find("").expect("answers").is_empty());
+    assert!(session.find("   ").expect("answers").is_empty());
+}
+
+#[test]
+fn the_same_child_re_renders_at_a_new_width() {
+    // A resize is not a fresh page. Re-rendering in the child that already has
+    // the document parsed is both cheaper and the reason a resize does not
+    // re-fetch every image on the page.
+    let html = "<body><p>a paragraph long enough that its height depends on how \
+                wide the viewport is, which is the whole point of this test</p></body>";
+    let (mut session, narrow) = session(html, 200);
+
+    let dir = std::env::temp_dir().join("2kbrowser-session-tests");
+    let (origin, at) = net::parse_url(&net::file_url(&dir.join("page.html"))).expect("parses");
+    let wide = session
+        .render(
+            html.as_bytes().to_vec(),
+            None,
+            600,
+            2000,
+            Some(origin),
+            at,
+            false,
+        )
+        .expect("re-renders");
+
+    assert_eq!(narrow.width, 200);
+    assert_eq!(wide.width, 600);
+    assert!(
+        wide.content_height < narrow.content_height,
+        "a wider viewport should need fewer lines: {} vs {}",
+        wide.content_height,
+        narrow.content_height
+    );
+}
+
+#[test]
+fn dropping_a_session_kills_its_child() {
+    // The mechanism that keeps "one page per process" true. Without it a tab
+    // that navigated away would leave its renderer running, and a page's
+    // leftovers would outlive the page.
+    let (first, _) = session("<body><p>x</p></body>", 200);
+    drop(first);
+
+    // The proof that it is gone is that a fresh one still works — a leaked
+    // child would eventually exhaust the process table rather than fail here,
+    // so this checks the path is repeatable rather than the kill directly.
+    for _ in 0..8 {
+        let (live, page) = session("<body><p>x</p></body>", 200);
+        assert!(page.width > 0);
+        drop(live);
+    }
+}

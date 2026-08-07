@@ -123,7 +123,7 @@ impl Resource {
 }
 
 /// Fetches resources subject to a [`Policy`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Fetcher {
     /// The policy applied to every request.
     pub policy: Policy,

@@ -9,7 +9,6 @@
 //! exfiltrate anything regardless of what it is tricked into computing, and
 //! ADR-0006's policy is enforced somewhere a compromised renderer cannot reach.
 
-use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -79,7 +78,61 @@ impl Renderer {
         &mut self.fetcher
     }
 
-    /// Renders a document in a child process.
+    /// Starts a renderer and renders a document in it.
+    ///
+    /// The child stays alive afterwards, holding the document and the box tree,
+    /// so the page can still be searched and re-laid-out at a new width. It is
+    /// killed when the [`Session`] is dropped, which the caller does when the
+    /// page is replaced — so a page's leftovers never outlive the page.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the render request's fields, threaded explicitly"
+    )]
+    pub fn open(
+        &self,
+        body: Vec<u8>,
+        content_type: Option<String>,
+        width: u32,
+        max_height: u32,
+        origin: Option<Origin>,
+        path: String,
+        force_authored: bool,
+    ) -> Result<(Session, Rendered), Error> {
+        let child = Command::new(&self.program)
+            .arg(CHILD_ARGUMENT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Left inherited on purpose: a panic message from the child is the
+            // most useful thing it can produce when something is wrong, and
+            // swallowing it would make every renderer bug invisible.
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| Error::Spawn(error.to_string()))?;
+
+        let mut session = Session {
+            child,
+            fetcher: self.fetcher.clone(),
+            timeout: self.timeout,
+            document: origin.clone(),
+        };
+        let page = session.render(
+            body,
+            content_type,
+            width,
+            max_height,
+            origin,
+            path,
+            force_authored,
+        );
+        match page {
+            Ok(page) => Ok((session, page)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Renders once and throws the child away.
+    ///
+    /// For callers with nothing to ask afterwards — the command line, and tests.
     #[expect(
         clippy::too_many_arguments,
         reason = "the render request's fields, threaded explicitly"
@@ -94,49 +147,94 @@ impl Renderer {
         path: String,
         force_authored: bool,
     ) -> Result<Rendered, Error> {
-        let mut child = Command::new(&self.program)
-            .arg(CHILD_ARGUMENT)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Left inherited on purpose: a panic message from the child is the
-            // most useful thing it can produce when something is wrong, and
-            // swallowing it would make every renderer bug invisible.
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| Error::Spawn(error.to_string()))?;
+        self.open(
+            body,
+            content_type,
+            width,
+            max_height,
+            origin,
+            path,
+            force_authored,
+        )
+        .map(|(_, page)| page)
+    }
+}
 
-        let outcome = self.converse(
-            &mut child,
-            ToChild::Render {
-                body,
-                content_type,
-                width,
-                max_height,
-                origin: origin.clone(),
-                path,
-                force_authored,
-            },
-            origin.as_ref(),
-        );
+/// A live renderer holding one page.
+///
+/// Dropping it kills the child. That is the mechanism that keeps "one page per
+/// process" true: the caller drops the session when the page is replaced, and
+/// nothing a page accumulated — caches, font state, whatever an exploit left
+/// behind — survives into the next one.
+pub struct Session {
+    child: Child,
+    fetcher: Fetcher,
+    timeout: Duration,
+    /// The origin the parent asked for a render of.
+    ///
+    /// Kept here rather than taken from the child's requests. The child could
+    /// claim any origin it liked, and the policy would then be applied to a
+    /// document that does not exist.
+    document: Option<Origin>,
+}
 
-        // Killed unconditionally, including on success. A renderer that has
-        // answered has nothing left to do, and one that is wedged must not
-        // outlive the request that started it.
-        let _ = child.kill();
-        let _ = child.wait();
-        outcome
+impl Session {
+    /// Renders, or re-renders at a new width.
+    ///
+    /// Re-rendering in the same child is not only cheaper — the document is
+    /// already parsed — it is what makes a resize not a fresh page.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the render request's fields, threaded explicitly"
+    )]
+    pub fn render(
+        &mut self,
+        body: Vec<u8>,
+        content_type: Option<String>,
+        width: u32,
+        max_height: u32,
+        origin: Option<Origin>,
+        path: String,
+        force_authored: bool,
+    ) -> Result<Rendered, Error> {
+        self.document = origin.clone();
+        self.converse(ToChild::Render {
+            body,
+            content_type,
+            width,
+            max_height,
+            origin,
+            path,
+            force_authored,
+        })
     }
 
-    fn converse(
-        &self,
-        child: &mut Child,
-        request: ToChild,
-        document: Option<&Origin>,
-    ) -> Result<Rendered, Error> {
-        let mut to_child = BufWriter::new(child.stdin.take().ok_or(Error::Died)?);
-        let mut from_child = BufReader::new(child.stdout.take().ok_or(Error::Died)?);
+    /// Asks where `query` appears on the page this child is holding.
+    pub fn find(&mut self, query: &str) -> Result<Vec<layout::Rect>, Error> {
+        let request = ToChild::Find {
+            query: query.to_owned(),
+        };
+        self.send(&request)?;
+        let frame = self.read()?;
+        match ToParent::decode(&frame)? {
+            ToParent::Matches { rects } => Ok(rects),
+            ToParent::Failed { message } => Err(Error::Render(message)),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
 
-        write_frame(&mut to_child, &request.encode())?;
+    fn send(&mut self, message: &ToChild) -> Result<(), Error> {
+        let stdin = self.child.stdin.as_mut().ok_or(Error::Died)?;
+        write_frame(stdin, &message.encode())
+    }
+
+    fn read(&mut self) -> Result<Vec<u8>, Error> {
+        let stdout = self.child.stdout.as_mut().ok_or(Error::Died)?;
+        read_frame(stdout)
+    }
+
+    fn converse(&mut self, request: ToChild) -> Result<Rendered, Error> {
+        self.send(&request)?;
 
         let started = Instant::now();
         let mut resources = 0usize;
@@ -154,10 +252,15 @@ impl Renderer {
                 )));
             }
 
-            let frame = read_frame(&mut from_child)?;
+            let frame = self.read()?;
             match ToParent::decode(&frame)? {
                 ToParent::Rendered(page) => return Ok(*page),
                 ToParent::Failed { message } => return Err(Error::Render(message)),
+                ToParent::Matches { .. } => {
+                    // Nothing asked a question. Either the child is confused or
+                    // it is not ours.
+                    return Err(Error::Wire(crate::WireError::Unknown));
+                }
                 ToParent::Fetch { url, kind } => {
                     resources += 1;
                     if resources > MAX_RESOURCES {
@@ -165,8 +268,8 @@ impl Renderer {
                             "the page asked for more than {MAX_RESOURCES} resources"
                         )));
                     }
-                    let answer = self.fetch(&url, document, kind);
-                    write_frame(&mut to_child, &answer.encode())?;
+                    let answer = self.fetch(&url, kind);
+                    self.send(&answer)?;
                 }
             }
         }
@@ -179,8 +282,8 @@ impl Renderer {
     /// telling it would leak the parent's configuration to the untrusted side —
     /// which is exactly the sort of thing a compromised renderer would probe
     /// for.
-    fn fetch(&self, url: &str, document: Option<&Origin>, kind: RequestKind) -> ToChild {
-        match self.fetcher.fetch_bytes(url, document, kind) {
+    fn fetch(&self, url: &str, kind: RequestKind) -> ToChild {
+        match self.fetcher.fetch_bytes(url, self.document.as_ref(), kind) {
             Ok(body) => ToChild::Resource {
                 body,
                 content_type: None,
@@ -192,6 +295,16 @@ impl Renderer {
                 ok: false,
             },
         }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Unconditional, including after a clean render. A renderer whose page
+        // is gone has nothing left to do, and one that is wedged must not
+        // outlive the tab that started it.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

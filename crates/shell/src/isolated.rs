@@ -47,6 +47,12 @@ impl crate::render::Loader for PipeLoader<'_> {
 /// Renders using this crate's pipeline. The child's half.
 pub struct PageRenderer {
     fonts: FontStore,
+    /// The page most recently rendered, kept so it can still be searched.
+    ///
+    /// This is the whole reason the child outlives a single message: the text
+    /// and the box tree a find query searches never cross the boundary, so the
+    /// only thing that can answer is the process holding them.
+    page: Option<crate::render::Page>,
 }
 
 impl Default for PageRenderer {
@@ -60,6 +66,7 @@ impl PageRenderer {
     pub fn new() -> Self {
         Self {
             fonts: FontStore::new(),
+            page: None,
         }
     }
 }
@@ -121,7 +128,7 @@ impl Render for PageRenderer {
         let can_toggle_layout =
             *force_authored || !matches!(page.mode, layout::RenderMode::Authored);
 
-        Ok(Rendered {
+        let rendered = Rendered {
             pixels: page.pixmap.data().to_vec(),
             width: page.pixmap.width(),
             height: page.pixmap.height(),
@@ -134,7 +141,23 @@ impl Render for PageRenderer {
                 .map(|(rect, url)| Link { rect, url })
                 .collect(),
             can_toggle_layout,
-        })
+        };
+        // Kept for the questions that come after: find, and re-rendering at a
+        // new width without re-fetching anything.
+        self.page = Some(page);
+        Ok(rendered)
+    }
+
+    fn find(&mut self, query: &str) -> Vec<layout::Rect> {
+        // An empty query matches everything, which is not what a reader who has
+        // just cleared the box wants to see.
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        match &self.page {
+            Some(page) => page.find(query),
+            None => Vec::new(),
+        }
     }
 }
 
