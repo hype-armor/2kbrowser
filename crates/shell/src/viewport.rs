@@ -62,6 +62,22 @@ pub struct Document {
     pub path: String,
 }
 
+/// Whether a rectangle has any pixels on a canvas this tall.
+///
+/// A page taller than one frame is rendered up to the canvas and no further
+/// ([`Viewport::is_truncated`]), and everything past that has no pixels at all.
+/// Offering it anyway is worse than leaving it out: a find match down there
+/// would be counted in "3 of 7" and then highlight nothing when stepped to, and
+/// a link down there would take keyboard focus and be outlined nowhere. Neither
+/// is something the reader can act on.
+///
+/// The *top* of the rectangle is what decides it, so something straddling the
+/// bottom edge counts — part of it is visible, and that part is worth
+/// highlighting.
+fn on_canvas(rect: &Rect, canvas_height: f32) -> bool {
+    rect.y < canvas_height
+}
+
 /// A page held by a live renderer.
 pub struct Viewport {
     session: sandbox::Session,
@@ -197,7 +213,13 @@ impl Viewport {
     pub fn links(&self) -> Vec<Link> {
         let mut out: Vec<Link> = Vec::new();
         let mut groups: Vec<u32> = Vec::new();
-        for link in &self.page.links {
+        let height = self.page.height as f32;
+        for link in self
+            .page
+            .links
+            .iter()
+            .filter(|link| on_canvas(&link.rect, height))
+        {
             match groups.iter().position(|group| *group == link.group) {
                 Some(at) => out[at].rects.push(link.rect),
                 None => {
@@ -233,7 +255,13 @@ impl Viewport {
 
     /// Where `query` appears, asked of the child holding the page.
     pub fn find(&mut self, query: &str) -> Vec<Rect> {
-        self.session.find(query).unwrap_or_default()
+        let height = self.page.height as f32;
+        self.session
+            .find(query)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rect| on_canvas(rect, height))
+            .collect()
     }
 
     /// Re-renders at a new width, in the same child.
