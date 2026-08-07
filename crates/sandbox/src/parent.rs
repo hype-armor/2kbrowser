@@ -76,7 +76,22 @@ impl Spawned {
 
 /// Starts an ordinary, unconfined child.
 fn spawn_plain(program: &Path) -> Result<Spawned, Error> {
-    Command::new(program)
+    let mut command = Command::new(program);
+    // Nothing from the parent's environment, for the same reason the Windows
+    // container names its own (see `contain::environment`): a browser's
+    // environment routinely holds API tokens, proxy credentials, and the shape
+    // of someone's home directory, and the renderer is the process that parses
+    // documents strangers wrote. Nothing in the render path reads any of it —
+    // the fonts are compiled in (ADR-0010) and every resource arrives over the
+    // pipe — so there is nothing to lose by withholding all of it.
+    //
+    // `RUST_BACKTRACE` is the exception, and only when it is already set: a
+    // renderer that panics is the case where its output matters most.
+    command.env_clear();
+    if let Some(backtrace) = std::env::var_os("RUST_BACKTRACE") {
+        command.env("RUST_BACKTRACE", backtrace);
+    }
+    command
         .arg(CHILD_ARGUMENT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
