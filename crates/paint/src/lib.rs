@@ -17,7 +17,7 @@ pub use images::{DecodedImage, ImageKey, ImageSlot, ImageStore, decode};
 // Re-exported for consumers that composite pixmaps of their own, such as the
 // frameset renderer.
 pub use tiny_skia::{
-    Color as RasterColor, Pixmap, PixmapPaint, PremultipliedColorU8 as PremultipliedColor,
+    Color as RasterColor, IntSize, Pixmap, PixmapPaint, PremultipliedColorU8 as PremultipliedColor,
     Transform,
 };
 
@@ -505,6 +505,17 @@ fn draw_glyph(
     origin_y: f32,
     color: Color,
 ) {
+    // The caller checks the text origin, which is not the same as this glyph's
+    // position: `glyph.x` and `glyph.y` are offsets within the run, and a run
+    // laid out from a stylesheet with `left: 1e30em` in it puts an in-range
+    // origin arbitrarily far from where the glyph lands. Found by the fuzzer,
+    // as a panic inside tiny-skia's `IntRect::from_xywh(...).unwrap()` — the
+    // same family as the `margin: 1e40px` bug, one layer further in.
+    let (x, y) = (origin_x + glyph.x, origin_y + glyph.y);
+    if !in_range(x) || !in_range(y) {
+        return;
+    }
+
     let Some((coverage, left, top, width, height)) = fonts.rasterise(glyph) else {
         return;
     };
@@ -529,8 +540,19 @@ fn draw_glyph(
         });
     }
 
-    let x = (origin_x + glyph.x) as i32 + left;
-    let y = (origin_y + glyph.y) as i32 - top;
+    // Checked rather than trusted even after the range guard above: `left`,
+    // `top`, and the bitmap's own size come from the rasteriser rather than
+    // from us, and what tiny-skia actually panics on is `x + width` leaving
+    // `i32` — so that is the sum to prove cannot.
+    let (Some(x), Some(y)) = ((x as i32).checked_add(left), (y as i32).checked_sub(top)) else {
+        return;
+    };
+    let (Some(_), Some(_)) = (
+        i32::try_from(width).ok().and_then(|w| x.checked_add(w)),
+        i32::try_from(height).ok().and_then(|h| y.checked_add(h)),
+    ) else {
+        return;
+    };
     pixmap.draw_pixmap(
         x,
         y,
@@ -565,6 +587,52 @@ mod tests {
             .iter()
             .filter(|p| p.red() != 255 || p.green() != 255 || p.blue() != 255)
             .count()
+    }
+
+    #[test]
+    fn a_glyph_pushed_out_of_range_by_its_own_offset_is_skipped() {
+        // The text *origin* is checked before `draw_glyph` is called, and that
+        // is not the same thing as where the glyph lands: `glyph.x` and
+        // `glyph.y` are offsets within the run. A stylesheet that shifts a run
+        // by an enormous amount puts an in-range origin arbitrarily far from an
+        // out-of-range glyph, and tiny-skia panics on the `i32` rectangle it
+        // builds from it rather than refusing.
+        //
+        // Found by the fuzzer as a mutation of the fixture written for the
+        // `margin: 1e40px` family. Same family, one layer in.
+        let mut list = DisplayList::default();
+        let mut fonts = FontStore::new();
+        let laid_out = fonts.layout("H", &crate::tests::glyph_style(), 1000.0);
+        let glyph = laid_out.lines[0].glyphs[0];
+
+        for (x, y) in [
+            (f32::INFINITY, 0.0),
+            (0.0, f32::INFINITY),
+            (1e30, 0.0),
+            (0.0, -1e30),
+            (f32::NAN, 0.0),
+        ] {
+            list.items.push(DisplayItem::Glyph {
+                glyph: text::PositionedGlyph { x, y, ..glyph },
+                origin_x: 1.0,
+                origin_y: 1.0,
+                color: Color::BLACK,
+            });
+        }
+
+        // The point is that this returns at all.
+        let images = ImageStore::new();
+        let pixmap = rasterise(&list, &mut fonts, &images, 50, 50).expect("pixmap");
+        assert_eq!(
+            count_non_white(&pixmap),
+            0,
+            "nothing should have been drawn"
+        );
+    }
+
+    /// A style for building a glyph to position by hand.
+    fn glyph_style() -> css::style::ComputedStyle {
+        css::style::ComputedStyle::default()
     }
 
     #[test]

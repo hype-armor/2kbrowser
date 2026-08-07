@@ -99,10 +99,14 @@ that mutates the reference fixtures into the HTML parser, the CSS parser, image
 decoding, URL parsing, and the whole render pipeline; `cargo run -p fuzz` soaks
 for as long as you leave it. The first soak found three panics reachable from
 an ordinary stylesheet — `font-size: 0`, `font-size: 99999px`, and
-`margin: 1e40px` — each of which stopped the browser. All three are fixed, and
-each has a regression test where the bug was rather than where it surfaced.
+`margin: 1e40px` — each of which stopped the browser. A later one found a
+fourth: a glyph shifted far enough by its own run offset that the rectangle
+built for it left `i32`, which the check on the text origin did not catch
+because the origin was not where the glyph landed. All four are fixed, and each
+has a regression test where the bug was rather than where it surfaced.
 
-**The browser now renders in a separate process.** The parent keeps the chrome,
+**Everything renders in a separate process** — the window, `render`, and
+`links` alike. The parent keeps the chrome,
 the network, and the disk; a child parses, lays out, and rasterises, and asks
 for every image, stylesheet, and frame it wants rather than fetching them
 (ADR-0012). A page rendered across the boundary is byte-identical to one

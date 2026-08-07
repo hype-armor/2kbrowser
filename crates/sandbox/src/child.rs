@@ -212,6 +212,7 @@ mod tests {
                 title: None,
                 links: Vec::new(),
                 can_toggle_layout: false,
+                images_loaded: 0,
             })
         }
 

@@ -1,0 +1,38 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; }
+  .side { float: left; margin-right: 10px; border: 40px; padding: 1e40px; border: 1e40px solid red; }
+.wide   { width: 1e40px; height: 1e40px; }
+.giant  { font-size: 99999px; }
+.offset { position: relative; top: -1e40px; left: 1e30em; }
+</style></head><body>
+<div class="huge">a</div><div class="wide">b</di&>
+<p class="giant">c</p><span class="offset">d</span>
+<table style="border-spacing: 1e1px solid #888888; }
+  .frame { border: 2px solid #cc0000; }
+</style></head><body>
+<p>Intrinsic size:</p>
+<img src="assets/logo.png">
+<p>Width only, aspect ratio preserved:</p>
+<img src="assets/logo.png" width="120">
+<p>Both dimensions, ratio ignored:</p>
+<img src="assets/logo.png" width="150" height="20">
+<p>Floated, with text beside it:</p>
+<img class="side" src="assets/logo.png" width="90">
+<p>This paragraph flows beside the floated image, whose width comes from its
+   declared size rather than from any text it contains.</p>
+<p>A missing image keeps its declared box:</p>
+<img class="frame" src="nope.png" width="80" height="30">
+<p>An image amid running text <img src="assets/logo.png" width="18" height="18">
+   sits on the line rather than interrupting it, and a taller one
+   <img src="assets/logo.png" width="36" height="36"> makes its line taller
+   without disturbing the lines around it. Long enough to wrap, so the boxes
+   have to be placed on more than one line.</p>
+; }
+</style></head><body>
+<p>Intrinsic size:</p>
+<img src="assets/logo.png">
+<p>Width only, aspect ratio preserved:</p>
+<img src="assets/logo.png" width="120">
+<p>Both dimensions, r<p>[<img src="assets/logo.png" width="18" height="18">] with no spaces around
+   it stays tight against the brackets.</p>
+</body></html>

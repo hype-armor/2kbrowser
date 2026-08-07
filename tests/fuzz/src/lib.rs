@@ -601,6 +601,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                 group: 0,
             }],
             can_toggle_layout: true,
+            images_loaded: 2,
         }))
         .encode(),
     ];

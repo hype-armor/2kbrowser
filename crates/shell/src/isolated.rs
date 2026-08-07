@@ -149,6 +149,7 @@ impl Render for PageRenderer {
                 })
                 .collect(),
             can_toggle_layout,
+            images_loaded: page.images_loaded as u32,
         };
         // Kept for the questions that come after: find, and re-rendering at a
         // new width without re-fetching anything.

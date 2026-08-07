@@ -111,6 +111,23 @@ impl Viewport {
         self.page.height
     }
 
+    /// How many images were fetched and decoded for this page.
+    pub fn images_loaded(&self) -> u32 {
+        self.page.images_loaded
+    }
+
+    /// The canvas as a pixmap, for saving.
+    ///
+    /// Rebuilt from the bytes that crossed the pipe rather than sent as one:
+    /// the message carries premultiplied RGBA and its dimensions, and
+    /// `ToParent::decode` has already checked that `width * height * 4` is
+    /// exactly how many bytes arrived — so this cannot be handed a buffer that
+    /// does not match its label.
+    pub fn to_pixmap(&self) -> Option<paint::Pixmap> {
+        let size = paint::IntSize::from_wh(self.page.width, self.page.height)?;
+        paint::Pixmap::from_vec(self.page.pixels.clone(), size)
+    }
+
     /// Height of the content, which may exceed the canvas.
     pub fn content_height(&self) -> f32 {
         self.page.content_height
@@ -138,6 +155,11 @@ impl Viewport {
     /// 401-row canvas and is not truncated.
     pub fn is_truncated(&self) -> bool {
         self.page.content_height.ceil() > self.page.height as f32
+    }
+
+    /// Where the document came from.
+    pub fn origin(&self) -> &net::Origin {
+        &self.document.origin
     }
 
     /// The page's title, when it had one.
