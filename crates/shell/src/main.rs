@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         // applied from outside and so cannot be applied by the process running
         // the probes. Not in the usage text: the self-test runs this on itself.
         Some(sandbox::confine::SELFTEST_PROBE_ARGUMENT) => {
-            println!("{}", sandbox::confine::selftest_probe());
+            println!("{}", sandbox::confine::selftest_probe(&args[1..]));
             ExitCode::SUCCESS
         }
         Some(sandbox::CHILD_ARGUMENT) => match shell::isolated::run_child() {

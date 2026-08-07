@@ -200,64 +200,88 @@ pub const SELFTEST_ARGUMENT: &str = "--confine-selftest";
 ///
 /// Windows needs this because the confinement is applied from outside: the
 /// process running the probes cannot be the process that built the container.
-/// Not in the usage text — it is how the self-test talks to itself.
+/// Takes the port and the file path to probe, because *neither can be derived
+/// on the far side*. Not in the usage text — it is how the self-test talks to
+/// itself.
 pub const SELFTEST_PROBE_ARGUMENT: &str = "--confine-selftest-probe";
 
-/// Where the file-open probe writes and then tries to read.
+/// What the probes are pointed at.
 ///
-/// Both halves of the Windows self-test have to agree on this path, and they
-/// are different processes, so it is derived rather than passed: `temp_dir`
-/// reads `TMP`/`TEMP`, which the child inherits.
-fn probe_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("2kbrowser-confine-probe")
+/// Both halves of the Windows self-test have to agree on these, and they are
+/// two different processes, so they are passed rather than derived. The first
+/// attempt derived the file path from `temp_dir` on the assumption that the
+/// child inherits `TMP` — it does, and an AppContainer *redirects* it anyway, so
+/// the child probed
+/// `…\Packages\2kbrowser.renderer\AC\Temp\` and got `NotFound` for a file that
+/// was never there. A check that cannot fail, again, for a new reason.
+struct Targets {
+    /// A port in the parent, with something listening on it.
+    port: u16,
+    /// A file the parent has written and can read.
+    file: std::path::PathBuf,
 }
 
 /// Applies confinement and then tries the things it is supposed to prevent.
 ///
 /// Prints one line per attempt. Uses `std` rather than raw syscalls on purpose:
 /// `TcpStream::connect` and `File::open` are what a compromised renderer would
-/// reach for, and they go through the same syscalls the filter names.
+/// reach for, and they go through the same calls the sandbox names.
 ///
 /// On Windows this cannot confine the process it is running in, so it builds a
-/// container and runs [`probes`] inside one instead.
+/// container and runs the probes inside one instead.
 pub fn selftest() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        windows_selftest()
+    // A listener the probe can actually connect to, rather than a port nothing
+    // answers on. That was the first design, and it was wrong on Windows:
+    // AppContainer's network block is enforced by the firewall, which resets
+    // the connection rather than failing the call, so a blocked connect and a
+    // dead port both report `ConnectionRefused`. With something listening,
+    // `OPENED` means the sandbox failed and nothing else does.
+    //
+    // Bound here, before anything is confined — under seccomp `bind` is denied,
+    // and the point is to test `connect`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0");
+    let port = match &listener {
+        Ok(listener) => match listener.local_addr() {
+            Ok(address) => address.port(),
+            Err(error) => return format!("confinement=Unknown\nLISTENER-UNBOUND({error})"),
+        },
+        Err(error) => return format!("confinement=Unknown\nLISTENER-UNBOUND({error})"),
+    };
+
+    // Written *and read back* by this process, so that a refusal on the far
+    // side is the sandbox refusing and not a path that was never good.
+    let file = std::env::temp_dir().join("2kbrowser-confine-probe");
+    if let Err(error) = std::fs::write(&file, b"probe") {
+        return format!("confinement=Unknown\nPROBE-UNWRITABLE({:?})", error.kind());
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // The probe file is created *before* confinement, and by this process,
-        // so that afterwards it certainly exists and certainly is readable.
-        // Anything else and a refusal is indistinguishable from a wrong path.
-        //
-        // This was got wrong first time round: the probe was `/etc/hostname`,
-        // which does not exist on Windows, so the check reported `NotFound`
-        // there whether or not a sandbox was blocking it — a test that could not
-        // fail, on the one platform where the sandbox was not written yet. Found
-        // by someone running it on Windows.
-        let prepared = std::fs::write(probe_path(), b"probe");
-        let confinement = apply();
-        format!("confinement={confinement:?}\n{}", probes(prepared))
+    if let Err(error) = std::fs::File::open(&file) {
+        return format!("confinement=Unknown\nPROBE-UNREADABLE({:?})", error.kind());
     }
+    let targets = Targets { port, file };
+
+    let report = {
+        #[cfg(target_os = "windows")]
+        {
+            windows_selftest(&targets)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let confinement = apply();
+            format!("confinement={confinement:?}\n{}", probes(&targets))
+        }
+    };
+    // Echoed by the side that chose them, so that a reader — and the test — can
+    // see whether the probes on the far side were aimed at the same things.
+    format!(
+        "{report}\nexpect-port={}\nexpect-file={}",
+        targets.port,
+        targets.file.display()
+    )
 }
 
 /// Builds a container, runs the probes inside it, and reports both halves.
-///
-/// The probe file is written out here, by the unconfined parent, so that a
-/// refusal on the far side is the container refusing rather than a missing
-/// file — the same mistake this self-test already made once.
 #[cfg(target_os = "windows")]
-fn windows_selftest() -> String {
-    let prepared = std::fs::write(probe_path(), b"probe");
-    if let Err(error) = &prepared {
-        return format!(
-            "confinement=Unknown\nPROBE-UNWRITABLE({:?})\nprobe={}",
-            error.kind(),
-            probe_path().display()
-        );
-    }
-
+fn windows_selftest(targets: &Targets) -> String {
     let program = match std::env::current_exe() {
         Ok(program) => program,
         Err(error) => {
@@ -268,11 +292,15 @@ fn windows_selftest() -> String {
         Ok(container) => container,
         Err(error) => return format!("confinement=Failed\nreason={error}"),
     };
-    let inside = crate::contain::capture(
-        &container,
-        SELFTEST_PROBE_ARGUMENT,
-        std::time::Duration::from_secs(30),
+    // Quoted because a Windows temp path routinely contains a space, and the
+    // child parses this back out of one command line.
+    let arguments = format!(
+        "{SELFTEST_PROBE_ARGUMENT} {} \"{}\"",
+        targets.port,
+        targets.file.display()
     );
+    let inside =
+        crate::contain::capture(&container, &arguments, std::time::Duration::from_secs(30));
     format!("confinement=AppContainer\n{}", inside.trim_end())
 }
 
@@ -280,14 +308,15 @@ fn windows_selftest() -> String {
 ///
 /// Split out from [`selftest`] because on Windows the process that confines and
 /// the process that is confined are not the same one.
-pub fn probes(prepared: std::io::Result<()>) -> String {
-    let probe = probe_path();
+fn probes(targets: &Targets) -> String {
     let mut lines = Vec::new();
 
-    // A socket to a port nothing listens on. `ConnectionRefused` means the
-    // syscall went through and the far end said no — the network was reachable.
-    // A confined process never gets that far.
-    let socket = std::net::TcpStream::connect("127.0.0.1:9");
+    // Something *is* listening, so `OPENED` is the only outcome that means the
+    // network was reachable, and it is unambiguous. Anything else is the
+    // attempt being stopped — by a syscall filter, by a firewall, by a token
+    // with no network capability. Which of those it was is not the question
+    // this answers.
+    let socket = std::net::TcpStream::connect(("127.0.0.1", targets.port));
     lines.push(format!(
         "socket={}",
         match socket {
@@ -298,19 +327,17 @@ pub fn probes(prepared: std::io::Result<()>) -> String {
 
     lines.push(format!(
         "file={}",
-        match (&prepared, std::fs::File::open(&probe)) {
-            // Nothing to conclude from a probe that was never written. Said
-            // outright rather than reported as a failure to open.
-            (Err(error), _) => format!("PROBE-UNWRITABLE({:?})", error.kind()),
-            (Ok(()), Ok(_)) => "OPENED".to_owned(),
-            (Ok(()), Err(error)) => format!("{:?}", error.kind()),
+        match std::fs::File::open(&targets.file) {
+            Ok(_) => "OPENED".to_owned(),
+            Err(error) => format!("{:?}", error.kind()),
         }
     ));
-    lines.push(format!("probe={}", probe.display()));
+    lines.push(format!("port={}", targets.port));
+    lines.push(format!("file-path={}", targets.file.display()));
 
-    // Something harmless, to prove the filter did not simply break everything —
-    // two `PermissionDenied` lines are also what a filter that killed the whole
-    // process would produce if it somehow got this far.
+    // Something harmless, to prove the sandbox did not simply break everything —
+    // two refusals above are also what a filter that killed the whole process
+    // would produce if it somehow got this far.
     lines.push(format!("compute={}", (1..=10).sum::<u32>()));
 
     lines.join("\n")
@@ -318,10 +345,19 @@ pub fn probes(prepared: std::io::Result<()>) -> String {
 
 /// Runs the probes in a process something else has already confined.
 ///
-/// The file it reports on was written by the parent, so `Ok(())` is passed in:
-/// this process is not supposed to be able to write anything.
-pub fn selftest_probe() -> String {
-    probes(Ok(()))
+/// Takes the port and path from the command line: see [`Targets`] for why
+/// neither can be worked out from inside a container.
+pub fn selftest_probe(arguments: &[String]) -> String {
+    let Some(port) = arguments.first().and_then(|port| port.parse::<u16>().ok()) else {
+        return "NO-PORT".to_owned();
+    };
+    let Some(file) = arguments.get(1) else {
+        return "NO-FILE".to_owned();
+    };
+    probes(&Targets {
+        port,
+        file: std::path::PathBuf::from(file),
+    })
 }
 
 #[cfg(test)]

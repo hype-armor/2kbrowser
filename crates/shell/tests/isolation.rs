@@ -400,10 +400,6 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
     };
     assert!(report.contains(expected), "{report}");
 
-    // Stated as the property rather than as an errno. `ConnectionRefused` is
-    // the interesting one to exclude: it means the connect went all the way out
-    // and something at the far end said no, which is proof the network was
-    // reachable. Anything else is the attempt being stopped before that.
     let field = |name: &str| {
         report
             .lines()
@@ -411,19 +407,42 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
             .unwrap_or_else(|| panic!("no `{name}` line in:\n{report}"))
             .to_owned()
     };
+
+    // First: were the probes aimed at the things the parent prepared? Both
+    // previous versions of this check failed here rather than at the assertions
+    // below — a path that did not exist on the far side, and then a temp
+    // directory an AppContainer silently redirects. A refusal is only evidence
+    // if the thing refused was really there.
+    assert_eq!(
+        field("port="),
+        field("expect-port="),
+        "the probe connected somewhere else:\n{report}"
+    );
+    assert_eq!(
+        field("file-path="),
+        field("expect-file="),
+        "the probe opened something else:\n{report}"
+    );
+
+    // Something is listening on that port, so `OPENED` is the one outcome that
+    // proves the network was reachable, and nothing else is ambiguous with it.
+    // A port with nothing behind it would not do: an AppContainer's network
+    // block is enforced by the firewall, which resets rather than failing the
+    // call, so blocked and dead both read as `ConnectionRefused`.
+    //
+    // Worth being precise about what this covers on Windows: loopback and
+    // outbound are separate AppContainer rules, and only loopback can be probed
+    // without reaching the internet from a test. What rules out outbound is the
+    // capability set being empty, which `sandbox::contain` asserts directly.
     let socket = field("socket=");
-    assert!(
-        socket != "OPENED" && socket != "ConnectionRefused",
-        "the renderer could still reach the network (socket={socket}):\n{report}"
+    assert_ne!(
+        socket, "OPENED",
+        "the renderer could still reach the network:\n{report}"
     );
     let file = field("file=");
-    assert!(
-        file != "OPENED",
-        "the renderer could still open a file (file={file}):\n{report}"
-    );
-    assert!(
-        !file.starts_with("PROBE-UNWRITABLE"),
-        "the probe file was never written, so the file check proves nothing:\n{report}"
+    assert_ne!(
+        file, "OPENED",
+        "the renderer could still open a file:\n{report}"
     );
     // And it is still able to do its actual job, which a sandbox that broke
     // everything would also satisfy the two assertions above.

@@ -124,11 +124,11 @@ impl Container {
     }
 
     /// Starts a renderer inside the container.
-    pub fn spawn(&self, argument: &str) -> Result<Contained, String> {
+    pub fn spawn(&self, arguments: &str) -> Result<Contained, String> {
         // `CreateProcess` takes the command line as one string and the child
         // parses it back into arguments, so argv[0] has to be here or the
         // renderer would read its own path as the first argument.
-        let command = format!("\"{}\" {argument}", self.program.display());
+        let command = format!("\"{}\" {arguments}", self.program.display());
 
         let options = LaunchOptions {
             exe: self.program.clone(),
@@ -201,8 +201,8 @@ impl Contained {
 /// For [`crate::confine::selftest`], which has to run its probes on the far
 /// side of the boundary — a container that installs successfully and confines
 /// nothing would pass every check written from the outside.
-pub fn capture(container: &Container, argument: &str, timeout: std::time::Duration) -> String {
-    let mut child = match container.spawn(argument) {
+pub fn capture(container: &Container, arguments: &str, timeout: std::time::Duration) -> String {
+    let mut child = match container.spawn(arguments) {
         Ok(child) => child,
         Err(error) => return format!("spawn-failed={error}"),
     };
@@ -216,4 +216,33 @@ pub fn capture(container: &Container, argument: &str, timeout: std::time::Durati
     // only ever waits on a child that has already closed its stdout.
     let _ = child.io.wait(Some(timeout));
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_renderer_container_is_granted_nothing() {
+        // The whole security argument rests on this being empty. Capabilities
+        // are the holes deliberately left in an AppContainer, and one added by
+        // accident — a `with_known` call that looked harmless, a builder default
+        // that changed on a version bump — would not show up anywhere else.
+        //
+        // Derived rather than created: this needs no registry entry and no ACL
+        // rewrite, so running the test leaves nothing behind.
+        let sid = rappct::derive_sid_from_name(PROFILE_NAME).expect("derives the package SID");
+        let capabilities = SecurityCapabilitiesBuilder::new(&sid)
+            .build()
+            .expect("builds the capability set");
+        assert!(
+            capabilities.caps.is_empty(),
+            "the renderer container was granted {:?}",
+            capabilities.caps
+        );
+        assert!(
+            !capabilities.lpac,
+            "LPAC changes which capabilities are needed, so it is not a free upgrade"
+        );
+    }
 }
