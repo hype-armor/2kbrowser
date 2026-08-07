@@ -320,6 +320,12 @@ pub struct Rendered {
     pub links: Vec<Link>,
     /// Whether there is a fallback decision to overrule.
     pub can_toggle_layout: bool,
+    /// How many images were fetched and decoded for this page.
+    ///
+    /// A diagnostic rather than something the window uses: `2kbrowser render`
+    /// reports it, and a page that suddenly loads no images is how a broken
+    /// subresource path first shows itself.
+    pub images_loaded: u32,
 }
 
 impl ToParent {
@@ -353,6 +359,7 @@ impl ToParent {
                     writer.u32(link.group);
                 }
                 writer.some(page.can_toggle_layout);
+                writer.u32(page.images_loaded);
             }
             ToParent::Failed { message } => {
                 writer.tag(2);
@@ -405,6 +412,7 @@ impl ToParent {
                     });
                 }
                 let can_toggle_layout = reader.some()?;
+                let images_loaded = reader.u32()?;
                 // The pixel buffer has to match the dimensions it is labelled
                 // with, or every reader of it indexes out of bounds. Checked
                 // here rather than trusted, because the sender is the
@@ -425,6 +433,7 @@ impl ToParent {
                     title,
                     links,
                     can_toggle_layout,
+                    images_loaded,
                 }))
             }
             2 => ToParent::Failed {
@@ -472,6 +481,7 @@ mod tests {
                 group: 0,
             }],
             can_toggle_layout: true,
+            images_loaded: 3,
         }
     }
 

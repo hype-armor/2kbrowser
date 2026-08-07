@@ -46,6 +46,15 @@ Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and
 `background-position`.
 
+A page taller than about 20,000 rows is cut short — the canvas covers the whole
+document so scrolling costs a blit rather than a re-layout, and it has to fit in
+one frame so a compromised renderer cannot make the parent allocate without
+limit. The bar says "page too long — the end is not shown" and the scroll stops
+where the pixels stop, rather than running on into white that looks exactly like
+the document ending. Find and keyboard focus stop there too: a match counted in
+"3 of 7" that highlights nothing when you step to it is worse than one that was
+never offered. Banded rendering is the real fix and is not written.
+
 Links work in the window: click to follow, Alt+Left/Right or Backspace for
 back and forward, and the cursor changes over a link. `2kbrowser links <page>`
 prints every link rectangle and where it leads, and
@@ -92,10 +101,14 @@ that mutates the reference fixtures into the HTML parser, the CSS parser, image
 decoding, URL parsing, and the whole render pipeline; `cargo run -p fuzz` soaks
 for as long as you leave it. The first soak found three panics reachable from
 an ordinary stylesheet — `font-size: 0`, `font-size: 99999px`, and
-`margin: 1e40px` — each of which stopped the browser. All three are fixed, and
-each has a regression test where the bug was rather than where it surfaced.
+`margin: 1e40px` — each of which stopped the browser. A later one found a
+fourth: a glyph shifted far enough by its own run offset that the rectangle
+built for it left `i32`, which the check on the text origin did not catch
+because the origin was not where the glyph landed. All four are fixed, and each
+has a regression test where the bug was rather than where it surfaced.
 
-**The browser now renders in a separate process.** The parent keeps the chrome,
+**Everything renders in a separate process** — the window, `render`, and
+`links` alike. The parent keeps the chrome,
 the network, and the disk; a child parses, lays out, and rasterises, and asks
 for every image, stylesheet, and frame it wants rather than fetching them
 (ADR-0012). A page rendered across the boundary is byte-identical to one
@@ -112,25 +125,42 @@ compromised renderer cannot reach.
 The engine is of its era; nothing protecting it is (ADR-0013). TLS 1.0 and 1.1
 are refused outright — not marked, not per-site, not behind a confirmation — so
 old sites that offer nothing newer do not load, and that is the intended
-outcome. There is no relaxed-certificate escape hatch. Roots come from Mozilla
+outcome. The bar says so in those words rather than showing a network error: a
+refusal nobody can recognise is indistinguishable from a bug, and a bad
+certificate says something different again, because the two mean opposite
+things. There is no relaxed-certificate escape hatch. Roots come from Mozilla
 rather than the platform, so a corporate root in the system store cannot quietly
 read this browser's traffic. All of it is asserted in tests rather than
 inherited from a library default, because "happens to be true" does not survive
 a dependency bump.
 
-On Linux the renderer is also confined by a seccomp filter, applied before it
-reads its first frame: no sockets, no opening files, no starting processes. It
-still renders the era fixture byte-identically with all three of its images
-arriving over the pipe, which is the check that the filter did not quietly break
-the thing it protects. `2kbrowser --confine-selftest` makes the browser confine
-itself and report what it can still reach.
+The renderer is confined on Linux and Windows, by the two mechanisms those
+platforms actually have — which are not the same shape. On Linux the child
+installs a seccomp filter on itself before reading its first frame: no sockets,
+no opening files, no starting processes — and no io_uring, which is the entry
+that matters most, because a ring does opens and network I/O on the kernel side
+where a syscall filter cannot see them, and would otherwise be a way around
+every other denial in the list. On Windows the *parent* builds an
+AppContainer with no capabilities at all and launches the child into it, because
+there is no call a running process can make to put itself in one. Capabilities
+are the holes deliberately left in a container, and this one has none, which
+makes it the stronger of the two: seccomp here is a denylist, so a syscall
+nobody named is allowed. Both were reached without writing any `unsafe`
+(ADR-0014).
 
-> **Not safe for browsing untrusted sites.** On macOS and Windows the renderer
-> is a separate process but an otherwise unconfined one — the App Sandbox and
-> AppContainer equivalents are not implemented, and the child says so on stderr
-> rather than pretending. The Linux filter is a denylist, so a syscall nobody
-> named is allowed. Neither the parser fuzzing nor any of this has been reviewed
-> by anyone but its authors. Until that changes this is a tool for its authors.
+It still renders the era fixture byte-identically with all three of its images
+arriving over the pipe, which is the check that the sandbox did not quietly
+break the thing it protects. `2kbrowser --confine-selftest` confines a renderer
+and reports what it can still reach — from inside, because a sandbox that
+installs successfully and confines nothing would pass any check written from
+the outside.
+
+> **Not safe for browsing untrusted sites.** On macOS the renderer is a separate
+> process but an otherwise unconfined one — the App Sandbox equivalent is not
+> implemented, and the browser says so on stderr rather than pretending. The
+> Linux filter is a denylist, so a syscall nobody named is allowed. Neither the
+> parser fuzzing nor any of this has been reviewed by anyone but its authors.
+> Until that changes this is a tool for its authors.
 
 ## Building
 

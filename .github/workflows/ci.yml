@@ -68,3 +68,35 @@ jobs:
           sudo apt-get install -y -qq xvfb libxkbcommon-x11-0
           cargo build -p shell
           ./scripts/smoke-window.sh
+
+  # The syscall filter names syscalls by number, and syscall numbers are
+  # per-architecture. That made `crates/sandbox` quietly x86_64-only in two
+  # ways at once: `libc` has no `SYS_open` on aarch64 because Linux has none
+  # there, so the crate did not compile; and the architecture the filter was
+  # built for was named rather than taken from the target, which is worse than
+  # it sounds — seccompiler puts an architecture check at the head of the
+  # program and the mismatch branch is `SECCOMP_RET_KILL_PROCESS`, so an ARM
+  # renderer would have been killed on its next syscall.
+  #
+  # A cross-compile is enough to catch both. It is a check, not a build: no ARM
+  # machine is needed, and nothing here runs.
+  cross-arch:
+    name: cross-compile (linux-aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and cross linker
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      # The whole workspace, not just `sandbox`. The bug that prompted this was
+      # in `sandbox`, and the reason it existed — code written against one
+      # architecture's constants without anything ever compiling it for another
+      # — is not specific to that crate.
+      - name: Check
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo check --workspace --target aarch64-unknown-linux-gnu

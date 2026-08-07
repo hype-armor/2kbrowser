@@ -11,7 +11,7 @@
 
 use sandbox::child::{Fetched, Render};
 use sandbox::message::{Link, Mode, Rendered};
-use sandbox::{Error, Renderer, ToChild};
+use sandbox::{Error, ToChild};
 use text::FontStore;
 
 /// Loads subresources by asking the parent.
@@ -149,6 +149,7 @@ impl Render for PageRenderer {
                 })
                 .collect(),
             can_toggle_layout,
+            images_loaded: page.images_loaded as u32,
         };
         // Kept for the questions that come after: find, and re-rendering at a
         // new width without re-fetching anything.
@@ -202,29 +203,6 @@ pub fn run_child() -> Result<(), Error> {
     let mut input = stdin.lock();
     let mut output = stdout.lock();
     sandbox::child::serve(&mut input, &mut output, &mut PageRenderer::new())
-}
-
-/// Renders a document in a child process.
-///
-/// The parent's half, for callers that have already fetched the document.
-pub fn render_isolated(
-    body: Vec<u8>,
-    content_type: Option<String>,
-    width: u32,
-    max_height: u32,
-    origin: Option<net::Origin>,
-    path: String,
-    force_authored: bool,
-) -> Result<Rendered, Error> {
-    Renderer::new()?.render(
-        body,
-        content_type,
-        width,
-        max_height,
-        origin,
-        path,
-        force_authored,
-    )
 }
 
 #[cfg(test)]

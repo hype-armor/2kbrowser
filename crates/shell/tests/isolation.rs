@@ -245,13 +245,68 @@ fn dropping_a_session_kills_its_child() {
     let (first, _) = session("<body><p>x</p></body>", 200);
     drop(first);
 
-    // The proof that it is gone is that a fresh one still works — a leaked
-    // child would eventually exhaust the process table rather than fail here,
-    // so this checks the path is repeatable rather than the kill directly.
     for _ in 0..8 {
         let (live, page) = session("<body><p>x</p></body>", 200);
         assert!(page.width > 0);
         drop(live);
+    }
+}
+
+#[test]
+fn a_dropped_session_leaves_no_process_behind() {
+    // The version of the check above that actually looks. The one above proves
+    // the path is repeatable, which it said in its own comment, and a leaked
+    // renderer per navigation would pass it every time.
+    //
+    // Worth its own test now because the two platforms kill by completely
+    // different means. On Unix the parent calls `kill` and reaps. On Windows it
+    // does not: the child is in a job object created with
+    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and what kills it is the job handle
+    // closing when the session drops. Nothing in the shared code path would
+    // notice if that stopped working.
+    let (live, _) = session("<body><p>x</p></body>", 200);
+    let pid = live.child_id();
+    assert!(alive(pid), "the renderer was not running to begin with");
+    drop(live);
+
+    // A moment for the kernel to finish with it. Windows tears down a job
+    // asynchronously, so an immediate check can still see the process.
+    for _ in 0..50 {
+        if !alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("renderer {pid} was still running a second after its session was dropped");
+}
+
+/// Whether a process id belongs to something still running.
+///
+/// Asked of the operating system rather than of our own bookkeeping, which is
+/// the whole point: our bookkeeping is what is on trial.
+fn alive(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // `tasklist` prints a header and a row when it matches, and a single
+        // "INFO: No tasks..." line when it does not.
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("tasklist runs");
+        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Signal 0 checks for existence without delivering anything. A reaped
+        // child is gone; a zombie would still answer, which is exactly the leak
+        // worth catching, since the parent is supposed to `wait` as well as
+        // `kill`.
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .expect("kill runs")
+            .status
+            .success()
     }
 }
 
@@ -371,35 +426,80 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn the_renderer_cannot_open_a_socket_or_a_file() {
     // The only honest way to test a sandbox is from inside it: a filter that
     // installs successfully and blocks nothing would pass any test written from
-    // outside. So the binary applies its own confinement and reports.
+    // outside. So the binary confines and reports from within.
+    //
+    // Both mechanisms answer here. On Linux the process filters itself; on
+    // Windows it builds an AppContainer and runs the probes in a child, because
+    // there is no call a process can make to put *itself* in one.
     let output = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
         .arg(sandbox::confine::SELFTEST_ARGUMENT)
         .output()
         .expect("the selftest runs");
     let report = String::from_utf8_lossy(&output.stdout);
 
-    // Skipped rather than failed where seccomp is unavailable — an old kernel,
-    // or a container that forbids installing a filter. A check that cannot run
-    // must not look like a check that passed, so it says so.
+    // Skipped rather than failed where the sandbox is unavailable — an old
+    // kernel, a container that forbids installing a filter, macOS. A check that
+    // cannot run must not look like a check that passed, so it says so.
     if report.contains("confinement=Failed") || report.contains("confinement=Unavailable") {
-        eprintln!("SKIP: seccomp is not available here\n{report}");
+        eprintln!("SKIP: no sandbox is available here\n{report}");
         return;
     }
 
-    assert!(report.contains("confinement=Seccomp"), "{report}");
-    assert!(
-        report.contains("socket=PermissionDenied"),
+    let expected = if cfg!(target_os = "windows") {
+        "confinement=AppContainer"
+    } else {
+        "confinement=Seccomp"
+    };
+    assert!(report.contains(expected), "{report}");
+
+    let field = |name: &str| {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no `{name}` line in:\n{report}"))
+            .to_owned()
+    };
+
+    // First: were the probes aimed at the things the parent prepared? Both
+    // previous versions of this check failed here rather than at the assertions
+    // below — a path that did not exist on the far side, and then a temp
+    // directory an AppContainer silently redirects. A refusal is only evidence
+    // if the thing refused was really there.
+    assert_eq!(
+        field("port="),
+        field("expect-port="),
+        "the probe connected somewhere else:\n{report}"
+    );
+    assert_eq!(
+        field("file-path="),
+        field("expect-file="),
+        "the probe opened something else:\n{report}"
+    );
+
+    // Something is listening on that port, so `OPENED` is the one outcome that
+    // proves the network was reachable, and nothing else is ambiguous with it.
+    // A port with nothing behind it would not do: an AppContainer's network
+    // block is enforced by the firewall, which resets rather than failing the
+    // call, so blocked and dead both read as `ConnectionRefused`.
+    //
+    // Worth being precise about what this covers on Windows: loopback and
+    // outbound are separate AppContainer rules, and only loopback can be probed
+    // without reaching the internet from a test. What rules out outbound is the
+    // capability set being empty, which `sandbox::contain` asserts directly.
+    let socket = field("socket=");
+    assert_ne!(
+        socket, "OPENED",
         "the renderer could still reach the network:\n{report}"
     );
-    assert!(
-        report.contains("file=PermissionDenied"),
+    let file = field("file=");
+    assert_ne!(
+        file, "OPENED",
         "the renderer could still open a file:\n{report}"
     );
-    // And it is still able to do its actual job, which a filter that broke
+    // And it is still able to do its actual job, which a sandbox that broke
     // everything would also satisfy the two assertions above.
     assert!(report.contains("compute=55"), "{report}");
 }
@@ -454,5 +554,222 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
         page.pixels(),
         direct.pixmap.data(),
         "a confined renderer produced different pixels"
+    );
+}
+
+#[test]
+fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
+    // The one limitation of the process boundary a reader can actually hit.
+    // The canvas covers the whole document so scrolling costs a blit, and it
+    // has to fit in one frame so a compromised renderer cannot make the parent
+    // allocate without limit — about 20,000 rows at 800 pixels wide. Past that
+    // the page simply stopped, with white below it, indistinguishable from the
+    // document ending.
+    //
+    // Provoked with a small canvas rather than a 20,000-row document: the
+    // property is "content taller than canvas", and rendering twenty thousand
+    // rows to assert it would cost seconds for nothing.
+    let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall.html");
+    let html = format!("<body>{}</body>", "<p>line</p>".repeat(200));
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let document = shell::viewport::Document {
+        body: html.as_bytes().to_vec(),
+        content_type: None,
+        origin,
+        path: at,
+    };
+
+    let tall = shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false)
+        .expect("the page opens");
+    assert!(
+        tall.content_height() > tall.height() as f32,
+        "the fixture was not tall enough to be clipped: {} content, {} canvas",
+        tall.content_height(),
+        tall.height()
+    );
+    assert!(tall.is_truncated());
+    // And the scroll stops where the pixels stop, rather than running on into
+    // rows that were never rendered.
+    assert_eq!(tall.scrollable_height(), tall.height() as f32);
+
+    // The same document with room for all of it is not truncated, which is what
+    // makes the assertion above about the page rather than about the type.
+    let whole = shell::viewport::Viewport::open(&renderer, document, 400, 20_000, false)
+        .expect("the page opens");
+    assert!(
+        !whole.is_truncated(),
+        "{} content, {} canvas",
+        whole.content_height(),
+        whole.height()
+    );
+}
+
+#[test]
+fn a_truncated_page_offers_no_matches_or_links_it_cannot_show() {
+    // A page cut off at the canvas still *has* text and links below the cut —
+    // the child holds the whole box tree and answers from it. Passing those on
+    // would give the reader "3 of 7" where four of the seven highlight nothing
+    // when stepped to, and links that take keyboard focus and are outlined
+    // nowhere.
+    let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall-links.html");
+    let html = format!(
+        "<body>{}</body>",
+        "<p><a href=\"a.html\">needle</a></p>".repeat(200)
+    );
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let document = shell::viewport::Document {
+        body: html.as_bytes().to_vec(),
+        content_type: None,
+        origin,
+        path: at,
+    };
+
+    let mut whole =
+        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 20_000, false)
+            .expect("the page opens");
+    assert!(!whole.is_truncated());
+    let (all_matches, all_links) = (whole.find("needle").len(), whole.links().len());
+    assert_eq!(all_matches, 200, "the fixture should match once per line");
+    assert_eq!(all_links, 200);
+
+    let mut cut = shell::viewport::Viewport::open(&renderer, document, 400, 300, false)
+        .expect("the page opens");
+    assert!(cut.is_truncated());
+
+    let canvas = cut.height() as f32;
+    let matches = cut.find("needle");
+    assert!(
+        matches.len() < all_matches && !matches.is_empty(),
+        "expected some but not all of {all_matches} matches, got {}",
+        matches.len()
+    );
+    for rect in &matches {
+        assert!(rect.y < canvas, "a match at {} is off the canvas", rect.y);
+    }
+
+    let links = cut.links();
+    assert!(
+        links.len() < all_links && !links.is_empty(),
+        "expected some but not all of {all_links} links, got {}",
+        links.len()
+    );
+    for link in &links {
+        for rect in &link.rects {
+            assert!(rect.y < canvas, "a link at {} is off the canvas", rect.y);
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_render_command_parses_in_a_child_rather_than_in_itself() {
+    // `render` and `links` used to parse and lay out in the calling process,
+    // which made ADR-0012 a property of the window rather than of the browser.
+    // Nothing failed when they did — the pixels are identical either way, which
+    // is exactly why this needs checking directly rather than through output.
+    //
+    // Linux only, because `/proc/<pid>/task/<pid>/children` is an exact answer
+    // and `ps` is a guess. Elsewhere this says it did not run rather than
+    // passing quietly.
+    let out = std::env::temp_dir().join("2kbrowser-cli-isolation.png");
+    let mut process = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
+        .args(["render", "../../tests/ref/fixtures/era-page.html"])
+        .arg("--out")
+        .arg(&out)
+        // Wide and tall, so the render takes long enough to be watched. A
+        // faster machine makes this shorter; the poll below is fine either way,
+        // because it only has to see the child once out of hundreds of looks.
+        .args(["--width", "2000", "--height", "8000"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the render command starts");
+
+    let children = format!("/proc/{pid}/task/{pid}/children", pid = process.id());
+    let mut saw_a_child = false;
+    loop {
+        if let Ok(listed) = std::fs::read_to_string(&children)
+            && !listed.trim().is_empty()
+        {
+            saw_a_child = true;
+            break;
+        }
+        match process.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+    let status = process.wait().expect("reaps");
+    assert!(status.success(), "the render itself failed");
+    assert!(
+        saw_a_child,
+        "`2kbrowser render` never spawned a renderer — it parsed the page itself"
+    );
+}
+
+#[test]
+fn renderers_built_at_the_same_time_all_start() {
+    // Windows builds the sandbox in the parent: an AppContainer profile in the
+    // registry, and a grant on the executable's DACL so the container can read
+    // the binary it is meant to run. Doing that from several threads while
+    // other threads launch processes from the same executable made
+    // `CreateProcessW` fail — two tests out of seventeen, on a run whose code
+    // had been green the time before.
+    //
+    // It was found by luck, so it is worth looking for on purpose: a race that
+    // only appears when the schedule interleaves the right two operations is
+    // one that comes back and gets dismissed as flakiness.
+    //
+    // On Linux this costs a few child processes and asserts nothing new, which
+    // is the right price for a check that only fails on the platform it is
+    // about.
+    let threads: Vec<_> = (0..6)
+        .map(|index| {
+            std::thread::spawn(move || {
+                let renderer = sandbox::Renderer::with_program(std::path::PathBuf::from(env!(
+                    "CARGO_BIN_EXE_2kbrowser"
+                )));
+                renderer
+                    .render(
+                        format!("<body><p>thread {index}</p></body>").into_bytes(),
+                        None,
+                        200,
+                        400,
+                        None,
+                        String::new(),
+                        false,
+                    )
+                    .map(|page| page.width)
+                    .map_err(|error| format!("thread {index}: {error}"))
+            })
+        })
+        .collect();
+
+    let outcomes: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("the thread does not panic"))
+        .collect();
+    let failures: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} concurrent renderers failed to start: {failures:?}",
+        failures.len(),
+        outcomes.len()
     );
 }

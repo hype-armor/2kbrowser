@@ -6,9 +6,8 @@
 
 use std::process::ExitCode;
 
-use shell::{render, window};
-
-use text::FontStore;
+use shell::viewport::Viewport;
+use shell::window;
 
 const USAGE: &str = "\
 2kbrowser — a web browser without the slop
@@ -52,6 +51,13 @@ fn main() -> ExitCode {
         // only honest way to test a sandbox is from inside one.
         Some(sandbox::confine::SELFTEST_ARGUMENT) => {
             println!("{}", sandbox::confine::selftest());
+            ExitCode::SUCCESS
+        }
+        // The far half of the self-test, for platforms where the confinement is
+        // applied from outside and so cannot be applied by the process running
+        // the probes. Not in the usage text: the self-test runs this on itself.
+        Some(sandbox::confine::SELFTEST_PROBE_ARGUMENT) => {
+            println!("{}", sandbox::confine::selftest_probe(&args[1..]));
             ExitCode::SUCCESS
         }
         Some(sandbox::CHILD_ARGUMENT) => match shell::isolated::run_child() {
@@ -159,18 +165,17 @@ impl Options {
 fn run_links(args: &[String]) -> Result<String, String> {
     let options = Options::parse(args)?;
     let input = options.input.ok_or("no input given")?;
-    let resource = load(&input)?;
+    let page = render_in_child(&input, options.width, options.height)?;
 
-    let mut fonts = FontStore::new();
-    let page = render::render_with_base(
-        &resource.body,
-        options.width,
-        options.height,
-        &mut fonts,
-        Some((&resource.origin, &resource.path)),
-    );
-
-    let links = page.links();
+    let links: Vec<(layout::Rect, String)> = page
+        .links()
+        .into_iter()
+        .flat_map(|link| {
+            link.rects
+                .into_iter()
+                .map(move |rect| (rect, link.url.clone()))
+        })
+        .collect();
     if links.is_empty() {
         return Ok("no links on this page".to_owned());
     }
@@ -215,42 +220,34 @@ fn run_render(args: &[String]) -> Result<String, String> {
     let (width, height) = (options.width, options.height);
 
     let input = options.input.ok_or("no input given")?;
-    let resource = load(&input)?;
+    let page = render_in_child(&input, width, height)?;
 
-    let mut fonts = FontStore::new();
-    let page = render::render_with_base(
-        &resource.body,
-        width,
-        height,
-        &mut fonts,
-        Some((&resource.origin, &resource.path)),
-    );
-    page.pixmap
+    let pixmap = page
+        .to_pixmap()
+        .ok_or_else(|| format!("{output}: the renderer returned an unusable canvas"))?;
+    pixmap
         .save_png(&output)
         .map_err(|e| format!("{output}: {e}"))?;
 
-    let mut message = format!(
-        "wrote {output} ({}x{})",
-        page.pixmap.width(),
-        page.pixmap.height()
-    );
-    if page.images_loaded > 0 {
-        message.push_str(&format!(", {} image(s)", page.images_loaded));
+    let mut message = format!("wrote {output} ({}x{})", page.width(), page.height());
+    if page.images_loaded() > 0 {
+        message.push_str(&format!(", {} image(s)", page.images_loaded()));
     }
-    if page.content_height.ceil() as u32 > page.pixmap.height() {
+    if page.is_truncated() {
         message.push_str(&format!(
-            "\nnote: page is {}px tall; output was clipped to --height",
-            page.content_height.ceil() as u32
+            "\nnote: page is {}px tall; output was clipped to {}px",
+            page.content_height().ceil() as u32,
+            page.height()
         ));
     }
     // ADR-0009 forbids switching rendering mode silently. With no chrome to
     // show a banner in, the CLI says it here.
-    if let Some(explanation) = page.mode.explanation() {
+    if let Some(explanation) = page.mode().explanation() {
         message.push('\n');
         message.push_str(&explanation);
     }
     // ADR-0006: plain HTTP is allowed but must never be presented as secure.
-    if resource.origin.scheme == net::Scheme::Http {
+    if page.origin().scheme == net::Scheme::Http {
         message.push_str(
             "\nnote: loaded over plain HTTP — not authenticated, and modifiable in transit",
         );
@@ -258,19 +255,50 @@ fn run_render(args: &[String]) -> Result<String, String> {
     Ok(message)
 }
 
-/// Loads the target, accepting a URL or a bare filesystem path.
+/// Fetches a page and renders it in a renderer child.
+///
+/// The command line used to parse and lay out in this process, which made
+/// ADR-0012 a property of the window rather than of the browser: `2kbrowser
+/// render https://example.com` would fetch a stranger's HTML and hand it
+/// straight to the parsers, in the process holding the network and the disk.
+/// The child is the same binary and the same confinement the window gets.
+///
+/// The canvas is capped at what one frame can carry, so a `--height` past that
+/// is a clipped page with a note rather than a renderer that cannot answer.
+fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, String> {
+    let (resource, _) = load_from(input)?;
+    let renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
+    if !renderer.confinement().is_confined() {
+        eprintln!("2kbrowser: {}", renderer.confinement().describe());
+        if let Some(reason) = renderer.confinement_failure() {
+            eprintln!("2kbrowser: {reason}");
+        }
+    }
+    Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            // Raw bytes, not decoded text: the encoding sniffer lives on the
+            // far side with every other parser.
+            body: resource.bytes,
+            content_type: None,
+            origin: resource.origin,
+            path: resource.path,
+        },
+        width,
+        height.min(sandbox::max_canvas_height(width)),
+        false,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Loads the target, accepting a URL or a bare filesystem path, and reports the
+/// absolute URL it settled on.
 ///
 /// A bare path is a convenience, resolved to an absolute `file:` URL so that
 /// everything downstream sees one representation and the policy has an origin
-/// to judge subresources against.
-fn load(input: &str) -> Result<net::Resource, String> {
-    load_from(input).map(|(resource, _)| resource)
-}
-
-/// Fetches, and reports the absolute URL it settled on.
-///
-/// The window needs that URL: it is the first history entry, and every
-/// relative link on the page is resolved against it.
+/// to judge subresources against. The window needs the URL as well: it is the
+/// first history entry, and every relative link on the page resolves against
+/// it.
 fn load_from(input: &str) -> Result<(net::Resource, String), String> {
     let fetcher = net::Fetcher::default();
     let url = absolute_url(input)?;

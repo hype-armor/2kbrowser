@@ -62,6 +62,22 @@ pub struct Document {
     pub path: String,
 }
 
+/// Whether a rectangle has any pixels on a canvas this tall.
+///
+/// A page taller than one frame is rendered up to the canvas and no further
+/// ([`Viewport::is_truncated`]), and everything past that has no pixels at all.
+/// Offering it anyway is worse than leaving it out: a find match down there
+/// would be counted in "3 of 7" and then highlight nothing when stepped to, and
+/// a link down there would take keyboard focus and be outlined nowhere. Neither
+/// is something the reader can act on.
+///
+/// The *top* of the rectangle is what decides it, so something straddling the
+/// bottom edge counts — part of it is visible, and that part is worth
+/// highlighting.
+fn on_canvas(rect: &Rect, canvas_height: f32) -> bool {
+    rect.y < canvas_height
+}
+
 /// A page held by a live renderer.
 pub struct Viewport {
     session: sandbox::Session,
@@ -111,9 +127,55 @@ impl Viewport {
         self.page.height
     }
 
+    /// How many images were fetched and decoded for this page.
+    pub fn images_loaded(&self) -> u32 {
+        self.page.images_loaded
+    }
+
+    /// The canvas as a pixmap, for saving.
+    ///
+    /// Rebuilt from the bytes that crossed the pipe rather than sent as one:
+    /// the message carries premultiplied RGBA and its dimensions, and
+    /// `ToParent::decode` has already checked that `width * height * 4` is
+    /// exactly how many bytes arrived — so this cannot be handed a buffer that
+    /// does not match its label.
+    pub fn to_pixmap(&self) -> Option<paint::Pixmap> {
+        let size = paint::IntSize::from_wh(self.page.width, self.page.height)?;
+        paint::Pixmap::from_vec(self.page.pixels.clone(), size)
+    }
+
     /// Height of the content, which may exceed the canvas.
     pub fn content_height(&self) -> f32 {
         self.page.content_height
+    }
+
+    /// How far the page can be scrolled, in pixels of canvas.
+    ///
+    /// The canvas rather than the content, which are the same number for every
+    /// page short enough. Beyond the canvas there is nothing to show — the blit
+    /// fills white — so scrolling there is scrolling into a void that looks like
+    /// the document ending. Better to stop where the pixels stop and say why.
+    pub fn scrollable_height(&self) -> f32 {
+        self.page.height as f32
+    }
+
+    /// Whether the document is taller than the canvas it was rendered onto.
+    ///
+    /// The frame bound in [`sandbox::max_canvas_height`] made this reachable:
+    /// one canvas covers the whole document so scrolling costs a blit, and one
+    /// frame is bounded so a compromised renderer cannot make the parent
+    /// allocate without limit. About 20,000 rows at 800 pixels wide.
+    ///
+    /// Rounded up before comparing, because the canvas is a whole number of
+    /// rows and the content height is not — a page 400.5 pixels tall gets a
+    /// 401-row canvas and is not truncated.
+    pub fn is_truncated(&self) -> bool {
+        self.page.content_height.ceil() > self.page.height as f32
+    }
+
+    /// Where the document came from.
+    pub fn origin(&self) -> &net::Origin {
+        &self.document.origin
     }
 
     /// The page's title, when it had one.
@@ -151,7 +213,13 @@ impl Viewport {
     pub fn links(&self) -> Vec<Link> {
         let mut out: Vec<Link> = Vec::new();
         let mut groups: Vec<u32> = Vec::new();
-        for link in &self.page.links {
+        let height = self.page.height as f32;
+        for link in self
+            .page
+            .links
+            .iter()
+            .filter(|link| on_canvas(&link.rect, height))
+        {
             match groups.iter().position(|group| *group == link.group) {
                 Some(at) => out[at].rects.push(link.rect),
                 None => {
@@ -187,7 +255,13 @@ impl Viewport {
 
     /// Where `query` appears, asked of the child holding the page.
     pub fn find(&mut self, query: &str) -> Vec<Rect> {
-        self.session.find(query).unwrap_or_default()
+        let height = self.page.height as f32;
+        self.session
+            .find(query)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rect| on_canvas(rect, height))
+            .collect()
     }
 
     /// Re-renders at a new width, in the same child.

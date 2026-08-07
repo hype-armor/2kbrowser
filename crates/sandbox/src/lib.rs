@@ -18,14 +18,17 @@
 //! containment, hang killing — which is the gap `tests/fuzz` recorded when it
 //! landed — and a bound on how much memory one page can take with it.
 //!
-//! Applying the OS sandbox primitives is *not* here yet. Until it is, a child
-//! is an ordinary process that happens to be separate, and an exploit inside it
-//! is contained only in the sense that it cannot reach the parent's memory. The
-//! README says so; it must keep saying so until seccomp, Seatbelt, and
-//! AppContainer are actually applied.
+//! Applying the OS sandbox primitives is here too, and it is two modules rather
+//! than one because the platforms disagree about who does it. [`confine`] is the
+//! child taking privileges away from itself, which is what seccomp is;
+//! [`contain`] is the parent building a container the child is launched into,
+//! which is what an AppContainer is. macOS has neither yet, and says so rather
+//! than pretending.
 
 pub mod child;
 pub mod confine;
+#[cfg(target_os = "windows")]
+pub mod contain;
 pub mod message;
 pub mod parent;
 pub mod wire;
@@ -113,7 +116,7 @@ impl From<WireError> for Error {
 ///
 /// Flushed rather than left to the buffer: the other end is blocked waiting for
 /// this, so a frame sitting in a buffer is a deadlock rather than a delay.
-pub fn write_frame(to: &mut impl Write, frame: &[u8]) -> Result<(), Error> {
+pub fn write_frame(to: &mut (impl Write + ?Sized), frame: &[u8]) -> Result<(), Error> {
     if frame.len() > MAX_FRAME {
         return Err(Error::Wire(WireError::BadLength));
     }
@@ -129,7 +132,7 @@ pub fn write_frame(to: &mut impl Write, frame: &[u8]) -> Result<(), Error> {
 /// This is the first thing either side does with bytes the other side chose, so
 /// it is the first place a four-byte field must not be able to ask for four
 /// gigabytes.
-pub fn read_frame(from: &mut impl Read) -> Result<Vec<u8>, Error> {
+pub fn read_frame(from: &mut (impl Read + ?Sized)) -> Result<Vec<u8>, Error> {
     let mut header = [0u8; 4];
     match from.read_exact(&mut header) {
         Ok(()) => {}
