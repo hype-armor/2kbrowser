@@ -568,6 +568,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
         .encode(),
         sandbox::ToChild::Resource {
             body: vec![0x89, b'P', b'N', b'G'],
+            content_type: None,
             ok: true,
         }
         .encode(),

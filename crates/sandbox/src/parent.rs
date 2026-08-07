@@ -181,9 +181,14 @@ impl Renderer {
     /// for.
     fn fetch(&self, url: &str, document: Option<&Origin>, kind: RequestKind) -> ToChild {
         match self.fetcher.fetch_bytes(url, document, kind) {
-            Ok(body) => ToChild::Resource { body, ok: true },
+            Ok(body) => ToChild::Resource {
+                body,
+                content_type: None,
+                ok: true,
+            },
             Err(_) => ToChild::Resource {
                 body: Vec::new(),
+                content_type: None,
                 ok: false,
             },
         }

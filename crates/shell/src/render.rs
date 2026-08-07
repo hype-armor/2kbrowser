@@ -177,6 +177,66 @@ impl Link {
     }
 }
 
+/// Where a page's subresources come from.
+///
+/// Rendering used to reach for a [`Fetcher`] wherever it wanted a stylesheet,
+/// an image, or a frame. That is fine in a single process and impossible in
+/// two: ADR-0012 puts rendering in a child with no sockets, so every one of
+/// those has to become a request the parent decides on.
+///
+/// A parameter rather than two code paths. The reference tests and the
+/// command line render in-process with a [`DirectLoader`]; the child renders
+/// with one that goes over a pipe. Same rendering code either way, which is
+/// the point — a second path would be the one that drifts.
+pub trait Loader {
+    /// Fetches a subresource, or `None` when it could not be had.
+    ///
+    /// Deliberately opaque about *why* not. Refused by policy, missing, and
+    /// unreachable are one answer here, because rendering behaves identically
+    /// for all three and because telling the untrusted side which would leak
+    /// the parent's configuration to it.
+    fn load(&mut self, url: &str, document: Option<&Origin>, kind: RequestKind) -> Option<Loaded>;
+}
+
+/// A fetched subresource.
+#[derive(Debug, Clone, Default)]
+pub struct Loaded {
+    /// The bytes.
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` it was served with, when there was one.
+    ///
+    /// Carried because a stylesheet's character set can come from the header,
+    /// and losing it would silently change how a legacy stylesheet decodes.
+    pub content_type: Option<String>,
+}
+
+impl Loaded {
+    /// The bytes decoded as text, the way a document body is.
+    fn text(&self) -> String {
+        let (text, ..) = net::encoding::decode_document(&self.bytes, self.content_type.as_deref());
+        text
+    }
+}
+
+/// Loads subresources in this process, subject to the network policy.
+///
+/// What the command line and the reference tests use. The browser itself does
+/// not: its rendering happens in a child that has no network at all.
+#[derive(Debug, Default)]
+pub struct DirectLoader {
+    fetcher: Fetcher,
+}
+
+impl Loader for DirectLoader {
+    fn load(&mut self, url: &str, document: Option<&Origin>, kind: RequestKind) -> Option<Loaded> {
+        let resource = self.fetcher.fetch(url, document, kind).ok()?;
+        Some(Loaded {
+            bytes: resource.bytes,
+            content_type: None,
+        })
+    }
+}
+
 /// Renders HTML at a given viewport width.
 ///
 /// `max_height` bounds the canvas so that a pathological page cannot allocate
@@ -196,7 +256,37 @@ pub fn render_with_base(
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
-    render_sized(html, width, max_height, Settings::default(), fonts, base)
+    render_with_base_and_loader(
+        html,
+        width,
+        max_height,
+        fonts,
+        &mut DirectLoader::default(),
+        base,
+    )
+}
+
+/// The same, with the caller supplying where subresources come from.
+///
+/// What the renderer child uses: its loader goes over a pipe to the parent
+/// rather than to a socket (ADR-0012).
+pub fn render_with_base_and_loader(
+    html: &str,
+    width: u32,
+    max_height: u32,
+    fonts: &mut FontStore,
+    loader: &mut dyn Loader,
+    base: Option<(&Origin, &str)>,
+) -> Page {
+    render_sized(
+        html,
+        width,
+        max_height,
+        Settings::default(),
+        fonts,
+        loader,
+        base,
+    )
 }
 
 /// Renders HTML into a canvas of exactly `height`, whatever the content needs.
@@ -213,6 +303,25 @@ pub fn render_in_viewport(
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
+    render_in_viewport_with(
+        html,
+        width,
+        height,
+        fonts,
+        &mut DirectLoader::default(),
+        base,
+    )
+}
+
+/// The same, with the caller supplying where subresources come from.
+fn render_in_viewport_with(
+    html: &str,
+    width: u32,
+    height: u32,
+    fonts: &mut FontStore,
+    loader: &mut dyn Loader,
+    base: Option<(&Origin, &str)>,
+) -> Page {
     render_sized(
         html,
         width,
@@ -222,6 +331,7 @@ pub fn render_in_viewport(
             ..Settings::default()
         },
         fonts,
+        loader,
         base,
     )
 }
@@ -239,6 +349,25 @@ pub fn render_as_authored(
     fonts: &mut FontStore,
     base: Option<(&Origin, &str)>,
 ) -> Page {
+    render_as_authored_with(
+        html,
+        width,
+        max_height,
+        fonts,
+        &mut DirectLoader::default(),
+        base,
+    )
+}
+
+/// The same, with the caller supplying where subresources come from.
+pub fn render_as_authored_with(
+    html: &str,
+    width: u32,
+    max_height: u32,
+    fonts: &mut FontStore,
+    loader: &mut dyn Loader,
+    base: Option<(&Origin, &str)>,
+) -> Page {
     render_sized(
         html,
         width,
@@ -248,6 +377,7 @@ pub fn render_as_authored(
             ..Settings::default()
         },
         fonts,
+        loader,
         base,
     )
 }
@@ -267,6 +397,7 @@ fn render_sized(
     max_height: u32,
     settings: Settings,
     fonts: &mut FontStore,
+    loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
 ) -> Page {
     let doc = dom::parse(html);
@@ -277,10 +408,12 @@ fn render_sized(
     if let Some(frameset) = doc.find_element("frameset")
         && let Some((origin, path)) = base
     {
-        return render_frameset(&doc, frameset, width, max_height, fonts, origin, path, 0);
+        return render_frameset(
+            &doc, frameset, width, max_height, fonts, loader, origin, path, 0,
+        );
     }
 
-    let author_sheets = collect_stylesheets(&doc, base);
+    let author_sheets = collect_stylesheets(&doc, loader, base);
     let styles = css::cascade::cascade(&doc, &author_sheets);
 
     // Classify before laying out: if the page needs layout we do not implement,
@@ -308,7 +441,9 @@ fn render_sized(
     // discards the author's layout, and pulling in its images with it would
     // spend requests on decoration nobody is going to see.
     let images = match (&mode, base) {
-        (RenderMode::Authored, Some((origin, path))) => load_images(&doc, &styles, origin, path),
+        (RenderMode::Authored, Some((origin, path))) => {
+            load_images(&doc, &styles, loader, origin, path)
+        }
         _ => ImageStore::new(),
     };
     // Only content images have an intrinsic size layout cares about: a
@@ -394,7 +529,7 @@ const DEFAULT_FRAMESET_HEIGHT: u32 = 600;
 /// Renders a frameset by rendering each frame and compositing the results.
 #[expect(
     clippy::too_many_arguments,
-    reason = "render context, threaded explicitly for clarity"
+    reason = "a frame's rendering context, threaded explicitly for clarity"
 )]
 fn render_frameset(
     doc: &dom::Document,
@@ -402,6 +537,7 @@ fn render_frameset(
     width: u32,
     max_height: u32,
     fonts: &mut FontStore,
+    loader: &mut dyn Loader,
     origin: &Origin,
     path: &str,
     depth: usize,
@@ -430,7 +566,6 @@ fn render_frameset(
         })
         .collect();
 
-    let fetcher = Fetcher::default();
     let mut loaded = 0usize;
     let mut frames: Vec<Frame> = Vec::new();
 
@@ -453,6 +588,7 @@ fn render_frameset(
                 cell_width as u32,
                 cell_height as u32,
                 fonts,
+                loader,
                 origin,
                 path,
                 depth + 1,
@@ -464,19 +600,26 @@ fn render_frameset(
             let url = net::resolve(origin, path, src);
             // A frame is a navigation to another document, not a subresource,
             // so it is not subject to the third-party rule (ADR-0006).
-            let Ok(resource) = fetcher.fetch(&url, None, RequestKind::Navigation) else {
+            let Some(resource) = loader.load(&url, None, RequestKind::Navigation) else {
                 continue;
             };
             if depth + 1 > MAX_FRAME_DEPTH {
                 continue;
             }
+            // The frame's own origin, resolved from the URL rather than
+            // reported by the loader: a loader on the far side of a process
+            // boundary is not a thing to take an origin from.
+            let Ok((frame_origin, frame_path)) = net::parse_url(&url) else {
+                continue;
+            };
             loaded += 1;
-            render_in_viewport(
-                &resource.body,
+            render_in_viewport_with(
+                &resource.text(),
                 cell_width as u32,
                 cell_height as u32,
                 fonts,
-                Some((&resource.origin, &resource.path)),
+                loader,
+                Some((&frame_origin, &frame_path)),
             )
         };
 
@@ -519,10 +662,10 @@ fn render_frameset(
 fn load_images(
     doc: &dom::Document,
     styles: &css::cascade::StyleMap,
+    loader: &mut dyn Loader,
     origin: &Origin,
     path: &str,
 ) -> ImageStore {
-    let fetcher = Fetcher::default();
     let mut store = ImageStore::new();
     let mut cache: std::collections::HashMap<String, Option<paint::DecodedImage>> =
         std::collections::HashMap::new();
@@ -530,18 +673,21 @@ fn load_images(
     // The same image often appears many times on a page — a tile appears on
     // every cell of a table — so fetching each URL once matters more here than
     // usual, since every fetch is synchronous.
-    let load = |url: &str, cache: &mut std::collections::HashMap<_, _>| {
-        cache
-            .entry(url.to_owned())
-            .or_insert_with(|| {
-                // Subresource, so ADR-0006's third-party rule applies.
-                let bytes = fetcher
-                    .fetch_bytes(url, Some(origin), RequestKind::Subresource)
-                    .ok()?;
-                paint::decode(&bytes)
-            })
-            .clone()
-    };
+    let load =
+        |url: &str,
+         loader: &mut dyn Loader,
+         cache: &mut std::collections::HashMap<String, Option<paint::DecodedImage>>| {
+            if let Some(hit) = cache.get(url) {
+                return hit.clone();
+            }
+            // Subresource, so ADR-0006's third-party rule applies — wherever the
+            // loader chooses to apply it.
+            let decoded = loader
+                .load(url, Some(origin), RequestKind::Subresource)
+                .and_then(|resource| paint::decode(&resource.bytes));
+            cache.insert(url.to_owned(), decoded.clone());
+            decoded
+        };
 
     for node in doc.descendants(doc.root()) {
         let Some(element) = doc.element(node) else {
@@ -551,7 +697,7 @@ fn load_images(
             && let Some(src) = element.attr("src")
         {
             let url = net::resolve(origin, path, src);
-            if let Some(image) = load(&url, &mut cache) {
+            if let Some(image) = load(&url, loader, &mut cache) {
                 store.insert(paint::ImageKey::content(node), image);
             }
         }
@@ -560,7 +706,7 @@ fn load_images(
             .and_then(|style| style.background_image.as_deref())
         {
             let url = net::resolve(origin, path, source);
-            if let Some(image) = load(&url, &mut cache) {
+            if let Some(image) = load(&url, loader, &mut cache) {
                 store.insert(paint::ImageKey::background(node), image);
             }
         }
@@ -586,7 +732,7 @@ const MAX_IMPORT_DEPTH: usize = 4;
 fn push_with_imports(
     sheets: &mut Vec<Stylesheet>,
     sheet: Stylesheet,
-    fetcher: &Fetcher,
+    loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
     depth: usize,
 ) {
@@ -595,16 +741,20 @@ fn push_with_imports(
     {
         for href in &sheet.imports {
             let url = net::resolve(origin, path, href);
-            let Ok(resource) = fetcher.fetch(&url, Some(origin), RequestKind::Subresource) else {
+            let Some(resource) = loader.load(&url, Some(origin), RequestKind::Subresource) else {
                 continue;
             };
             // The imported sheet's own imports resolve against *it*, not
-            // against whatever imported it.
+            // against whatever imported it — and its origin comes from the URL
+            // we asked for rather than from whatever answered.
+            let Ok((sheet_origin, sheet_path)) = net::parse_url(&url) else {
+                continue;
+            };
             push_with_imports(
                 sheets,
-                Stylesheet::parse(&resource.body),
-                fetcher,
-                Some((&resource.origin, &resource.path)),
+                Stylesheet::parse(&resource.text()),
+                loader,
+                Some((&sheet_origin, &sheet_path)),
                 depth + 1,
             );
         }
@@ -630,8 +780,11 @@ fn is_applied_stylesheet(rel: Option<&str>) -> bool {
     stylesheet
 }
 
-fn collect_stylesheets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Vec<Stylesheet> {
-    let fetcher = Fetcher::default();
+fn collect_stylesheets(
+    doc: &dom::Document,
+    loader: &mut dyn Loader,
+    base: Option<(&Origin, &str)>,
+) -> Vec<Stylesheet> {
     let mut sheets = Vec::new();
 
     for node in doc.descendants(doc.root()) {
@@ -642,7 +795,7 @@ fn collect_stylesheets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Ve
             "style" => {
                 let sheet = Stylesheet::parse(&doc.text_content(node));
                 // A `<style>` block's imports resolve against the document.
-                push_with_imports(&mut sheets, sheet, &fetcher, base, 0);
+                push_with_imports(&mut sheets, sheet, loader, base, 0);
             }
             // An external stylesheet is how a site of this era shared one look
             // across every page; skipping them leaves those pages unstyled.
@@ -657,15 +810,17 @@ fn collect_stylesheets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Ve
                 let url = net::resolve(origin, path, href);
                 // Subresource, so ADR-0006's third-party rule applies: a sheet
                 // from another origin is refused like any other.
-                if let Ok(resource) = fetcher.fetch(&url, Some(origin), RequestKind::Subresource) {
-                    let sheet = Stylesheet::parse(&resource.body);
+                if let Some(resource) = loader.load(&url, Some(origin), RequestKind::Subresource)
+                    && let Ok((sheet_origin, sheet_path)) = net::parse_url(&url)
+                {
+                    let sheet = Stylesheet::parse(&resource.text());
                     // An imported sheet's URLs resolve against the sheet that
                     // imported it, not against the document.
                     push_with_imports(
                         &mut sheets,
                         sheet,
-                        &fetcher,
-                        Some((&resource.origin, &resource.path)),
+                        loader,
+                        Some((&sheet_origin, &sheet_path)),
                         0,
                     );
                 }

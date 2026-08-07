@@ -109,6 +109,7 @@ fn a_child_given_nonsense_refuses_it_rather_than_crashing() {
             &mut stdin,
             &ToChild::Resource {
                 body: Vec::new(),
+                content_type: None,
                 ok: true,
             }
             .encode(),

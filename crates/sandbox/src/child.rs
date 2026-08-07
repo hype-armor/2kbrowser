@@ -17,7 +17,16 @@ use crate::{Error, read_frame, write_frame};
 ///
 /// A refusal and a failure are the same value, deliberately — see the parent's
 /// note on why the child is not told which.
-pub type Fetched = Option<Vec<u8>>;
+pub type Fetched = Option<Resource>;
+
+/// A subresource the parent supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Resource {
+    /// The bytes.
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` it was served with, when there was one.
+    pub content_type: Option<String>,
+}
 
 /// Renders a document, asking `fetch` for anything it references.
 pub trait Render {
@@ -86,7 +95,14 @@ pub fn serve(
                 }
             };
             match ToChild::decode(&answer) {
-                Ok(ToChild::Resource { body, ok: true }) => Some(body),
+                Ok(ToChild::Resource {
+                    body,
+                    content_type,
+                    ok: true,
+                }) => Some(Resource {
+                    bytes: body,
+                    content_type,
+                }),
                 Ok(_) => None,
                 Err(error) => {
                     transport = Err(Error::Wire(error));
@@ -187,6 +203,7 @@ mod tests {
             request(),
             ToChild::Resource {
                 body: b"image bytes".to_vec(),
+                content_type: None,
                 ok: true,
             }
             .encode(),
@@ -198,7 +215,13 @@ mod tests {
             fail: false,
         };
         serve(&mut input.as_slice(), &mut output, &mut stub).expect("serves");
-        assert_eq!(stub.got, vec![Some(b"image bytes".to_vec())]);
+        assert_eq!(
+            stub.got,
+            vec![Some(Resource {
+                bytes: b"image bytes".to_vec(),
+                content_type: None,
+            })]
+        );
 
         let mut reading = output.as_slice();
         let asked = ToParent::decode(&read_frame(&mut reading).expect("reads")).expect("decodes");
@@ -214,6 +237,7 @@ mod tests {
             request(),
             ToChild::Resource {
                 body: Vec::new(),
+                content_type: None,
                 ok: false,
             }
             .encode(),
@@ -252,6 +276,7 @@ mod tests {
     fn a_first_message_that_is_not_a_render_request_is_refused() {
         let input = pipe(&[ToChild::Resource {
             body: Vec::new(),
+            content_type: None,
             ok: true,
         }
         .encode()]);

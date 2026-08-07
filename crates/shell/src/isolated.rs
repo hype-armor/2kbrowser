@@ -14,6 +14,36 @@ use sandbox::message::{Link, Mode, Rendered};
 use sandbox::{Error, Renderer, ToChild};
 use text::FontStore;
 
+/// Loads subresources by asking the parent.
+///
+/// The child has no sockets and no filesystem of its own (ADR-0012), so this is
+/// the only way anything gets in. Every request crosses the pipe and the parent
+/// applies ADR-0006's policy — which is the improvement worth having: the rule
+/// is now enforced in a process a compromised renderer cannot reach.
+struct PipeLoader<'a> {
+    fetch: &'a mut dyn FnMut(&str, net::RequestKind) -> Fetched,
+}
+
+impl crate::render::Loader for PipeLoader<'_> {
+    fn load(
+        &mut self,
+        url: &str,
+        _document: Option<&net::Origin>,
+        kind: net::RequestKind,
+    ) -> Option<crate::render::Loaded> {
+        // The document origin is dropped rather than sent. The parent already
+        // knows it — it is what the parent asked for a render of — and taking
+        // it from the untrusted side would let a compromised renderer claim to
+        // be an origin it is not, which is the whole policy defeated in one
+        // field.
+        let resource = (self.fetch)(url, kind)?;
+        Some(crate::render::Loaded {
+            bytes: resource.bytes,
+            content_type: resource.content_type,
+        })
+    }
+}
+
 /// Renders using this crate's pipeline. The child's half.
 pub struct PageRenderer {
     fonts: FontStore,
@@ -38,7 +68,7 @@ impl Render for PageRenderer {
     fn render(
         &mut self,
         request: &ToChild,
-        _fetch: &mut dyn FnMut(&str, net::RequestKind) -> Fetched,
+        fetch: &mut dyn FnMut(&str, net::RequestKind) -> Fetched,
     ) -> Result<Rendered, String> {
         let ToChild::Render {
             body,
@@ -57,17 +87,28 @@ impl Render for PageRenderer {
         // on the sandboxed side with every other parser.
         let (html, ..) = net::encoding::decode_document(body, content_type.as_deref());
 
-        // Subresources still go through the in-process fetcher for now. That is
-        // the remaining hole in ADR-0012's story and it is deliberate: routing
-        // them through `fetch` means rewriting how `render_sized` loads images,
-        // stylesheets, and frames, and doing it in the same change as the
-        // process boundary would make a large diff impossible to review. The
-        // boundary lands first, provably identical; the network moves next.
+        // Every subresource — images, stylesheets, `@import` chains, frames —
+        // goes over the pipe. Nothing in this process opens a socket or a file.
+        let mut loader = PipeLoader { fetch };
         let base = origin.as_ref().map(|origin| (origin, path.as_str()));
         let page = if *force_authored {
-            crate::render::render_as_authored(&html, *width, *max_height, &mut self.fonts, base)
+            crate::render::render_as_authored_with(
+                &html,
+                *width,
+                *max_height,
+                &mut self.fonts,
+                &mut loader,
+                base,
+            )
         } else {
-            crate::render::render_with_base(&html, *width, *max_height, &mut self.fonts, base)
+            crate::render::render_with_base_and_loader(
+                &html,
+                *width,
+                *max_height,
+                &mut self.fonts,
+                &mut loader,
+                base,
+            )
         };
 
         let mode = match &page.mode {
@@ -152,6 +193,15 @@ mod tests {
 
     fn no_fetch(_: &str, _: net::RequestKind) -> Fetched {
         None
+    }
+
+    /// A real PNG, so a decode that succeeds means the bytes arrived intact.
+    fn tile() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/ref/fixtures/assets/tile.png"),
+        )
+        .expect("the reference fixture tile")
     }
 
     #[test]
@@ -278,5 +328,114 @@ mod tests {
             "resolved absolutely, so the parent never resolves anything: {}",
             page.links[0].url
         );
+    }
+
+    #[test]
+    fn every_subresource_is_asked_for_rather_than_fetched() {
+        // The property this whole change exists for. Nothing in the child may
+        // open a socket or a file: a stylesheet, an `@import` inside it, and an
+        // image all have to arrive as answers to requests.
+        let dir = std::env::temp_dir().join("2kbrowser-pipe-loader");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (origin, at) = net::parse_url(&net::file_url(&dir.join("page.html"))).expect("parses");
+
+        let html = "<html><head><link rel=\"stylesheet\" href=\"site.css\"></head>\
+                    <body><img src=\"tile.png\"><p>text</p></body></html>";
+
+        let mut asked: Vec<String> = Vec::new();
+        let mut fetch = |url: &str, _kind: net::RequestKind| -> Fetched {
+            asked.push(url.to_owned());
+            if url.ends_with("site.css") {
+                return Some(sandbox::child::Resource {
+                    bytes: b"@import url(more.css); p { color: #ff0000 }".to_vec(),
+                    content_type: Some("text/css".to_owned()),
+                });
+            }
+            if url.ends_with("more.css") {
+                return Some(sandbox::child::Resource {
+                    bytes: b"body { background: #00ff00 }".to_vec(),
+                    content_type: None,
+                });
+            }
+            if url.ends_with("tile.png") {
+                return Some(sandbox::child::Resource {
+                    bytes: tile(),
+                    content_type: Some("image/png".to_owned()),
+                });
+            }
+            None
+        };
+
+        let page = PageRenderer::new()
+            .render(
+                &ToChild::Render {
+                    body: html.as_bytes().to_vec(),
+                    content_type: None,
+                    width: 300,
+                    max_height: 600,
+                    origin: Some(origin),
+                    path: at,
+                    force_authored: false,
+                },
+                &mut fetch,
+            )
+            .expect("renders");
+
+        assert!(
+            asked.iter().any(|url| url.ends_with("site.css")),
+            "the stylesheet was not asked for: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|url| url.ends_with("more.css")),
+            "the @import inside it was not asked for: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|url| url.ends_with("tile.png")),
+            "the image was not asked for: {asked:?}"
+        );
+
+        // And the answers were actually used. The imported sheet paints the
+        // body green, which nothing else in this page does.
+        let green = page
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| p[0] < 80 && p[1] > 150 && p[2] < 80)
+            .count();
+        assert!(green > 0, "the imported stylesheet did not reach the paint");
+    }
+
+    #[test]
+    fn a_subresource_the_parent_refuses_is_simply_absent() {
+        // A refusal and a failure look identical to the child, and both render
+        // as "no image" rather than as an error. Nothing about the parent's
+        // policy leaks across.
+        let dir = std::env::temp_dir().join("2kbrowser-pipe-loader");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (origin, at) = net::parse_url(&net::file_url(&dir.join("page.html"))).expect("parses");
+
+        let html = "<body><img src=\"https://tracker.example.net/pixel.gif\"><p>text</p></body>";
+        let mut refused = 0usize;
+        let mut fetch = |_url: &str, _kind: net::RequestKind| -> Fetched {
+            refused += 1;
+            None
+        };
+
+        let page = PageRenderer::new()
+            .render(
+                &ToChild::Render {
+                    body: html.as_bytes().to_vec(),
+                    content_type: None,
+                    width: 200,
+                    max_height: 200,
+                    origin: Some(origin),
+                    path: at,
+                    force_authored: false,
+                },
+                &mut fetch,
+            )
+            .expect("renders anyway");
+
+        assert_eq!(refused, 1, "it was asked for exactly once");
+        assert!(page.width > 0, "the page still rendered");
     }
 }

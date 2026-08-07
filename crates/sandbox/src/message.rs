@@ -138,6 +138,12 @@ pub enum ToChild {
     Resource {
         /// The bytes, or empty when it could not be had.
         body: Vec<u8>,
+        /// The `Content-Type` it was served with, when there was one.
+        ///
+        /// Carried because a stylesheet's character set can come from the
+        /// header, and dropping it here would silently change how a legacy
+        /// stylesheet decodes on the far side.
+        content_type: Option<String>,
         /// Whether it was retrieved at all.
         ok: bool,
     },
@@ -172,9 +178,17 @@ impl ToChild {
                 writer.str(path);
                 writer.some(*force_authored);
             }
-            ToChild::Resource { body, ok } => {
+            ToChild::Resource {
+                body,
+                content_type,
+                ok,
+            } => {
                 writer.tag(1);
                 writer.bytes(body);
+                writer.some(content_type.is_some());
+                if let Some(content_type) = content_type {
+                    writer.str(content_type);
+                }
                 writer.some(*ok);
             }
         }
@@ -209,10 +223,19 @@ impl ToChild {
                     force_authored: reader.some()?,
                 }
             }
-            1 => ToChild::Resource {
-                body: reader.bytes()?.to_vec(),
-                ok: reader.some()?,
-            },
+            1 => {
+                let body = reader.bytes()?.to_vec();
+                let content_type = if reader.some()? {
+                    Some(reader.str()?)
+                } else {
+                    None
+                };
+                ToChild::Resource {
+                    body,
+                    content_type,
+                    ok: reader.some()?,
+                }
+            }
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;
