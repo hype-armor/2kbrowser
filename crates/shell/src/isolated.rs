@@ -136,9 +136,17 @@ impl Render for PageRenderer {
             mode,
             title: page.title.clone(),
             links: page
-                .links()
+                .link_groups()
                 .into_iter()
-                .map(|(rect, url)| Link { rect, url })
+                .enumerate()
+                .flat_map(|(group, link)| {
+                    let url = link.url;
+                    link.rects.into_iter().map(move |rect| Link {
+                        rect,
+                        url: url.clone(),
+                        group: group as u32,
+                    })
+                })
                 .collect(),
             can_toggle_layout,
         };

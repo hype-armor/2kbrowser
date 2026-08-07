@@ -10,4 +10,5 @@ pub mod history;
 pub mod isolated;
 pub mod render;
 pub mod tabs;
+pub mod viewport;
 pub mod window;

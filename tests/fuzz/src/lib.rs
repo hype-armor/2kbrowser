@@ -598,6 +598,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                     height: 4.0,
                 },
                 url: "https://example.com/next.html".to_owned(),
+                group: 0,
             }],
             can_toggle_layout: true,
         }))

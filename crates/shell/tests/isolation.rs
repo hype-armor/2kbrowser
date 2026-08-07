@@ -254,3 +254,118 @@ fn dropping_a_session_kills_its_child() {
         drop(live);
     }
 }
+
+/// A `Viewport` over a real child, with the page written to disk so
+/// subresources and links resolve.
+fn viewport(html: &str, width: u32) -> shell::viewport::Viewport {
+    let dir = std::env::temp_dir().join("2kbrowser-viewport-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("page.html");
+    std::fs::write(&path, html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        width,
+        2000,
+        false,
+    )
+    .expect("the page opens")
+}
+
+#[test]
+fn a_viewport_answers_everything_the_window_asks_of_a_page() {
+    let mut page = viewport(
+        "<title>Titled</title><body><p>some text to search</p>\
+         <p><a href=\"next.html\">a link</a></p></body>",
+        400,
+    );
+
+    assert_eq!(page.title(), Some("Titled"));
+    assert_eq!(page.width(), 400);
+    assert!(page.content_height() > 0.0);
+    assert_eq!(
+        page.pixels().len(),
+        (page.width() * page.height() * 4) as usize
+    );
+    assert!(matches!(page.mode(), layout::RenderMode::Authored));
+    assert!(!page.can_toggle_layout());
+    assert!(!page.find("search").is_empty());
+
+    let links = page.links();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert!(links[0].url.ends_with("/next.html"), "{}", links[0].url);
+}
+
+#[test]
+fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
+    // Hit testing is answered from the rectangles the child sent, because the
+    // box tree it would otherwise test against is on the far side — and because
+    // a round trip per pointer move would be absurd.
+    let page = viewport(
+        "<body><p><a href=\"there.html\">click me</a></p></body>",
+        400,
+    );
+    let links = page.links();
+    let rect = links[0].rects[0];
+
+    let hit = page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    assert!(
+        hit.is_some_and(|url| url.ends_with("/there.html")),
+        "{hit:?}"
+    );
+
+    assert_eq!(page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0), None);
+    assert_eq!(page.link_at(rect.x, rect.y + rect.height + 200.0), None);
+}
+
+#[test]
+fn resizing_re_lays_out_without_a_new_page() {
+    let mut page = viewport(
+        "<body><p>a paragraph long enough that how many lines it needs depends \
+         entirely on how wide the viewport happens to be right now</p></body>",
+        200,
+    );
+    let narrow = page.content_height();
+    page.resize(700, 2000).expect("re-renders");
+    assert_eq!(page.width(), 700);
+    assert!(
+        page.content_height() < narrow,
+        "wider should need fewer lines: {} vs {narrow}",
+        page.content_height()
+    );
+}
+
+#[test]
+fn overruling_the_document_fallback_changes_the_mode_it_reports() {
+    // ADR-0009's override, across the boundary. The reader must be able to see
+    // what the author wrote, and the chrome must be told which it is looking at.
+    let mut page = viewport(
+        "<body><div style=\"display: flex\"><div style=\"display: grid\">a</div></div></body>",
+        300,
+    );
+    assert!(
+        matches!(page.mode(), layout::RenderMode::Document { .. }),
+        "expected the fallback, got {:?}",
+        page.mode()
+    );
+    assert!(page.can_toggle_layout());
+    assert!(!page.forcing_authored());
+
+    page.set_forcing_authored(true, 300, 2000)
+        .expect("re-renders");
+    assert!(matches!(page.mode(), layout::RenderMode::Authored));
+    assert!(page.forcing_authored());
+    assert!(
+        page.can_toggle_layout(),
+        "once overruling, there has to be a way back"
+    );
+}

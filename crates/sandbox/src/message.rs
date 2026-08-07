@@ -65,6 +65,14 @@ pub struct Link {
     pub rect: Rect,
     /// The absolute URL it leads to, already resolved by the child.
     pub url: String,
+    /// Which link this rectangle belongs to.
+    ///
+    /// A link that wraps across a line break is several rectangles and one
+    /// destination, and keyboard focus moves link by link — so the grouping has
+    /// to cross the boundary rather than be guessed at afterwards. Guessing by
+    /// URL would be wrong: two different links on a page may lead to the same
+    /// place.
+    pub group: u32,
 }
 
 fn write_rect(writer: &mut Writer, rect: &Rect) {
@@ -342,6 +350,7 @@ impl ToParent {
                 for link in &page.links {
                     write_rect(&mut writer, &link.rect);
                     writer.str(&link.url);
+                    writer.u32(link.group);
                 }
                 writer.some(page.can_toggle_layout);
             }
@@ -392,6 +401,7 @@ impl ToParent {
                     links.push(Link {
                         rect: read_rect(&mut reader)?,
                         url: reader.str()?,
+                        group: reader.u32()?,
                     });
                 }
                 let can_toggle_layout = reader.some()?;
@@ -459,6 +469,7 @@ mod tests {
                     height: 4.0,
                 },
                 url: "https://example.com/".to_owned(),
+                group: 0,
             }],
             can_toggle_layout: true,
         }
