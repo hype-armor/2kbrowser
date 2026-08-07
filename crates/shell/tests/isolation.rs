@@ -609,3 +609,51 @@ fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
         whole.height()
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_render_command_parses_in_a_child_rather_than_in_itself() {
+    // `render` and `links` used to parse and lay out in the calling process,
+    // which made ADR-0012 a property of the window rather than of the browser.
+    // Nothing failed when they did — the pixels are identical either way, which
+    // is exactly why this needs checking directly rather than through output.
+    //
+    // Linux only, because `/proc/<pid>/task/<pid>/children` is an exact answer
+    // and `ps` is a guess. Elsewhere this says it did not run rather than
+    // passing quietly.
+    let out = std::env::temp_dir().join("2kbrowser-cli-isolation.png");
+    let mut process = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
+        .args(["render", "../../tests/ref/fixtures/era-page.html"])
+        .arg("--out")
+        .arg(&out)
+        // Wide and tall, so the render takes long enough to be watched. A
+        // faster machine makes this shorter; the poll below is fine either way,
+        // because it only has to see the child once out of hundreds of looks.
+        .args(["--width", "2000", "--height", "8000"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the render command starts");
+
+    let children = format!("/proc/{pid}/task/{pid}/children", pid = process.id());
+    let mut saw_a_child = false;
+    loop {
+        if let Ok(listed) = std::fs::read_to_string(&children)
+            && !listed.trim().is_empty()
+        {
+            saw_a_child = true;
+            break;
+        }
+        match process.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+    let status = process.wait().expect("reaps");
+    assert!(status.success(), "the render itself failed");
+    assert!(
+        saw_a_child,
+        "`2kbrowser render` never spawned a renderer — it parsed the page itself"
+    );
+}
