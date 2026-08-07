@@ -123,7 +123,7 @@ fn third_party_requests() -> Check {
         );
     };
     let document = logo.with_file_name("budget-page.html");
-    let url = format!("file://{}", document.display());
+    let url = net::file_url(&document);
     let Ok((origin, path)) = net::parse_url(&url) else {
         return fail(
             "-".to_owned(),

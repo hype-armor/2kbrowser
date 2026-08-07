@@ -49,7 +49,7 @@ fn fixtures_match_their_baselines() {
         let (html, _, _) = net::encoding::decode_document(&bytes, None);
         // Render with the fixture's own location as the base, so relative
         // subresource URLs resolve and image fixtures actually exercise images.
-        let url = format!("file://{}", path.display());
+        let url = net::file_url(path);
         let (origin, base_path) = net::parse_url(&url).expect("fixture url");
         let page = shell::render::render_with_base(
             &html,

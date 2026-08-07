@@ -14,7 +14,7 @@ fn main() {
     let path = std::path::Path::new(&input)
         .canonicalize()
         .expect("input exists");
-    let url = format!("file://{}", path.display());
+    let url = net::file_url(&path);
     let fetcher = net::Fetcher::default();
     let resource = fetcher
         .fetch(&url, None, net::RequestKind::Navigation)

@@ -237,7 +237,7 @@ mod tests {
         std::fs::write(&path, "<p>hello</p>").expect("write");
 
         let fetcher = Fetcher::default();
-        let url = format!("file://{}", path.display());
+        let url = file_url(&path);
         let resource = fetcher
             .fetch(&url, None, RequestKind::Navigation)
             .expect("fetch succeeds");

@@ -222,8 +222,23 @@ pub fn is_drive_path(text: &str) -> bool {
 ///
 /// The result round-trips: [`parse_url`] then [`to_file_path`] gives back a
 /// path that opens.
+///
+/// Plain UNC paths (`\\server\share`) are not handled. Nothing here produces
+/// one — `canonicalize` spells a network path with the verbatim prefix below —
+/// and on Unix a leading `//` is a legitimate way to write a root-relative
+/// path, so there is no way to tell the two apart from the string alone.
 pub fn file_url(path: &std::path::Path) -> String {
     let separated = path.display().to_string().replace('\\', "/");
+    // `\\?\D:\dir` is what Windows `canonicalize` hands back. The prefix is a
+    // Win32 API detail rather than part of the path, and a URL carrying it
+    // resolves against nothing: `logo.png` beside `\\?\D:\x\page.html` comes
+    // out as `/?/D:/x/logo.png`, which is not a file anywhere.
+    let separated = separated.strip_prefix("//?/").unwrap_or(&separated);
+    // Its network spelling, `\\?\UNC\server\share`, names a host — and a host
+    // belongs where a URL keeps one rather than buried in the path.
+    if let Some(rest) = separated.strip_prefix("UNC/") {
+        return format!("file://{rest}");
+    }
     format!("file:///{}", separated.trim_start_matches('/'))
 }
 
@@ -742,6 +757,34 @@ mod windows_path_tests {
         assert!(!is_drive_path("/home/user/a.html"));
         assert!(!is_drive_path("example.com"));
         assert!(!is_drive_path("C:"), "a drive with no path is not one");
+    }
+
+    #[test]
+    fn an_extended_length_path_loses_its_win32_prefix() {
+        // `canonicalize` returns this form on Windows, and the budget harness
+        // pasted it after `file://` — so a same-origin image beside the
+        // document resolved to `/?/D:/...`, which is not a file anywhere. The
+        // budget it broke exists to prove a zero means something, and it
+        // correctly refused to claim one.
+        let verbatim = std::path::Path::new(r"\\?\D:\a\fixtures\page.html");
+        assert_eq!(file_url(verbatim), "file:///D:/a/fixtures/page.html");
+
+        let (origin, at) = parse_url(&file_url(verbatim)).expect("parses");
+        let image = resolve(&origin, &at, "logo.png");
+        assert_eq!(image, "file:///D:/a/fixtures/logo.png");
+        assert_eq!(
+            to_file_path(&parse_url(&image).expect("parses").1),
+            "D:/a/fixtures/logo.png",
+            "and that is a path that opens"
+        );
+    }
+
+    #[test]
+    fn a_verbatim_network_path_keeps_its_host_where_a_host_goes() {
+        assert_eq!(
+            file_url(std::path::Path::new(r"\\?\UNC\server\share\page.html")),
+            "file://server/share/page.html"
+        );
     }
 
     #[test]

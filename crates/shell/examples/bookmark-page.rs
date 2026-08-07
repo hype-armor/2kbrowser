@@ -17,7 +17,7 @@ fn main() {
         std::fs::create_dir_all(parent).expect("config directory");
     }
     std::fs::write(&path, &html).expect("write the page");
-    let url = format!("file://{}", path.display());
+    let url = net::file_url(&path);
     let (origin, at) = net::parse_url(&url).expect("a file URL");
 
     let mut fonts = text::FontStore::new();
