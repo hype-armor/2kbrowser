@@ -48,6 +48,12 @@ fn main() -> ExitCode {
         //
         // Nothing may be printed on this path — stdout is the protocol, and a
         // stray line would be read as a frame header.
+        // Applies the sandbox and reports what it could and could not do. The
+        // only honest way to test a sandbox is from inside one.
+        Some(sandbox::confine::SELFTEST_ARGUMENT) => {
+            println!("{}", sandbox::confine::selftest());
+            ExitCode::SUCCESS
+        }
         Some(sandbox::CHILD_ARGUMENT) => match shell::isolated::run_child() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

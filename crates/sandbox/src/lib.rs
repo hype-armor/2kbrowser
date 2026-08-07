@@ -25,12 +25,14 @@
 //! AppContainer are actually applied.
 
 pub mod child;
+pub mod confine;
 pub mod message;
 pub mod parent;
 pub mod wire;
 
 use std::io::{Read, Write};
 
+pub use confine::Confinement;
 pub use message::{Link, Mode, Rendered, ToChild, ToParent};
 pub use parent::{Renderer, Session};
 pub use wire::{MAX_FRAME, WireError};

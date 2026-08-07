@@ -369,3 +369,84 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
         "once overruling, there has to be a way back"
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_renderer_cannot_open_a_socket_or_a_file() {
+    // The only honest way to test a sandbox is from inside it: a filter that
+    // installs successfully and blocks nothing would pass any test written from
+    // outside. So the binary applies its own confinement and reports.
+    let output = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
+        .arg(sandbox::confine::SELFTEST_ARGUMENT)
+        .output()
+        .expect("the selftest runs");
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    // Skipped rather than failed where seccomp is unavailable — an old kernel,
+    // or a container that forbids installing a filter. A check that cannot run
+    // must not look like a check that passed, so it says so.
+    if report.contains("confinement=Failed") || report.contains("confinement=Unavailable") {
+        eprintln!("SKIP: seccomp is not available here\n{report}");
+        return;
+    }
+
+    assert!(report.contains("confinement=Seccomp"), "{report}");
+    assert!(
+        report.contains("socket=PermissionDenied"),
+        "the renderer could still reach the network:\n{report}"
+    );
+    assert!(
+        report.contains("file=PermissionDenied"),
+        "the renderer could still open a file:\n{report}"
+    );
+    // And it is still able to do its actual job, which a filter that broke
+    // everything would also satisfy the two assertions above.
+    assert!(report.contains("compute=55"), "{report}");
+}
+
+#[test]
+fn a_confined_renderer_still_renders_a_page_with_subresources() {
+    // The risk with any syscall filter is that it stops the thing working. This
+    // is the era fixture, which has images, a tiled background, and nested
+    // tables — rendered by a child that cannot open a file or a socket, so
+    // every one of those arrived over the pipe.
+    let path = std::path::Path::new("../../tests/ref/fixtures/era-page.html")
+        .canonicalize()
+        .expect("the era fixture");
+    let bytes = std::fs::read(&path).expect("read");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: bytes.clone(),
+            content_type: None,
+            origin: origin.clone(),
+            path: at.clone(),
+        },
+        800,
+        4000,
+        false,
+    )
+    .expect("the confined renderer opens the page");
+
+    // Byte-identical to rendering it here, where nothing is confined and the
+    // fetcher is in-process.
+    let mut fonts = text::FontStore::new();
+    let (html, ..) = net::encoding::decode_document(&bytes, None);
+    let direct =
+        shell::render::render_with_base(&html, 800, 4000, &mut fonts, Some((&origin, &at)));
+
+    assert_eq!(direct.images_loaded, 3, "the fixture should load 3 images");
+    assert_eq!(
+        (page.width(), page.height()),
+        (direct.pixmap.width(), direct.pixmap.height())
+    );
+    assert_eq!(
+        page.pixels(),
+        direct.pixmap.data(),
+        "a confined renderer produced different pixels"
+    );
+}

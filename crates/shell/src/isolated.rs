@@ -176,6 +176,21 @@ impl Render for PageRenderer {
 /// interleave with a frame and corrupt it, and this is the one process where a
 /// stray `println!` is a protocol violation rather than noise.
 pub fn run_child() -> Result<(), Error> {
+    // Before anything is read. The very first frame carries the document, so it
+    // is already attacker-influenced — confining afterwards would be confining
+    // after the interesting bytes had arrived.
+    //
+    // The font store is built after this on purpose too: it reads only embedded
+    // data (ADR-0010), and building it under the filter is the check that it
+    // really does not touch the filesystem.
+    let confinement = sandbox::confine::apply();
+    if !confinement.is_confined() {
+        // stderr, never stdout: stdout is the protocol. Worth saying every time
+        // rather than only in the README, because an unconfined renderer is a
+        // fact about the process that is running, not about the build.
+        eprintln!("2kbrowser renderer: {}", confinement.describe());
+    }
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();

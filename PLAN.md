@@ -454,16 +454,35 @@ Two consequences worth recording rather than discovering later:
 
 Not done, and the README must keep saying so:
 
-1. **The OS sandbox primitives are not applied.** seccomp-bpf with Landlock on
-   Linux, the App Sandbox entitlement model on macOS, an AppContainer with a
-   restricted token on Windows. ADR-0012 named Seatbelt; ADR-0013 supersedes
-   that — `sandbox_init` has been deprecated since macOS 10.8, and "what
-   Chromium does with twenty years of momentum" is a different question from
-   what a new program should adopt. Until they are, a child is an ordinary
-   process that happens to be separate — an exploit inside it is contained only
-   in that it cannot reach the parent's memory. **This is the only thing left
-   between the current state and what ADR-0012 claims.**
-2. **A legacy-TLS refusal is not legible.** ADR-0013 refuses TLS 1.0 and 1.1
+**The syscall filter is on, on Linux.** The renderer applies a seccomp-bpf
+filter before it reads its first frame — that frame carries the document, so it
+is already attacker-influenced. No sockets, no opening files, no starting or
+attaching to processes. Proven from inside: the binary confines itself and
+reports, and the era fixture still renders byte-identically with all three
+images arriving over the pipe.
+
+It is a **denylist**, and that is a real weakening worth stating. An allowlist
+refuses anything nobody named, including a syscall nobody thought about; it is
+also what breaks a browser in the field, because the set a renderer touches is
+decided by the allocator, the shaper, and the standard library and moves under
+you on a toolchain bump. Denied calls return `EPERM` rather than killing the
+process, so a legitimate call that meets the filter degrades into an error the
+renderer already handles. An allowlist is the stronger end state and wants a
+measured set of what the renderer actually uses.
+
+Still not done:
+
+1. **macOS and Windows are unconfined.** The App Sandbox entitlement model and
+   an AppContainer with a restricted token respectively; neither is implemented,
+   and neither is stubbed to look done — the child reports `Unavailable` and
+   says so on stderr. A sandbox that claims to work and does not is worse than
+   one that says it is missing.
+2. **Landlock is not used.** It would add filesystem confinement beyond
+   "cannot call `open`", and `landlock_create_ruleset` returns `ENOSYS` on the
+   kernel this was developed against, so it could not be tested. Filesystem
+   access is denied at the syscall level instead, which covers opening but not
+   every path to a descriptor.
+3. **A legacy-TLS refusal is not legible.** ADR-0013 refuses TLS 1.0 and 1.1
    outright, and the chrome shows that as an ordinary network error — so an
    honest refusal reads as a bug.
 

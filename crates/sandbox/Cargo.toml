@@ -9,5 +9,14 @@ publish = false
 layout = { path = "../layout" }
 net = { path = "../net" }
 
+# Security-critical by construction, so it falls inside the dependency rule set
+# in issue #4 rather than needing a separate argument. `seccompiler` is AWS's,
+# maintained for Firecracker, and it is what holds the `unsafe` that installing
+# a BPF filter requires — ADR-0002 forbids it here, not everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.5"
+
+
 [lints]
 workspace = true

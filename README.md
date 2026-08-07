@@ -118,12 +118,19 @@ read this browser's traffic. All of it is asserted in tests rather than
 inherited from a library default, because "happens to be true" does not survive
 a dependency bump.
 
-> **Not safe for browsing untrusted sites.** The OS sandbox primitives —
-> Landlock and seccomp, the App Sandbox, AppContainer — are not applied yet, so
-> a renderer child is an ordinary process that merely happens to be separate: an
-> exploit inside it is contained only in that it cannot reach the parent's
-> memory. That is the last thing standing between the current state and what
-> ADR-0012 claims. Until it is done this is a tool for its authors.
+On Linux the renderer is also confined by a seccomp filter, applied before it
+reads its first frame: no sockets, no opening files, no starting processes. It
+still renders the era fixture byte-identically with all three of its images
+arriving over the pipe, which is the check that the filter did not quietly break
+the thing it protects. `2kbrowser --confine-selftest` makes the browser confine
+itself and report what it can still reach.
+
+> **Not safe for browsing untrusted sites.** On macOS and Windows the renderer
+> is a separate process but an otherwise unconfined one — the App Sandbox and
+> AppContainer equivalents are not implemented, and the child says so on stderr
+> rather than pretending. The Linux filter is a denylist, so a syscall nobody
+> named is allowed. Neither the parser fuzzing nor any of this has been reviewed
+> by anyone but its authors. Until that changes this is a tool for its authors.
 
 ## Building
 
