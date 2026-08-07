@@ -101,12 +101,21 @@ rendered without it (ADR-0012). Why bother, when `unsafe` is forbidden: the
 libraries that meet a hostile page *first* have roughly 460 `unsafe` sites
 between them. Forbidding it describes our discipline, not our attack surface.
 
-> **Not safe for browsing untrusted sites.** The OS sandbox primitives — seccomp,
-> Seatbelt, AppContainer — are not applied yet, so a renderer child is an
-> ordinary process that merely happens to be separate. The window still renders
-> in-process, subresources still load inside the child rather than being asked
-> for over the pipe, and TLS review has not happened. Until all of that is done
-> this is a tool for its authors.
+The engine is of its era; nothing protecting it is (ADR-0013). TLS 1.0 and 1.1
+are refused outright — not marked, not per-site, not behind a confirmation — so
+old sites that offer nothing newer do not load, and that is the intended
+outcome. There is no relaxed-certificate escape hatch. Roots come from Mozilla
+rather than the platform, so a corporate root in the system store cannot quietly
+read this browser's traffic. All of it is asserted in tests rather than
+inherited from a library default, because "happens to be true" does not survive
+a dependency bump.
+
+> **Not safe for browsing untrusted sites.** The OS sandbox primitives —
+> Landlock and seccomp, the App Sandbox, AppContainer — are not applied yet, so
+> a renderer child is an ordinary process that merely happens to be separate.
+> The window still renders in-process, and subresources still load inside the
+> child rather than being asked for over the pipe. Until that is done this is a
+> tool for its authors.
 
 ## Building
 

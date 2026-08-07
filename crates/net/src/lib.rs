@@ -6,6 +6,7 @@
 
 pub mod encoding;
 pub mod policy;
+pub mod tls;
 
 pub use policy::{
     Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path, parse_url, resolve,
@@ -205,7 +206,10 @@ fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>), FetchError> {
     // No custom User-Agent games: this browser does not run scripts, and
     // pretending otherwise to get the script path served would produce exactly
     // the silent breakage ADR-0003 rejects.
-    let response = ureq::get(url).call().map_err(|error| match error {
+    // Through our own agent, not `ureq::get`, so the TLS posture is the one
+    // `tls::agent` states rather than whatever the library defaults to at the
+    // version we happen to be pinned at.
+    let response = tls::agent().get(url).call().map_err(|error| match error {
         ureq::Error::StatusCode(code) => FetchError::Status { code },
         other => FetchError::Transport(other.to_string()),
     })?;

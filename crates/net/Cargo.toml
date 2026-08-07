@@ -7,6 +7,9 @@ publish = false
 
 [dependencies]
 encoding_rs = "0.8"
+# Named directly only so the TLS posture in `tls.rs` can be asserted against
+# the library rather than remembered. Comes in through `ureq` regardless.
+rustls = { version = "0.23", default-features = false }
 ureq = "3"
 
 [lints]

@@ -115,7 +115,9 @@ punish amateurs:
   handled exactly this era's markup.
 - **CSS tokenisation** — likewise spec-defined. Use `cssparser`.
 - **Character encoding detection and decoding** — `encoding_rs`.
-- **TLS** — never. `rustls`.
+- **TLS** — never. `rustls`, and only ever `rustls`: TLS 1.0 and 1.1 are refused
+  outright rather than offered behind a downgrade (ADR-0013). The engine is
+  period; everything protecting it is present-day.
 - **Font shaping, line breaking, bidi** — the single hardest part of a renderer.
   Use `cosmic-text` (which layers `rustybuzz` + `swash` + Unicode line breaking).
 - **Image decoding** — `image`, restricted to GIF, JPEG, and PNG.
@@ -423,7 +425,11 @@ move is to send the parent something malformed.
 Not done, and the README must keep saying so:
 
 1. **The OS sandbox primitives are not applied.** seccomp-bpf with Landlock on
-   Linux, Seatbelt on macOS, an AppContainer with a restricted token on Windows.
+   Linux, the App Sandbox entitlement model on macOS, an AppContainer with a
+   restricted token on Windows. ADR-0012 named Seatbelt; ADR-0013 supersedes
+   that — `sandbox_init` has been deprecated since macOS 10.8, and "what
+   Chromium does with twenty years of momentum" is a different question from
+   what a new program should adopt.
    Until they are, a child is an ordinary process that happens to be separate —
    an exploit inside it is contained only in that it cannot reach the parent's
    memory.
@@ -506,11 +512,11 @@ that it has one home and can be closed:
 | --- | --- | --- |
 | ~~[1](https://github.com/hype-armor/2kbrowser/issues/1)~~ | ~~Period-authentic chrome, or a modern shell?~~ Resolved: a modern shell around a period engine (ADR-0011) | — |
 | ~~[2](https://github.com/hype-armor/2kbrowser/issues/2)~~ | ~~Move reader mode earlier than M5?~~ Resolved: yes, M3 (ADR-0009) | — |
-| [3](https://github.com/hype-armor/2kbrowser/issues/3) | Legacy TLS: marked downgrade, or unreachable? | M4 |
+| ~~[3](https://github.com/hype-armor/2kbrowser/issues/3)~~ | ~~Legacy TLS: marked downgrade, or unreachable?~~ Resolved: unreachable — refused outright (ADR-0013) | — |
 | [4](https://github.com/hype-armor/2kbrowser/issues/4) | Revisit dependency posture? | nothing |
-| [5](https://github.com/hype-armor/2kbrowser/issues/5) | No metric-compatible clone for Verdana/Tahoma | nothing |
-| [6](https://github.com/hype-armor/2kbrowser/issues/6) | `cursive`/`fantasy` resolve to sans-serif | nothing |
-| [7](https://github.com/hype-armor/2kbrowser/issues/7) | Vendor fonts in git, or fetch with pinned checksums? | M1 |
+| ~~[5](https://github.com/hype-armor/2kbrowser/issues/5)~~ | ~~No metric-compatible clone for Verdana/Tahoma~~ Resolved: accept the reflow | — |
+| ~~[6](https://github.com/hype-armor/2kbrowser/issues/6)~~ | ~~`cursive`/`fantasy` resolve to sans-serif~~ Resolved: fall back, do not chase it | — |
+| ~~[7](https://github.com/hype-armor/2kbrowser/issues/7)~~ | ~~Vendor fonts in git, or fetch with pinned checksums?~~ Resolved: fetch with pins (ADR-0010) | — |
 | [8](https://github.com/hype-armor/2kbrowser/issues/8) | Per-script optional font payloads | release |
 
 None of these block starting M1 except #7, which only needs answering when the
