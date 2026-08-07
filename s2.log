@@ -1,3 +1,0 @@
-Could not open file or uri for loading server certificate private key from k.pem
-40C72B4E4B7F0000:error:16000069:STORE routines:ossl_store_get0_loader_int:unregistered scheme:../crypto/store/store_register.c:237:scheme=file
-40C72B4E4B7F0000:error:80000002:system library:file_open:No such file or directory:../providers/implementations/storemgmt/file_store.c:267:calling stat(k.pem)
