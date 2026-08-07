@@ -206,21 +206,46 @@ impl Contained {
 /// For [`crate::confine::selftest`], which has to run its probes on the far
 /// side of the boundary — a container that installs successfully and confines
 /// nothing would pass every check written from the outside.
+/// The read happens on a thread so that `timeout` bounds it. Reading a pipe
+/// blocks, and there is no portable way to interrupt that — a child that starts
+/// and then wedges would otherwise hang whoever called this, which for the
+/// self-test means hanging CI until the job's own timeout hours later. Giving
+/// up leaves the thread parked on a read it will never finish, which is fine:
+/// dropping `child` closes the job handle, the kernel kills the process, the
+/// pipe closes, and the thread ends.
 pub fn capture(container: &Container, arguments: &str, timeout: std::time::Duration) -> String {
     let mut child = match container.spawn(arguments) {
         Ok(child) => child,
         Err(error) => return format!("spawn-failed={error}"),
     };
-    let mut output = String::new();
-    if let Some(stdout) = child.stdout()
-        && let Err(error) = stdout.read_to_string(&mut output)
+    let Some(stdout) = child.io.stdout.take() else {
+        return "no-stdout".to_owned();
+    };
+
+    let (finished, output) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("contained-selftest".to_owned())
+        .spawn(move || {
+            let mut stdout = stdout;
+            let mut text = String::new();
+            let read = stdout.read_to_string(&mut text);
+            let _ = finished.send(match read {
+                Ok(_) => text,
+                Err(error) => format!("{text}\nread-failed={error}"),
+            });
+        })
+        .is_err()
     {
-        output.push_str(&format!("\nread-failed={error}"));
+        return "no-thread".to_owned();
     }
-    // The read above ends at end of pipe, which is the child exiting, so this
-    // only ever waits on a child that has already closed its stdout.
-    let _ = child.io.wait(Some(timeout));
-    output
+
+    match output.recv_timeout(timeout) {
+        Ok(text) => text,
+        Err(_) => format!(
+            "timed-out after {}s waiting for the contained process to answer",
+            timeout.as_secs()
+        ),
+    }
 }
 
 #[cfg(test)]
