@@ -61,6 +61,19 @@ pub enum FetchError {
     Refused(Refusal),
     /// The transport failed.
     Transport(String),
+    /// The server offered no TLS version this browser accepts.
+    ///
+    /// Not a failure so much as ADR-0013 being enforced, and worth its own
+    /// variant for exactly that reason: without one it reached the reader as an
+    /// unexplained network error, indistinguishable from a server that was
+    /// down. A refusal nobody can recognise is indistinguishable from a bug.
+    LegacyTls,
+    /// The server's certificate did not check out.
+    ///
+    /// Separate from [`FetchError::LegacyTls`] because the two mean opposite
+    /// things: one says the site is too old to talk to, the other says
+    /// something is wrong with its identity.
+    Certificate(String),
     /// The server answered with a non-success status.
     Status {
         /// HTTP status code.
@@ -77,6 +90,22 @@ impl std::fmt::Display for FetchError {
         match self {
             FetchError::Refused(refusal) => write!(f, "{refusal}"),
             FetchError::Transport(message) => write!(f, "transport error: {message}"),
+            // "refused", not "failed": someone reading this should be able to
+            // tell that the browser worked exactly as intended. Short, because
+            // it also has to fit in the chrome bar beside a URL, and the words
+            // that matter are at the front so truncation costs the least.
+            FetchError::LegacyTls => {
+                write!(
+                    f,
+                    "refused: this site's TLS is too old — needs 1.2 or newer"
+                )
+            }
+            FetchError::Certificate(reason) => {
+                write!(
+                    f,
+                    "refused: this site's certificate is not valid ({reason})"
+                )
+            }
             FetchError::Status { code } => write!(f, "server returned {code}"),
             FetchError::Io(error) => write!(f, "{error}"),
             FetchError::TooLarge => write!(f, "response exceeded the size limit"),
@@ -235,7 +264,13 @@ fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>), FetchError> {
     // version we happen to be pinned at.
     let response = tls::agent().get(url).call().map_err(|error| match error {
         ureq::Error::StatusCode(code) => FetchError::Status { code },
-        other => FetchError::Transport(other.to_string()),
+        // Asked before falling back to a generic transport error, so that the
+        // one failure this browser causes on purpose says so.
+        other => match tls::classify(&other) {
+            Some(tls::Handshake::LegacyVersion) => FetchError::LegacyTls,
+            Some(tls::Handshake::Certificate(reason)) => FetchError::Certificate(reason),
+            None => FetchError::Transport(other.to_string()),
+        },
     })?;
 
     let content_type = response

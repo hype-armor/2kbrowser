@@ -72,9 +72,111 @@ pub fn tls_config() -> TlsConfig {
         .build()
 }
 
+/// Why a secure connection could not be established.
+///
+/// ADR-0013 decided that legacy TLS is refused rather than downgraded to. That
+/// decision was invisible in use: a site offering nothing newer than TLS 1.1
+/// failed with the same shrug as a site that was simply down, so the reader had
+/// no way to tell "this browser refused" from "this server is broken". A
+/// refusal nobody can recognise is indistinguishable from a bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handshake {
+    /// The server offered no protocol version this browser accepts.
+    LegacyVersion,
+    /// The certificate did not check out.
+    Certificate(String),
+}
+
+/// Works out whether a transport failure was the TLS handshake, and which way.
+///
+/// Reads the `rustls` error out of the `io::Error` rather than matching on the
+/// message text: the text is a `Display` impl nobody promised us, and it would
+/// change silently. `get_ref` gives back the real error, and it downcasts.
+pub fn classify(error: &ureq::Error) -> Option<Handshake> {
+    let ureq::Error::Io(io) = error else {
+        return None;
+    };
+    let failure = io.get_ref()?.downcast_ref::<rustls::Error>()?;
+    match failure {
+        // What a correctly-implemented old server actually sends: it cannot
+        // satisfy a ClientHello offering only 1.2 and 1.3, so it says so.
+        rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion) => {
+            Some(Handshake::LegacyVersion)
+        }
+        // rustls' own conclusion that there is no common ground — a server that
+        // never offers a version it can use, rather than one that objects.
+        rustls::Error::PeerIncompatible(_) => Some(Handshake::LegacyVersion),
+        rustls::Error::InvalidCertificate(reason) => {
+            Some(Handshake::Certificate(format!("{reason:?}")))
+        }
+        // `AlertReceived(HandshakeFailure)` is deliberately not here. It is what
+        // an old server sends *and* what a current one sends when only its
+        // cipher suites are too weak, and calling the second one "too old" would
+        // be a confident sentence that is sometimes false. Under-claiming beats
+        // a wrong explanation.
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wraps a `rustls` error the way `ureq` does, so [`classify`] sees what it
+    /// would see in the field.
+    fn as_ureq(error: rustls::Error) -> ureq::Error {
+        ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    #[test]
+    fn a_server_refusing_our_protocol_versions_is_recognised() {
+        // Measured, not guessed: an OpenSSL server started with `-tls1` answers
+        // a ClientHello offering only 1.2 and 1.3 with exactly this alert.
+        assert_eq!(
+            classify(&as_ureq(rustls::Error::AlertReceived(
+                rustls::AlertDescription::ProtocolVersion
+            ))),
+            Some(Handshake::LegacyVersion)
+        );
+    }
+
+    #[test]
+    fn a_bad_certificate_is_not_reported_as_an_old_server() {
+        // The two failures mean opposite things to a reader — "this site is too
+        // old to talk to" versus "something is wrong with this site's identity"
+        // — so conflating them would be worse than saying nothing.
+        let classified = classify(&as_ureq(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        )));
+        assert!(
+            matches!(classified, Some(Handshake::Certificate(_))),
+            "{classified:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_connection_failure_is_not_a_handshake_failure() {
+        // A server that is down must not be reported as a server that is old.
+        let refused = ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        assert_eq!(classify(&refused), None);
+        assert_eq!(classify(&ureq::Error::ConnectionFailed), None);
+    }
+
+    #[test]
+    fn a_handshake_failure_alert_is_left_unexplained() {
+        // Ambiguous between an old server and a current one with weak ciphers.
+        // Asserted so that adding it later is a deliberate change rather than a
+        // drive-by.
+        assert_eq!(
+            classify(&as_ureq(rustls::Error::AlertReceived(
+                rustls::AlertDescription::HandshakeFailure
+            ))),
+            None
+        );
+    }
 
     #[test]
     fn certificate_verification_is_on() {

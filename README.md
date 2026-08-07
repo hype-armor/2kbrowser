@@ -112,7 +112,10 @@ compromised renderer cannot reach.
 The engine is of its era; nothing protecting it is (ADR-0013). TLS 1.0 and 1.1
 are refused outright — not marked, not per-site, not behind a confirmation — so
 old sites that offer nothing newer do not load, and that is the intended
-outcome. There is no relaxed-certificate escape hatch. Roots come from Mozilla
+outcome. The bar says so in those words rather than showing a network error: a
+refusal nobody can recognise is indistinguishable from a bug, and a bad
+certificate says something different again, because the two mean opposite
+things. There is no relaxed-certificate escape hatch. Roots come from Mozilla
 rather than the platform, so a corporate root in the system store cannot quietly
 read this browser's traffic. All of it is asserted in tests rather than
 inherited from a library default, because "happens to be true" does not survive
