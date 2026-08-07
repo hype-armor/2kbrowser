@@ -5,8 +5,10 @@
 Status: **under construction**. M0 through M3 are done: the engine renders the
 era's HTML and CSS, the three platforms agree pixel for pixel, and there is a
 browser around it — tabs, history, a URL bar, find-in-page, bookmarks, and the
-document fallback. M4 is next, and until it lands this is a tool for its
-authors. See §6 for what each milestone covers and what is known to be missing.
+document fallback. M4 is under way — fuzzing, the process boundary, a confined
+renderer on Linux and Windows, and the TLS posture — and until it lands this is
+a tool for its authors. See §6 for what each milestone covers and what is known
+to be missing.
 
 This document started as a proposal and is now also the record of what was
 decided and why. Decisions that would be expensive to revisit are in
@@ -470,21 +472,60 @@ process, so a legitimate call that meets the filter degrades into an error the
 renderer already handles. An allowlist is the stronger end state and wants a
 measured set of what the renderer actually uses.
 
+**Windows is confined too, by a different mechanism.** seccomp is
+self-restriction; an AppContainer is not. The parent creates a package profile,
+builds a `SECURITY_CAPABILITIES` structure, and attaches it to `CreateProcess`
+through `STARTUPINFOEX` — there is no call a running process can make to put
+itself in one. So on Windows the confinement lives next to the spawn, in
+`crates/sandbox/src/contain.rs`, and `confine::apply()` correctly does nothing.
+
+The container is built with **no capabilities at all**, which makes it the
+stronger of the two: capabilities are the holes deliberately left in an
+AppContainer, and the renderer needs none because every resource it wants is a
+request the parent answers. Reached without writing any `unsafe`, through a
+pinned dependency rather than an ADR-0002 exception —
+[ADR-0014](docs/adr/0014-appcontainer-through-a-dependency.md) records that
+trade and does not pretend it is free.
+
+The self-test had to change shape for it. On Windows the process that confines
+and the process that is confined cannot be the same one, so it builds a
+container and runs the probes inside. Two versions of that check were wrong
+before Windows CI caught them, both in the same way — a check that could not
+fail, dressed as a check that passed. The file probe used `temp_dir()` computed
+independently on each side, and an AppContainer *redirects* the temp directory.
+The network probe treated `ConnectionRefused` as proof, which is sound for
+seccomp (it fails the syscall) and wrong for AppContainer (the firewall resets
+the connection, so blocked and dead are indistinguishable). It now connects to a
+listener the parent binds, and both sides echo what they aimed at.
+
 Still not done:
 
-1. **macOS and Windows are unconfined.** The App Sandbox entitlement model and
-   an AppContainer with a restricted token respectively; neither is implemented,
-   and neither is stubbed to look done — the child reports `Unavailable` and
-   says so on stderr. A sandbox that claims to work and does not is worse than
-   one that says it is missing.
+1. **macOS is unconfined.** The App Sandbox is not implemented, and it is not
+   stubbed to look done — the parent reports `Unavailable` and says so on
+   stderr. A sandbox that claims to work and does not is worse than one that
+   says it is missing. Unlike Windows there is no third way round ADR-0002:
+   Seatbelt has no safe wrapper on crates.io, only raw FFI bindings, so it needs
+   either a lint exception or a quarantined crate — and neither of us can test
+   it. See [issue #4](https://github.com/hype-armor/2kbrowser/issues/4).
 2. **Landlock is not used.** It would add filesystem confinement beyond
    "cannot call `open`", and `landlock_create_ruleset` returns `ENOSYS` on the
    kernel this was developed against, so it could not be tested. Filesystem
    access is denied at the syscall level instead, which covers opening but not
    every path to a descriptor.
-3. **A legacy-TLS refusal is not legible.** ADR-0013 refuses TLS 1.0 and 1.1
-   outright, and the chrome shows that as an ordinary network error — so an
-   honest refusal reads as a bug.
+3. **Only loopback is probed on Windows.** Loopback and outbound are separate
+   AppContainer rules, and reaching the internet from a test is not something to
+   depend on. What rules out outbound is the capability set being empty, which
+   is asserted directly instead.
+
+**A legacy-TLS refusal is legible — done.** ADR-0013 refuses TLS 1.0 and 1.1
+outright, and until this landed the chrome showed that as an ordinary network
+error, so an honest refusal read as a bug. The bar now says "refused: this
+site's TLS is too old — needs 1.2 or newer", and a bad certificate says
+something different, because the two mean opposite things to a reader.
+Classified from the structured `rustls` error rather than from message text, so
+it does not break when a `Display` impl nobody promised us changes. Tested end
+to end without needing `openssl` on the machine: what an old server sends is a
+seven-byte fatal `protocol_version` alert, so the test sends exactly those bytes.
 
 ### M5 — The slop layer
 Content-quality signals surfaced in the UI. Optional community blocklists for
