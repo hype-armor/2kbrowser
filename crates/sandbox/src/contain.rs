@@ -194,6 +194,11 @@ impl Contained {
     pub fn stdout(&mut self) -> Option<&mut std::fs::File> {
         self.io.stdout.as_mut()
     }
+
+    /// The child's process id.
+    pub fn id(&self) -> u32 {
+        self.io.pid
+    }
 }
 
 /// Runs a program inside a container and returns everything it printed.

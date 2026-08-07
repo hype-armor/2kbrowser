@@ -50,6 +50,14 @@ impl Spawned {
         }
     }
 
+    fn id(&self) -> u32 {
+        match self {
+            Spawned::Plain(child) => child.id(),
+            #[cfg(target_os = "windows")]
+            Spawned::Contained(child) => child.id(),
+        }
+    }
+
     fn kill(&mut self) {
         match self {
             Spawned::Plain(child) => {
@@ -319,6 +327,18 @@ impl Session {
             path,
             force_authored,
         })
+    }
+
+    /// The renderer's process id.
+    ///
+    /// Exposed for one reason: so a test can go and look. Dropping a session is
+    /// supposed to kill its child, and the two platforms do that by completely
+    /// different means — an explicit `kill` on Unix, a job object closing on
+    /// Windows — so "it works" is worth checking rather than asserting. The
+    /// test that used to cover this said in its own comment that it checked the
+    /// path was repeatable rather than that the child was gone.
+    pub fn child_id(&self) -> u32 {
+        self.child.id()
     }
 
     /// Asks where `query` appears on the page this child is holding.

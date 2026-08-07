@@ -245,13 +245,68 @@ fn dropping_a_session_kills_its_child() {
     let (first, _) = session("<body><p>x</p></body>", 200);
     drop(first);
 
-    // The proof that it is gone is that a fresh one still works — a leaked
-    // child would eventually exhaust the process table rather than fail here,
-    // so this checks the path is repeatable rather than the kill directly.
     for _ in 0..8 {
         let (live, page) = session("<body><p>x</p></body>", 200);
         assert!(page.width > 0);
         drop(live);
+    }
+}
+
+#[test]
+fn a_dropped_session_leaves_no_process_behind() {
+    // The version of the check above that actually looks. The one above proves
+    // the path is repeatable, which it said in its own comment, and a leaked
+    // renderer per navigation would pass it every time.
+    //
+    // Worth its own test now because the two platforms kill by completely
+    // different means. On Unix the parent calls `kill` and reaps. On Windows it
+    // does not: the child is in a job object created with
+    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and what kills it is the job handle
+    // closing when the session drops. Nothing in the shared code path would
+    // notice if that stopped working.
+    let (live, _) = session("<body><p>x</p></body>", 200);
+    let pid = live.child_id();
+    assert!(alive(pid), "the renderer was not running to begin with");
+    drop(live);
+
+    // A moment for the kernel to finish with it. Windows tears down a job
+    // asynchronously, so an immediate check can still see the process.
+    for _ in 0..50 {
+        if !alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("renderer {pid} was still running a second after its session was dropped");
+}
+
+/// Whether a process id belongs to something still running.
+///
+/// Asked of the operating system rather than of our own bookkeeping, which is
+/// the whole point: our bookkeeping is what is on trial.
+fn alive(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // `tasklist` prints a header and a row when it matches, and a single
+        // "INFO: No tasks..." line when it does not.
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("tasklist runs");
+        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Signal 0 checks for existence without delivering anything. A reaped
+        // child is gone; a zombie would still answer, which is exactly the leak
+        // worth catching, since the parent is supposed to `wait` as well as
+        // `kill`.
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .expect("kill runs")
+            .status
+            .success()
     }
 }
 
