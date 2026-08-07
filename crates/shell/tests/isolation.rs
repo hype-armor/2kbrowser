@@ -719,3 +719,57 @@ fn the_render_command_parses_in_a_child_rather_than_in_itself() {
         "`2kbrowser render` never spawned a renderer — it parsed the page itself"
     );
 }
+
+#[test]
+fn renderers_built_at_the_same_time_all_start() {
+    // Windows builds the sandbox in the parent: an AppContainer profile in the
+    // registry, and a grant on the executable's DACL so the container can read
+    // the binary it is meant to run. That grant is read-modify-write, and doing
+    // it from several threads at once is a lost update — the second write lands
+    // without the first thread's entry, and `CreateProcess` then fails with
+    // access denied for a container that looked correctly built.
+    //
+    // That is not hypothetical: it happened, as two tests out of seventeen
+    // failing on CI while the same code had been green on the run before. It
+    // was found by luck, so it is worth a test that looks for it on purpose.
+    //
+    // On Linux this costs a few child processes and asserts nothing new, which
+    // is the right price for a check that only fails on the platform it is
+    // about.
+    let threads: Vec<_> = (0..6)
+        .map(|index| {
+            std::thread::spawn(move || {
+                let renderer = sandbox::Renderer::with_program(std::path::PathBuf::from(env!(
+                    "CARGO_BIN_EXE_2kbrowser"
+                )));
+                renderer
+                    .render(
+                        format!("<body><p>thread {index}</p></body>").into_bytes(),
+                        None,
+                        200,
+                        400,
+                        None,
+                        String::new(),
+                        false,
+                    )
+                    .map(|page| page.width)
+                    .map_err(|error| format!("thread {index}: {error}"))
+            })
+        })
+        .collect();
+
+    let outcomes: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("the thread does not panic"))
+        .collect();
+    let failures: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} concurrent renderers failed to start: {failures:?}",
+        failures.len(),
+        outcomes.len()
+    );
+}
