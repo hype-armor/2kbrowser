@@ -17,3 +17,6 @@ that ADRs are superseded rather than edited.
 | [0009](0009-automatic-document-fallback.md) | Re-render as a document when a page is too modern | accepted |
 | [0010](0010-font-acquisition.md) | Fetch fonts at build time, against pinned checksums | accepted |
 | [0011](0011-modern-shell-period-engine.md) | A modern shell around a period engine | accepted |
+| [0012](0012-process-isolation.md) | Render in a separate process | accepted |
+| [0013](0013-modern-security-only.md) | Period engine, present-day security | accepted |
+| [0014](0014-appcontainer-through-a-dependency.md) | The Windows sandbox comes through a dependency | accepted |

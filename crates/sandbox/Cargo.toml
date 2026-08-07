@@ -17,6 +17,12 @@ net = { path = "../net" }
 libc = "0.2"
 seccompiler = "0.5"
 
+# The AppContainer half (ADR-0014). This is where the `unsafe` that
+# `CreateProcess`-with-a-security-capabilities-attribute requires actually
+# lives; ADR-0002 forbids it in this workspace, not in the world.
+[target.'cfg(target_os = "windows")'.dependencies]
+rappct = "=0.13.3"
+
 
 [lints]
 workspace = true

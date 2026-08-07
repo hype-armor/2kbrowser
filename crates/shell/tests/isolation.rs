@@ -371,35 +371,61 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn the_renderer_cannot_open_a_socket_or_a_file() {
     // The only honest way to test a sandbox is from inside it: a filter that
     // installs successfully and blocks nothing would pass any test written from
-    // outside. So the binary applies its own confinement and reports.
+    // outside. So the binary confines and reports from within.
+    //
+    // Both mechanisms answer here. On Linux the process filters itself; on
+    // Windows it builds an AppContainer and runs the probes in a child, because
+    // there is no call a process can make to put *itself* in one.
     let output = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
         .arg(sandbox::confine::SELFTEST_ARGUMENT)
         .output()
         .expect("the selftest runs");
     let report = String::from_utf8_lossy(&output.stdout);
 
-    // Skipped rather than failed where seccomp is unavailable — an old kernel,
-    // or a container that forbids installing a filter. A check that cannot run
-    // must not look like a check that passed, so it says so.
+    // Skipped rather than failed where the sandbox is unavailable — an old
+    // kernel, a container that forbids installing a filter, macOS. A check that
+    // cannot run must not look like a check that passed, so it says so.
     if report.contains("confinement=Failed") || report.contains("confinement=Unavailable") {
-        eprintln!("SKIP: seccomp is not available here\n{report}");
+        eprintln!("SKIP: no sandbox is available here\n{report}");
         return;
     }
 
-    assert!(report.contains("confinement=Seccomp"), "{report}");
+    let expected = if cfg!(target_os = "windows") {
+        "confinement=AppContainer"
+    } else {
+        "confinement=Seccomp"
+    };
+    assert!(report.contains(expected), "{report}");
+
+    // Stated as the property rather than as an errno. `ConnectionRefused` is
+    // the interesting one to exclude: it means the connect went all the way out
+    // and something at the far end said no, which is proof the network was
+    // reachable. Anything else is the attempt being stopped before that.
+    let field = |name: &str| {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no `{name}` line in:\n{report}"))
+            .to_owned()
+    };
+    let socket = field("socket=");
     assert!(
-        report.contains("socket=PermissionDenied"),
-        "the renderer could still reach the network:\n{report}"
+        socket != "OPENED" && socket != "ConnectionRefused",
+        "the renderer could still reach the network (socket={socket}):\n{report}"
+    );
+    let file = field("file=");
+    assert!(
+        file != "OPENED",
+        "the renderer could still open a file (file={file}):\n{report}"
     );
     assert!(
-        report.contains("file=PermissionDenied"),
-        "the renderer could still open a file:\n{report}"
+        !file.starts_with("PROBE-UNWRITABLE"),
+        "the probe file was never written, so the file check proves nothing:\n{report}"
     );
-    // And it is still able to do its actual job, which a filter that broke
+    // And it is still able to do its actual job, which a sandbox that broke
     // everything would also satisfy the two assertions above.
     assert!(report.contains("compute=55"), "{report}");
 }

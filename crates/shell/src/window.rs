@@ -1357,15 +1357,20 @@ pub fn open(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
-    // Said once, here, rather than by every renderer child on spawn. Whether
-    // this build can confine anything is a property of the build, and someone
-    // deciding whether to point this at a strange page should be told plainly.
-    if !sandbox::confine::available() {
+    let renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
+    // Said once, here, rather than by every renderer child on spawn: twenty
+    // copies of a warning in one run is how a warning becomes something people
+    // scroll past. Someone deciding whether to point this at a strange page
+    // should be told plainly, and once is plainly.
+    if !renderer.confinement().is_confined() {
         eprintln!(
             "2kbrowser: {} — pages are rendered in a separate process, but an \
              unconfined one",
-            sandbox::Confinement::Unavailable.describe()
+            renderer.confinement().describe()
         );
+        if let Some(reason) = renderer.confinement_failure() {
+            eprintln!("2kbrowser: {reason}");
+        }
     }
 
     let event_loop = EventLoop::new().map_err(|error| {
@@ -1386,7 +1391,7 @@ pub fn open(
             url,
         )),
         fetcher: net::Fetcher::default(),
-        renderer: sandbox::Renderer::new().map_err(|error| error.to_string())?,
+        renderer,
         fonts: FontStore::new(),
         window: None,
         surface: None,

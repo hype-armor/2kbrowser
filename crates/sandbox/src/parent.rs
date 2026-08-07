@@ -9,14 +9,77 @@
 //! exfiltrate anything regardless of what it is tricked into computing, and
 //! ADR-0006's policy is enforced somewhere a compromised renderer cannot reach.
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use net::{Fetcher, Origin, RequestKind};
 
+use crate::confine::Confinement;
 use crate::message::{Rendered, ToChild, ToParent};
 use crate::{CHILD_ARGUMENT, Error, read_frame, write_frame};
+
+/// A renderer process, however it was started.
+///
+/// Two ways in: an ordinary child, and — on Windows — one launched into an
+/// AppContainer, which cannot go through `Command` because the container has to
+/// be attached at `CreateProcess` time (see [`crate::contain`]). Both ends up as
+/// two pipes and something that kills the process, which is all the rest of this
+/// file needs.
+enum Spawned {
+    Plain(Child),
+    #[cfg(target_os = "windows")]
+    Contained(crate::contain::Contained),
+}
+
+impl Spawned {
+    fn stdin(&mut self) -> Option<&mut dyn Write> {
+        match self {
+            Spawned::Plain(child) => child.stdin.as_mut().map(|pipe| pipe as &mut dyn Write),
+            #[cfg(target_os = "windows")]
+            Spawned::Contained(child) => child.stdin().map(|pipe| pipe as &mut dyn Write),
+        }
+    }
+
+    fn stdout(&mut self) -> Option<&mut dyn Read> {
+        match self {
+            Spawned::Plain(child) => child.stdout.as_mut().map(|pipe| pipe as &mut dyn Read),
+            #[cfg(target_os = "windows")]
+            Spawned::Contained(child) => child.stdout().map(|pipe| pipe as &mut dyn Read),
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            Spawned::Plain(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Nothing to do: the job object was created with kill-on-close, so
+            // dropping this closes the handle and the kernel kills the child.
+            // That is stronger than an explicit `kill`, because it also fires
+            // when the browser is killed outright rather than exiting.
+            #[cfg(target_os = "windows")]
+            Spawned::Contained(_) => {}
+        }
+    }
+}
+
+/// Starts an ordinary, unconfined child.
+fn spawn_plain(program: &Path) -> Result<Spawned, Error> {
+    Command::new(program)
+        .arg(CHILD_ARGUMENT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Left inherited on purpose: a panic message from the child is the most
+        // useful thing it can produce when something is wrong, and swallowing it
+        // would make every renderer bug invisible.
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map(Spawned::Plain)
+        .map_err(|error| Error::Spawn(error.to_string()))
+}
 
 /// How long one page may take before the renderer is killed.
 ///
@@ -41,6 +104,12 @@ pub struct Renderer {
     program: PathBuf,
     fetcher: Fetcher,
     timeout: Duration,
+    /// The container children are launched into, where the parent builds one.
+    #[cfg(target_os = "windows")]
+    container: Option<crate::contain::Container>,
+    confinement: Confinement,
+    /// Why the container could not be built, when that is what happened.
+    failure: Option<String>,
 }
 
 impl Renderer {
@@ -51,20 +120,74 @@ impl Renderer {
     pub fn new() -> Result<Self, Error> {
         let program = std::env::current_exe()
             .map_err(|error| Error::Spawn(format!("cannot find this executable: {error}")))?;
-        Ok(Self {
-            program,
-            fetcher: Fetcher::default(),
-            timeout: RENDER_TIMEOUT,
-        })
+        Ok(Self::for_program(program))
     }
 
     /// A renderer that runs a named program instead. For tests.
     pub fn with_program(program: PathBuf) -> Self {
+        Self::for_program(program)
+    }
+
+    /// The container is built once here rather than per page: creating the
+    /// profile writes to the registry and granting the executable rewrites its
+    /// ACL, and doing either on every navigation would be absurd.
+    fn for_program(program: PathBuf) -> Self {
+        #[cfg(target_os = "windows")]
+        let (container, confinement, failure) = match crate::contain::Container::new(&program) {
+            Ok(container) => (Some(container), Confinement::AppContainer, None),
+            // Not fatal. A browser that refuses to render anything because it
+            // could not build a sandbox is a browser nobody can use to find out
+            // why; the failure is carried instead, and said once by the caller.
+            Err(reason) => (None, Confinement::Failed, Some(reason)),
+        };
+        #[cfg(not(target_os = "windows"))]
+        // What the child will install for itself after `exec`. It reports its
+        // own failure — the parent cannot see it from here.
+        let (confinement, failure) = if cfg!(target_os = "linux") {
+            (Confinement::Seccomp, None)
+        } else {
+            (Confinement::Unavailable, None)
+        };
+
         Self {
             program,
             fetcher: Fetcher::default(),
             timeout: RENDER_TIMEOUT,
+            #[cfg(target_os = "windows")]
+            container,
+            confinement,
+            failure,
         }
+    }
+
+    /// What confines the renderers this spawns.
+    ///
+    /// Half the story on Linux, and honestly so: there the child installs its
+    /// own filter after `exec`, so this is what the build *will* apply rather
+    /// than what it did, and the child prints if the install failed. On Windows
+    /// the parent builds the container itself, so this is the outcome.
+    pub fn confinement(&self) -> Confinement {
+        self.confinement
+    }
+
+    /// Why the container could not be built, if that is what happened.
+    ///
+    /// A sentence for the operator. `None` everywhere the parent does not build
+    /// the confinement itself.
+    pub fn confinement_failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    /// Starts one renderer, contained if this platform's parent can contain it.
+    fn spawn(&self) -> Result<Spawned, Error> {
+        #[cfg(target_os = "windows")]
+        if let Some(container) = &self.container {
+            return container
+                .spawn(CHILD_ARGUMENT)
+                .map(Spawned::Contained)
+                .map_err(Error::Spawn);
+        }
+        spawn_plain(&self.program)
     }
 
     /// Sets how long a page may take.
@@ -98,19 +221,8 @@ impl Renderer {
         path: String,
         force_authored: bool,
     ) -> Result<(Session, Rendered), Error> {
-        let child = Command::new(&self.program)
-            .arg(CHILD_ARGUMENT)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Left inherited on purpose: a panic message from the child is the
-            // most useful thing it can produce when something is wrong, and
-            // swallowing it would make every renderer bug invisible.
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| Error::Spawn(error.to_string()))?;
-
         let mut session = Session {
-            child,
+            child: self.spawn()?,
             fetcher: self.fetcher.clone(),
             timeout: self.timeout,
             document: origin.clone(),
@@ -167,7 +279,7 @@ impl Renderer {
 /// nothing a page accumulated — caches, font state, whatever an exploit left
 /// behind — survives into the next one.
 pub struct Session {
-    child: Child,
+    child: Spawned,
     fetcher: Fetcher,
     timeout: Duration,
     /// The origin the parent asked for a render of.
@@ -224,12 +336,12 @@ impl Session {
     }
 
     fn send(&mut self, message: &ToChild) -> Result<(), Error> {
-        let stdin = self.child.stdin.as_mut().ok_or(Error::Died)?;
+        let stdin = self.child.stdin().ok_or(Error::Died)?;
         write_frame(stdin, &message.encode())
     }
 
     fn read(&mut self) -> Result<Vec<u8>, Error> {
-        let stdout = self.child.stdout.as_mut().ok_or(Error::Died)?;
+        let stdout = self.child.stdout().ok_or(Error::Died)?;
         read_frame(stdout)
     }
 
@@ -303,8 +415,7 @@ impl Drop for Session {
         // Unconditional, including after a clean render. A renderer whose page
         // is gone has nothing left to do, and one that is wedged must not
         // outlive the tab that started it.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill();
     }
 }
 

@@ -54,6 +54,13 @@ fn main() -> ExitCode {
             println!("{}", sandbox::confine::selftest());
             ExitCode::SUCCESS
         }
+        // The far half of the self-test, for platforms where the confinement is
+        // applied from outside and so cannot be applied by the process running
+        // the probes. Not in the usage text: the self-test runs this on itself.
+        Some(sandbox::confine::SELFTEST_PROBE_ARGUMENT) => {
+            println!("{}", sandbox::confine::selftest_probe());
+            ExitCode::SUCCESS
+        }
         Some(sandbox::CHILD_ARGUMENT) => match shell::isolated::run_child() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

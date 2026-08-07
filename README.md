@@ -118,19 +118,30 @@ read this browser's traffic. All of it is asserted in tests rather than
 inherited from a library default, because "happens to be true" does not survive
 a dependency bump.
 
-On Linux the renderer is also confined by a seccomp filter, applied before it
-reads its first frame: no sockets, no opening files, no starting processes. It
-still renders the era fixture byte-identically with all three of its images
-arriving over the pipe, which is the check that the filter did not quietly break
-the thing it protects. `2kbrowser --confine-selftest` makes the browser confine
-itself and report what it can still reach.
+The renderer is confined on Linux and Windows, by the two mechanisms those
+platforms actually have — which are not the same shape. On Linux the child
+installs a seccomp filter on itself before reading its first frame: no sockets,
+no opening files, no starting processes. On Windows the *parent* builds an
+AppContainer with no capabilities at all and launches the child into it, because
+there is no call a running process can make to put itself in one. Capabilities
+are the holes deliberately left in a container, and this one has none, which
+makes it the stronger of the two: seccomp here is a denylist, so a syscall
+nobody named is allowed. Both were reached without writing any `unsafe`
+(ADR-0014).
 
-> **Not safe for browsing untrusted sites.** On macOS and Windows the renderer
-> is a separate process but an otherwise unconfined one — the App Sandbox and
-> AppContainer equivalents are not implemented, and the child says so on stderr
-> rather than pretending. The Linux filter is a denylist, so a syscall nobody
-> named is allowed. Neither the parser fuzzing nor any of this has been reviewed
-> by anyone but its authors. Until that changes this is a tool for its authors.
+It still renders the era fixture byte-identically with all three of its images
+arriving over the pipe, which is the check that the sandbox did not quietly
+break the thing it protects. `2kbrowser --confine-selftest` confines a renderer
+and reports what it can still reach — from inside, because a sandbox that
+installs successfully and confines nothing would pass any check written from
+the outside.
+
+> **Not safe for browsing untrusted sites.** On macOS the renderer is a separate
+> process but an otherwise unconfined one — the App Sandbox equivalent is not
+> implemented, and the browser says so on stderr rather than pretending. The
+> Linux filter is a denylist, so a syscall nobody named is allowed. Neither the
+> parser fuzzing nor any of this has been reviewed by anyone but its authors.
+> Until that changes this is a tool for its authors.
 
 ## Building
 
