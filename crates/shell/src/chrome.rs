@@ -175,6 +175,16 @@ pub struct State<'a> {
     pub finding: Option<(&'a crate::field::Field, usize, usize)>,
     /// Whether this page is in the saved list.
     pub saved: bool,
+    /// Whether the page is taller than the canvas it was rendered onto.
+    ///
+    /// A real limitation of the process boundary rather than a rare edge: the
+    /// canvas covers the whole document so scrolling costs a blit rather than a
+    /// re-layout, and it has to fit in one frame so a compromised renderer
+    /// cannot make the parent allocate without limit. Around 20,000 rows at 800
+    /// pixels wide, which almost nothing reaches and something eventually will.
+    /// Until banded rendering exists, the browser says the page is not all
+    /// there instead of ending in white.
+    pub truncated: bool,
 }
 
 /// A control in the bar.
@@ -303,6 +313,12 @@ pub fn scheme_notice(url: &str) -> Option<&'static str> {
 pub fn status(state: &State<'_>) -> Option<String> {
     if let Some(error) = state.error {
         return Some(error.to_owned());
+    }
+    // Above the rendering mode, and deliberately: how a page was laid out
+    // matters less than the page not being all there. Both can be true at
+    // once and there is one line to say it in.
+    if state.truncated {
+        return Some("page too long — the end is not shown".to_owned());
     }
     match state.mode {
         RenderMode::Authored => scheme_notice(state.url).map(str::to_owned),
@@ -723,7 +739,31 @@ mod tests {
             editing: None,
             finding: None,
             saved: false,
+            truncated: false,
         }
+    }
+
+    #[test]
+    fn a_page_too_long_to_render_says_so_and_outranks_the_mode() {
+        // The one limitation of the process boundary a reader can actually run
+        // into, and it used to be silent: the page simply stopped, with white
+        // below it, exactly as if the document had ended there.
+        let mut plain = state("https://example.com/a.html", &RenderMode::Authored);
+        plain.truncated = true;
+        let said = status(&plain).expect("says something");
+        assert!(said.contains("too long"), "{said}");
+
+        // Above the mode notice, because a page not being all there matters
+        // more than how the part that is there was laid out. Below an error,
+        // because a page that failed to load is not on screen at all.
+        let document = RenderMode::Document {
+            unsupported_share: 1.0,
+        };
+        let mut both = state("https://example.com/a.html", &document);
+        both.truncated = true;
+        assert!(status(&both).expect("says something").contains("too long"));
+        both.error = Some("server returned 500");
+        assert_eq!(status(&both).as_deref(), Some("server returned 500"));
     }
 
     #[test]

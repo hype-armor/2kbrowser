@@ -87,8 +87,14 @@ fn pack(pixel: &paint::PremultipliedColor) -> u32 {
 ///
 /// Pure, and therefore testable without a display — which is most of what this
 /// module gets wrong when it gets anything wrong.
-fn clamp_scroll(offset: f32, content_height: f32, viewport_height: f32) -> f32 {
-    let max = (content_height - viewport_height).max(0.0);
+///
+/// The range is the *canvas*, not the content, and for every page short enough
+/// those are the same number. Past the canvas there are no pixels — the blit
+/// fills white — so a taller document used to be scrollable into a void that
+/// looked exactly like the document ending. Stopping where the pixels stop is
+/// half the answer; the bar saying the page is not all there is the other half.
+fn clamp_scroll(offset: f32, scrollable_height: f32, viewport_height: f32) -> f32 {
+    let max = (scrollable_height - viewport_height).max(0.0);
     offset.clamp(0.0, max)
 }
 
@@ -274,7 +280,7 @@ impl App {
 
         if let Some(page) = tab.page.as_ref() {
             tab.can_toggle_layout = page.can_toggle_layout();
-            tab.scroll = clamp_scroll(tab.scroll, page.content_height(), viewport);
+            tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
         }
 
         // The old matches pointed at the old layout.
@@ -401,6 +407,10 @@ impl App {
                     .as_ref()
                     .map(|field| (field, tab.current_match, tab.matches.len())),
                 saved: bookmarks.contains(tab.history.current()),
+                truncated: tab
+                    .page
+                    .as_ref()
+                    .is_some_and(crate::viewport::Viewport::is_truncated),
             },
             size.0,
             fonts,
@@ -582,7 +592,12 @@ impl App {
     /// wraps across a line break can be scrolled to and still be half off
     /// screen.
     fn scroll_into_view(&mut self, bounds: layout::Rect) {
-        let Some(height) = self.tab().page.as_ref().map(|page| page.content_height()) else {
+        let Some(height) = self
+            .tab()
+            .page
+            .as_ref()
+            .map(|page| page.scrollable_height())
+        else {
             return;
         };
         let viewport = self.viewport_height();
@@ -819,6 +834,11 @@ impl App {
                     .as_ref()
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
                 saved: self.bookmarks.contains(self.tab().history.current()),
+                truncated: self
+                    .tab()
+                    .page
+                    .as_ref()
+                    .is_some_and(crate::viewport::Viewport::is_truncated),
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -858,7 +878,7 @@ impl App {
         let before = self.tab().scroll;
         self.tab_mut().scroll = clamp_scroll(
             self.tab().scroll + delta,
-            page.content_height(),
+            page.scrollable_height(),
             self.viewport_height(),
         );
         if self.tab().scroll != before

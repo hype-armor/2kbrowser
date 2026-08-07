@@ -556,3 +556,56 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
         "a confined renderer produced different pixels"
     );
 }
+
+#[test]
+fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
+    // The one limitation of the process boundary a reader can actually hit.
+    // The canvas covers the whole document so scrolling costs a blit, and it
+    // has to fit in one frame so a compromised renderer cannot make the parent
+    // allocate without limit — about 20,000 rows at 800 pixels wide. Past that
+    // the page simply stopped, with white below it, indistinguishable from the
+    // document ending.
+    //
+    // Provoked with a small canvas rather than a 20,000-row document: the
+    // property is "content taller than canvas", and rendering twenty thousand
+    // rows to assert it would cost seconds for nothing.
+    let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall.html");
+    let html = format!("<body>{}</body>", "<p>line</p>".repeat(200));
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let document = shell::viewport::Document {
+        body: html.as_bytes().to_vec(),
+        content_type: None,
+        origin,
+        path: at,
+    };
+
+    let tall = shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false)
+        .expect("the page opens");
+    assert!(
+        tall.content_height() > tall.height() as f32,
+        "the fixture was not tall enough to be clipped: {} content, {} canvas",
+        tall.content_height(),
+        tall.height()
+    );
+    assert!(tall.is_truncated());
+    // And the scroll stops where the pixels stop, rather than running on into
+    // rows that were never rendered.
+    assert_eq!(tall.scrollable_height(), tall.height() as f32);
+
+    // The same document with room for all of it is not truncated, which is what
+    // makes the assertion above about the page rather than about the type.
+    let whole = shell::viewport::Viewport::open(&renderer, document, 400, 20_000, false)
+        .expect("the page opens");
+    assert!(
+        !whole.is_truncated(),
+        "{} content, {} canvas",
+        whole.content_height(),
+        whole.height()
+    );
+}

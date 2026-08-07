@@ -46,6 +46,13 @@ Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and
 `background-position`.
 
+A page taller than about 20,000 rows is cut short — the canvas covers the whole
+document so scrolling costs a blit rather than a re-layout, and it has to fit in
+one frame so a compromised renderer cannot make the parent allocate without
+limit. The bar says "page too long — the end is not shown" and the scroll stops
+where the pixels stop, rather than running on into white that looks exactly like
+the document ending. Banded rendering is the real fix and is not written.
+
 Links work in the window: click to follow, Alt+Left/Right or Backspace for
 back and forward, and the cursor changes over a link. `2kbrowser links <page>`
 prints every link rectangle and where it leads, and

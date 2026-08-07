@@ -116,6 +116,30 @@ impl Viewport {
         self.page.content_height
     }
 
+    /// How far the page can be scrolled, in pixels of canvas.
+    ///
+    /// The canvas rather than the content, which are the same number for every
+    /// page short enough. Beyond the canvas there is nothing to show — the blit
+    /// fills white — so scrolling there is scrolling into a void that looks like
+    /// the document ending. Better to stop where the pixels stop and say why.
+    pub fn scrollable_height(&self) -> f32 {
+        self.page.height as f32
+    }
+
+    /// Whether the document is taller than the canvas it was rendered onto.
+    ///
+    /// The frame bound in [`sandbox::max_canvas_height`] made this reachable:
+    /// one canvas covers the whole document so scrolling costs a blit, and one
+    /// frame is bounded so a compromised renderer cannot make the parent
+    /// allocate without limit. About 20,000 rows at 800 pixels wide.
+    ///
+    /// Rounded up before comparing, because the canvas is a whole number of
+    /// rows and the content height is not — a page 400.5 pixels tall gets a
+    /// 401-row canvas and is not truncated.
+    pub fn is_truncated(&self) -> bool {
+        self.page.content_height.ceil() > self.page.height as f32
+    }
+
     /// The page's title, when it had one.
     pub fn title(&self) -> Option<&str> {
         self.page.title.as_deref()
