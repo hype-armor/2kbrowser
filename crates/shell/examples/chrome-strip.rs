@@ -73,6 +73,21 @@ fn main() {
             saved: false,
             truncated: false,
         },
+        // A page the canvas could not hold all of. Says so rather than ending
+        // in white, which is indistinguishable from the document ending.
+        chrome::State {
+            url: "https://example.com/a-very-long-archive-page.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: None,
+            saved: false,
+            truncated: true,
+        },
         chrome::State {
             url: "https://example.com/something-modern",
             mode: &document,
