@@ -1,0 +1,13 @@
+<!doctype html><html><head><style>
+/* Regression seed: `font-size: 0` is legal CSS and a common one — it closes
+   the gap between inline-blocks. Our line height derives from the font size,
+   and cosmic-text asserts a line height is never zero, so this panicked the
+   whole browser. Found by the first soak; fixed in crates/text. */
+.gap { font-size: 0; }
+.huge { font-size: 1e40px; }
+.flat { line-height: 0; }
+</style></head><body>
+<p class="gap">invisible</p>
+<p class="huge">enormous</p>
+<p class="flat">flat</p>
+</body></html>

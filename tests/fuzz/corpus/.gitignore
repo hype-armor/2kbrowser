@@ -1,0 +1,4 @@
+# The in-flight file is whatever a run was holding when it died: a duplicate
+# of a recorded crasher at best, noise at worst. Findings themselves are
+# committed, so a fixed bug stays fixed.
+*/in-flight.bin

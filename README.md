@@ -86,10 +86,18 @@ outlined rather than tinted, so it does not read as a find match — both can be
 on screen at once and they mean different things — and a link that wraps across
 a line break is outlined in every piece, because it is one link.
 
-M3 is complete. See [PLAN.md](PLAN.md).
+M3 is complete, and M4 has started with fuzzing. `cargo test` runs a short pass
+that mutates the reference fixtures into the HTML parser, the CSS parser, image
+decoding, URL parsing, and the whole render pipeline; `cargo run -p fuzz` soaks
+for as long as you leave it. The first soak found three panics reachable from
+an ordinary stylesheet — `font-size: 0`, `font-size: 99999px`, and
+`margin: 1e40px` — each of which stopped the browser. All three are fixed, and
+each has a regression test where the bug was rather than where it surfaced.
 
-> **Not safe for browsing untrusted sites.** Sandboxing, parser fuzzing, and
-> TLS review all land in M4. Until then this is a tool for its authors.
+> **Not safe for browsing untrusted sites.** Sandboxing and TLS review are still
+> to come in M4, and the fuzzer cannot catch a hang — it times each input after
+> the fact, so an input that never returns hangs the harness rather than being
+> reported. Until that is done this is a tool for its authors.
 
 ## Building
 

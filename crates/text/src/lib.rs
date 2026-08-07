@@ -75,6 +75,14 @@ const MONO: &[(&str, &[u8])] = &[
     ),
 ];
 
+/// Largest font size we will ask the outline rasteriser for, in pixels.
+///
+/// Well past any size a document uses on purpose — a 2048-pixel letter already
+/// fills a screen — and far below where the glyph bitmap stops being a sensible
+/// allocation. Browsers all clamp somewhere similar; the number is a judgement
+/// call, the existence of one is not.
+const MAX_GLYPH_SIZE: f32 = 2048.0;
+
 /// One shaped, positioned glyph.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionedGlyph {
@@ -373,6 +381,53 @@ impl FontStore {
         }
     }
 
+    /// The line height to lay out with.
+    ///
+    /// A line height reaches here from the cascade, and the cascade computes it
+    /// from the font size — so `font-size: 1e40px`, which parses to infinity in
+    /// an `f32`, arrives as an infinite line height and poisons every
+    /// coordinate downstream. Geometry that leaves this crate is finite.
+    fn line_height_for(style: &ComputedStyle) -> f32 {
+        if style.line_height.is_finite() && style.line_height >= 0.0 {
+            style.line_height
+        } else {
+            0.0
+        }
+    }
+
+    /// Metrics cosmic-text will accept.
+    ///
+    /// `Buffer::new` asserts that the line height is not zero, and ours is
+    /// derived from the font size — so `font-size: 0`, which is a legal
+    /// declaration and a common one (it is how the era's authors and ours both
+    /// close the gap between inline-blocks), took the whole browser down. A
+    /// panic reachable from a stylesheet is not a rendering bug, it is a denial
+    /// of service, and the fuzzer found it in the first soak.
+    ///
+    /// `line-height: 0` on its own is legal too and means something different:
+    /// the text still has glyphs and width, the line box just contributes no
+    /// height. So the floor here is only about keeping the shaper alive — what
+    /// the caller reports as the line's height is decided in [`Self::shape_segment`].
+    ///
+    /// Non-finite values are floored for the same reason: a `NaN` size would
+    /// propagate silently into every coordinate downstream of it.
+    fn metrics_for(style: &ComputedStyle) -> Metrics {
+        /// Small enough to be invisible, large enough that no arithmetic
+        /// downstream divides by something near zero.
+        const FLOOR: f32 = 0.01;
+        let size = if style.font_size.is_finite() && style.font_size > FLOOR {
+            style.font_size
+        } else {
+            FLOOR
+        };
+        let line = if style.line_height.is_finite() && style.line_height > FLOOR {
+            style.line_height
+        } else {
+            FLOOR
+        };
+        Metrics::new(size, line)
+    }
+
     /// Attributes for one inline span.
     fn attrs_for(style: &ComputedStyle) -> Attrs<'static> {
         Attrs::new()
@@ -383,7 +438,7 @@ impl FontStore {
                 FontStyle::Italic => Style::Italic,
                 FontStyle::Normal => Style::Normal,
             })
-            .metrics(Metrics::new(style.font_size, style.line_height))
+            .metrics(Self::metrics_for(style))
             .color(cosmic_text::Color::rgba(
                 style.color.r,
                 style.color.g,
@@ -407,8 +462,17 @@ impl FontStore {
         if text.is_empty() {
             return Shaped::default();
         }
-        let metrics = Metrics::new(style.font_size, style.line_height);
-        let mut buffer = Buffer::new(&mut self.system, metrics);
+        // Text at zero size occupies nothing. Shaping it would be work whose
+        // every result is multiplied by zero, and the glyphs would be invisible
+        // either way — so it is skipped rather than floored, which is also what
+        // keeps `font-size: 0` from quietly rendering at the floor size.
+        if !(style.font_size.is_finite() && style.font_size > 0.0) {
+            return Shaped {
+                text: text.to_owned(),
+                ..Shaped::default()
+            };
+        }
+        let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style));
         let mut buffer = buffer.borrow_with(&mut self.system);
         // No width limit: a segment is by definition not broken further.
         buffer.set_size(None, None);
@@ -483,8 +547,12 @@ impl FontStore {
         let mut y = 0.0f32;
         let mut current: Vec<Segment> = Vec::new();
         let mut x = 0.0f32;
-        let mut line_height = default_style.line_height;
-        let mut ascent = default_style.font_size * 0.8;
+        let mut line_height = Self::line_height_for(default_style);
+        let mut ascent = if default_style.font_size.is_finite() {
+            default_style.font_size * 0.8
+        } else {
+            0.0
+        };
 
         // The available width depends on the line's height, and the height
         // depends on what lands on the line. Query with the height so far and
@@ -499,7 +567,7 @@ impl FontStore {
                 Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
-                line_height = default_style.line_height;
+                line_height = Self::line_height_for(default_style);
                 ascent = default_style.font_size * 0.8;
                 available = constraints(y, line_height).1;
             }
@@ -520,7 +588,7 @@ impl FontStore {
                 Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
-                line_height = default_style.line_height;
+                line_height = Self::line_height_for(default_style);
                 ascent = default_style.font_size * 0.8;
                 available = constraints(y, line_height).1;
             }
@@ -816,7 +884,7 @@ impl FontStore {
                     } else if mandatory {
                         out.push(Segment {
                             shaped: Shaped {
-                                height: run.style.line_height,
+                                height: Self::line_height_for(&run.style),
                                 ascent: run.style.font_size * 0.8,
                                 ..Shaped::default()
                             },
@@ -894,6 +962,17 @@ impl FontStore {
         &mut self,
         glyph: &PositionedGlyph,
     ) -> Option<(Vec<u8>, i32, i32, usize, usize)> {
+        // A glyph this large is a resource attack rather than typography: the
+        // outline rasteriser allocates a bitmap proportional to the em square,
+        // so `font-size: 99999px` asks for something on the order of ten
+        // billion pixels. Upstream panics rather than refusing, so the refusal
+        // has to happen here — and a glyph nobody could read is no loss.
+        //
+        // Same shape of guard as the decompression-bomb limit on images: the
+        // number that matters is the decoded size, not the source's.
+        if !glyph.font_size.is_finite() || glyph.font_size > MAX_GLYPH_SIZE {
+            return None;
+        }
         let key = cosmic_text::CacheKey::new(
             glyph.font_id,
             glyph.glyph_id,
@@ -928,6 +1007,58 @@ mod tests {
             font_size: size,
             line_height: size * 1.2,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zero_sized_text_takes_no_space_instead_of_taking_the_browser_down() {
+        // `font-size: 0` is legal CSS and a common one — it is how the gap
+        // between inline-blocks gets closed. Our line height derives from the
+        // font size, and cosmic-text asserts a line height is never zero, so
+        // this panicked: a stylesheet could stop the browser. The fuzzer found
+        // it in the first soak.
+        let mut fonts = FontStore::new();
+        let laid = fonts.layout("invisible", &style(0.0), 400.0);
+        assert_eq!(laid.width, 0.0);
+        assert!(
+            laid.lines.iter().all(|line| line.glyphs.is_empty()),
+            "zero-sized text has nothing to draw"
+        );
+    }
+
+    #[test]
+    fn a_line_height_of_zero_still_has_glyphs() {
+        // Different declaration, different meaning: `line-height: 0` leaves the
+        // text its glyphs and its width and contributes no height to the line
+        // box. Flooring it the way the shaper needs must not turn into
+        // flooring what the author asked for.
+        let mut fonts = FontStore::new();
+        let flat = ComputedStyle {
+            font_size: 16.0,
+            line_height: 0.0,
+            ..Default::default()
+        };
+        let laid = fonts.layout("visible", &flat, 400.0);
+        assert!(laid.width > 0.0, "the text still has width");
+        assert!(
+            laid.lines.iter().any(|line| !line.glyphs.is_empty()),
+            "and still has glyphs"
+        );
+    }
+
+    #[test]
+    fn a_nonsense_font_size_does_not_propagate() {
+        // A `NaN` size would otherwise reach every coordinate downstream of it,
+        // where it stops being traceable to anything.
+        let mut fonts = FontStore::new();
+        for size in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -12.0] {
+            let laid = fonts.layout("text", &style(size), 400.0);
+            assert!(
+                laid.width.is_finite() && laid.height.is_finite(),
+                "size {size} produced {}x{}",
+                laid.width,
+                laid.height
+            );
         }
     }
 

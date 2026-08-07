@@ -367,6 +367,43 @@ paths, TLS configuration review, `AccessKit` integration for screen readers.
 *Done when:* we are willing to tell a stranger to browse untrusted sites with it.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
+**Fuzzing — done, and it found things.** `tests/fuzz` mutates the reference
+fixtures into the HTML parser, the CSS parser, image decoding, URL parsing, and
+the whole render pipeline. Written here rather than taken from `cargo-fuzz`:
+that needs nightly and `rust-toolchain.toml` pins stable, and its great strength
+— finding memory-unsafety — is not in play under ADR-0002. What is reachable
+here is panics, hangs, and unbounded allocation, and a mutator finds those with
+no instrumentation and no new dependency. It is a dumb mutator, not a
+coverage-guided one, and will not find a bug behind a magic constant it has to
+guess. `cargo test` runs a short fixed-seed pass; `cargo run -p fuzz` soaks.
+
+Three panics in the first soak, all reachable from an ordinary stylesheet, all
+fixed:
+
+- `font-size: 0` — legal CSS and a common idiom, since it is how the gap
+  between inline-blocks gets closed. Our line height derives from the font size
+  and cosmic-text asserts a line height is never zero, so a stylesheet could
+  stop the browser.
+- `font-size: 99999px` — the outline rasteriser allocates a bitmap proportional
+  to the em square and panicked rather than refusing. Glyph size is now capped.
+- `margin: 1e40px` and its neighbours — `1e40` does not fit in an `f32`, so it
+  computes to infinity, saturates the cast to `i32::MAX`, and panicked inside
+  tiny-skia on the next addition. Geometry outside a drawable range is now
+  skipped.
+
+**Known and not fixed: layout is slow on pathological input.** The fuzzer's
+worst render is about 11x the slowest real fixture — a 9 KB document at 99 ms
+in release, against a few ms for a normal page of that size. It is linear
+rather than quadratic, so it is a poor constant rather than an algorithmic
+hole, and it comes from long unbroken runs of characters inside nested tables
+being re-measured once per table level. Not a denial of service on the evidence
+so far, and not scheduled.
+
+**The fuzzer cannot catch a true hang.** It times each input after the fact, so
+something that never returns hangs the harness rather than being reported. CI's
+job timeout is the only backstop, which is a blunt one — a real interrupt needs
+the process isolation that is the other half of this milestone.
+
 ### M5 — The slop layer
 Content-quality signals surfaced in the UI. Optional community blocklists for
 content farms. (Reader mode moved to M3 — see ADR-0009.)

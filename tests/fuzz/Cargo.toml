@@ -1,0 +1,25 @@
+[package]
+name = "fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "fuzz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuzz"
+path = "src/main.rs"
+
+[dependencies]
+css = { path = "../../crates/css" }
+dom = { path = "../../crates/dom" }
+net = { path = "../../crates/net" }
+paint = { path = "../../crates/paint" }
+shell = { path = "../../crates/shell" }
+text = { path = "../../crates/text" }
+
+[lints]
+workspace = true

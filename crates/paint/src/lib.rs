@@ -317,15 +317,26 @@ pub fn rasterise(
     }
 
     for item in &list.items {
+        // Nothing beyond the drawable range is drawn at all. See `MAX_COORD`:
+        // this is the one place every item passes through, so it is the one
+        // place the check has to be.
         match item {
-            DisplayItem::Rect { rect, color } => fill_rect(&mut pixmap, rect, *color),
+            DisplayItem::Rect { rect, color } => {
+                if drawable(rect) {
+                    fill_rect(&mut pixmap, rect, *color);
+                }
+            }
             DisplayItem::Image { node, rect } => {
-                if let Some(image) = images.get(&ImageKey::content(*node)) {
+                if drawable(rect)
+                    && let Some(image) = images.get(&ImageKey::content(*node))
+                {
                     draw_image(&mut pixmap, image, rect);
                 }
             }
             DisplayItem::Tile { node, rect, repeat } => {
-                if let Some(image) = images.get(&ImageKey::background(*node)) {
+                if drawable(rect)
+                    && let Some(image) = images.get(&ImageKey::background(*node))
+                {
                     tile_image(&mut pixmap, image, rect, *repeat);
                 }
             }
@@ -335,11 +346,44 @@ pub fn rasterise(
                 origin_y,
                 color,
             } => {
-                draw_glyph(&mut pixmap, fonts, glyph, *origin_x, *origin_y, *color);
+                if in_range(*origin_x) && in_range(*origin_y) {
+                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, *origin_y, *color);
+                }
             }
         }
     }
     Some(pixmap)
+}
+
+/// Furthest from the canvas a coordinate may be and still be worth drawing.
+///
+/// tiny-skia works in `i32` pixel space and builds rectangles that must not
+/// overflow it. A coordinate arriving as infinity — which is what
+/// `margin: 1e40px` computes to, since `1e40` does not fit in an `f32` —
+/// saturates to `i32::MAX` on the cast, and the first addition inside the
+/// library after that panics. So does a merely enormous but finite one.
+///
+/// Ten million pixels is roughly a thousand screens in either direction:
+/// nothing this far out is visible, and a page is not entitled to crash the
+/// browser by asking for it.
+const MAX_COORD: f32 = 1e7;
+
+/// Whether a single coordinate can be drawn at.
+fn in_range(value: f32) -> bool {
+    value.is_finite() && value.abs() <= MAX_COORD
+}
+
+/// Whether a rectangle is worth handing to the rasteriser.
+///
+/// Also bounds the tile loop, which steps across a rectangle one image at a
+/// time: an enormous rectangle is a hang even where it is not a panic.
+fn drawable(rect: &Rect) -> bool {
+    in_range(rect.x)
+        && in_range(rect.y)
+        && in_range(rect.width)
+        && in_range(rect.height)
+        && in_range(rect.x + rect.width)
+        && in_range(rect.y + rect.height)
 }
 
 /// Draws an image scaled into `rect`.

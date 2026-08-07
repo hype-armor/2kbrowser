@@ -1,0 +1,15 @@
+<!doctype html><html><head><style>
+/* Regression seed: enormous and nonsense lengths. `1e40px` does not fit in an
+   f32, so it computes to infinity, saturates the cast to i32::MAX, and
+   panicked inside the rasteriser on the next addition. `99999px` is finite and
+   panicked differently, in the glyph outline rasteriser. Both found by the
+   first soak; fixed in crates/paint and crates/text. */
+.huge   { margin: 1e40px; padding: 1e40px; border: 1e40px solid red; }
+.wide   { width: 1e40px; height: 1e40px; }
+.giant  { font-size: 99999px; }
+.offset { position: relative; top: -1e40px; left: 1e30em; }
+</style></head><body>
+<div class="huge">a</div><div class="wide">b</div>
+<p class="giant">c</p><span class="offset">d</span>
+<table style="border-spacing: 1e40px"><tr><td>e</td></tr></table>
+</body></html>
