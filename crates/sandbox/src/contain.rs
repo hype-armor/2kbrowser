@@ -113,6 +113,60 @@ static PREPARED: std::sync::OnceLock<Result<SecurityCapabilities, String>> =
 /// Executables already granted access, so the DACL is rewritten once each.
 static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+/// The environment the renderer is given.
+///
+/// Named, rather than inherited. Two reasons, and both are the point.
+///
+/// **It is what the parent knows.** A browser's environment routinely holds
+/// API tokens, proxy credentials, and the shape of someone's home directory,
+/// and handing all of it to the process that parses hostile documents is
+/// exactly backwards. The renderer reads a pipe, allocates, and computes; it
+/// has no use for any of it.
+///
+/// **Inheriting does not work everywhere.** Passing no environment block means
+/// `CreateProcessW` uses the caller's, and on some machines that fails when the
+/// child is going into an AppContainer — reported as
+/// `ERROR_ENVVAR_NOT_FOUND (203)`, "the system could not find the environment
+/// option that was entered", which is an unusually unhelpful way to say it.
+/// `rappct` documents an explicit block as the remedy. It was not reproducible
+/// on CI and was on a real machine, which is the ordinary shape of an
+/// environment-dependent bug.
+///
+/// So: the handful Windows itself wants to start a process, and nothing else.
+/// `RUST_BACKTRACE` is passed through when it is set, because a renderer that
+/// panics is the case where its output matters most.
+#[cfg(target_os = "windows")]
+fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    // `SystemRoot` and `windir` are how the loader finds the system DLLs every
+    // Windows process links; the processor variables are read by the C runtime
+    // during startup. Nothing here names a path belonging to the user.
+    const WANTED: &[&str] = &[
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
+        "ComSpec",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        // Not needed by the renderer, which opens no files, but an
+        // AppContainer redirects these into its own profile anyway, so they
+        // leak nothing and their absence surprises anything that assumes them.
+        "TEMP",
+        "TMP",
+        // Only when the operator asked for it.
+        "RUST_BACKTRACE",
+    ];
+    WANTED
+        .iter()
+        .filter_map(|name| {
+            std::env::var_os(name).map(|value| (std::ffi::OsString::from(*name), value))
+        })
+        .collect()
+}
+
 /// A built AppContainer, ready to spawn renderers into.
 ///
 /// Built once per browser process rather than once per page: creating the
@@ -200,6 +254,7 @@ impl Container {
             exe: self.program.clone(),
             cmdline: Some(command),
             stdio: StdioConfig::Pipe,
+            env: Some(environment()),
             join_job: Some(JobLimits {
                 // The renderer dies when this handle closes, which happens when
                 // the session is dropped *and* if the browser is killed outright.
@@ -279,13 +334,19 @@ impl Contained {
 /// up leaves the thread parked on a read it will never finish, which is fine:
 /// dropping `child` closes the job handle, the kernel kills the process, the
 /// pipe closes, and the thread ends.
-pub fn capture(container: &Container, arguments: &str, timeout: std::time::Duration) -> String {
-    let mut child = match container.spawn(arguments) {
-        Ok(child) => child,
-        Err(error) => return format!("spawn-failed={error}"),
-    };
+pub fn capture(
+    container: &Container,
+    arguments: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    // A failure here is *not* a report about a confined process, and returning
+    // one as if it were is how the self-test came to print
+    // `confinement=AppContainer` above a line saying the container never
+    // launched anything. The whole point of this file is that a sandbox which
+    // claims to work and does not is worse than one that says it is missing.
+    let mut child = container.spawn(arguments)?;
     let Some(stdout) = child.io.stdout.take() else {
-        return "no-stdout".to_owned();
+        return Err("the contained process had no stdout".to_owned());
     };
 
     let (finished, output) = std::sync::mpsc::channel();
@@ -302,16 +363,15 @@ pub fn capture(container: &Container, arguments: &str, timeout: std::time::Durat
         })
         .is_err()
     {
-        return "no-thread".to_owned();
+        return Err("could not start a thread to read the contained process".to_owned());
     }
 
-    match output.recv_timeout(timeout) {
-        Ok(text) => text,
-        Err(_) => format!(
-            "timed-out after {}s waiting for the contained process to answer",
+    output.recv_timeout(timeout).map_err(|_| {
+        format!(
+            "the contained process said nothing for {}s",
             timeout.as_secs()
-        ),
-    }
+        )
+    })
 }
 
 #[cfg(test)]

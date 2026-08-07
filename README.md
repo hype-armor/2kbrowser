@@ -156,7 +156,9 @@ installs successfully and confines nothing would pass any check written from
 the outside.
 
 > **Not safe for browsing untrusted sites.** On macOS the renderer is a separate
-> process but an otherwise unconfined one — the App Sandbox equivalent is not
+> process but an otherwise unconfined one, and on Windows a machine that refuses
+> to launch the container falls back to one, saying so on stderr and in
+> `--confine-selftest` — the App Sandbox equivalent is not
 > implemented, and the browser says so on stderr rather than pretending. The
 > Linux filter is a denylist, so a syscall nobody named is allowed. Neither the
 > parser fuzzing nor any of this has been reviewed by anyone but its authors.

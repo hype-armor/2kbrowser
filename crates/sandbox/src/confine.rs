@@ -434,9 +434,14 @@ fn windows_selftest(targets: &Targets) -> String {
         targets.port,
         targets.file.display()
     );
-    let inside =
-        crate::contain::capture(&container, &arguments, std::time::Duration::from_secs(30));
-    format!("confinement=AppContainer\n{}", inside.trim_end())
+    match crate::contain::capture(&container, &arguments, std::time::Duration::from_secs(30)) {
+        Ok(inside) => format!("confinement=AppContainer\n{}", inside.trim_end()),
+        // Not `AppContainer`: nothing ran inside one. Printing that above a
+        // line explaining the launch failed is the self-test lying about the
+        // one thing it exists to check, and it did — a real machine reported
+        // `confinement=AppContainer` and `spawn-failed=` together.
+        Err(reason) => format!("confinement=Failed\nreason={reason}"),
+    }
 }
 
 /// Tries the things confinement is supposed to prevent, and says what happened.

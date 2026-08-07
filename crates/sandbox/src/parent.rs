@@ -118,6 +118,13 @@ pub struct Renderer {
     confinement: Confinement,
     /// Why the container could not be built, when that is what happened.
     failure: Option<String>,
+    /// Why the container stopped being usable, if a launch failed.
+    ///
+    /// Set at most once, by the first launch that fails. Building a container
+    /// can succeed and launching into it still fail — an environment block the
+    /// machine will not accept, a policy that forbids it — and that is not
+    /// discoverable until the first page.
+    launch_failure: std::sync::OnceLock<String>,
 }
 
 impl Renderer {
@@ -165,6 +172,7 @@ impl Renderer {
             container,
             confinement,
             failure,
+            launch_failure: std::sync::OnceLock::new(),
         }
     }
 
@@ -175,6 +183,9 @@ impl Renderer {
     /// than what it did, and the child prints if the install failed. On Windows
     /// the parent builds the container itself, so this is the outcome.
     pub fn confinement(&self) -> Confinement {
+        if self.launch_failure.get().is_some() {
+            return Confinement::Failed;
+        }
         self.confinement
     }
 
@@ -183,17 +194,42 @@ impl Renderer {
     /// A sentence for the operator. `None` everywhere the parent does not build
     /// the confinement itself.
     pub fn confinement_failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+        self.launch_failure
+            .get()
+            .map(String::as_str)
+            .or(self.failure.as_deref())
     }
 
     /// Starts one renderer, contained if this platform's parent can contain it.
+    ///
+    /// A container that cannot launch falls back to an ordinary child, loudly
+    /// and once. That is a security control degrading, so it is worth being
+    /// explicit about why: the alternative is a browser that renders nothing at
+    /// all on a machine where `CreateProcess` refuses the container, and a
+    /// browser nobody can open is a browser nobody can use to find out why.
+    /// It is the same answer already given when the container cannot be *built*
+    /// — this is the same fact discovered one step later — and it is not
+    /// silent: the reason is printed, [`Renderer::confinement`] then reports
+    /// [`Confinement::Failed`], and the chrome says so at startup.
     fn spawn(&self) -> Result<Spawned, Error> {
         #[cfg(target_os = "windows")]
-        if let Some(container) = &self.container {
-            return container
-                .spawn(CHILD_ARGUMENT)
-                .map(Spawned::Contained)
-                .map_err(Error::Spawn);
+        if let Some(container) = &self.container
+            && self.launch_failure.get().is_none()
+        {
+            match container.spawn(CHILD_ARGUMENT) {
+                Ok(child) => return Ok(Spawned::Contained(child)),
+                Err(reason) => {
+                    // Said here rather than left to the caller, because this is
+                    // the only place that knows, and said once because
+                    // `OnceLock` admits exactly one writer.
+                    eprintln!("2kbrowser: {reason}");
+                    eprintln!(
+                        "2kbrowser: {} — falling back to an unconfined renderer",
+                        Confinement::Failed.describe()
+                    );
+                    let _ = self.launch_failure.set(reason);
+                }
+            }
         }
         spawn_plain(&self.program)
     }
