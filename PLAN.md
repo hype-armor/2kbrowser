@@ -404,6 +404,16 @@ fixed:
   tiny-skia on the next addition. Geometry outside a drawable range is now
   skipped.
 
+A later soak found a fourth, and it is worth recording because it is the same
+family one layer in — which is what a corpus that keeps its findings is for. The
+drawable-range check was on the *text origin*, and the origin is not where a
+glyph lands: `glyph.x` and `glyph.y` are offsets within the run, so a stylesheet
+that shifts a run far enough puts an in-range origin arbitrarily far from an
+out-of-range glyph, and tiny-skia panics building the `i32` rectangle for it.
+The check now sits at the position actually drawn at, and the sum that overflows
+— `x + width` — is checked rather than assumed. Found by mutating the fixture
+written for the first three.
+
 **Known and not fixed: layout is slow on pathological input.** The fuzzer's
 worst render is about 11x the slowest real fixture — a 9 KB document at 99 ms
 in release, against a few ms for a normal page of that size. It is linear
@@ -437,7 +447,10 @@ Also done since: **every subresource crosses the pipe** — images, stylesheets,
 `@import` chains, and frames are requests the parent decides on, so ADR-0006's
 policy is enforced where a compromised renderer cannot reach it. And **the
 window renders out of process**, holding a `Viewport` over a live child rather
-than a `Page`. A page rendered across the boundary is byte-identical to one
+than a `Page`. So do `render` and `links`, which did not until later and were
+the gap that mattered most in practice: `2kbrowser render https://example.com`
+is the documented way to point this at a stranger's page, and it was handing
+their HTML to the parsers in the process holding the network and the disk. A page rendered across the boundary is byte-identical to one
 rendered without: verified on the era fixture, 0 differing bytes of 2.5 MB.
 
 Two consequences worth recording rather than discovering later:
