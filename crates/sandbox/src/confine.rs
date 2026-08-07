@@ -96,14 +96,87 @@ impl Confinement {
 /// first frame is already attacker-influenced, since its body is the document.
 #[cfg(target_os = "linux")]
 pub fn apply() -> Confinement {
-    use seccompiler::{
-        BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch, apply_filter,
-    };
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, apply_filter};
     use std::collections::BTreeMap;
 
-    // Everything here is a family, not a single call. Denying `socket` while
-    // leaving `socketpair` is not a denial.
-    let denied: &[i64] = &[
+    // An architecture this was not built for gets no filter at all. That is not
+    // caution, it is the only safe answer: seccompiler puts an architecture
+    // check at the head of the program and the mismatch branch is
+    // `SECCOMP_RET_KILL_PROCESS`, so a filter naming the wrong architecture does
+    // not fail open or fail closed — it kills the renderer on its next syscall,
+    // whatever that is.
+    let Some(architecture) = architecture() else {
+        return Confinement::Unavailable;
+    };
+
+    let rules: BTreeMap<i64, Vec<SeccompRule>> =
+        denied().iter().map(|nr| (*nr, Vec::new())).collect();
+
+    // Denied calls return EPERM; everything else is allowed. The default has to
+    // be `Allow` for a denylist, and that is the trade this file's header
+    // states plainly.
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        architecture,
+    );
+    let Ok(filter) = filter else {
+        return Confinement::Failed;
+    };
+    let Ok(program) = BpfProgram::try_from(filter) else {
+        return Confinement::Failed;
+    };
+    match apply_filter(&program) {
+        Ok(()) => Confinement::Seccomp,
+        // A kernel without seccomp, or a container that forbids installing a
+        // filter. Reported rather than swallowed.
+        Err(_) => Confinement::Failed,
+    }
+}
+
+/// The architecture to build the filter for, or `None` if this is not one.
+///
+/// Taken from the build target rather than named, which sounds obvious and was
+/// got wrong: the filter said `x86_64` unconditionally. On an ARM machine that
+/// is not a filter that does the wrong thing, it is a filter that kills the
+/// renderer immediately — the architecture check at the head of a seccompiler
+/// program returns `SECCOMP_RET_KILL_PROCESS` when it does not match.
+#[cfg(target_os = "linux")]
+const fn architecture() -> Option<seccompiler::TargetArch> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(seccompiler::TargetArch::x86_64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(seccompiler::TargetArch::aarch64)
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        Some(seccompiler::TargetArch::riscv64)
+    }
+    // 32-bit ARM, x86, and anything else seccompiler does not know. Reported as
+    // unconfined rather than approximated with a neighbouring architecture,
+    // because syscall numbers are per-architecture and a filter built from the
+    // wrong table denies whatever happens to share a number.
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    {
+        None
+    }
+}
+
+/// The syscalls the renderer is not allowed to make.
+///
+/// Everything here is a family, not a single call. Denying `socket` while
+/// leaving `socketpair` is not a denial.
+#[cfg(target_os = "linux")]
+fn denied() -> Vec<i64> {
+    let mut denied = vec![
         // Network. The renderer has no business reaching anything; the parent
         // fetches on its behalf.
         libc::SYS_socket,
@@ -119,17 +192,11 @@ pub fn apply() -> Confinement {
         libc::SYS_recvmsg,
         // Opening files. The fonts are in the binary and the pipes are already
         // open, so nothing legitimate opens anything.
-        libc::SYS_open,
         libc::SYS_openat,
         libc::SYS_openat2,
-        libc::SYS_creat,
         libc::SYS_truncate,
-        libc::SYS_unlink,
         libc::SYS_unlinkat,
-        libc::SYS_rename,
-        libc::SYS_renameat,
         libc::SYS_renameat2,
-        libc::SYS_mkdir,
         libc::SYS_mkdirat,
         // Starting or inspecting other processes. A renderer that has been
         // taken over should not be able to run anything.
@@ -140,30 +207,29 @@ pub fn apply() -> Confinement {
         libc::SYS_process_vm_writev,
     ];
 
-    let rules: BTreeMap<i64, Vec<SeccompRule>> =
-        denied.iter().map(|nr| (*nr, Vec::new())).collect();
+    // The pre-`*at` calls, which the architectures designed after them never
+    // had. Naming them unconditionally does not compile on aarch64 — `libc` has
+    // no `SYS_open` there, because Linux has no `open` there — which is how this
+    // whole file turned out to be x86_64-only.
+    //
+    // Each of these was checked against `libc` on all three architectures
+    // rather than assumed from the shape of the name: `accept` looks like it
+    // belongs in this group and does not, and putting it here would have left
+    // ARM able to accept connections.
+    #[cfg(target_arch = "x86_64")]
+    denied.extend_from_slice(&[
+        libc::SYS_open,
+        libc::SYS_creat,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+    ]);
+    // `renameat` predates `renameat2` and survives on x86_64 and aarch64, but
+    // not on riscv64, which only ever had the newer one.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    denied.push(libc::SYS_renameat);
 
-    // Denied calls return EPERM; everything else is allowed. The default has to
-    // be `Allow` for a denylist, and that is the trade this file's header
-    // states plainly.
-    let filter = SeccompFilter::new(
-        rules,
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-        TargetArch::x86_64,
-    );
-    let Ok(filter) = filter else {
-        return Confinement::Failed;
-    };
-    let Ok(program) = BpfProgram::try_from(filter) else {
-        return Confinement::Failed;
-    };
-    match apply_filter(&program) {
-        Ok(()) => Confinement::Seccomp,
-        // A kernel without seccomp, or a container that forbids installing a
-        // filter. Reported rather than swallowed.
-        Err(_) => Confinement::Failed,
-    }
+    denied
 }
 
 /// Drops the privileges the renderer does not need.
@@ -383,6 +449,46 @@ mod tests {
             assert_ne!(apply(), Confinement::Unavailable);
         } else {
             assert_eq!(apply(), Confinement::Unavailable);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_denied_list_is_built_for_this_architecture() {
+        // Syscall numbers are per-architecture, so a list assembled with the
+        // wrong `cfg` denies whatever happens to share a number. Two things
+        // worth asserting cheaply: that the list is not empty on a platform
+        // that claims to confine, and that no number appears twice — a
+        // duplicate is harmless to the filter and a sign the `cfg` blocks
+        // overlap.
+        let denied = denied();
+        assert!(!denied.is_empty());
+        let mut sorted = denied.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), denied.len(), "a syscall is named twice");
+
+        // The pre-`*at` calls exist only where Linux still has them, and
+        // `accept` is the one that looks like it belongs in that group and does
+        // not — it is on all three architectures, and leaving it out would have
+        // let an ARM renderer accept connections.
+        assert!(denied.contains(&libc::SYS_accept));
+        #[cfg(target_arch = "x86_64")]
+        assert!(denied.contains(&libc::SYS_open));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_architecture_without_a_filter_is_unconfined_rather_than_guessed_at() {
+        // The mismatch branch of seccompiler's architecture check is
+        // `SECCOMP_RET_KILL_PROCESS`, so naming the wrong architecture does not
+        // fail open or closed — it kills the renderer on its next syscall. The
+        // only safe answer for an architecture this was not built for is no
+        // filter at all, said out loud.
+        if architecture().is_none() {
+            assert_eq!(apply(), Confinement::Unavailable);
+        } else {
+            assert_ne!(apply(), Confinement::Unavailable);
         }
     }
 
