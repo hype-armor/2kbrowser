@@ -66,6 +66,13 @@ fn url_parsing_survives_mutated_urls() {
 }
 
 #[test]
+fn the_process_boundary_survives_mutated_frames() {
+    // The decoder the parent runs on bytes a sandboxed process chose. If it can
+    // be made to panic, an exploit that was contained is no longer contained.
+    soak(Target::Wire, 0x2000_0006);
+}
+
+#[test]
 fn the_whole_pipeline_survives_mutated_documents() {
     // The one that reaches cascade, layout, and paint. A parser can survive
     // garbage and still hand the next stage something it cannot cope with.

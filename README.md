@@ -94,10 +94,19 @@ an ordinary stylesheet — `font-size: 0`, `font-size: 99999px`, and
 `margin: 1e40px` — each of which stopped the browser. All three are fixed, and
 each has a regression test where the bug was rather than where it surfaced.
 
-> **Not safe for browsing untrusted sites.** Sandboxing and TLS review are still
-> to come in M4, and the fuzzer cannot catch a hang — it times each input after
-> the fact, so an input that never returns hangs the harness rather than being
-> reported. Until that is done this is a tool for its authors.
+The process boundary M4 needs is built but not yet switched on. `crates/sandbox`
+runs the renderer in a child process — the parent keeps the chrome, the network,
+and the disk, and a page rendered across the boundary is byte-identical to one
+rendered without it (ADR-0012). Why bother, when `unsafe` is forbidden: the
+libraries that meet a hostile page *first* have roughly 460 `unsafe` sites
+between them. Forbidding it describes our discipline, not our attack surface.
+
+> **Not safe for browsing untrusted sites.** The OS sandbox primitives — seccomp,
+> Seatbelt, AppContainer — are not applied yet, so a renderer child is an
+> ordinary process that merely happens to be separate. The window still renders
+> in-process, subresources still load inside the child rather than being asked
+> for over the pipe, and TLS review has not happened. Until all of that is done
+> this is a tool for its authors.
 
 ## Building
 

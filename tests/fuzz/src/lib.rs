@@ -195,16 +195,23 @@ pub enum Target {
     Url,
     /// The whole pipeline: parse, cascade, lay out, paint.
     Render,
+    /// The process-boundary protocol.
+    ///
+    /// Fuzzed like every other parser rather than trusted because both ends are
+    /// ours (ADR-0012). The decoder on the parent's side reads bytes chosen by
+    /// the sandboxed process, so it is the last boundary there is.
+    Wire,
 }
 
 impl Target {
     /// Every target, for a run that names none.
-    pub const ALL: [Target; 5] = [
+    pub const ALL: [Target; 6] = [
         Target::Html,
         Target::Css,
         Target::Image,
         Target::Url,
         Target::Render,
+        Target::Wire,
     ];
 
     /// Its name on the command line.
@@ -215,6 +222,7 @@ impl Target {
             Target::Image => "image",
             Target::Url => "url",
             Target::Render => "render",
+            Target::Wire => "wire",
         }
     }
 
@@ -229,9 +237,9 @@ impl Target {
             Target::Html | Target::Render => &["html"],
             Target::Css => &["css"],
             Target::Image => &["png", "gif", "jpg", "jpeg"],
-            // URLs are short and structured; the seeds are written out below
-            // rather than read from disk.
-            Target::Url => &[],
+            // URLs and protocol frames are short and structured; their seeds
+            // are built below rather than read from disk.
+            Target::Url | Target::Wire => &[],
         }
     }
 }
@@ -283,6 +291,15 @@ pub fn run_once(target: Target, input: &[u8], fonts: &mut text::FontStore) {
             }
             let _ = net::policy::has_scheme(&text);
             let _ = net::policy::is_drive_path(&text);
+        }
+        Target::Wire => {
+            // Both directions. The parent decoding a frame from a compromised
+            // child is the case that matters, but a child fed nonsense by a
+            // buggy parent must not crash either.
+            let _ = sandbox::ToChild::decode(input);
+            let _ = sandbox::ToParent::decode(input);
+            // And the framing itself, which is what reads the length first.
+            let _ = sandbox::read_frame(&mut &input[..]);
         }
         Target::Render => {
             let (html, ..) = net::encoding::decode_document(input, None);
@@ -393,6 +410,9 @@ impl Session {
         // until nothing can ever trip it.
         collect_all(&root.join("corpus").join(target.name()), &mut corpus);
 
+        if target == Target::Wire {
+            corpus.extend(wire_seeds());
+        }
         if target == Target::Url {
             corpus.extend(
                 [
@@ -525,6 +545,75 @@ fn write_input(path: &Path, input: &[u8]) -> std::io::Result<()> {
     // Flushed rather than left to the drop, because the process this is
     // guarding against may not get to run destructors.
     file.flush()
+}
+
+/// Valid frames of every message shape, for the mutator to break.
+///
+/// Built rather than stored: they are the encoder's own output, so they cannot
+/// drift out of step with the format the way a checked-in blob would.
+fn wire_seeds() -> Vec<Vec<u8>> {
+    use sandbox::message::{Link, Mode, Rendered};
+
+    let origin = net::parse_url("https://example.com/a/b.html").map(|(origin, _)| origin);
+    let mut seeds = vec![
+        sandbox::ToChild::Render {
+            body: b"<html><body><p>a page</p></body></html>".to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            width: 800,
+            max_height: 2000,
+            origin: origin.ok(),
+            path: "/a/b.html".to_owned(),
+            force_authored: false,
+        }
+        .encode(),
+        sandbox::ToChild::Resource {
+            body: vec![0x89, b'P', b'N', b'G'],
+            ok: true,
+        }
+        .encode(),
+        sandbox::ToParent::Fetch {
+            url: "https://example.com/x.png".to_owned(),
+            kind: net::RequestKind::Subresource,
+        }
+        .encode(),
+        sandbox::ToParent::Failed {
+            message: "could not render".to_owned(),
+        }
+        .encode(),
+        sandbox::ToParent::Rendered(Box::new(Rendered {
+            pixels: vec![0; 4 * 4 * 4],
+            width: 4,
+            height: 4,
+            content_height: 64.0,
+            mode: Mode::Document {
+                unsupported_share: 0.5,
+            },
+            title: Some("A Page".to_owned()),
+            links: vec![Link {
+                rect: layout::Rect {
+                    x: 1.0,
+                    y: 2.0,
+                    width: 30.0,
+                    height: 4.0,
+                },
+                url: "https://example.com/next.html".to_owned(),
+            }],
+            can_toggle_layout: true,
+        }))
+        .encode(),
+    ];
+    // The same frames with their length header in front, since `read_frame`
+    // reads that first and it is the very first thing either side parses.
+    let framed: Vec<Vec<u8>> = seeds
+        .iter()
+        .map(|frame| {
+            let mut out = (frame.len() as u32).to_le_bytes().to_vec();
+            out.extend_from_slice(frame);
+            out
+        })
+        .collect();
+    seeds.extend(framed);
+    seeds
 }
 
 /// Reads every file in `directory` with one of `extensions`.

@@ -400,9 +400,41 @@ being re-measured once per table level. Not a denial of service on the evidence
 so far, and not scheduled.
 
 **The fuzzer cannot catch a true hang.** It times each input after the fact, so
-something that never returns hangs the harness rather than being reported. CI's
-job timeout is the only backstop, which is a blunt one — a real interrupt needs
-the process isolation that is the other half of this milestone.
+something that never returns hangs the harness rather than being reported. The
+renderer process below can be killed, which is where that gap closes for the
+browser; the fuzzer itself still runs in-process and still cannot be
+interrupted.
+
+**Process model — decided and half-built.** [ADR-0012](docs/adr/0012-process-isolation.md):
+the parent keeps the chrome, the network, and the disk; a child parses, lays
+out, and rasterises. The reason is counted rather than assumed — roughly 460
+`unsafe` sites sit between a hostile document and the process, in the libraries
+ADR-0007 deliberately chose not to write here. "We forbid `unsafe`" describes
+our discipline, not our attack surface.
+
+Done: the boundary itself. `crates/sandbox` is the transport — spawning, a
+length-prefixed protocol, the request/response conversation, and killing a child
+that hangs or dies. It is generic over the rendering, which is what keeps it
+below `shell`. A page rendered across a process is byte-identical to one
+rendered without, proven against the real binary rather than a stub, and the
+protocol is fuzzed like every other parser because a compromised renderer's last
+move is to send the parent something malformed.
+
+Not done, and the README must keep saying so:
+
+1. **The OS sandbox primitives are not applied.** seccomp-bpf with Landlock on
+   Linux, Seatbelt on macOS, an AppContainer with a restricted token on Windows.
+   Until they are, a child is an ordinary process that happens to be separate —
+   an exploit inside it is contained only in that it cannot reach the parent's
+   memory.
+2. **Subresources still load in-process.** Images, stylesheets, and frames go
+   through the child's own fetcher rather than being asked for over the pipe.
+   The protocol and the parent's policy enforcement are both already there; what
+   remains is rewriting how `render_sized` loads them. Doing that in the same
+   change as the boundary would have made the diff unreviewable.
+3. **The window still renders in-process.** The boundary is exercised by tests
+   and available to callers; switching the browser over is the next step, and
+   wants the subresource work first so the switch does not lose images.
 
 ### M5 — The slop layer
 Content-quality signals surfaced in the UI. Optional community blocklists for

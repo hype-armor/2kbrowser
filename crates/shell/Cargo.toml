@@ -10,6 +10,7 @@ name = "2kbrowser"
 path = "src/main.rs"
 
 [dependencies]
+sandbox = { path = "../sandbox" }
 css = { path = "../css" }
 dom = { path = "../dom" }
 layout = { path = "../layout" }

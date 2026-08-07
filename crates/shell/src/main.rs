@@ -43,6 +43,18 @@ PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // The renderer child (ADR-0012). Not in the usage text: it is how the
+        // browser talks to itself, not something to run by hand.
+        //
+        // Nothing may be printed on this path — stdout is the protocol, and a
+        // stray line would be read as a frame header.
+        Some(sandbox::CHILD_ARGUMENT) => match shell::isolated::run_child() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("renderer: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("render") => report(run_render(&args[1..])),
         Some("links") => report(run_links(&args[1..])),
         Some("open") => report(run_open(&args[1..])),

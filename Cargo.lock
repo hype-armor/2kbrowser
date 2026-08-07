@@ -615,8 +615,10 @@ version = "0.0.0"
 dependencies = [
  "css",
  "dom",
+ "layout",
  "net",
  "paint",
+ "sandbox",
  "shell",
  "text",
 ]
@@ -1739,6 +1741,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox"
+version = "0.0.0"
+dependencies = [
+ "layout",
+ "net",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1813,6 +1823,7 @@ dependencies = [
  "layout",
  "net",
  "paint",
+ "sandbox",
  "softbuffer",
  "text",
  "tiny-skia",
