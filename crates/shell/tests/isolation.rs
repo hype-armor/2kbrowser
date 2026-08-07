@@ -724,14 +724,14 @@ fn the_render_command_parses_in_a_child_rather_than_in_itself() {
 fn renderers_built_at_the_same_time_all_start() {
     // Windows builds the sandbox in the parent: an AppContainer profile in the
     // registry, and a grant on the executable's DACL so the container can read
-    // the binary it is meant to run. That grant is read-modify-write, and doing
-    // it from several threads at once is a lost update — the second write lands
-    // without the first thread's entry, and `CreateProcess` then fails with
-    // access denied for a container that looked correctly built.
+    // the binary it is meant to run. Doing that from several threads while
+    // other threads launch processes from the same executable made
+    // `CreateProcessW` fail — two tests out of seventeen, on a run whose code
+    // had been green the time before.
     //
-    // That is not hypothetical: it happened, as two tests out of seventeen
-    // failing on CI while the same code had been green on the run before. It
-    // was found by luck, so it is worth a test that looks for it on purpose.
+    // It was found by luck, so it is worth looking for on purpose: a race that
+    // only appears when the schedule interleaves the right two operations is
+    // one that comes back and gets dismissed as flakiness.
     //
     // On Linux this costs a few child processes and asserts nothing new, which
     // is the right price for a check that only fails on the platform it is

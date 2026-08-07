@@ -92,14 +92,21 @@ fn chain(error: &dyn std::error::Error) -> String {
 ///
 /// `CreateAppContainerProfile` writes to the registry and the ACL grant below
 /// rewrites the executable's DACL. Doing either more than once is waste; doing
-/// them *concurrently* is a bug, and it is the bug this exists to fix.
+/// them *concurrently* is what broke.
 ///
-/// Granting is read the DACL, add an entry, write it back. Two threads doing
-/// that at once is a lost update: the second write can land without the first
-/// thread's entry, and then `CreateProcess` fails with access denied for a
-/// container that looked correctly built. It showed up as two tests out of
-/// seventeen failing on Windows CI at `CreateProcessW` while the others passed
-/// — the shape of a race, not of a broken feature.
+/// What was observed: two tests out of seventeen failing on Windows CI inside
+/// `CreateProcessW`, while the same code had been green on the run before and
+/// fifteen other tests passed in the same run. Both failures were in tests that
+/// build several renderers, and the suite runs them on several threads — so
+/// several threads were rewriting the same executable's security descriptor
+/// while other threads were launching processes from that same executable.
+///
+/// The exact mechanism is not confirmed and is not claimed here; a security
+/// descriptor being replaced while `CreateProcess` opens the image is the
+/// obvious candidate. What is certain is that the rewrite never needed to
+/// happen more than once, and the comments in this file already said it did
+/// not. They were wrong, and nothing made that visible until the machine
+/// disagreed.
 static PREPARED: std::sync::OnceLock<Result<SecurityCapabilities, String>> =
     std::sync::OnceLock::new();
 
