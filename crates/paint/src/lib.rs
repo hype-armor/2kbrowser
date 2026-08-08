@@ -60,6 +60,8 @@ pub enum DisplayItem {
         rect: Rect,
         /// Which axes the image repeats along.
         repeat: css::style::BackgroundRepeat,
+        /// Where within the box the image is anchored.
+        position: css::style::BackgroundPosition,
     },
     /// A single positioned glyph.
     Glyph {
@@ -84,7 +86,11 @@ pub struct DisplayList {
     /// page — and the background has to reach the bottom of it either way.
     pub canvas: Color,
     /// Image tiled across the whole canvas, for the same reason.
-    pub canvas_image: Option<(dom::NodeId, css::style::BackgroundRepeat)>,
+    pub canvas_image: Option<(
+        dom::NodeId,
+        css::style::BackgroundRepeat,
+        css::style::BackgroundPosition,
+    )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
 }
@@ -114,7 +120,7 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
     // §14.2 again: an element whose background was propagated to the canvas
     // does not paint it a second time. Drawing it twice is invisible while the
     // colour is opaque and wrong the moment it is not.
-    let propagated = layout.canvas_image.map(|(node, _)| node);
+    let propagated = layout.canvas_image.map(|(node, ..)| node);
     paint_box(&layout.root, 0.0, 0.0, propagated, &mut list);
     list
 }
@@ -158,6 +164,7 @@ fn paint_box(
                 height: box_.rect.height,
             },
             repeat: box_.style.background_repeat,
+            position: box_.style.background_position,
         });
     }
 
@@ -325,20 +332,31 @@ pub fn rasterise_band(
     ));
 
     // The canvas tile goes over the canvas colour and under everything else.
-    if let Some((node, repeat)) = list.canvas_image
+    if let Some((node, repeat, position)) = list.canvas_image
         && let Some(image) = images.get(&ImageKey::background(node))
     {
-        // Anchored at the top of the *document*, not of the band, or the tiling
-        // phase would jump every time the band moved.
+        // The canvas is the whole document, so the anchor is measured against
+        // the document rather than the band — otherwise the tiling phase, and
+        // any percentage in the position, would move every time the reader
+        // scrolled.
         let full = Rect {
             x: 0.0,
             y: 0.0,
             width: pixmap.width() as f32,
             height: top + pixmap.height() as f32,
         };
-        if let Some(slice) = tiled_band(&full, image.height(), repeat, top, pixmap.height() as f32)
-        {
-            tile_image(&mut pixmap, image, &shifted(&slice, top), repeat);
+        let anchor = anchor_of(&full, position, image);
+        if let Some(slice) = banded(&full, top, pixmap.height() as f32) {
+            let slice = shifted(&slice, top);
+            if drawable(&slice) {
+                tile_image(
+                    &mut pixmap,
+                    image,
+                    &slice,
+                    (anchor.0, anchor.1 - top),
+                    repeat,
+                );
+            }
         }
     }
 
@@ -361,14 +379,28 @@ pub fn rasterise_band(
                     draw_image(&mut pixmap, image, &rect);
                 }
             }
-            DisplayItem::Tile { node, rect, repeat } => {
+            DisplayItem::Tile {
+                node,
+                rect,
+                repeat,
+                position,
+            } => {
                 if let Some(image) = images.get(&ImageKey::background(*node))
-                    && let Some(slice) =
-                        tiled_band(rect, image.height(), *repeat, top, pixmap.height() as f32)
+                    && let Some(slice) = banded(rect, top, pixmap.height() as f32)
                 {
+                    // The anchor comes from the element's own box in document
+                    // coordinates and is then shifted with everything else, so
+                    // a band draws the tiles a whole-page render would have.
+                    let anchor = anchor_of(rect, *position, image);
                     let slice = shifted(&slice, top);
                     if drawable(&slice) {
-                        tile_image(&mut pixmap, image, &slice, *repeat);
+                        tile_image(
+                            &mut pixmap,
+                            image,
+                            &slice,
+                            (anchor.0, anchor.1 - top),
+                            *repeat,
+                        );
                     }
                 }
             }
@@ -396,50 +428,48 @@ fn shifted(rect: &Rect, top: f32) -> Rect {
     }
 }
 
-/// The part of a tiled rectangle a band needs, still in document coordinates.
+/// The rows of a rectangle a band can see, still in document coordinates.
 ///
-/// Two things have to survive being cut down to a band. The *phase* — where the
-/// tile boundaries fall — belongs to the element's own box, so the slice starts
-/// at a whole number of tiles below the box's top rather than wherever the band
-/// happens to begin. And the *cost*: `tile_image` steps one image at a time, so
-/// handing it a rectangle as tall as the document is how a 1-pixel tile on a
-/// long page becomes millions of draws. Clipping to the band bounds that by the
-/// band's height however tall the element is.
+/// This used to do more, and the more was a workaround. Tiling started at the
+/// rectangle's top-left corner, so a band had to be handed a rectangle whose
+/// top sat on a tile boundary or the pattern would jump every time the reader
+/// scrolled. `tile_image` now takes the anchor separately and works out which
+/// tiles overlap the clip, so the phase is carried by the anchor — which is
+/// where `background-position` had to put it anyway — and this is left doing
+/// the one thing it should: saying which rows are worth drawing.
 ///
-/// Only when the background actually repeats downwards. A tile drawn once sits
-/// at the top of its box, and moving that origin to a tile boundary would move
-/// the tile.
-fn tiled_band(
-    rect: &Rect,
-    tile_height: f32,
-    repeat: css::style::BackgroundRepeat,
-    top: f32,
-    band_height: f32,
-) -> Option<Rect> {
-    let (_, tiles_down) = repeat.axes();
-    if !tiles_down || tile_height <= 0.0 || !tile_height.is_finite() {
-        return Some(*rect);
-    }
-    let (band_top, band_bottom) = (top, top + band_height);
-    let (box_top, box_bottom) = (rect.y, rect.y + rect.height);
-    let visible_top = box_top.max(band_top);
-    let visible_bottom = box_bottom.min(band_bottom);
+/// Cost still depends on it. `tile_image` steps one image at a time, so a
+/// clip as tall as the document is how a one-pixel tile on a long page becomes
+/// millions of draws. Clipping to the band bounds that by the band's height
+/// however tall the element is.
+fn banded(rect: &Rect, top: f32, band_height: f32) -> Option<Rect> {
+    let visible_top = rect.y.max(top);
+    let visible_bottom = (rect.y + rect.height).min(top + band_height);
     if visible_bottom <= visible_top {
         return None;
     }
-    // Down to the tile boundary at or above the first visible row, so the
-    // pattern lands where it would have without banding.
-    let whole_tiles = ((visible_top - box_top) / tile_height).floor();
-    if !whole_tiles.is_finite() {
-        return Some(*rect);
-    }
-    let start = box_top + whole_tiles * tile_height;
     Some(Rect {
         x: rect.x,
-        y: start,
+        y: visible_top,
         width: rect.width,
-        height: visible_bottom - start,
+        height: visible_bottom - visible_top,
     })
+}
+
+/// Where the image's top-left corner lands, in the same space as `rect`.
+///
+/// The whole of `background-position` at paint time: the property is stored as
+/// a length or a percentage, and the percentage cannot be resolved until the
+/// image's size is known, which is here and not in the cascade.
+fn anchor_of(
+    rect: &Rect,
+    position: css::style::BackgroundPosition,
+    image: &DecodedImage,
+) -> (f32, f32) {
+    (
+        rect.x + css::style::background_offset(position.x, rect.width, image.width()),
+        rect.y + css::style::background_offset(position.y, rect.height, image.height()),
+    )
 }
 
 /// Furthest from the canvas a coordinate may be and still be worth drawing.
@@ -497,48 +527,80 @@ fn draw_image(pixmap: &mut Pixmap, image: &DecodedImage, rect: &Rect) {
     );
 }
 
-/// Tiles a background image across `rect`, at its natural size.
+/// Where one tile begins, and how many are needed to cover `clip` along an axis.
+///
+/// The anchor is where `background-position` put the image, which is not
+/// necessarily inside the clip and not necessarily inside the box: a repeating
+/// background tiles outwards from it in both directions, so the first tile that
+/// shows is usually one at a negative index.
+///
+/// `None` where the arithmetic leaves the range worth drawing in — a tile count
+/// that is infinite or negative is a pathological input, not a background.
+fn tile_span(anchor: f32, size: f32, start: f32, length: f32, tiles: bool) -> Option<(f32, u32)> {
+    if !tiles {
+        // One tile, wherever the anchor is. It may miss the clip entirely, and
+        // the mask takes care of that.
+        return Some((anchor, 1));
+    }
+    let index = ((start - anchor) / size).floor();
+    if !index.is_finite() {
+        return None;
+    }
+    let first = anchor + index * size;
+    let count = ((start + length - first) / size).ceil();
+    if !count.is_finite() || count < 0.0 {
+        return None;
+    }
+    Some((first, count as u32))
+}
+
+/// Tiles a background image over `clip`, with one tile's corner at `anchor`.
 ///
 /// A background image is never scaled — that is what distinguishes it from a
 /// content image, and it is why a 20-pixel tile fills a page rather than being
-/// stretched across it. Tiles are drawn from the box's top-left corner, which
-/// is `background-position: 0 0`.
+/// stretched across it.
+///
+/// The anchor and the clip are separate arguments because
+/// `background-position` separated them. They used to be the same rectangle,
+/// on the assumption that tiling starts at the box's top-left corner; a
+/// position of `50% 20px` breaks that in both directions at once, since the
+/// phase moves and the first visible tile can begin above and to the left of
+/// the box.
+///
+/// Keeping them apart also bounds the work better than the old arrangement did.
+/// Tiles are counted from the *clip*, which for a banded render is the handful
+/// of rows on screen rather than the whole document, so a one-pixel tile on a
+/// very long page costs a band's worth of draws instead of a page's.
 fn tile_image(
     pixmap: &mut Pixmap,
     image: &DecodedImage,
-    rect: &Rect,
+    clip: &Rect,
+    anchor: (f32, f32),
     repeat: css::style::BackgroundRepeat,
 ) {
     let (width, height) = (image.width(), image.height());
-    if rect.width <= 0.0 || rect.height <= 0.0 || width < 1.0 || height < 1.0 {
+    if clip.width <= 0.0 || clip.height <= 0.0 || width < 1.0 || height < 1.0 {
         return;
     }
 
     let (tile_x, tile_y) = repeat.axes();
-    // A tile count rather than a while-loop on coordinates: with a 1px tile and
-    // a tall page the loop is long, and bounding it here keeps a pathological
-    // image from turning into an unbounded amount of work.
-    let columns = if tile_x {
-        (rect.width / width).ceil() as u32
-    } else {
-        1
+    let Some((first_x, columns)) = tile_span(anchor.0, width, clip.x, clip.width, tile_x) else {
+        return;
     };
-    let rows = if tile_y {
-        (rect.height / height).ceil() as u32
-    } else {
-        1
+    let Some((first_y, rows)) = tile_span(anchor.1, height, clip.y, clip.height, tile_y) else {
+        return;
     };
 
-    let clip = tiny_skia::IntRect::from_xywh(
-        rect.x.floor() as i32,
-        rect.y.floor() as i32,
-        rect.width.ceil() as u32,
-        rect.height.ceil() as u32,
+    let bounds = tiny_skia::IntRect::from_xywh(
+        clip.x.floor() as i32,
+        clip.y.floor() as i32,
+        clip.width.ceil() as u32,
+        clip.height.ceil() as u32,
     );
-    let Some(mask) = clip.and_then(|clip| {
+    let Some(mask) = bounds.and_then(|bounds| {
         let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
         let mut builder = PathBuilder::new();
-        builder.push_rect(clip.to_rect());
+        builder.push_rect(bounds.to_rect());
         let path = builder.finish()?;
         mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
         Some(mask)
@@ -550,8 +612,8 @@ fn tile_image(
     for row in 0..rows {
         for column in 0..columns {
             pixmap.draw_pixmap(
-                (rect.x + column as f32 * width).round() as i32,
-                (rect.y + row as f32 * height).round() as i32,
+                (first_x + column as f32 * width).round() as i32,
+                (first_y + row as f32 * height).round() as i32,
                 image.pixmap.as_ref(),
                 &paint,
                 Transform::identity(),
@@ -1000,6 +1062,28 @@ mod tile_tests {
         DecodedImage { pixmap }
     }
 
+    /// A 4x4 image with a red top row and left column, white elsewhere.
+    ///
+    /// A *patterned* tile, because a uniform one cannot show where the tile
+    /// boundaries fall. That is not hypothetical: the band test below was
+    /// written with `red_tile` and passed with the phase deliberately broken,
+    /// since tiling a solid colour covers everything whatever the offset. Any
+    /// test about position or phase needs a tile that looks different in
+    /// different places.
+    fn corner_tile() -> DecodedImage {
+        let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::WHITE);
+        let red = PremultipliedColor::from_rgba(255, 0, 0, 255).expect("opaque red");
+        let pixels = pixmap.pixels_mut();
+        for pixel in pixels.iter_mut().take(4) {
+            *pixel = red;
+        }
+        for y in 0..4usize {
+            pixels[y * 4] = red;
+        }
+        DecodedImage { pixmap }
+    }
+
     fn canvas() -> Pixmap {
         let mut pixmap = Pixmap::new(20, 20).expect("pixmap");
         pixmap.fill(tiny_skia::Color::WHITE);
@@ -1031,7 +1115,13 @@ mod tile_tests {
             width: 20.0,
             height: 20.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::Repeat);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::Repeat,
+        );
         assert_eq!(red_pixels(&pixmap), 400, "every pixel covered");
     }
 
@@ -1046,7 +1136,13 @@ mod tile_tests {
             width: 20.0,
             height: 4.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::RepeatX);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::RepeatX,
+        );
         assert!(is_red(&pixmap, 19, 3), "the last tile is drawn");
         assert!(!is_red(&pixmap, 0, 4), "and nothing below the box");
     }
@@ -1064,12 +1160,19 @@ mod tile_tests {
             &mut horizontal,
             &red_tile(),
             &rect,
+            (rect.x, rect.y),
             BackgroundRepeat::RepeatX,
         );
         assert_eq!(red_pixels(&horizontal), 80, "one row of tiles");
 
         let mut vertical = canvas();
-        tile_image(&mut vertical, &red_tile(), &rect, BackgroundRepeat::RepeatY);
+        tile_image(
+            &mut vertical,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::RepeatY,
+        );
         assert_eq!(red_pixels(&vertical), 80, "one column of tiles");
     }
 
@@ -1082,8 +1185,134 @@ mod tile_tests {
             width: 20.0,
             height: 20.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::NoRepeat);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::NoRepeat,
+        );
         assert_eq!(red_pixels(&pixmap), 16);
+    }
+
+    #[test]
+    fn a_positioned_tile_starts_where_it_was_put() {
+        // `background-position: 5px 3px`, no repeat: exactly one 4x4 tile, and
+        // its corner is where the offset says rather than the box's.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x + 5.0, rect.y + 3.0),
+            BackgroundRepeat::NoRepeat,
+        );
+        assert_eq!(red_pixels(&pixmap), 16, "still one tile");
+        assert!(is_red(&pixmap, 5, 3), "its corner");
+        assert!(is_red(&pixmap, 8, 6), "its far corner");
+        assert!(!is_red(&pixmap, 4, 3), "nothing to the left of it");
+        assert!(!is_red(&pixmap, 5, 2), "nothing above it");
+    }
+
+    #[test]
+    fn a_percentage_lines_the_image_up_with_the_box_rather_than_offsetting_it() {
+        // The half of §14.2.1 that is easy to get wrong. `50%` on a 20px box
+        // holding a 4px tile is *not* 10px across — it is 50% of (20 − 4) = 8,
+        // which is what puts the middle of the image at the middle of the box.
+        let position = css::style::BackgroundPosition {
+            x: css::value::Length::Percent(50.0),
+            y: css::value::Length::Percent(100.0),
+        };
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let anchor = anchor_of(&rect, position, &red_tile());
+        assert_eq!(anchor, (8.0, 16.0), "centred across, flush to the bottom");
+
+        // And it goes negative when the image is bigger than the box, which is
+        // the case that reads as wrong and is correct: the middle of a large
+        // image still lands at the middle of a small box.
+        let narrow = Rect { width: 2.0, ..rect };
+        assert_eq!(anchor_of(&narrow, position, &red_tile()).0, -1.0);
+    }
+
+    #[test]
+    fn a_repeating_tile_extends_backwards_from_its_position() {
+        // A positioned repeat tiles in both directions, so the box's own corner
+        // is covered by a tile at a negative index. Getting this wrong leaves a
+        // gap along the top and left that only appears once a position is set.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x + 5.0, rect.y + 3.0),
+            BackgroundRepeat::Repeat,
+        );
+        assert_eq!(red_pixels(&pixmap), 400, "no gap anywhere");
+    }
+
+    #[test]
+    fn a_band_tiles_a_positioned_background_where_the_whole_page_would() {
+        // What the anchor/clip split was for. A band renders rows from part-way
+        // down the document, and the tiling phase has to come from the
+        // element's box rather than from wherever the band starts — with a
+        // position on top of that, which shifts the phase again.
+        //
+        // Drawn twice: once as one tall canvas, once as bands, and compared.
+        // The tile is patterned, which is load-bearing — see `corner_tile`.
+        let tile = corner_tile();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 30.0,
+        };
+        let anchor = (rect.x + 1.0, rect.y + 3.0);
+
+        let mut whole = Pixmap::new(20, 30).expect("pixmap");
+        whole.fill(tiny_skia::Color::WHITE);
+        tile_image(&mut whole, &tile, &rect, anchor, BackgroundRepeat::Repeat);
+
+        for top in [0.0, 7.0, 11.0, 22.0] {
+            let height = 8.0_f32.min(30.0 - top);
+            let mut band = Pixmap::new(20, height as u32).expect("pixmap");
+            band.fill(tiny_skia::Color::WHITE);
+            let slice = banded(&rect, top, height).expect("the band overlaps");
+            tile_image(
+                &mut band,
+                &tile,
+                &shifted(&slice, top),
+                (anchor.0, anchor.1 - top),
+                BackgroundRepeat::Repeat,
+            );
+
+            for y in 0..height as u32 {
+                for x in 0..20 {
+                    assert_eq!(
+                        is_red(&band, x, y),
+                        is_red(&whole, x, y + top as u32),
+                        "row {} of the band from {top} differs at x={x}",
+                        y,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1097,7 +1326,13 @@ mod tile_tests {
             width: 6.0,
             height: 6.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::Repeat);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::Repeat,
+        );
         assert!(is_red(&pixmap, 7, 7), "inside the box");
         assert!(!is_red(&pixmap, 8, 7), "past its right edge");
         assert!(!is_red(&pixmap, 1, 1), "before its top-left corner");
@@ -1132,7 +1367,7 @@ mod canvas_background_tests {
         // merely wasteful; with a translucent one it doubles the alpha.
         let (list, doc) = list_for(r#"<body background="tile.gif"><p>x</p></body>"#);
         let body = doc.find_element("body").expect("body");
-        assert_eq!(list.canvas_image.map(|(node, _)| node), Some(body));
+        assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(body));
         assert_eq!(tiles(&list), 0, "the body must not tile itself as well");
     }
 
@@ -1151,7 +1386,7 @@ mod canvas_background_tests {
              <body background=\"body.gif\"><p>x</p></body></html>",
         );
         let html = doc.find_element("html").expect("html");
-        assert_eq!(list.canvas_image.map(|(node, _)| node), Some(html));
+        assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(html));
         // The body's own tile is not propagated, so it still paints normally.
         assert_eq!(tiles(&list), 1);
     }

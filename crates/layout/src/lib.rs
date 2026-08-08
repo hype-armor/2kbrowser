@@ -231,7 +231,11 @@ pub struct Layout {
     /// and how it repeats. Propagated from the root or the body by the same
     /// §14.2 rule as the colour, and for the same reason: a tile that stopped
     /// at the content height would leave a band of blank canvas below it.
-    pub canvas_image: Option<(NodeId, css::style::BackgroundRepeat)>,
+    pub canvas_image: Option<(
+        NodeId,
+        css::style::BackgroundRepeat,
+        css::style::BackgroundPosition,
+    )>,
     /// Colour the whole canvas takes, per CSS 2.1 §14.2.
     ///
     /// The root element's background covers the canvas however tall that
@@ -505,9 +509,13 @@ pub fn layout(
     // and a body with a tile is ordinary markup, and both belong on the canvas.
     let canvas_image = match (html, html_style) {
         (Some(node), Some(style)) if style.background_image.is_some() => {
-            Some((node, style.background_repeat))
+            Some((node, style.background_repeat, style.background_position))
         }
-        _ if body_style.background_image.is_some() => Some((body, body_style.background_repeat)),
+        _ if body_style.background_image.is_some() => Some((
+            body,
+            body_style.background_repeat,
+            body_style.background_position,
+        )),
         _ => None,
     };
 
@@ -1313,9 +1321,19 @@ fn layout_block(
         }
 
         // `clear` pushes this box below the floats it names.
-        cursor_y = context.clearance(child_style.clear, cursor_y);
-        let child_context =
-            context.translated(0.0, cursor_y - padding_top - border_top, content_width);
+        //
+        // Asked in the *context's* coordinates and converted back, which is the
+        // conversion every other use of `cursor_y` here already does — the two
+        // lines below it, and the float placement above. `context` was
+        // translated into this block's content box, and `cursor_y` counts from
+        // its border box, so asking directly cleared to a point too high by
+        // exactly this block's top padding and border. The symptom was a
+        // paragraph whose *box* sat below the floats correctly while its first
+        // line dodged sideways as though one were still in the way, on any
+        // container with padding — which is most of them.
+        let into_context = padding_top + border_top;
+        cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
+        let child_context = context.translated(0.0, cursor_y - into_context, content_width);
         let child_containing = containing.descend(padding_left + border_left, cursor_y);
         let consumed = layout_block(
             doc,
@@ -3188,6 +3206,50 @@ mod tests {
         assert!(
             paragraph_y(&uncleared) < 80.0,
             "without clear it stays alongside"
+        );
+    }
+
+    #[test]
+    fn a_cleared_line_starts_at_the_edge_inside_a_padded_container() {
+        // The existing `clear` test puts the floats directly in `body` with no
+        // padding, and passed throughout this bug. `clear` was asked in the
+        // wrong coordinate space — `cursor_y` counts from the block's border
+        // box and the float context had been translated into its content box —
+        // so clearance fell short by exactly the container's top padding and
+        // border.
+        //
+        // What that looks like is not a box in the wrong place: the box lands
+        // correctly, because it is moved again by the enclosing flow. It is the
+        // box's *first line* dodging sideways as though a float were still
+        // beside it. So the assertion is about where the text starts, not where
+        // the block does — the version of this test that checks `rect.y`
+        // passes with the bug in place.
+        let rendered = run(
+            "<body><div class=\"pad\">\
+             <div class=\"f\"></div><p class=\"c\">after</p>\
+             </div></body>",
+            "body { margin: 0 } \
+             .pad { padding: 12px; border: 1px solid #888 } \
+             .f { float: left; width: 100px; height: 80px } \
+             .c { clear: both; margin: 0 }",
+            500.0,
+        );
+
+        let line_x = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.float == Float::None && b.text.is_some())
+            .and_then(|b| {
+                b.text
+                    .as_ref()
+                    .and_then(|layout| layout.lines.first())
+                    .map(|line| line.glyphs.first().map(|g| g.x).unwrap_or(0.0))
+            })
+            .expect("the cleared paragraph has a line");
+
+        assert!(
+            line_x < 1.0,
+            "the cleared paragraph's first line starts at {line_x}, so it is \
+             still avoiding a float it was cleared past",
         );
     }
 

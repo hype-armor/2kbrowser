@@ -51,7 +51,18 @@ pub fn read_components(input: &mut Parser<'_, '_>) -> Vec<Raw> {
             Token::Ident(name) => Raw::Ident(name.as_ref().to_ascii_lowercase()),
             Token::QuotedString(s) => Raw::Str(s.as_ref().to_owned()),
             Token::Number { value, .. } => Raw::Number(value),
-            Token::Percentage { unit_value, .. } => Raw::Percentage(unit_value * 100.0),
+            // `int_value` where the source wrote a whole number, because
+            // `unit_value` is the fraction and multiplying it back up does not
+            // land where it started: `30%` arrives as 0.3, and 0.3 × 100 is
+            // 30.000002 in an `f32`. Harmless in most places and not in all —
+            // table columns are sized in percentages, and a width that is a
+            // fraction of a pixel wide of where the author put it rounds the
+            // wrong way often enough to be visible.
+            Token::Percentage {
+                unit_value,
+                int_value,
+                ..
+            } => Raw::Percentage(int_value.map_or(unit_value * 100.0, |whole| whole as f32)),
             Token::Dimension {
                 value, ref unit, ..
             } => Raw::Dimension {

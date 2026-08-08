@@ -54,7 +54,9 @@ Working: the cascade with selectors, specificity, and inheritance; the box
 model with borders and backgrounds; inline layout with per-span styles and
 Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`, and
 `cellspacing`; images,
-including ones sitting in a line; relative and absolute positioning;
+including ones sitting in a line; `background-position`, including the
+percentage form, which aligns a point on the image with the same point on the
+box rather than offsetting from the corner; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
 text decorations; tiled background images; external stylesheets, including
@@ -74,8 +76,12 @@ The window opens on a virtual display in CI and is checked to survive
 loop, and the rendering it drives is covered by the reference tests.
 
 Known to be missing or wrong, rather than hidden: collapsed borders, fixed
-table layout, dashed and dotted borders painting solid, and
-`background-position`.
+table layout, dashed and dotted borders painting solid, and `inline-block`,
+which is recognised and then laid out as though it were plain `inline` — an
+empty one with a width and a height collapses to nothing at all. That last is
+the worst-behaved of them, because unlike the others it fails silently: the
+declaration is understood, so the document fallback does not offer the author's
+layout either (ADR-0009).
 
 Pages of any length work. The renderer paints a *band* — a few windows' worth
 of rows around where you are reading — rather than the whole document, and the

@@ -328,8 +328,8 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, dashed and dotted borders painting solid, `background-position`, and
-proper block-in-inline splitting — an inline element containing a block is
+layout, dashed and dotted borders painting solid, `inline-block` laid out as
+plain `inline`, and proper block-in-inline splitting — an inline element containing a block is
 laid out as a block instead, which matches for the shapes that occur but is
 not what CSS 2.1 §9.2.1.1 describes.
 
@@ -788,6 +788,13 @@ configuration has not been reviewed. Issue #3 blocks part of it; nothing else
 in §9 does.
 
 The engine's known gaps — collapsed borders, fixed table layout, dashed and
-dotted borders, `background-position`, proper block-in-inline splitting — are
-listed under M2 and are not scheduled. They are places the browser is wrong
-rather than places it falls over, and none of them is what makes this unsafe.
+dotted borders, `inline-block`, proper block-in-inline splitting — are listed
+under M2 and are not scheduled. They are places the browser is wrong rather
+than places it falls over, and none of them is what makes this unsafe.
+
+`background-position` came off that list. It was the most self-contained of
+them and it paid for itself twice over: implementing it needed the tiling code
+to separate *where a tile is anchored* from *which rows are being painted*,
+which the banded renderer had been conflating, and writing its fixture turned
+up two bugs that had nothing to do with backgrounds — `inline-block` collapsing
+to nothing, and `clear` falling short by a container's top padding.

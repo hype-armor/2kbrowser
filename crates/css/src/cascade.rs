@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use dom::{Document, ElementData, NodeId};
 
 use crate::style::{
-    BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle, DEFAULT_FONT_SIZE, Edges,
-    FontStack, FontStyle, GenericFamily, MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace,
-    parse_background_repeat, parse_border_style, parse_clear, parse_display, parse_float,
-    parse_list_style_type, parse_position, parse_text_decoration, parse_vertical_align,
+    BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
+    DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
+    NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
+    parse_border_style, parse_clear, parse_display, parse_float, parse_list_style_type,
+    parse_position, parse_text_decoration, parse_vertical_align,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -189,6 +190,28 @@ fn compute(
     style
 }
 
+/// Whether a value in the `background` shorthand belongs to the position.
+///
+/// Only asked inside that shorthand, where the question is answerable: nothing
+/// else it takes is a length or a percentage, and none of the four edge
+/// keywords is a colour or a repeat mode. `center` is the one that looks like
+/// it might collide and does not.
+///
+/// Deliberately loose about *which* lengths are valid — `parse_background_position`
+/// decides that, and it sees the pair. This only has to sort tokens into piles.
+fn is_position_component(raw: &Raw) -> bool {
+    match raw {
+        Raw::Dimension { .. } | Raw::Percentage(_) => true,
+        Raw::Ident(name) => {
+            matches!(
+                name.as_str(),
+                "left" | "right" | "top" | "bottom" | "center"
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Reads a `url(...)` value in either of its two token forms.
 ///
 /// Unquoted it arrives as a URL token; quoted, the tokenizer sees an ordinary
@@ -252,6 +275,14 @@ fn apply(
                 style.background_repeat = repeat;
             }
         }
+        "background-position" => {
+            // The element's own font size, not the parent's: `em` here is
+            // relative to the size this element ends up with, and `font-size`
+            // is the one property where that is not true.
+            if let Some(position) = parse_background_position(values, style.font_size) {
+                style.background_position = position;
+            }
+        }
         // The shorthand sets everything it names and resets everything it does
         // not — that reset is the whole reason `background: white` reliably
         // clears an image, and skipping it leaves the image showing through.
@@ -259,6 +290,13 @@ fn apply(
             style.background_color = Color::TRANSPARENT;
             style.background_image = None;
             style.background_repeat = BackgroundRepeat::Repeat;
+            style.background_position = BackgroundPosition::default();
+            // Position is the one component of this shorthand that is more than
+            // one token, so its pieces are collected as they go by and parsed
+            // together at the end. Gathered rather than parsed in place because
+            // `10px 20px` only means anything as a pair, and the two are not
+            // necessarily adjacent to anything that identifies them.
+            let mut position = Vec::new();
             for value in values {
                 if let Some(url) = url_value(value) {
                     style.background_image = Some(url.to_owned());
@@ -266,9 +304,16 @@ fn apply(
                     && let Some(repeat) = parse_background_repeat(name)
                 {
                     style.background_repeat = repeat;
+                } else if is_position_component(value) {
+                    position.push(value.clone());
                 } else if let Some(color) = parse_color(value) {
                     style.background_color = color;
                 }
+            }
+            if !position.is_empty()
+                && let Some(parsed) = parse_background_position(&position, style.font_size)
+            {
+                style.background_position = parsed;
             }
         }
         // font-size resolves em and % against the *parent's* size, not its own.
@@ -936,7 +981,9 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{BackgroundRepeat, Display, ListStyleType, VerticalAlign};
+    use crate::style::{
+        BackgroundPosition, BackgroundRepeat, Display, ListStyleType, VerticalAlign,
+    };
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
         let doc = dom::parse(html);
@@ -1423,6 +1470,122 @@ mod tests {
         assert_eq!(style.background_image.as_deref(), Some("tile.gif"));
         assert_eq!(style.background_color, crate::Color::rgb(255, 0, 0));
         assert_eq!(style.background_repeat, BackgroundRepeat::NoRepeat);
+    }
+
+    #[test]
+    fn background_position_reads_keywords_lengths_and_percentages() {
+        let position = |css: &str| {
+            style_of("<body>x</body>", &format!("body {{ {css} }}"), "body").background_position
+        };
+        let percent = |x: f32, y: f32| BackgroundPosition {
+            x: Length::Percent(x),
+            y: Length::Percent(y),
+        };
+
+        // The initial value, which is what every other case is a change from.
+        assert_eq!(position(""), percent(0.0, 0.0));
+        assert_eq!(position("background-position: center"), percent(50.0, 50.0));
+        assert_eq!(
+            position("background-position: right bottom"),
+            percent(100.0, 100.0)
+        );
+
+        // One value sets the horizontal and centres the other — unless it
+        // cannot be horizontal. `top` alone is centred across, which is the
+        // rule most easily got wrong by treating the first value positionally.
+        assert_eq!(position("background-position: 25%"), percent(25.0, 50.0));
+        assert_eq!(position("background-position: top"), percent(50.0, 0.0));
+        assert_eq!(
+            position("background-position: bottom"),
+            percent(50.0, 100.0)
+        );
+
+        // Keywords may be written either way round; anything else may not.
+        assert_eq!(position("background-position: top left"), percent(0.0, 0.0));
+        assert_eq!(
+            position("background-position: bottom center"),
+            percent(50.0, 100.0)
+        );
+
+        assert_eq!(
+            position("background-position: 10px 20px"),
+            BackgroundPosition {
+                x: Length::Px(10.0),
+                y: Length::Px(20.0),
+            }
+        );
+        // `em` is resolved during the cascade, against this element's own size.
+        assert_eq!(
+            position("font-size: 20px; background-position: 2em 0"),
+            BackgroundPosition {
+                x: Length::Px(40.0),
+                y: Length::Px(0.0),
+            }
+        );
+    }
+
+    #[test]
+    fn an_invalid_background_position_leaves_the_previous_one_alone() {
+        // CSS drops a declaration it cannot parse, and here that matters more
+        // than usual: half a position puts the image somewhere the author never
+        // asked for, which is worse than ignoring them.
+        for bad in [
+            // Two of the same axis.
+            "top bottom",
+            "left right",
+            // A vertical keyword where only a horizontal one is allowed. The
+            // reversed order is legal only when *both* parts are keywords.
+            "top 50%",
+            "50% left",
+            // Not lengths at all.
+            "auto",
+            "banana",
+            // The three-value form, which is CSS3 (ADR-0004).
+            "left top 10px",
+        ] {
+            let style = style_of(
+                "<body>x</body>",
+                &format!("body {{ background-position: 25% 75%; background-position: {bad} }}"),
+                "body",
+            );
+            assert_eq!(
+                style.background_position,
+                BackgroundPosition {
+                    x: Length::Percent(25.0),
+                    y: Length::Percent(75.0),
+                },
+                "`{bad}` was not rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_background_shorthand_carries_and_resets_the_position() {
+        let style = style_of(
+            "<body>x</body>",
+            "body { background: url(tile.gif) no-repeat 30% 10px }",
+            "body",
+        );
+        assert_eq!(style.background_image.as_deref(), Some("tile.gif"));
+        assert_eq!(style.background_repeat, BackgroundRepeat::NoRepeat);
+        assert_eq!(
+            style.background_position,
+            BackgroundPosition {
+                x: Length::Percent(30.0),
+                y: Length::Px(10.0),
+            }
+        );
+
+        // And the reset, which is the half that bites: a later shorthand naming
+        // no position must put it back to the corner rather than leave the
+        // earlier one in place.
+        let style = style_of(
+            "<body>x</body>",
+            "body { background: url(a.gif) 30% 10px } body { background: url(b.gif) }",
+            "body",
+        );
+        assert_eq!(style.background_image.as_deref(), Some("b.gif"));
+        assert_eq!(style.background_position, BackgroundPosition::default());
     }
 
     #[test]

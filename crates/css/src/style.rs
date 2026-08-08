@@ -1,6 +1,6 @@
 //! Computed values.
 
-use crate::value::{Color, Length};
+use crate::value::{Color, Length, Raw};
 
 /// The `display` property.
 ///
@@ -236,6 +236,155 @@ pub fn parse_background_repeat(name: &str) -> Option<BackgroundRepeat> {
         _ => return None,
     };
     Some(value)
+}
+
+/// The `background-position` property (CSS 2.1 §14.2.1).
+///
+/// Two [`Length`]s, and only `Px` and `Percent` ever appear in them: `em` is
+/// resolved during the cascade against the element's own font size, which is
+/// what "computed value: absolute length or percentage" means, and `auto` is
+/// not a value this property takes.
+///
+/// The percentage is the interesting half, because it does not mean what a
+/// percentage usually means. `50%` does not offset by half the box — it lines
+/// the point halfway across the *image* up with the point halfway across the
+/// *box*, so the resolved offset is `p × (box − image)` and goes negative when
+/// the image is larger than the box. That is why this is resolved at paint
+/// time: the cascade does not know how big the image is, and may not, since it
+/// has not been fetched yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackgroundPosition {
+    /// Horizontal component. `left` is `0%`, `center` `50%`, `right` `100%`.
+    pub x: Length,
+    /// Vertical component. `top` is `0%`, `center` `50%`, `bottom` `100%`.
+    pub y: Length,
+}
+
+impl Default for BackgroundPosition {
+    fn default() -> Self {
+        Self {
+            x: Length::Percent(0.0),
+            y: Length::Percent(0.0),
+        }
+    }
+}
+
+/// Where the image's edge goes along one axis, relative to the box's.
+///
+/// `box_size` and `image_size` are along the same axis. A percentage resolves
+/// against their *difference*, so an image wider than its box is pulled left
+/// rather than pushed right — the correct and surprising half of §14.2.1. The
+/// font size is not needed: `em` was already resolved during the cascade.
+pub fn background_offset(component: Length, box_size: f32, image_size: f32) -> f32 {
+    component.to_px(0.0, box_size - image_size)
+}
+
+/// One keyword of `background-position`, as the percentage it stands for.
+///
+/// Returned with which axes it may apply to: `left` and `right` are horizontal
+/// only, `top` and `bottom` vertical only, and `center` is either. That is what
+/// makes `top left` and `left top` both legal and `top bottom` not.
+fn position_keyword(name: &str) -> Option<(Length, Axes)> {
+    let value = match name {
+        "left" => (Length::Percent(0.0), Axes::Horizontal),
+        "right" => (Length::Percent(100.0), Axes::Horizontal),
+        "top" => (Length::Percent(0.0), Axes::Vertical),
+        "bottom" => (Length::Percent(100.0), Axes::Vertical),
+        "center" => (Length::Percent(50.0), Axes::Either),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// Which axis a `background-position` keyword can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axes {
+    Horizontal,
+    Vertical,
+    Either,
+}
+
+/// Parses `background-position`, returning `None` if the whole value is invalid.
+///
+/// All-or-nothing on purpose. A declaration this does not understand must leave
+/// the previous value alone rather than half-apply — CSS says an invalid
+/// declaration is dropped, and half a position is worse than none, because it
+/// puts the image somewhere the author never asked for.
+///
+/// `font_size` resolves `em`, which is the element's own here rather than the
+/// parent's: unlike `font-size` itself, this property's lengths are relative to
+/// the size it ends up with.
+pub fn parse_background_position(values: &[Raw], font_size: f32) -> Option<BackgroundPosition> {
+    /// A length, a percentage, or a keyword — the three shapes a component
+    /// takes, with the keyword's axis kept so the pair can be checked.
+    fn component(raw: &Raw, font_size: f32) -> Option<(Length, Axes)> {
+        if let Raw::Ident(name) = raw {
+            return position_keyword(name);
+        }
+        let length = crate::value::parse_length(raw)?;
+        let resolved = match length {
+            Length::Px(v) => Length::Px(v),
+            Length::Em(v) => Length::Px(v * font_size),
+            Length::Percent(v) => Length::Percent(v),
+            // Not a value this property takes. Refused rather than treated as
+            // zero, so the declaration is dropped as CSS requires.
+            Length::Auto => return None,
+        };
+        Some((resolved, Axes::Either))
+    }
+
+    match values {
+        // One value sets that axis and centres the other. Which axis depends on
+        // the value: `background-position: top` is horizontally centred, not
+        // `top` across and centre down, because `top` cannot be horizontal.
+        [only] => {
+            let (value, axes) = component(only, font_size)?;
+            Some(match axes {
+                Axes::Vertical => BackgroundPosition {
+                    x: Length::Percent(50.0),
+                    y: value,
+                },
+                _ => BackgroundPosition {
+                    x: value,
+                    y: Length::Percent(50.0),
+                },
+            })
+        }
+        [first, second] => {
+            let (first_value, first_axes) = component(first, font_size)?;
+            let (second_value, second_axes) = component(second, font_size)?;
+            match (first_axes, second_axes) {
+                // Written the other way round, which only keywords may do:
+                // `top left` is legal and `0% left` is not, because a bare
+                // length is horizontal by position rather than by meaning.
+                (Axes::Vertical, Axes::Horizontal) => Some(BackgroundPosition {
+                    x: second_value,
+                    y: first_value,
+                }),
+                (Axes::Vertical, Axes::Either) if matches!(second, Raw::Ident(_)) => {
+                    Some(BackgroundPosition {
+                        x: second_value,
+                        y: first_value,
+                    })
+                }
+                // Everything else with an axis in the wrong place. Two of the
+                // same one (`top bottom`), a vertical keyword followed by a
+                // number (`top 50%`), or a horizontal keyword second
+                // (`50% left`). CSS 2.1's grammar allows the reversed order
+                // only when *both* components are keywords, which is what the
+                // arms above cover; the rest is invalid and dropped rather than
+                // guessed at.
+                (Axes::Vertical, _) | (_, Axes::Horizontal) => None,
+                _ => Some(BackgroundPosition {
+                    x: first_value,
+                    y: second_value,
+                }),
+            }
+        }
+        // Zero values, or the three- and four-value forms that arrived with
+        // CSS3. Out of scope (ADR-0004) and refused rather than half-read.
+        _ => None,
+    }
 }
 
 /// The `list-style-type` property.
@@ -672,6 +821,8 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     /// `background-repeat`.
     pub background_repeat: BackgroundRepeat,
+    /// `background-position`.
+    pub background_position: BackgroundPosition,
     /// `vertical-align`, as it applies to a table cell.
     pub vertical_align: VerticalAlign,
     /// `border-spacing`, the gap between cell borders in the separated model.
@@ -737,6 +888,7 @@ impl Default for ComputedStyle {
             background_color: Color::TRANSPARENT,
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
+            background_position: BackgroundPosition::default(),
             vertical_align: VerticalAlign::Middle,
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             font_family: FontStack::default(),
