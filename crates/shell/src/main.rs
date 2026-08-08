@@ -102,16 +102,13 @@ fn report(outcome: Result<String, String>) -> ExitCode {
 fn run_open(args: &[String]) -> Result<String, String> {
     let options = Options::parse(args)?;
     let input = options.input.ok_or("no input given")?;
-    let (resource, url) = load_from(&input)?;
+    let (document, url) = load_from(&input)?;
     window::open(
-        // The raw bytes, not the decoded text: the window renders in a child
-        // process, and the encoding sniffer lives there with every other parser
-        // (ADR-0012).
-        resource.bytes,
-        None,
+        document.body,
+        document.content_type,
         url,
-        resource.origin,
-        resource.path,
+        document.origin,
+        document.path,
         options.width,
         options.height.min(2000),
     )?;
@@ -269,7 +266,7 @@ fn run_render(args: &[String]) -> Result<String, String> {
 /// The canvas is capped at what one frame can carry, so a `--height` past that
 /// is a clipped page with a note rather than a renderer that cannot answer.
 fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, String> {
-    let (resource, _) = load_from(input)?;
+    let (document, _) = load_from(input)?;
     let renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
     if !renderer.confinement().is_confined() {
         eprintln!("2kbrowser: {}", renderer.confinement().describe());
@@ -279,14 +276,7 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
     }
     Viewport::open(
         &renderer,
-        shell::viewport::Document {
-            // Raw bytes, not decoded text: the encoding sniffer lives on the
-            // far side with every other parser.
-            body: resource.bytes,
-            content_type: None,
-            origin: resource.origin,
-            path: resource.path,
-        },
+        document,
         width,
         height.min(sandbox::max_canvas_height(width)),
         false,
@@ -302,13 +292,29 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
 /// to judge subresources against. The window needs the URL as well: it is the
 /// first history entry, and every relative link on the page resolves against
 /// it.
-fn load_from(input: &str) -> Result<(net::Resource, String), String> {
+///
+/// Raw, and *with* the `Content-Type`. The bytes stay undecoded because the
+/// encoding sniffer lives on the far side of the renderer boundary with every
+/// other parser (ADR-0012) — but the header has to travel with them, because on
+/// a page that declares its encoding nowhere else the header is the only thing
+/// that knows. Dropping it decoded Hacker News, which says `charset=utf-8` in
+/// the header and nothing in the markup, as windows-1252: every em dash and
+/// curly quote came out as mojibake.
+fn load_from(input: &str) -> Result<(shell::viewport::Document, String), String> {
     let fetcher = net::Fetcher::default();
     let url = absolute_url(input)?;
-    let resource = fetcher
-        .fetch(&url, None, net::RequestKind::Navigation)
+    let (body, content_type, origin, path) = fetcher
+        .fetch_raw(&url, None, net::RequestKind::Navigation)
         .map_err(|error| format!("{url}: {error}"))?;
-    Ok((resource, url))
+    Ok((
+        shell::viewport::Document {
+            body,
+            content_type,
+            origin,
+            path,
+        },
+        url,
+    ))
 }
 
 /// Turns a command-line argument into a URL.

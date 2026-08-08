@@ -894,3 +894,54 @@ fn a_blocking_question_does_not_swallow_a_band_in_flight() {
         .expect("the band paints");
     assert_eq!(band.top, 300);
 }
+
+#[test]
+fn a_charset_that_only_the_header_knows_still_reaches_the_renderer() {
+    // The bytes stay undecoded across the boundary because the encoding sniffer
+    // lives with every other parser on the far side (ADR-0012). The header has
+    // to travel with them: on a page that declares its encoding nowhere else,
+    // the header is the only thing that knows.
+    //
+    // Found by looking at a screenshot. Hacker News says `charset=utf-8` in the
+    // header and nothing at all in the markup, and the command line was passing
+    // `content_type: None` — so every em dash and curly quote on it came out as
+    // windows-1252 mojibake. The same page reached through a *link* decoded
+    // correctly, because that path kept the header, which is the sort of
+    // inconsistency nobody would think to look for.
+    let utf8 = "<title>Möbius — 1,060 texts</title><body><p>Möbius</p></body>";
+    assert!(
+        !utf8.is_ascii(),
+        "the fixture has to contain something that decodes differently"
+    );
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let titled = |content_type: Option<&str>| {
+        renderer
+            .render(
+                utf8.as_bytes().to_vec(),
+                content_type.map(str::to_owned),
+                300,
+                0,
+                400,
+                None,
+                String::new(),
+                false,
+            )
+            .expect("renders")
+            .title
+    };
+
+    assert_eq!(
+        titled(Some("text/html; charset=utf-8")).as_deref(),
+        Some("Möbius — 1,060 texts"),
+        "the header's charset did not reach the renderer"
+    );
+    // And without it the browser falls back to the era's default, which is what
+    // makes the assertion above about the header rather than about the bytes.
+    assert_ne!(
+        titled(None).as_deref(),
+        Some("Möbius — 1,060 texts"),
+        "the fixture decodes the same either way, so it proves nothing"
+    );
+}

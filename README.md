@@ -14,6 +14,36 @@ test suite. Unlike an engine chasing the modern web, this one has a finish line.
 See [PLAN.md](PLAN.md) for the full rationale and roadmap, and
 [docs/adr/](docs/adr/) for the decisions that constrain it.
 
+## What it looks like
+
+Real pages, screenshotted from the running browser. Regenerate them with
+`scripts/screenshots.sh`.
+
+![Hacker News in 2kbrowser](docs/images/hacker-news.png)
+
+Hacker News, today, with no JavaScript. Most of the web that is worth reading
+looks like this without scripts — the constraint is the filter, not a
+limitation to work around. The bar says nothing, because an ordinary page over
+HTTPS has nothing to say.
+
+![The first website in 2kbrowser](docs/images/first-website.png)
+
+The first website, still up, still plain HTTP. The bar marks it *not encrypted*
+— never the reverse, because decorating the secure case teaches people to look
+for a signal whose absence is easy to miss (ADR-0006).
+
+![A modern page re-rendered as a document](docs/images/document-fallback.png)
+
+A page built with layout this engine does not implement. Rather than render it
+as jumbled boxes and let you think the browser is broken, it says what it did
+and offers you the author's layout anyway (ADR-0009).
+
+![Every state of the chrome bar](docs/images/chrome.png)
+
+Every state the bar can be in, drawn by `cargo run -p shell --example
+chrome-strip` — which is also how it is reviewed, since a headless test can
+compare pixels and a person cannot compare descriptions.
+
 ## Status
 
 **M2 — it renders the era's web.** HTML is fetched over HTTP(S) or read from
