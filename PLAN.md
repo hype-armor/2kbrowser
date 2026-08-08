@@ -455,12 +455,23 @@ rendered without: verified on the era fixture, 0 differing bytes of 2.5 MB.
 
 Two consequences worth recording rather than discovering later:
 
-- **A page taller than one frame is clipped.** The canvas covers the whole
-  document so scrolling costs a blit rather than a re-layout, and a frame is
-  bounded so a compromised child cannot make the parent allocate without limit.
-  At 800 pixels wide that allows roughly 20,000 rows. The honest fix is to
-  render a band around the scroll position instead of the whole document, which
-  changes how scrolling works and is not something to fold into the boundary.
+- **A page taller than one frame was clipped, and is not any more.** The canvas
+  used to cover the whole document, which made scrolling a blit and made a page
+  past roughly 20,000 rows stop dead. The fix named here — render a band around
+  the scroll position — is now written. The display list is in document
+  coordinates and does not change between bands, so a band is paint-only: no
+  parse, no cascade, no layout. The conversation moved onto a thread so the rows
+  ahead can be asked for while the window carries on drawing, which is what
+  keeps ordinary scrolling from waiting on anything.
+
+  Two bugs came out of building it, both invisible until a canvas started
+  somewhere other than document row zero. `draw_pixmap` fills a rectangle with
+  the glyph bitmap as a *pattern*, and a pattern sampled outside its bounds pads
+  with its edge, so a glyph straddling the top of a band gained a duplicated
+  row; glyphs are cropped to the canvas now and never drawn at a negative
+  offset. And the placement cast truncated toward zero, which changes rounding
+  direction at zero. Both were found by asserting a band is exactly the rows it
+  names.
 - **Find and resize keep the child alive.** One *page* per process, not one
   message: a page's lifetime includes the questions asked of it while it is on
   screen, and the text those questions search never crosses. The child is killed

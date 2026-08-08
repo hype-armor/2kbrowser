@@ -561,17 +561,11 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
 }
 
 #[test]
-fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
-    // The one limitation of the process boundary a reader can actually hit.
-    // The canvas covers the whole document so scrolling costs a blit, and it
-    // has to fit in one frame so a compromised renderer cannot make the parent
-    // allocate without limit — about 20,000 rows at 800 pixels wide. Past that
-    // the page simply stopped, with white below it, indistinguishable from the
-    // document ending.
-    //
-    // Provoked with a small canvas rather than a 20,000-row document: the
-    // property is "content taller than canvas", and rendering twenty thousand
-    // rows to assert it would cost seconds for nothing.
+fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
+    // What banded rendering is for. A page used to stop at the canvas it was
+    // given: the rows past it had no pixels, the scroll stopped there, and the
+    // bar said the end was not shown. Now the canvas is a *band*, the scroll
+    // range is the document, and the rows arrive when they are reached.
     let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("tall.html");
@@ -588,91 +582,43 @@ fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
         path: at,
     };
 
-    let tall = shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false)
+    let mut page = shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false)
         .expect("the page opens");
     assert!(
-        tall.content_height() > tall.height() as f32,
-        "the fixture was not tall enough to be clipped: {} content, {} canvas",
-        tall.content_height(),
-        tall.height()
+        page.content_height() > page.height() as f32,
+        "the fixture is too short to band: {} content, {} band",
+        page.content_height(),
+        page.height()
     );
-    assert!(tall.is_truncated());
-    // And the scroll stops where the pixels stop, rather than running on into
-    // rows that were never rendered.
-    assert_eq!(tall.scrollable_height(), tall.height() as f32);
+    // The whole document, not the band. This is the assertion that used to say
+    // the opposite.
+    assert_eq!(page.scrollable_height(), page.content_height());
+    assert_eq!(page.band_top(), 0);
 
-    // The same document with room for all of it is not truncated, which is what
-    // makes the assertion above about the page rather than about the type.
-    let whole = shell::viewport::Viewport::open(&renderer, document, 400, 20_000, false)
-        .expect("the page opens");
-    assert!(
-        !whole.is_truncated(),
-        "{} content, {} canvas",
-        whole.content_height(),
-        whole.height()
-    );
-}
-
-#[test]
-fn a_truncated_page_offers_no_matches_or_links_it_cannot_show() {
-    // A page cut off at the canvas still *has* text and links below the cut —
-    // the child holds the whole box tree and answers from it. Passing those on
-    // would give the reader "3 of 7" where four of the seven highlight nothing
-    // when stepped to, and links that take keyboard focus and are outlined
-    // nowhere.
-    let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("tall-links.html");
-    let html = format!(
-        "<body>{}</body>",
-        "<p><a href=\"a.html\">needle</a></p>".repeat(200)
-    );
-    std::fs::write(&path, &html).expect("write");
-    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
-
-    let renderer =
-        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
-    let document = shell::viewport::Document {
-        body: html.as_bytes().to_vec(),
-        content_type: None,
-        origin,
-        path: at,
-    };
-
-    let mut whole =
-        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 20_000, false)
-            .expect("the page opens");
-    assert!(!whole.is_truncated());
-    let (all_matches, all_links) = (whole.find("needle").len(), whole.links().len());
-    assert_eq!(all_matches, 200, "the fixture should match once per line");
-    assert_eq!(all_links, 200);
-
-    let mut cut = shell::viewport::Viewport::open(&renderer, document, 400, 300, false)
-        .expect("the page opens");
-    assert!(cut.is_truncated());
-
-    let canvas = cut.height() as f32;
-    let matches = cut.find("needle");
-    assert!(
-        matches.len() < all_matches && !matches.is_empty(),
-        "expected some but not all of {all_matches} matches, got {}",
-        matches.len()
-    );
-    for rect in &matches {
-        assert!(rect.y < canvas, "a match at {} is off the canvas", rect.y);
-    }
-
-    let links = cut.links();
-    assert!(
-        links.len() < all_links && !links.is_empty(),
-        "expected some but not all of {all_links} links, got {}",
-        links.len()
-    );
-    for link in &links {
-        for rect in &link.rects {
-            assert!(rect.y < canvas, "a link at {} is off the canvas", rect.y);
+    // And the last rows of the document are reachable.
+    let last = page.content_height() as u32 - 100;
+    page.request_band(last, 300).expect("asks");
+    let arrived = loop {
+        if page.accept_band() {
+            break true;
         }
-    }
+        if !page.band_outstanding() {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(arrived, "the band never arrived");
+    assert_eq!(page.band_top(), last);
+
+    // Every match is offered, wherever it is. They used to be filtered to the
+    // painted canvas because a match below it could not be shown; now it can.
+    let matches = page.find("line");
+    assert_eq!(matches.len(), 200, "every line should match");
+    assert!(
+        matches.iter().any(|rect| rect.y > page.height() as f32),
+        "matches beyond the band should still be offered"
+    );
+    assert_eq!(page.links().len(), 0);
 }
 
 #[test]

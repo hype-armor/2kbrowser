@@ -46,14 +46,13 @@ Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and
 `background-position`.
 
-A page taller than about 20,000 rows is cut short — the canvas covers the whole
-document so scrolling costs a blit rather than a re-layout, and it has to fit in
-one frame so a compromised renderer cannot make the parent allocate without
-limit. The bar says "page too long — the end is not shown" and the scroll stops
-where the pixels stop, rather than running on into white that looks exactly like
-the document ending. Find and keyboard focus stop there too: a match counted in
-"3 of 7" that highlights nothing when you step to it is worse than one that was
-never offered. Banded rendering is the real fix and is not written.
+Pages of any length work. The renderer paints a *band* — a few windows' worth
+of rows around where you are reading — rather than the whole document, and the
+rows ahead of you are asked for before you reach them, on a thread, so ordinary
+scrolling never waits. The parse, the cascade, and the layout all stay done
+between bands, so moving down a long page costs only the pixels. A band is
+exactly the rows it names from a whole-page render, which is asserted at both
+levels: against the rasteriser directly, and across a real process boundary.
 
 Links work in the window: click to follow, Alt+Left/Right or Backspace for
 back and forward, and the cursor changes over a link. `2kbrowser links <page>`

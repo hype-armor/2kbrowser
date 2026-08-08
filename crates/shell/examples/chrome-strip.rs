@@ -45,7 +45,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "http://example.org/an-old-page.html",
@@ -58,7 +57,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: true,
-            truncated: false,
         },
         chrome::State {
             url: "file:///home/user/pages/index.html",
@@ -71,7 +69,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
-            truncated: false,
         },
         // A page the canvas could not hold all of. Says so rather than ending
         // in white, which is indistinguishable from the document ending.
@@ -86,7 +83,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
-            truncated: true,
         },
         chrome::State {
             url: "https://example.com/something-modern",
@@ -99,7 +95,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: true,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/app",
@@ -112,7 +107,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/gone.html",
@@ -125,7 +119,6 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/a-page.html",
@@ -138,7 +131,6 @@ fn main() {
             editing: Some(&selected),
             finding: None,
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/",
@@ -151,7 +143,6 @@ fn main() {
             editing: Some(&typing),
             finding: None,
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -164,7 +155,6 @@ fn main() {
             editing: Some(&partial),
             finding: None,
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -177,7 +167,6 @@ fn main() {
             editing: None,
             finding: Some((&searching, 2, 7)),
             saved: false,
-            truncated: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -190,7 +179,6 @@ fn main() {
             editing: None,
             finding: Some((&fruitless, 0, 0)),
             saved: false,
-            truncated: false,
         },
     ];
 

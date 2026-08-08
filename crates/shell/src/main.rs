@@ -233,7 +233,10 @@ fn run_render(args: &[String]) -> Result<String, String> {
     if page.images_loaded() > 0 {
         message.push_str(&format!(", {} image(s)", page.images_loaded()));
     }
-    if page.is_truncated() {
+    // Still a real clip here, and still worth saying: a PNG is one image, so
+    // `--height` is a ceiling rather than a band. The window has no such limit
+    // any more — it paints whatever rows the reader scrolls to.
+    if page.content_height().ceil() > page.height() as f32 {
         message.push_str(&format!(
             "\nnote: page is {}px tall; output was clipped to {}px",
             page.content_height().ceil() as u32,

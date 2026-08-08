@@ -28,6 +28,23 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+/// What a renderer thread sends to wake the window.
+///
+/// winit waits for events rather than polling (a document browser has nothing
+/// to animate), so a band arriving on another thread has to *become* an event
+/// or nothing would redraw until the reader moved the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandReady;
+
+/// How much taller than the window a painted band is.
+///
+/// The reader sees one window's worth; painting three means scrolling roughly a
+/// screen in either direction before anything has to be asked for, and asking
+/// starts a screen before the edge. Bigger costs memory and a longer first
+/// paint; smaller asks more often. Three is the smallest that leaves a margin
+/// on both sides of the window.
+const BAND_SCREENS: u32 = 3;
+
 /// Pixels scrolled per arrow-key press.
 const SCROLL_STEP: f32 = 60.0;
 /// Multiplier applied to line-based mouse wheel deltas.
@@ -218,6 +235,11 @@ struct App {
     /// The saved list, shared by every tab: a bookmark is a property of the
     /// browser, not of the window you happened to press Ctrl+D in.
     bookmarks: crate::bookmarks::Bookmarks,
+    /// How a renderer thread wakes this loop when a band is ready.
+    ///
+    /// `None` only in tests and before the loop starts, where nothing is
+    /// waiting to be woken.
+    waker: Option<winit::event_loop::EventLoopProxy<BandReady>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
 }
@@ -233,6 +255,58 @@ impl App {
         self.tabs.active_mut()
     }
 
+    /// How tall a painted band is.
+    fn band_span(&self) -> u32 {
+        let screens = (self.viewport_height() as u32).max(1) * BAND_SCREENS;
+        screens.min(sandbox::max_canvas_height(self.size.0.max(1)))
+    }
+
+    /// Asks for the rows around the reader, if the painted band is running out.
+    ///
+    /// Speculative on purpose: the request goes out while the window is still
+    /// drawing rows it already has, so in ordinary reading the next band has
+    /// arrived before the reader reaches the edge of this one. A margin of one
+    /// window on each side is what "before" means here.
+    fn refresh_band(&mut self) {
+        let viewport = self.viewport_height();
+        let span = self.band_span();
+        let scroll = self.tab().scroll;
+        let Some(page) = self.tab().page.as_ref() else {
+            return;
+        };
+        // One band in flight at a time. A second would be answered after the
+        // first and immediately replace it, which is work for a picture nobody
+        // sees.
+        if page.band_outstanding() {
+            return;
+        }
+        let (band_top, band_height) = (page.band_top() as f32, page.height() as f32);
+        let content = page.content_height().max(band_height);
+        // Comfortable means a window's worth of margin above and below, or the
+        // document's own edge where there is no more page to have.
+        let wanted_top = (scroll - viewport).max(0.0);
+        let wanted_bottom = (scroll + viewport * 2.0).min(content);
+        if wanted_top >= band_top && wanted_bottom <= band_top + band_height {
+            return;
+        }
+        let furthest = (content - span as f32).max(0.0);
+        let desired = (scroll - viewport).clamp(0.0, furthest) as u32;
+        if desired == page.band_top() {
+            return;
+        }
+        if let Some(page) = self.tab_mut().page.as_mut() {
+            let _ = page.request_band(desired, span);
+        }
+    }
+
+    /// Shows a band that has arrived. Returns whether anything changed.
+    fn accept_band(&mut self) -> bool {
+        self.tab_mut()
+            .page
+            .as_mut()
+            .is_some_and(crate::viewport::Viewport::accept_band)
+    }
+
     /// Re-renders at the current width. Called on open and on resize, because
     /// layout depends on viewport width and nothing else here does.
     fn rerender(&mut self) {
@@ -241,30 +315,44 @@ impl App {
             return;
         }
         let viewport = self.viewport_height();
-        // The canvas is the full document height, not the viewport height:
-        // scrolling then costs a blit offset rather than a re-layout. Bounded
-        // by what fits in one frame across the boundary — a page taller than
-        // that is clipped, which `sandbox::max_canvas_height` states plainly.
-        let max_height = sandbox::max_canvas_height(width);
+        // A band several windows tall rather than the whole document: scrolling
+        // within it costs a blit offset, and leaving it costs a paint of the
+        // rows ahead — which is asked for before the reader gets there. Still
+        // bounded by what fits in one frame across the boundary, because that
+        // bound is about what a compromised renderer can make the parent
+        // allocate and has nothing to do with how long the page is.
+        let band = self.band_span();
 
         // Destructured so the borrows are disjoint: opening a page needs the
         // renderer while the tab is held mutably.
-        let App { tabs, renderer, .. } = self;
+        let App {
+            tabs,
+            renderer,
+            waker,
+            ..
+        } = self;
         let tab = tabs.active_mut();
 
         // Re-render in the child that already holds this document when there is
         // one — a resize is not a fresh page, and re-opening would re-fetch
         // every image on it.
         let outcome = match tab.page.as_mut() {
-            Some(page) => page.resize(width, max_height),
+            Some(page) => page.resize(width, band),
             None => match crate::viewport::Viewport::open(
                 renderer,
                 tab.loaded.clone(),
                 width,
-                max_height,
+                band,
                 tab.forcing_authored,
             ) {
                 Ok(page) => {
+                    // How a band painted on another thread reaches a window
+                    // that is otherwise asleep.
+                    if let Some(waker) = waker.clone() {
+                        page.set_wake(Box::new(move || {
+                            let _ = waker.send_event(BandReady);
+                        }));
+                    }
                     tab.page = Some(page);
                     Ok(())
                 }
@@ -306,6 +394,9 @@ impl App {
                 tab.error.as_deref(),
             ));
         }
+        // A fresh render paints from the top of the document; if the reader was
+        // not there, the rows they are looking at have to be asked for.
+        self.refresh_band();
         self.refresh_chrome();
     }
 
@@ -407,10 +498,6 @@ impl App {
                     .as_ref()
                     .map(|field| (field, tab.current_match, tab.matches.len())),
                 saved: bookmarks.contains(tab.history.current()),
-                truncated: tab
-                    .page
-                    .as_ref()
-                    .is_some_and(crate::viewport::Viewport::is_truncated),
             },
             size.0,
             fonts,
@@ -609,6 +696,9 @@ impl App {
         // jammed against the top edge.
         let target = bounds.y - viewport / 3.0;
         self.tab_mut().scroll = clamp_scroll(target, height, viewport);
+        // A match or a link can be anywhere in the document, so scrolling to
+        // one is the case most likely to leave the painted band entirely.
+        self.refresh_band();
     }
 
     /// Saves the current page, or forgets it if it is already saved.
@@ -834,11 +924,6 @@ impl App {
                     .as_ref()
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
                 saved: self.bookmarks.contains(self.tab().history.current()),
-                truncated: self
-                    .tab()
-                    .page
-                    .as_ref()
-                    .is_some_and(crate::viewport::Viewport::is_truncated),
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -881,10 +966,14 @@ impl App {
             page.scrollable_height(),
             self.viewport_height(),
         );
-        if self.tab().scroll != before
-            && let Some(window) = &self.window
-        {
-            window.request_redraw();
+        if self.tab().scroll != before {
+            // Before the reader gets there, which is the whole point of asking
+            // speculatively: the rows ahead are usually painted by the time
+            // they are scrolled to.
+            self.refresh_band();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -916,6 +1005,9 @@ impl App {
 
         let (page_width, page_height) = (page.width(), page.height());
         let page_pixels = page.pixels();
+        // Where the painted band sits in the document, so a scroll offset in
+        // document coordinates can be turned into a row of the band.
+        let band_top = page.band_top();
         let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
         let strip_height = if tabs.len() > 1 {
@@ -942,10 +1034,18 @@ impl App {
         blit(&mut buffer, chrome, strip_height, bar_height - strip_height);
 
         for row in bar_height..height.get() {
-            let source_row = row - bar_height + offset;
+            let document_row = row - bar_height + offset;
             let start = row as usize * viewport_width;
+            // Rows the painted band does not cover: past the end of the
+            // document, or ahead of a band still being painted. White rather
+            // than stale pixels either way — showing the previous band's rows
+            // under the wrong offset would be showing the wrong part of the
+            // page, which is worse than showing none of it.
+            let Some(source_row) = document_row.checked_sub(band_top) else {
+                buffer[start..start + viewport_width].fill(0x00ff_ffff);
+                continue;
+            };
             if source_row >= page_height {
-                // Past the end of the document: white, not stale pixels.
                 buffer[start..start + viewport_width].fill(0x00ff_ffff);
                 continue;
             }
@@ -1089,7 +1189,16 @@ fn highlight_matches(
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<BandReady> for App {
+    /// A band painted on a renderer thread has arrived.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: BandReady) {
+        if self.accept_band()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
@@ -1393,9 +1502,13 @@ pub fn open(
         }
     }
 
-    let event_loop = EventLoop::new().map_err(|error| {
-        format!("could not start the event loop ({error}); is a display available?")
-    })?;
+    // With a user event, so a band painted on a renderer thread can wake a
+    // window that is otherwise asleep waiting for input.
+    let event_loop = EventLoop::<BandReady>::with_user_event()
+        .build()
+        .map_err(|error| {
+            format!("could not start the event loop ({error}); is a display available?")
+        })?;
     // Wait rather than poll: a document browser has nothing to animate, and
     // polling would burn CPU against the resource-weight goal for no benefit.
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1424,6 +1537,7 @@ pub fn open(
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        waker: Some(event_loop.create_proxy()),
     };
     event_loop
         .run_app(&mut app)
