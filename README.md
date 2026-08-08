@@ -78,10 +78,11 @@ loop, and the rendering it drives is covered by the reference tests.
 Known to be missing or wrong, rather than hidden: collapsed borders, fixed
 table layout, dashed and dotted borders painting solid, and `inline-block`,
 which is recognised and then laid out as though it were plain `inline` — an
-empty one with a width and a height collapses to nothing at all. That last is
-the worst-behaved of them, because unlike the others it fails silently: the
-declaration is understood, so the document fallback does not offer the author's
-layout either (ADR-0009).
+empty one with a width and a height collapses to nothing at all. That last one
+now counts as layout this engine does not implement, alongside flex and grid,
+so a page built on inline-blocks is re-rendered as a document and told so
+rather than coming out subtly wrong in silence (ADR-0009). It is a share and
+not a switch, so a navigation bar of them does not move an article.
 
 Pages of any length work. The renderer paints a *band* — a few windows' worth
 of rows around where you are reading — rather than the whole document, and the

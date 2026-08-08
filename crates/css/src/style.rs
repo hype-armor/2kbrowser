@@ -16,6 +16,11 @@ pub enum Display {
     /// Generates one or more inline boxes.
     Inline,
     /// Inline-level box with a block container inside.
+    ///
+    /// Parsed and cascaded, and **not laid out**: it is treated as plain
+    /// `inline`, so a width, a height, a border and a background on one are all
+    /// dropped, and an empty one collapses to nothing at all. Counted as
+    /// unsupported layout for that reason — see [`Display::is_supported_layout`].
     InlineBlock,
     /// A list item; laid out as a block for now.
     ListItem,
@@ -41,8 +46,22 @@ impl Display {
     /// `false` feeds the document-fallback classifier (ADR-0009), not an error
     /// path: the page is still rendered, just as a document rather than with
     /// the author's layout.
+    ///
+    /// `InlineBlock` is here alongside flex and grid, and it is the one that
+    /// reads as a mistake. The difference between it and them is only that it
+    /// *nearly* works: an inline-block is laid out as a plain inline, so its
+    /// content still appears and only its box is lost. That made it the one
+    /// unimplemented thing here that failed **silently** — no fallback, no
+    /// notice, just a page that is subtly wrong and an empty spacer that
+    /// vanishes. Being nearly right is not a reason to say nothing; it is the
+    /// case ADR-0009 was written for.
+    ///
+    /// This is a share, not a switch: the classifier weighs how much of the
+    /// page's text sits under unsupported layout, so a navigation bar built
+    /// from inline-blocks does not push an article into document mode, and a
+    /// page whose body depends on them does.
     pub fn is_supported_layout(self) -> bool {
-        !matches!(self, Display::Flex | Display::Grid)
+        !matches!(self, Display::Flex | Display::Grid | Display::InlineBlock)
     }
 
     /// Whether the box participates in inline layout.

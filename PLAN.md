@@ -329,7 +329,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
 layout, dashed and dotted borders painting solid, `inline-block` laid out as
-plain `inline`, and proper block-in-inline splitting — an inline element containing a block is
+plain `inline` — and counted as unsupported layout for that reason, so a page
+depending on it falls back to a document rather than failing quietly — and
+proper block-in-inline splitting — an inline element containing a block is
 laid out as a block instead, which matches for the shapes that occur but is
 not what CSS 2.1 §9.2.1.1 describes.
 
