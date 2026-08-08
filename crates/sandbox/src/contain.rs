@@ -131,18 +131,37 @@ static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new(
 /// child is going into an AppContainer — reported as
 /// `ERROR_ENVVAR_NOT_FOUND (203)`, "the system could not find the environment
 /// option that was entered", which is an unusually unhelpful way to say it.
-/// `rappct` documents an explicit block as the remedy. It was not reproducible
-/// on CI and was on a real machine, which is the ordinary shape of an
-/// environment-dependent bug.
+/// `rappct` documents an explicit block as the remedy.
 ///
-/// So: the handful Windows itself wants to start a process, and nothing else.
-/// `RUST_BACKTRACE` is passed through when it is set, because a renderer that
-/// panics is the case where its output matters most.
+/// The first version of this said the bug "was not reproducible on CI and was
+/// on a real machine, which is the ordinary shape of an environment-dependent
+/// bug". That was wrong, and wrong in the way that costs the most: it *was*
+/// happening on CI, on every push, and the test that should have said so was
+/// skipping silently because no sandbox had been installed. The explicit block
+/// did not fix the error — it was the error, and nothing was watching.
+///
+/// Two things were missing from it, and both are named by `rappct` itself.
+///
+/// **`PATH`.** Its `merge_parent_env` exists for exactly this, and its comment
+/// says so — these are the keys "whose absence causes common failures (e.g.,
+/// error 203)". Called here rather than copied, so that anything upstream
+/// learns about this arrives with a version bump.
+///
+/// **Sorted order.** Win32 wants a Unicode environment block sorted
+/// case-insensitively by name. `rappct`'s block builder does not sort what a
+/// caller hands it, and its own test path sorts before calling — which is the
+/// tell. An unsorted block is the kind of input that works until something
+/// downstream does a binary search over it.
+///
+/// So: the handful Windows itself wants to start a process, plus what upstream
+/// adds, in the order Win32 asks for. `RUST_BACKTRACE` is passed through when
+/// it is set, because a renderer that panics is the case where its output
+/// matters most.
 #[cfg(target_os = "windows")]
 fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     // `SystemRoot` and `windir` are how the loader finds the system DLLs every
     // Windows process links; the processor variables are read by the C runtime
-    // during startup. Nothing here names a path belonging to the user.
+    // during startup.
     const WANTED: &[&str] = &[
         "SystemRoot",
         "windir",
@@ -162,12 +181,21 @@ fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
         // Only when the operator asked for it.
         "RUST_BACKTRACE",
     ];
-    WANTED
+    let wanted = WANTED
         .iter()
         .filter_map(|name| {
             std::env::var_os(name).map(|value| (std::ffi::OsString::from(*name), value))
         })
-        .collect()
+        .collect();
+
+    // Adds `PATH` and anything else upstream considers essential, without
+    // duplicating what is already here. It does bring in a variable naming
+    // directories belonging to the user, which the earlier version of this
+    // avoided on purpose — a fair trade only because the container cannot open
+    // any of them, and not one to make silently.
+    let mut environment = rappct::launch::merge_parent_env(wanted);
+    environment.sort_by_key(|(name, _)| name.to_string_lossy().to_lowercase());
+    environment
 }
 
 /// A built AppContainer, ready to spawn renderers into.
