@@ -516,8 +516,27 @@ message. It traces real children across every fixture, the fuzzer's corpus,
 bands, find, resize, and subresources over the pipe, and prints what was used
 and what was refused. Rerun it after a toolchain bump.
 
-What remains unproven is breadth: x86_64, glibc, one kernel. The syscall
-*numbers* are already per-architecture; the *set* might not be.
+**It was run twice, against two C libraries, and the second run found the gap
+the first could not.** A set decided by the libc is not evidence about the libc,
+so the browser was built against musl and measured again. Rendering: identical.
+Failing: not. glibc's `abort` raises its signal with `tgkill`, musl's with
+`tkill`, and the first list named only the one it had seen. The failure was
+milder than predicted and worse than it sounds — musl does not hang when the
+call is refused, it falls through to crashing on purpose, so a panicking
+renderer died of `SIGSEGV` rather than `SIGABRT`. In a project that forbids
+`unsafe` and says so, a panic that reports itself as a memory fault is a false
+alarm about the one claim worth protecting. Both calls are allowed now; neither
+reaches further than the other.
+
+musl is a *probe*, not a supported target, and CI does not build it — enforcing
+it would claim support that is not offered. The script takes a target directory
+so the probe can be repeated:
+`scripts/renderer-syscalls.sh target/x86_64-unknown-linux-musl/release`.
+
+What remains unproven is architecture. Everything so far is x86_64. The syscall
+*numbers* are already handled per-architecture and each name in the list was
+checked to exist on all three; whether the *set* is the same on aarch64 has not
+been measured, because running an aarch64 renderer needs an aarch64 machine.
 
 **Windows is confined too, by a different mechanism.** seccomp is
 self-restriction; an AppContainer is not. The parent creates a package profile,

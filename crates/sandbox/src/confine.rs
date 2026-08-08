@@ -38,6 +38,14 @@
 //! browser that opened its own fonts, resolved its own hostnames, or ran a
 //! thread pool.
 //!
+//! **Measured twice, on two C libraries**, because one measurement of a set
+//! decided by the libc is not evidence about the libc. The rendering set is
+//! identical under glibc and musl. Failing is not: glibc's `abort` raises its
+//! signal with `tgkill` and musl's with `tkill`, and the first version of this
+//! list named only the one it had seen. That is what a second measurement is
+//! for, and it is the shape of what a third would find — the *failure* paths
+//! vary between libcs where the working path does not.
+//!
 //! What is *not* in the list is the point. No `socket`, no `openat`, no
 //! `execve`, no `ptrace`, no `io_uring` — and no `open_by_handle_at`, `fsopen`,
 //! or `open_tree`, which are the routes to a file descriptor that a denylist
@@ -242,29 +250,34 @@ fn allowed() -> Vec<i64> {
         // The paths a hostile page can drive the renderer down, which no
         // fixture reaches and which were measured separately: a panic, an
         // abort, and a stack overflow from a document nested deeply enough.
-        // `tgkill` is how `abort` raises its own signal, and a filter that
-        // refuses it does not prevent the abort — it leaves the process
-        // wedged trying to.
         libc::SYS_getpid,
         libc::SYS_gettid,
-        libc::SYS_tgkill,
         libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigreturn,
         libc::SYS_futex,
+        // How `abort` raises its own signal — and there are two of them, which
+        // is the one thing measuring a second libc found. glibc uses `tgkill`;
+        // musl uses `tkill`. Refusing the one your libc uses does not prevent
+        // the abort: musl falls through to crashing on purpose, so the renderer
+        // dies of `SIGSEGV` rather than `SIGABRT`. Nothing hangs, and the
+        // outcome is still wrong — in a codebase that forbids `unsafe`, a panic
+        // that reports itself as a segmentation fault is a false alarm about the
+        // one thing this project claims not to have.
+        //
+        // Allowing both costs nothing. `tkill` reaches no further than `tgkill`:
+        // either can signal any thread the user could signal anyway, and
+        // `tgkill` was already here.
+        libc::SYS_tgkill,
+        libc::SYS_tkill,
         // ---- Not measured, and here on purpose ----
         //
-        // `rt_sigreturn` is the kernel's own way back out of a signal handler.
-        // It was not observed because every handler that ran here aborted
-        // instead of returning, and refusing it is not a degradation — there is
-        // nothing for the process to do next. `restart_syscall` is the same
-        // shape: the kernel issues it, not the program, to resume a call a
-        // signal interrupted, and refusing it turns a signal into a spurious
-        // error on a read that was going fine.
-        libc::SYS_rt_sigreturn,
+        // `restart_syscall` is issued by the kernel rather than by the program,
+        // to resume a call a signal interrupted. Refusing it turns a signal into
+        // a spurious error on a read that was going fine.
         libc::SYS_restart_syscall,
-        // Installing a handler and ending a thread. Both happen before this
-        // filter is in force today, and both are one library version away from
-        // happening after it.
-        libc::SYS_rt_sigaction,
+        // Ending a thread, as opposed to the process. Nothing here has a second
+        // thread today and one library version could change that.
         libc::SYS_exit,
         // Memory the allocator manages rather than the program: returning pages
         // (`madvise`), and the permissions on its own arenas (`mprotect`).

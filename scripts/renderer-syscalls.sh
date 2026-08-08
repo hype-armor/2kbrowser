@@ -28,6 +28,16 @@
 # renderer needed and did not get). The tool cannot tell those apart. A person
 # can.
 #
+# Takes an optional target directory, so the same measurement can be run against
+# a different C library — which is not a nicety. The set is decided by the libc,
+# so measuring one libc says nothing about libcs. Doing it twice is what found
+# the only gap this list has had: glibc's `abort` raises its signal with
+# `tgkill` and musl's with `tkill`, and the first version of the allowlist named
+# only the one it had seen.
+#
+#   scripts/renderer-syscalls.sh
+#   scripts/renderer-syscalls.sh target/x86_64-unknown-linux-musl/release
+#
 # Linux only — seccomp is the mechanism being measured. Skipped rather than
 # failed where `strace` is missing, because a check that cannot run must not
 # look like a check that passed.
@@ -45,13 +55,19 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-BROWSER=./target/release/2kbrowser
-FAILURES=./target/release/examples/confined-failure
+BUILT="${1:-target/release}"
+BROWSER="./$BUILT/2kbrowser"
+FAILURES="./$BUILT/examples/confined-failure"
 if [ ! -x "$BROWSER" ] || [ ! -x "$FAILURES" ]; then
+    if [ "$BUILT" != "target/release" ]; then
+        echo "FAIL: $BUILT does not hold both binaries; build them for that target first"
+        exit 1
+    fi
     echo "building what is measured"
     cargo build --release >/dev/null
     cargo build --release -p sandbox --example confined-failure >/dev/null
 fi
+echo "measuring $BROWSER"
 
 TRACES="$(mktemp -d)"
 trap 'rm -rf "$TRACES"' EXIT
@@ -80,10 +96,17 @@ for page in tests/fuzz/corpus/render/*.html; do
         "$BROWSER" render "$page" --out "$TRACES/out.png"
 done
 
-echo "tracing bands, find, resize, and subresources over the pipe"
-# Through cargo so the tests find their fixtures; -f follows into the children
-# it spawns, which is where the renderers are.
-trace "isolation" cargo test --release -p shell --test isolation -- --test-threads=1
+if [ "$BUILT" = "target/release" ]; then
+    echo "tracing bands, find, resize, and subresources over the pipe"
+    # Through cargo so the tests find their fixtures; -ff follows into the
+    # children it spawns, which is where the renderers are.
+    trace "isolation" cargo test --release -p shell --test isolation -- --test-threads=1
+else
+    # `cargo test` would build for the host, so the children it spawned would be
+    # the wrong binaries and the run would silently measure the default target
+    # again. Skipped and said out loud rather than quietly wrong.
+    echo "skipping the isolation tests: they build for the host, not $BUILT"
+fi
 
 echo "tracing the ways a renderer fails"
 for how in panic abort overflow exit; do

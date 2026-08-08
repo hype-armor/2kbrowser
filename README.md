@@ -180,6 +180,14 @@ stack-overflow paths were measured too. `scripts/renderer-syscalls.sh` is that
 measurement, so it can be rechecked after a toolchain bump instead of trusted
 (ADR-0016).
 
+It was measured on two C libraries, because a set decided by the libc is not
+evidence about the libc — and the second one earned its keep. Rendering is
+identical under glibc and musl; *failing* is not. glibc's `abort` raises its
+signal with `tgkill` and musl's with `tkill`, and a list naming only the first
+did not hang a musl renderer — it made one die of `SIGSEGV` instead, so a panic
+reported itself as a memory fault in a codebase that forbids `unsafe`. Both are
+allowed now, and neither reaches further than the other.
+
 On Windows the *parent* builds an AppContainer with no capabilities at all and
 launches the child into it, because there is no call a running process can make
 to put itself in one. Capabilities are the holes deliberately left in a
@@ -205,8 +213,8 @@ the outside.
 > to launch the container falls back to one, saying so on stderr and in
 > `--confine-selftest` — the App Sandbox equivalent is not
 > implemented, and the browser says so on stderr rather than pretending. The
-> Linux allowlist was measured on one machine, so a different libc or a
-> toolchain bump could refuse something the renderer needs. Neither the
+> Linux allowlist was measured on two libcs and one architecture, so a
+> toolchain bump could still refuse something the renderer needs. Neither the
 > parser fuzzing nor any of this has been reviewed by anyone but its authors.
 > Until that changes this is a tool for its authors.
 
