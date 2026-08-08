@@ -78,25 +78,59 @@ jobs:
   # program and the mismatch branch is `SECCOMP_RET_KILL_PROCESS`, so an ARM
   # renderer would have been killed on its next syscall.
   #
-  # A cross-compile is enough to catch both. It is a check, not a build: no ARM
-  # machine is needed, and nothing here runs.
-  cross-arch:
-    name: cross-compile (linux-aarch64)
-    runs-on: ubuntu-latest
+  # This was a cross-compile for a while, and said so: "a check, not a build —
+  # no ARM machine is needed, and nothing here runs". Compiling was enough for
+  # the bug that prompted it, and stopped being enough when the filter became an
+  # allowlist (ADR-0016). Which syscalls *exist* on an architecture is a
+  # compile-time fact; which ones the renderer *makes* is not, and an allowlist
+  # measured only on x86_64 is a filter that could refuse something an ARM
+  # renderer needs, on a machine nobody here has.
+  #
+  # So it runs now. Free for public repositories, which this is; a private fork
+  # would need to pay for these runners or drop back to `cargo check` against
+  # `aarch64-unknown-linux-gnu`.
+  arm:
+    name: test (linux-aarch64)
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain and cross linker
-        run: |
-          rustup target add aarch64-unknown-linux-gnu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
 
-      # The whole workspace, not just `sandbox`. The bug that prompted this was
-      # in `sandbox`, and the reason it existed — code written against one
+      # The whole workspace, not just `sandbox`. The bug that prompted this job
+      # was in `sandbox`, and the reason it existed — code written against one
       # architecture's constants without anything ever compiling it for another
       # — is not specific to that crate.
-      - name: Check
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --target aarch64-unknown-linux-gnu
+      #
+      # It includes the reference tests, so this is also a fourth platform
+      # agreeing on the baselines byte for byte (ADR-0005), and the isolation
+      # tests, which install the real filter and probe it from inside.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Upload reference-test diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reftest-actual-linux-aarch64
+          path: tests/ref/baselines/*.actual.png
+          if-no-files-found: ignore
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Budgets
+        run: cargo run --release -p budgets
+
+      # What the allowlist was missing until now: the set of calls a renderer
+      # makes on a second architecture, measured rather than inferred from the
+      # fact that it compiled. Informational — the script prints what was used
+      # and what was refused, and only fails outright if no child installed a
+      # filter at all. Reading the two lists is a person's job.
+      - name: Measure the renderer's syscalls
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq strace
+          cargo build --release -p sandbox --example confined-failure
+          ./scripts/renderer-syscalls.sh
