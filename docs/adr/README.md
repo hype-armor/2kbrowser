@@ -21,3 +21,4 @@ that ADRs are superseded rather than edited.
 | [0013](0013-modern-security-only.md) | Period engine, present-day security | accepted |
 | [0014](0014-appcontainer-through-a-dependency.md) | The Windows sandbox comes through a dependency | accepted |
 | [0015](0015-local-roots-marked.md) | Accept this computer's roots, and say when they were needed | accepted |
+| [0016](0016-syscall-allowlist-measured.md) | The renderer's syscall filter is an allowlist, and the list was measured | accepted |

@@ -487,14 +487,37 @@ attaching to processes. Proven from inside: the binary confines itself and
 reports, and the era fixture still renders byte-identically with all three
 images arriving over the pipe.
 
-It is a **denylist**, and that is a real weakening worth stating. An allowlist
-refuses anything nobody named, including a syscall nobody thought about; it is
-also what breaks a browser in the field, because the set a renderer touches is
-decided by the allocator, the shaper, and the standard library and moves under
-you on a toolchain bump. Denied calls return `EPERM` rather than killing the
-process, so a legitimate call that meets the filter degrades into an error the
-renderer already handles. An allowlist is the stronger end state and wants a
-measured set of what the renderer actually uses.
+It began as a **denylist**, which this section recorded as a real weakening: an
+allowlist refuses anything nobody named, including a syscall nobody thought
+about, and the condition for switching was named here — *a measured set of what
+the renderer actually uses*. That measurement was taken, and it changed the
+answer. **The filter is an allowlist now**
+([ADR-0016](docs/adr/0016-syscall-allowlist-measured.md)).
+
+Rendering a page uses nine syscalls. That is the whole surprise: read a pipe,
+write a pipe, four ways of asking for memory, one seed for the hash tables, the
+signal stack, and exit. It is small because of decisions already made — fonts
+compiled in (ADR-0010), every subresource a request the parent answers
+(ADR-0012), no JavaScript and so no JIT (ADR-0003) — and a browser without those
+would not have the option. Failing uses calls rendering never does, so a panic,
+an abort, and a stack overflow from a deeply nested document were traced
+separately; guessing at those is how an allowlist turns a crash into a hang.
+
+Two properties are kept rather than inverted. Unnamed calls still return `EPERM`
+rather than killing the process, so a call nobody measured costs a page instead
+of the browser — which is what makes shipping a stronger filter honest on a
+measurement taken from one machine. And the old denylist is kept as an
+*assertion*: `socket` and `io_uring_enter` no longer need naming, but the
+reasoning about why each family is dangerous outlived the list, and it is now
+what a test checks the allowlist against.
+
+The measurement is `scripts/renderer-syscalls.sh`, not a paragraph in a commit
+message. It traces real children across every fixture, the fuzzer's corpus,
+bands, find, resize, and subresources over the pipe, and prints what was used
+and what was refused. Rerun it after a toolchain bump.
+
+What remains unproven is breadth: x86_64, glibc, one kernel. The syscall
+*numbers* are already per-architecture; the *set* might not be.
 
 **Windows is confined too, by a different mechanism.** seccomp is
 self-restriction; an AppContainer is not. The parent creates a package profile,

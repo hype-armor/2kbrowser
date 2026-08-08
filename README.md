@@ -168,17 +168,30 @@ a dependency bump.
 
 The renderer is confined on Linux and Windows, by the two mechanisms those
 platforms actually have — which are not the same shape. On Linux the child
-installs a seccomp filter on itself before reading its first frame: no sockets,
-no opening files, no starting processes — and no io_uring, which is the entry
-that matters most, because a ring does opens and network I/O on the kernel side
-where a syscall filter cannot see them, and would otherwise be a way around
-every other denial in the list. On Windows the *parent* builds an
-AppContainer with no capabilities at all and launches the child into it, because
-there is no call a running process can make to put itself in one. Capabilities
-are the holes deliberately left in a container, and this one has none, which
-makes it the stronger of the two: seccomp here is a denylist, so a syscall
-nobody named is allowed. Both were reached without writing any `unsafe`
-(ADR-0014).
+installs a seccomp filter on itself before reading its first frame, and it is an
+**allowlist**: everything not named is refused. What is named was measured
+rather than guessed, by tracing real renderer children across every fixture, the
+fuzzer's corpus, band and find requests, and subresources arriving over the
+pipe. Rendering a page turns out to use *nine* syscalls — read a pipe, write a
+pipe, ask for memory, seed the hash tables, exit — which is what makes an
+allowlist practical here and would not be in a browser that opened its own fonts
+or resolved its own hostnames. Failing uses a few more, so the panic, abort, and
+stack-overflow paths were measured too. `scripts/renderer-syscalls.sh` is that
+measurement, so it can be rechecked after a toolchain bump instead of trusted
+(ADR-0016).
+
+On Windows the *parent* builds an AppContainer with no capabilities at all and
+launches the child into it, because there is no call a running process can make
+to put itself in one. Capabilities are the holes deliberately left in a
+container, and this one has none. Both refuse by default; what is left between
+them is a difference in kind, not strength — seccomp filters calls and is
+installed by the process being confined, an AppContainer restricts resources and
+is built by the parent, so nothing the child does can undo it. Both were reached
+without writing any `unsafe` (ADR-0014).
+
+A syscall the allowlist forgot returns `EPERM` rather than killing the process.
+That is a deliberate softening: a call nobody measured costs a page, which the
+parent already reports, rather than a renderer that dies where a reader sees it.
 
 It still renders the era fixture byte-identically with all three of its images
 arriving over the pipe, which is the check that the sandbox did not quietly
@@ -192,7 +205,8 @@ the outside.
 > to launch the container falls back to one, saying so on stderr and in
 > `--confine-selftest` — the App Sandbox equivalent is not
 > implemented, and the browser says so on stderr rather than pretending. The
-> Linux filter is a denylist, so a syscall nobody named is allowed. Neither the
+> Linux allowlist was measured on one machine, so a different libc or a
+> toolchain bump could refuse something the renderer needs. Neither the
 > parser fuzzing nor any of this has been reviewed by anyone but its authors.
 > Until that changes this is a tool for its authors.
 

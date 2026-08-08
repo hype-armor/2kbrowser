@@ -502,6 +502,22 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
         file, "OPENED",
         "the renderer could still open a file:\n{report}"
     );
+    // The direction of the filter, which the two assertions above cannot show.
+    // A denylist that names `socket` and `openat` produces exactly the same two
+    // refusals as an allowlist naming neither — so the check that ADR-0016
+    // actually landed is a call *nobody named*, refused because it was not on
+    // the list. Reading the working directory is that call.
+    //
+    // Linux only. An AppContainer restricts resources rather than filtering
+    // calls, so this succeeds inside one and is not evidence of anything there.
+    if cfg!(target_os = "linux") {
+        assert_ne!(
+            field("unnamed-call="),
+            "ALLOWED",
+            "the filter permits calls it does not name — it is not an allowlist:\n{report}"
+        );
+    }
+
     // And it is still able to do its actual job, which a sandbox that broke
     // everything would also satisfy the two assertions above.
     assert!(report.contains("compute=55"), "{report}");

@@ -18,10 +18,13 @@
 //! whole point — the renderer's needs are memory and CPU, and every resource it
 //! wants is a request the parent answers over the pipe.
 //!
-//! That makes the Windows confinement stronger than the Linux one rather than
-//! equivalent to it. Linux gets a denylist, so a syscall nobody named is
-//! allowed; an AppContainer with no capabilities refuses by default and grants
-//! only what is named, and nothing is named.
+//! Both platforms refuse by default now — the Linux filter became an allowlist
+//! in [ADR-0016](../../../docs/adr/0016-syscall-allowlist-measured.md), and
+//! before that this paragraph said the Windows side was categorically stronger
+//! for exactly that reason. What is left is a difference in kind rather than in
+//! strength. seccomp filters *calls* and is installed by the process being
+//! confined; an AppContainer restricts access to *resources* and is built by the
+//! parent, so nothing the child does can undo it. Neither subsumes the other.
 //!
 //! # What it still needs
 //!

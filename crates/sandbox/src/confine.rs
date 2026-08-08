@@ -14,33 +14,50 @@
 //! the parent answers.
 //!
 //! So: no sockets, no opening files, no starting processes, no attaching to
-//! them.
+//! them — and, because this is an allowlist, no anything else either.
 //!
-//! Two of those need more than the obvious call named. A file descriptor can be
-//! got without `openat` — `open_by_handle_at` takes a handle rather than a path,
-//! and the mount API's `open_tree` and `fsopen` return descriptors of their own
-//! — so those are denied too. And **io_uring is denied outright**, which is the
-//! entry here that matters most: a ring performs opens, reads, writes, and
-//! network operations on the kernel side, so a filter watching syscalls sees
-//! `io_uring_enter` and nothing about what was queued into it. Every denial in
-//! this file is reachable around it. Nothing in a renderer that reads one pipe
-//! and computes has any use for it.
+//! # An allowlist, and how its contents were arrived at
 //!
-//! # A denylist, and why
+//! This was a denylist first, and said so: an allowlist is stronger, because a
+//! syscall nobody thought of is refused rather than allowed, but it is also the
+//! one that breaks a browser in the field. The set a renderer touches is decided
+//! by the allocator, the shaper, and the standard library, and guessing at it
+//! from the outside is how you ship a filter that kills the renderer on a page
+//! nobody tested.
 //!
-//! An allowlist is stronger: anything not named is refused, so a syscall nobody
-//! thought about is refused too. It is also the one that breaks the browser in
-//! the field, because the set a renderer touches is decided by the allocator,
-//! the shaper, and the standard library, and it changes underneath you on a
-//! toolchain bump.
+//! So it was not guessed at. Every call named in [`allowed`] was either
+//! *observed* — `strace` on real renderer children, across every reference
+//! fixture, the fuzzer's corpus, band and find requests, a re-render at a new
+//! width, and subresources arriving over the pipe — or is in a short, named
+//! margin of calls whose absence is unfixable rather than degrading.
+//! `scripts/renderer-syscalls.sh` is that measurement, so the list can be
+//! rechecked after a toolchain bump instead of trusted.
 //!
-//! This denies the families that matter and returns `EPERM` rather than killing
-//! the process. Two consequences, both deliberate: a syscall nobody listed is
-//! *allowed*, and a legitimate call that runs into the filter degrades into an
-//! error the renderer already knows how to handle instead of a crash a reader
-//! sees. An allowlist is the stronger end state and wants a measured set of what
-//! the renderer actually uses; this is the version that can ship without
-//! guessing.
+//! The measurement's surprise was how small the set is: rendering a page uses
+//! nine calls. That is what makes an allowlist practical here and would not in a
+//! browser that opened its own fonts, resolved its own hostnames, or ran a
+//! thread pool.
+//!
+//! What is *not* in the list is the point. No `socket`, no `openat`, no
+//! `execve`, no `ptrace`, no `io_uring` — and no `open_by_handle_at`, `fsopen`,
+//! or `open_tree`, which are the routes to a file descriptor that a denylist
+//! naming `openat` and stopping there leaves open. Under an allowlist those stop
+//! being entries anyone has to remember, which is the whole argument for one.
+//! [`must_stay_denied`] keeps naming them anyway, as an assertion rather than a
+//! filter: it is the test that a future edit widening this list does not quietly
+//! let one back in.
+//!
+//! The default action is still `EPERM` rather than killing the process. A
+//! syscall this list forgot degrades into an error — usually a page that fails
+//! to render, which the parent already reports — rather than a renderer that
+//! dies where a reader sees it. That is a deliberate softening of an allowlist's
+//! usual posture, and it is what makes the stronger filter safe to ship on a
+//! measurement taken on one machine.
+//!
+//! Deliberately not done: refusing `PROT_EXEC` on `mmap` and `mprotect`. It is
+//! easy from here — seccomp can filter on arguments — and it is worth less than
+//! it looks, because code that has got far enough to map a page has already got
+//! far enough not to need to.
 //!
 //! # Where each platform's confinement lives
 //!
@@ -90,7 +107,10 @@ impl Confinement {
     /// A phrase for a log line or a status message.
     pub fn describe(self) -> &'static str {
         match self {
-            Confinement::Seccomp => "confined: no sockets, no file opens, no new processes",
+            Confinement::Seccomp => {
+                "confined: only the syscalls a renderer was measured to need — no sockets, \
+                 no file opens, no new processes"
+            }
             Confinement::AppContainer => {
                 "confined: an AppContainer with no capabilities — no network, no filesystem"
             }
@@ -120,15 +140,22 @@ pub fn apply() -> Confinement {
     };
 
     let rules: BTreeMap<i64, Vec<SeccompRule>> =
-        denied().iter().map(|nr| (*nr, Vec::new())).collect();
+        allowed().iter().map(|nr| (*nr, Vec::new())).collect();
 
-    // Denied calls return EPERM; everything else is allowed. The default has to
-    // be `Allow` for a denylist, and that is the trade this file's header
-    // states plainly.
+    // Everything not named returns EPERM; the named calls are allowed. The
+    // second argument is the default and the third is what a *matched* rule
+    // does, so an allowlist is this pair the other way round from a denylist —
+    // a two-line edit that inverts the filter without changing a syscall name.
+    // Which is why the self-test probes a call *nobody* named: refusing
+    // `socket` proves the list, and only refusing something absent from it
+    // proves the direction.
+    //
+    // `Errno` rather than `KillProcess` for the default: see this module's
+    // header. A call this list forgot should cost a page, not the browser.
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
         architecture,
     );
     let Ok(filter) = filter else {
@@ -180,12 +207,104 @@ const fn architecture() -> Option<seccompiler::TargetArch> {
     }
 }
 
-/// The syscalls the renderer is not allowed to make.
+/// The only syscalls the renderer is allowed to make.
+///
+/// Two groups, and the difference between them is the difference between a
+/// measurement and a judgement, so they are kept apart rather than merged into
+/// one alphabetical list.
+///
+/// Everything in the first group was *seen*, by `strace` on real renderer
+/// children — `scripts/renderer-syscalls.sh` is the measurement and prints this
+/// set. Everything in the second was not seen and is here anyway, because
+/// denying it is either unfixable or would turn a rare event into a hang.
+#[cfg(target_os = "linux")]
+fn allowed() -> Vec<i64> {
+    vec![
+        // ---- Measured: rendering a page ----
+        //
+        // Nine calls, and they do not vary. The pipes, the allocator, and one
+        // seed for the hash tables — that is the whole of what a renderer that
+        // parses, lays out, and rasterises asks the kernel for. Fonts are in the
+        // binary (ADR-0010) and every subresource is a request the parent
+        // answers (ADR-0012), which is why nothing here opens or connects to
+        // anything.
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mremap,
+        libc::SYS_brk,
+        libc::SYS_getrandom,
+        libc::SYS_sigaltstack,
+        libc::SYS_exit_group,
+        // ---- Measured: failing ----
+        //
+        // The paths a hostile page can drive the renderer down, which no
+        // fixture reaches and which were measured separately: a panic, an
+        // abort, and a stack overflow from a document nested deeply enough.
+        // `tgkill` is how `abort` raises its own signal, and a filter that
+        // refuses it does not prevent the abort — it leaves the process
+        // wedged trying to.
+        libc::SYS_getpid,
+        libc::SYS_gettid,
+        libc::SYS_tgkill,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_futex,
+        // ---- Not measured, and here on purpose ----
+        //
+        // `rt_sigreturn` is the kernel's own way back out of a signal handler.
+        // It was not observed because every handler that ran here aborted
+        // instead of returning, and refusing it is not a degradation — there is
+        // nothing for the process to do next. `restart_syscall` is the same
+        // shape: the kernel issues it, not the program, to resume a call a
+        // signal interrupted, and refusing it turns a signal into a spurious
+        // error on a read that was going fine.
+        libc::SYS_rt_sigreturn,
+        libc::SYS_restart_syscall,
+        // Installing a handler and ending a thread. Both happen before this
+        // filter is in force today, and both are one library version away from
+        // happening after it.
+        libc::SYS_rt_sigaction,
+        libc::SYS_exit,
+        // Memory the allocator manages rather than the program: returning pages
+        // (`madvise`), and the permissions on its own arenas (`mprotect`).
+        // Whether either is called at all depends on the libc, its version, and
+        // how much the page allocated, so their absence from one machine's
+        // measurement says very little. Neither can reach anything outside this
+        // process's own address space.
+        libc::SYS_madvise,
+        libc::SYS_mprotect,
+        // `close` is the one entry seen in a confined child that was not seen
+        // in a *render*: the self-test's probes release the descriptors they
+        // failed to get. Rendering never closes anything, because it never opens
+        // anything. Allowed regardless, since giving up a descriptor cannot gain
+        // the caller anything.
+        libc::SYS_close,
+        // `sched_yield` is what a spin lock does before it gives up and sleeps.
+        // `clock_gettime` is normally answered by the vDSO without a syscall at
+        // all — but not on every kernel and not in every container, and a
+        // browser whose clock reads fail is a baffling thing to debug.
+        libc::SYS_sched_yield,
+        libc::SYS_clock_gettime,
+    ]
+}
+
+/// The syscalls that must never appear in [`allowed`].
+///
+/// This is the old denylist, kept as an assertion rather than a filter. Once
+/// the filter refuses everything it does not name, none of these needs naming —
+/// which is the argument for an allowlist and also the thing that makes the
+/// reasoning behind them easy to lose. Held here so that widening [`allowed`]
+/// has to get past a test that says why each of them was refused.
 ///
 /// Everything here is a family, not a single call. Denying `socket` while
 /// leaving `socketpair` is not a denial.
-#[cfg(target_os = "linux")]
-fn denied() -> Vec<i64> {
+///
+/// Compiled only for tests, because that is all it is now: an oracle, not a
+/// filter. Building it into the shipped binary would suggest it does something
+/// at run time.
+#[cfg(all(target_os = "linux", test))]
+fn must_stay_denied() -> Vec<i64> {
     let mut denied = vec![
         // Network. The renderer has no business reaching anything; the parent
         // fetches on its behalf.
@@ -475,6 +594,25 @@ fn probes(targets: &Targets) -> String {
     lines.push(format!("port={}", targets.port));
     lines.push(format!("file-path={}", targets.file.display()));
 
+    // A call nothing here has ever named, and which is harmless: reading the
+    // working directory. It is the probe that tells an allowlist from a
+    // denylist, and neither of the two above can. `socket` and `openat` were
+    // refused under the old filter too, so a report showing them refused is
+    // consistent with a filter that permits everything nobody thought of —
+    // which is precisely what this replaced.
+    //
+    // Only meaningful on Linux. An AppContainer restricts access to resources
+    // rather than filtering calls, so `GetCurrentDirectory` inside one succeeds
+    // and should: the line is still printed there, and the test that reads it
+    // asserts only where the mechanism is a syscall filter.
+    lines.push(format!(
+        "unnamed-call={}",
+        match std::env::current_dir() {
+            Ok(_) => "ALLOWED".to_owned(),
+            Err(error) => format!("{:?}", error.kind()),
+        }
+    ));
+
     // Something harmless, to prove the sandbox did not simply break everything —
     // two refusals above are also what a filter that killed the whole process
     // would produce if it somehow got this far.
@@ -528,14 +666,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_denied_list_is_built_for_this_architecture() {
+    fn nothing_dangerous_is_reachable_through_the_allowlist() {
+        // The check that matters after the inversion. An allowlist does not
+        // name `socket` or `io_uring_enter`, so nothing stops someone widening
+        // it until one of them is reachable again — except this, which walks the
+        // families the denylist used to name and asserts none of them made it
+        // in.
+        let allowed = allowed();
+        for dangerous in must_stay_denied() {
+            assert!(
+                !allowed.contains(&dangerous),
+                "syscall {dangerous} is allowed and must not be",
+            );
+        }
+
+        // No duplicates, and not empty: a duplicate is harmless to the filter
+        // and a sign that two `cfg` blocks overlap.
+        let mut sorted = allowed.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), allowed.len(), "a syscall is named twice");
+        assert!(!allowed.is_empty());
+
+        // The measured core. Named individually rather than counted, because a
+        // renderer that cannot `read` its pipe or `write` its answer is not
+        // confined, it is broken, and the failure would look like a hang.
+        for essential in [
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_mmap,
+            libc::SYS_exit_group,
+            // The abort path. Refusing this does not stop a renderer aborting;
+            // it stops it *finishing* aborting.
+            libc::SYS_tgkill,
+        ] {
+            assert!(
+                allowed.contains(&essential),
+                "syscall {essential} is needed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_denied_families_are_built_for_this_architecture() {
         // Syscall numbers are per-architecture, so a list assembled with the
-        // wrong `cfg` denies whatever happens to share a number. Two things
+        // wrong `cfg` names whatever happens to share a number. Two things
         // worth asserting cheaply: that the list is not empty on a platform
         // that claims to confine, and that no number appears twice — a
-        // duplicate is harmless to the filter and a sign the `cfg` blocks
-        // overlap.
-        let denied = denied();
+        // duplicate is harmless and a sign the `cfg` blocks overlap.
+        let denied = must_stay_denied();
         assert!(!denied.is_empty());
         let mut sorted = denied.clone();
         sorted.sort_unstable();
