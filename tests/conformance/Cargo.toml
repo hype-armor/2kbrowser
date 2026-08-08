@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 dom = { path = "../../crates/dom" }
 net = { path = "../../crates/net" }
+paint = { path = "../../crates/paint" }
 shell = { path = "../../crates/shell" }
 text = { path = "../../crates/text" }
 

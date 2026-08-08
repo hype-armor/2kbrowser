@@ -211,6 +211,18 @@ pub struct LayoutBox {
     pub node: Option<NodeId>,
 }
 
+/// The single margin that two adjoining ones collapse into (CSS 2.1 §8.3.1).
+///
+/// Not `max`, which is the rule everyone remembers and is only the rule while
+/// both are positive. The spec is stated over the whole set: take the largest
+/// positive, take the most negative, and add them. For two margins that comes
+/// out as the maximum when both are positive, the *minimum* when both are
+/// negative — two -20px margins pull by 20, not 40 — and the sum when they
+/// disagree, which is how a negative margin cancels a positive one.
+fn collapse(first: f32, second: f32) -> f32 {
+    first.max(second).max(0.0) + first.min(second).min(0.0)
+}
+
 impl LayoutBox {
     /// Total height of this box including its margins.
     fn outer_height(&self, font_size: f32) -> f32 {
@@ -1245,6 +1257,11 @@ fn layout_block(
     // Inline children seen since the last block child. Flushed as an anonymous
     // box when a block child arrives, and again at the end.
     let mut pending: Vec<NodeId> = Vec::new();
+    // The bottom margin of the last in-flow block placed, kept so the next
+    // one's top margin can collapse into it (§8.3.1). `None` means there is
+    // nothing to collapse with — either nothing has been placed yet, or
+    // something in between separated them.
+    let mut previous_bottom: Option<f32> = None;
 
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
@@ -1283,8 +1300,10 @@ fn layout_block(
             continue;
         }
 
-        // A block child ends the run of inline content before it.
-        cursor_y += flush_inline(
+        // A block child ends the run of inline content before it. Content
+        // between two blocks stops their margins touching, so it also ends the
+        // run of collapsing.
+        let flushed = flush_inline(
             doc,
             styles,
             fonts,
@@ -1298,6 +1317,10 @@ fn layout_block(
             padding_top + border_top,
             &mut box_,
         );
+        cursor_y += flushed;
+        if flushed > 0.0 {
+            previous_bottom = None;
+        }
         // Place any float declared before this child, at the height reached so
         // far rather than at the top of the container.
         while let Some((float_node, float_style)) = late.first().cloned() {
@@ -1331,7 +1354,34 @@ fn layout_block(
         // paragraph whose *box* sat below the floats correctly while its first
         // line dodged sideways as though one were still in the way, on any
         // container with padding — which is most of them.
+        // Collapse this child's top margin into the previous sibling's bottom
+        // one. `layout_block` places a box at `y + margin_top` and returns
+        // `margin_top + height + margin_bottom`, so left alone the two margins
+        // simply add — which is what the CSS 2.1 suite caught: two paragraphs
+        // 40px apart were getting 80.
+        //
+        // Taken off the cursor rather than passed down, so the child still
+        // computes its own position from its own margin and nothing else needs
+        // to know this happened.
+        let child_margins = (
+            child_style
+                .margin
+                .top
+                .to_px(child_style.font_size, content_width),
+            child_style
+                .margin
+                .bottom
+                .to_px(child_style.font_size, content_width),
+        );
+        if let Some(previous) = previous_bottom {
+            cursor_y -= previous + child_margins.0 - collapse(previous, child_margins.0);
+        }
+
         let into_context = padding_top + border_top;
+        // Clearance is applied *after* collapsing, and pushes down from
+        // wherever collapsing left the cursor. A box that clears is separated
+        // from the floats above it by construction, so it cannot end up higher
+        // than it would have without the collapse.
         cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
         let child_context = context.translated(0.0, cursor_y - into_context, content_width);
         let child_containing = containing.descend(padding_left + border_left, cursor_y);
@@ -1350,6 +1400,7 @@ fn layout_block(
             &mut box_,
         );
         cursor_y += consumed;
+        previous_bottom = Some(child_margins.1);
     }
 
     // Trailing inline content, after the last block child.
@@ -3206,6 +3257,75 @@ mod tests {
         assert!(
             paragraph_y(&uncleared) < 80.0,
             "without clear it stays alongside"
+        );
+    }
+
+    #[test]
+    fn adjacent_sibling_margins_collapse_into_one() {
+        // §8.3.1, and the single largest thing the CSS 2.1 suite found missing:
+        // two blocks 40px apart were getting 80px between them.
+        let rendered = run(
+            "<body><div class=\"a\"></div><div class=\"b\"></div></body>",
+            "body { margin: 0 } \
+             .a { height: 20px; margin-bottom: 40px } \
+             .b { height: 20px; margin-top: 40px }",
+            200.0,
+        );
+        let boxes: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.rect.height == 20.0)
+            .collect();
+        assert_eq!(boxes.len(), 2, "both blocks are laid out");
+        assert_eq!(
+            boxes[1].rect.y - (boxes[0].rect.y + boxes[0].rect.height),
+            40.0,
+            "the gap is one 40px margin, not two",
+        );
+    }
+
+    #[test]
+    fn collapsing_takes_the_largest_positive_and_the_most_negative() {
+        // The rule people remember is `max`, and that is only right while both
+        // margins are positive. Two negatives pull by the larger of the two
+        // rather than by their sum, and a mixed pair cancels.
+        assert_eq!(collapse(40.0, 10.0), 40.0);
+        assert_eq!(collapse(-20.0, -20.0), -20.0);
+        assert_eq!(collapse(-10.0, -30.0), -30.0);
+        assert_eq!(collapse(40.0, -15.0), 25.0);
+        assert_eq!(collapse(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn content_between_two_blocks_stops_their_margins_collapsing() {
+        // The margins have to be *adjoining*. A line of text between them is
+        // not nothing, and treating it as nothing pulls the blocks together
+        // through their own content.
+        let with_text = run(
+            "<body><div class=\"a\"></div>between<div class=\"b\"></div></body>",
+            "body { margin: 0 } \
+             .a { height: 20px; margin-bottom: 40px } \
+             .b { height: 20px; margin-top: 40px }",
+            200.0,
+        );
+        let without = run(
+            "<body><div class=\"a\"></div><div class=\"b\"></div></body>",
+            "body { margin: 0 } \
+             .a { height: 20px; margin-bottom: 40px } \
+             .b { height: 20px; margin-top: 40px }",
+            200.0,
+        );
+        let last_y = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .filter(|b| b.rect.height == 20.0)
+                .map(|b| b.rect.y)
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            last_y(&with_text) > last_y(&without),
+            "text between the blocks must keep both margins: {} vs {}",
+            last_y(&with_text),
+            last_y(&without),
         );
     }
 

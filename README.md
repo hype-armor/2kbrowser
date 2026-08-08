@@ -77,17 +77,22 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **941 of 4578 reference tests pass,
-20.6%**, with no panics across roughly nine thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **1382 of 4821 reference tests pass,
+28.7%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way — but the
 failures are largely real: on a random sample of 150 of them, headless Chromium
 renders 140 identically. `cargo run --profile conformance -p conformance` does
 it; the suite is not vendored.
 
-Known to be missing or wrong, rather than hidden: **adjacent sibling margins do
-not collapse**, which the conformance run found and this list did not previously
-contain; collapsed borders; fixed
+The first run of that reported 20.6%, and the number was wrong three times over
+before it was worth anything — see PLAN.md, because the harness's own bugs are
+more instructive than the figure.
+
+Known to be missing or wrong, rather than hidden: margin collapsing is done
+between **adjacent siblings only** — a parent still does not collapse with its
+first or last child, and an empty block does not collapse through itself;
+collapsed borders; fixed
 table layout; the three-dimensional border styles (`double`, `groove`, `ridge`,
 `inset`, `outset`) painting solid; and `inline-block`,
 which is recognised and then laid out as though it were plain `inline` — an

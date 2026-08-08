@@ -799,7 +799,7 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**941 of 4578 reference tests pass — 20.6%.** Zero panics across roughly nine
+**1382 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
@@ -816,8 +816,25 @@ headless Chromium on a random sample of 150 failures: **140 render identically
 there**. So roughly 93% of the ~3,500 failures are this engine's, not the
 suite's.
 
-**The harness was wrong twice before the number meant anything**, and both
-errors flattered nobody — they just added noise. Ahem-flagged tests were being
+**The harness was wrong three times before the number meant anything.** The
+first published figure, 20.6%, was an artefact of my own tooling, and the errors
+are more instructive than the number.
+
+The worst of them compared *whole-page* renders rather than a viewport. A
+reftest is a screenshot of a window; comparing full pages instead fails every
+pair that differs only in a trailing margin, because the two images come out
+different sizes while everything a reader sees is identical. That one did not
+merely add noise — it **inverted a measurement**. Sibling margin collapsing,
+scored against full-page renders, appeared to fix zero tests and break ten. The
+same change measured against an 800x600 viewport fixes 163 and moves the total
+from 25.3% to 28.7%. Had the first number been trusted, the correct change would
+have looked like a regression and been reverted.
+
+It was caught by a result that made no sense: a fix that repairs nothing at all,
+in a suite of five thousand tests, is not a fix that failed — it is a
+measurement that is not measuring.
+
+The other two flattered nobody and just added noise. Ahem-flagged tests were being
 counted as failures when they cannot be run here at all: the suite uses that
 font to draw a block of known size, and a test rendering `X` at `100px/1 Ahem`
 against a 100×100 `div` is not a colour test we fail but a test we cannot
@@ -826,19 +843,28 @@ perform, since fonts are compiled in and never loaded from a document
 were being looked for relative to the test, which made 268 present files look
 missing.
 
-**The biggest single finding is one the known-gaps list did not contain:
-adjacent sibling margins do not collapse** (§8.3.1). Two blocks with 40px
-margins between them get 80px of space where they should get 40. It is not
-implemented, it was not written down as missing, and it affects essentially
-every page with more than one paragraph. It was found by pulling on one
-selector test that should have passed and did not — the test used a `div` where
-its reference used a `p`, which in a browser is the *same* rendering precisely
-because the margins collapse.
+**The biggest single finding was one the known-gaps list did not contain:
+margins did not collapse at all** (§8.3.1). Two blocks with 40px margins between
+them got 80px of space where they should get 40 — not implemented, not written
+down as missing, and affecting essentially every page with more than one
+paragraph. It was found by pulling on one selector test that should have passed
+and did not: the test used a `div` where its reference used a `p`, which in a
+browser is the *same* rendering precisely because the margins collapse.
+
+**Adjacent siblings collapse now**, which is the case that governs consecutive
+paragraphs and is therefore most of the value. Nineteen of the twenty-one
+reference baselines moved, all of them tighter and all of them closer to what
+Chromium draws for the same fixture. What is still missing is a parent
+collapsing with its first or last child, and an empty block collapsing through
+itself; those need `layout_block` to return the margins it collapsed at each
+end rather than a single height, which is a larger change to a function with
+many callers.
 
 That is what a conformance run is for. The known-wrong list was the list of
 things we had noticed; this is the list.
 
-The engine's known gaps — margin collapsing, collapsed borders, fixed table
+The engine's known gaps — margin collapsing between a parent and its children,
+collapsed borders, fixed table
 layout, the three-dimensional border styles, `inline-block`, proper
 block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather

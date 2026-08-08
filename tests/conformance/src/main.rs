@@ -48,8 +48,22 @@ use text::FontStore;
 /// tests fail on wrapping that has nothing to do with what they check.
 const WIDTH: u32 = 800;
 
-/// Tall enough that a test's content is not cut off, since a page cut at
-/// different points on each side would compare unequal for the wrong reason.
+/// Height of that viewport.
+///
+/// The comparison is of a fixed 800x600 window, not of the whole page, because
+/// that is what a reftest means: browsers screenshot the viewport, and the
+/// suite is written against one. Comparing full-page renders instead makes
+/// every pair that differs only in a *trailing* margin fail, since the two
+/// images come out different sizes while the visible content is identical.
+///
+/// That was not a theory. Rendering to content height, sibling margin
+/// collapsing fixed exactly zero tests and broke ten — a result that made no
+/// sense until it turned out the harness was comparing document heights rather
+/// than what a reader would see.
+const HEIGHT: u32 = 600;
+
+/// Rendered taller than the viewport, then cropped, so that content below the
+/// fold still influences layout above it the way it would in a real window.
 const MAX_HEIGHT: u32 = 3000;
 
 /// Flags marking a test no headless image comparison can perform.
@@ -247,7 +261,24 @@ fn render(path: &Path, fonts: &mut FontStore) -> Option<Vec<u8>> {
     let (origin, base) = net::parse_url(&url).ok()?;
     let page =
         shell::render::render_with_base(&html, WIDTH, MAX_HEIGHT, fonts, Some((&origin, &base)));
-    Some(page.pixmap.data().to_vec())
+    Some(viewport(&page.pixmap))
+}
+
+/// The top-left 800x600 of a render, padded with white where the page is
+/// shorter — which is what a browser window shows.
+fn viewport(pixmap: &paint::Pixmap) -> Vec<u8> {
+    const CHANNELS: usize = 4;
+    let stride = WIDTH as usize * CHANNELS;
+    let mut out = vec![0xffu8; stride * HEIGHT as usize];
+    let source = pixmap.data();
+    let rows = pixmap.height().min(HEIGHT) as usize;
+    let columns = pixmap.width().min(WIDTH) as usize * CHANNELS;
+    for row in 0..rows {
+        let from = row * pixmap.width() as usize * CHANNELS;
+        let to = row * stride;
+        out[to..to + columns].copy_from_slice(&source[from..from + columns]);
+    }
+    out
 }
 
 /// The `href` of this document's `<link rel="match">`, if it has one.
