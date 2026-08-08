@@ -143,6 +143,14 @@ GPU rasterisation is a later optimisation, not a dependency. "Fast on a
 ten-year-old laptop" is the constraint, and that laptop's GPU drivers are the
 least reliable thing about it.
 
+`tiny-skia` **stays taken, and will not be reimplemented** — the sharpest form
+of issue #4, now settled. It is the largest single block of `unsafe` this
+project depends on, which is what kept the question open, and rasterising in
+this project's own code would be trading a reviewed implementation of a hard,
+well-specified problem for an unreviewed one. What that surface actually costs
+is answered elsewhere and better: it is why ADR-0012 put a process boundary in
+front of it and why ADR-0016 and ADR-0017 confine what is behind it.
+
 ### Cross-platform rendering is nearly free, and we should exploit it
 
 Linux, macOS, and Windows are all first-class from M1, with reference tests
@@ -697,7 +705,7 @@ that it has one home and can be closed:
 | ~~[1](https://github.com/hype-armor/2kbrowser/issues/1)~~ | ~~Period-authentic chrome, or a modern shell?~~ Resolved: a modern shell around a period engine (ADR-0011) | — |
 | ~~[2](https://github.com/hype-armor/2kbrowser/issues/2)~~ | ~~Move reader mode earlier than M5?~~ Resolved: yes, M3 (ADR-0009) | — |
 | ~~[3](https://github.com/hype-armor/2kbrowser/issues/3)~~ | ~~Legacy TLS: marked downgrade, or unreachable?~~ Resolved: unreachable — refused outright (ADR-0013) | — |
-| [4](https://github.com/hype-armor/2kbrowser/issues/4) | Revisit dependency posture? | nothing |
+| ~~[4](https://github.com/hype-armor/2kbrowser/issues/4)~~ | ~~Revisit dependency posture?~~ Resolved: keep taking `tiny-skia` and do not reimplement it; macOS gets one quarantined `unsafe` crate instead (ADR-0017) | — |
 | ~~[5](https://github.com/hype-armor/2kbrowser/issues/5)~~ | ~~No metric-compatible clone for Verdana/Tahoma~~ Resolved: accept the reflow | — |
 | ~~[6](https://github.com/hype-armor/2kbrowser/issues/6)~~ | ~~`cursive`/`fantasy` resolve to sans-serif~~ Resolved: fall back, do not chase it | — |
 | ~~[7](https://github.com/hype-armor/2kbrowser/issues/7)~~ | ~~Vendor fonts in git, or fetch with pinned checksums?~~ Resolved: fetch with pins (ADR-0010) | — |

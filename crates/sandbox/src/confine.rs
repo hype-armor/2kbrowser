@@ -737,9 +737,17 @@ mod tests {
 
     #[test]
     fn availability_matches_the_platforms_that_have_an_implementation() {
+        // A mirror of the `cfg!` inside `available()`, which is close to
+        // tautological and earns its place anyway: this is the assertion that
+        // caught macOS being added to one list and not the other, on the only
+        // runner where the difference is visible.
         assert_eq!(
             available(),
-            cfg!(any(target_os = "linux", target_os = "windows"))
+            cfg!(any(
+                target_os = "linux",
+                target_os = "windows",
+                target_os = "macos"
+            ))
         );
     }
 
