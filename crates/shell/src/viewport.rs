@@ -187,6 +187,16 @@ impl Viewport {
         self.session.set_wake(wake);
     }
 
+    /// The renderer process holding this page.
+    ///
+    /// For asking the operating system about it — the budget harness measures
+    /// the pair, since a browser that moved its memory into a child did not
+    /// save anyone anything, and a test checks the child is gone once the page
+    /// is dropped.
+    pub fn child_id(&self) -> u32 {
+        self.session.child_id()
+    }
+
     /// Where the document came from.
     pub fn origin(&self) -> &net::Origin {
         &self.document.origin

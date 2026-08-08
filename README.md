@@ -237,7 +237,12 @@ BLESS=1 cargo test -p reftests    # then review the new images before committing
 ```
 
 Budgets are enforced in CI. Checks that cannot be measured yet report `PENDING`
-rather than passing:
+rather than passing — which is how the memory number stayed honest until there
+was something to measure. There is now: rendering the era fixture peaks at
+around 27 MB across both processes, against a limit of 100, which is the
+"tens of megabytes, not hundreds" claim in PLAN.md checked rather than
+asserted. Linux only, because reading a peak from the kernel needs FFI on the
+other two and ADR-0002 forbids it here.
 
 ```sh
 cargo build --release && cargo run --release -p budgets

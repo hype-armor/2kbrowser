@@ -105,11 +105,10 @@ fn pack(pixel: &paint::PremultipliedColor) -> u32 {
 /// Pure, and therefore testable without a display — which is most of what this
 /// module gets wrong when it gets anything wrong.
 ///
-/// The range is the *canvas*, not the content, and for every page short enough
-/// those are the same number. Past the canvas there are no pixels — the blit
-/// fills white — so a taller document used to be scrollable into a void that
-/// looked exactly like the document ending. Stopping where the pixels stop is
-/// half the answer; the bar saying the page is not all there is the other half.
+/// The range is the whole document. It was briefly the painted canvas, back
+/// when a page stopped at one and scrolling past it showed white that looked
+/// exactly like the document ending — banded rendering removed that, and this
+/// comment with it.
 fn clamp_scroll(offset: f32, scrollable_height: f32, viewport_height: f32) -> f32 {
     let max = (scrollable_height - viewport_height).max(0.0);
     offset.clamp(0.0, max)

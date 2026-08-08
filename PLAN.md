@@ -36,7 +36,7 @@ all four kinds of slop fall out of one decision:
 | --- | --- |
 | **Browser bloat** | No JS engine means no JIT, no sync account, no extension host, no AI sidebar, no sponsored tiles. There is nowhere to put the bloat. |
 | **Page-level junk** | Consent modals, popups, autoplay, and infinite scroll are script-driven. They simply do not run. |
-| **Resource weight** | No JIT, no JS heap, CPU rasterisation. Tens of MB of RAM, not hundreds. |
+| **Resource weight** | No JIT, no JS heap, CPU rasterisation. Tens of MB of RAM, not hundreds — measured at ~27 MB for the era fixture across both processes, and enforced as a budget. |
 | **AI-generated content** | Not solved by the engine — needs its own layer (§7). It is the hardest of the four and is deliberately scheduled last. |
 
 The sites that break without JS are, to a striking degree, the same sites that

@@ -124,6 +124,7 @@ name = "budgets"
 version = "0.0.0"
 dependencies = [
  "net",
+ "sandbox",
  "shell",
  "text",
 ]
