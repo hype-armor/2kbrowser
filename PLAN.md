@@ -422,11 +422,26 @@ hole, and it comes from long unbroken runs of characters inside nested tables
 being re-measured once per table level. Not a denial of service on the evidence
 so far, and not scheduled.
 
-**The fuzzer cannot catch a true hang.** It times each input after the fact, so
-something that never returns hangs the harness rather than being reported. The
-renderer process below can be killed, which is where that gap closes for the
-browser; the fuzzer itself still runs in-process and still cannot be
-interrupted.
+**The fuzzer catches a true hang now.** It used to time each input after the
+fact, which means an input that never returns is never timed: the harness hung
+along with it and the only evidence was a process that had stopped printing. A
+hang is a denial of service on a browser — the thing this milestone is about —
+so being unable to *name* one was the gap worth closing.
+
+A watchdog thread closes it. The fuzzing loop publishes when the current input
+started; the watchdog wakes four times a second and, past ten times the slow
+threshold, prints which input and ends the process with a distinct exit status.
+It does not interrupt the stuck thread, and that is deliberate rather than a
+limitation accepted: Rust has no safe way to, and an unsafe one would be worse
+than the problem — a harness that can stop arbitrary code at an arbitrary point
+is a harness whose findings nobody can trust. What it converts is "the fuzzer
+stopped printing" into a named file and a non-zero exit.
+
+Checked from outside the process, because what it does is end one: the binary
+hangs on purpose behind `--hang-selftest` and a test reads the corpse. That test
+has a deadline of its own, since the obvious version of it does not fail when
+the watchdog breaks — it hangs, which would be an unusually pointed way to get
+this wrong.
 
 **Process model — decided and half-built.** [ADR-0012](docs/adr/0012-process-isolation.md):
 the parent keeps the chrome, the network, and the disk; a child parses, lays

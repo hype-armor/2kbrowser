@@ -39,9 +39,27 @@
 //! profile sets `panic = "abort"`, and an abort leaves nothing to catch. In
 //! both cases the bytes are already on disk, so the crasher survives the
 //! process that found it.
+//!
+//! # Hangs, which timing after the fact cannot find
+//!
+//! A slow input is timed once it returns. One that never returns is not slow,
+//! and for a while this could not report one: the harness hung along with it,
+//! and the only evidence was a process that had stopped printing. A hang is a
+//! denial of service on a browser — the thing the plan says this milestone is
+//! about — so being unable to name one was the gap worth closing.
+//!
+//! A watchdog thread closes it. The loop publishes when the current input
+//! started; the watchdog wakes four times a second and, if an input has been
+//! running past [`HANG_FACTOR`] times the slow threshold, says which input and
+//! ends the process. It cannot stop the stuck thread — nothing safe can — so it
+//! does not try. It turns "the fuzzer stopped printing" into a named file and a
+//! non-zero exit, which is the whole difference between a finding and a
+//! mystery.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A deterministic pseudo-random generator.
@@ -327,6 +345,8 @@ pub struct Report {
     pub baseline: Duration,
     /// What counted as too slow in this run.
     pub threshold: Duration,
+    /// What counted as never coming back. See [`HANG_FACTOR`].
+    pub hang: Duration,
 }
 
 impl Report {
@@ -371,6 +391,39 @@ const MAX_RECORDED: usize = 16;
 /// A target whose seeds all parse in microseconds — `url` — would otherwise get
 /// a threshold in the low milliseconds, where scheduler noise alone trips it.
 pub const SLOW_FLOOR: Duration = Duration::from_secs(2);
+
+/// How many times the slow threshold an input may run before it is called a
+/// hang.
+///
+/// Deliberately far past "slow". Slow is a finding the run records and carries
+/// on from; this is the run giving up, so it has to be a number no legitimately
+/// slow input reaches. The slow threshold is already 50x a real fixture and the
+/// worst thing ever observed sat at 11x, so ten times *that* is not a judgement
+/// call about whether an input is coming back — nothing has ever come back from
+/// anywhere near it.
+pub const HANG_FACTOR: u32 = 10;
+
+/// Floor under the computed hang limit, for the same reason [`SLOW_FLOOR`] has
+/// one — and higher, because ending the run is a worse thing to get wrong than
+/// recording a finding.
+pub const HANG_FLOOR: Duration = Duration::from_secs(30);
+
+/// How often the watchdog looks.
+///
+/// Four times a second: fast enough that the message names the input while the
+/// operator is still watching, cheap enough to be irrelevant against a limit
+/// measured in tens of seconds.
+const WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What the fuzzing loop tells the watchdog about the input in its hands.
+///
+/// `None` between inputs, so the watchdog cannot mistake a slow *seed* load or
+/// the gap between iterations for an input that will not return.
+#[derive(Debug, Default)]
+struct Watched {
+    started: Option<Instant>,
+    iteration: usize,
+}
 
 /// A fuzzing run against one target.
 pub struct Session {
@@ -480,6 +533,17 @@ impl Session {
 
         report.baseline = self.calibrate();
         report.threshold = (report.baseline * SLOW_FACTOR).max(SLOW_FLOOR);
+        report.hang = (report.threshold * HANG_FACTOR).max(HANG_FLOOR);
+
+        let in_flight = self.directory.join("in-flight.bin");
+        let watched = Arc::new(Mutex::new(Watched::default()));
+        let watchdog = Watchdog::start(
+            Arc::clone(&watched),
+            report.hang,
+            self.target,
+            seed,
+            in_flight.clone(),
+        );
 
         for iteration in 0..iterations {
             let base = rng.choose(&self.corpus).cloned().unwrap_or_default();
@@ -487,15 +551,25 @@ impl Session {
 
             // Written before it runs. An abort — which is what the release
             // profile does with a panic — leaves nothing to catch, so the only
-            // reliable record is one made in advance.
-            let in_flight = self.directory.join("in-flight.bin");
+            // reliable record is one made in advance. It is also what the
+            // watchdog names when an input never returns, which is why the file
+            // has to be on disk before the call rather than after it.
             let _ = write_input(&in_flight, &input);
 
             let started = Instant::now();
+            if let Ok(mut watched) = watched.lock() {
+                *watched = Watched {
+                    started: Some(started),
+                    iteration,
+                };
+            }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_once(self.target, &input, &mut self.fonts);
             }));
             let elapsed = started.elapsed();
+            if let Ok(mut watched) = watched.lock() {
+                watched.started = None;
+            }
 
             report.iterations += 1;
             report.worst = report.worst.max(elapsed);
@@ -509,6 +583,7 @@ impl Session {
             }
             let _ = std::fs::remove_file(&in_flight);
         }
+        watchdog.stop();
         report
     }
 
@@ -535,6 +610,116 @@ impl Session {
         path
     }
 }
+
+/// A thread that ends the process if an input stops coming back.
+///
+/// It does not try to stop the stuck thread. Rust has no safe way to, and an
+/// unsafe one would be worse than the problem: a fuzzing harness that can
+/// interrupt arbitrary code at an arbitrary point is a harness whose findings
+/// nobody can trust. So this reports and exits.
+struct Watchdog {
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn start(
+        watched: Arc<Mutex<Watched>>,
+        limit: Duration,
+        target: Target,
+        seed: u64,
+        in_flight: PathBuf,
+    ) -> Self {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stopping);
+        let thread = std::thread::spawn(move || {
+            while !signal.load(Ordering::Relaxed) {
+                std::thread::sleep(WATCHDOG_INTERVAL);
+                let Ok(watched) = watched.lock() else {
+                    // The fuzzing thread panicked while holding the lock. The
+                    // panic is the finding, and it is already being reported by
+                    // the machinery that catches it; there is nothing left here
+                    // to watch.
+                    return;
+                };
+                let Some(started) = watched.started else {
+                    continue;
+                };
+                let elapsed = started.elapsed();
+                if elapsed <= limit {
+                    continue;
+                }
+
+                // Kept where the harness already put it, under the name it is
+                // already picked up from, rather than copied somewhere tidier:
+                // the process is about to end and the file on disk is the whole
+                // record.
+                eprintln!(
+                    "\nHANG   {} seed {seed:#018x} iteration {} — still running after {:.1?}\n\
+                            the input is at {}\n\
+                     reproduce with: cargo run -p fuzz -- --target {} --seed {seed:#018x}",
+                    target.name(),
+                    watched.iteration,
+                    elapsed,
+                    in_flight.display(),
+                    target.name(),
+                );
+                // Not `panic!`: this is not the fuzzing thread, and unwinding
+                // here would leave the hung one running and the process alive.
+                std::process::exit(HANG_EXIT);
+            }
+        });
+        Self {
+            stopping,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Starts the watchdog against an input that never returns, and lets it fire.
+///
+/// The watchdog's whole job is to end the process, which is why it cannot be
+/// checked from inside one: a test asserting it fired would be killed by it
+/// firing. So the check is a process — `--hang-selftest` runs this, and
+/// `tests/watchdog.rs` asserts the exit status and the message.
+///
+/// It uses the real [`Watchdog`], with the real interval and a limit shortened
+/// to a second. What it does not exercise is the fuzzing loop publishing what
+/// it is holding; that is four lines either side of `catch_unwind` and is
+/// visible in one screen, which is the trade being made here.
+pub fn hang_selftest() -> ! {
+    let watched = Arc::new(Mutex::new(Watched {
+        started: Some(Instant::now()),
+        iteration: 7,
+    }));
+    let _watchdog = Watchdog::start(
+        watched,
+        Duration::from_secs(1),
+        Target::Html,
+        0,
+        PathBuf::from("tests/fuzz/corpus/html/in-flight.bin"),
+    );
+    // What a hung input looks like from the watchdog's side: a thread that is
+    // never coming back. Sleeping rather than spinning, so a machine running
+    // this alongside a build does not lose a core to it.
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Exit status for a run that ended because an input never returned.
+///
+/// Distinct from an ordinary failure, because the two need different responses:
+/// findings are in the corpus and the run finished, against a run that did not
+/// finish and whose remaining iterations were never tried.
+pub const HANG_EXIT: i32 = 3;
 
 fn write_input(path: &Path, input: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {

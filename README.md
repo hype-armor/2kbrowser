@@ -136,6 +136,13 @@ built for it left `i32`, which the check on the text origin did not catch
 because the origin was not where the glyph landed. All four are fixed, and each
 has a regression test where the bug was rather than where it surfaced.
 
+A hang is a finding too, and for a while it was the one kind the fuzzer could
+not report: it times an input once it returns, and an input that never returns
+is never timed — the harness hung along with it. A watchdog thread now names the
+input and ends the run with its own exit status. It does not interrupt the stuck
+thread, on purpose: nothing safe can, and a harness that could stop arbitrary
+code at an arbitrary point is one whose findings nobody could trust.
+
 **Everything renders in a separate process** — the window, `render`, and
 `links` alike. The parent keeps the chrome,
 the network, and the disk; a child parses, lays out, and rasterises, and asks
