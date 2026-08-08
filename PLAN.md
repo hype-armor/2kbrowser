@@ -640,11 +640,42 @@ what the launch had actually been handed.
 
 Still not done:
 
-1. **Landlock is not used.** It would add filesystem confinement beyond
-   "cannot call `open`", and `landlock_create_ruleset` returns `ENOSYS` on the
-   kernel this was developed against, so it could not be tested. Filesystem
-   access is denied at the syscall level instead, which covers opening but not
-   every path to a descriptor.
+1. **Landlock is not used, and the reason has changed.** It used to be "could
+   not be tested" — `landlock_create_ruleset` returns `ENOSYS` on the kernel
+   this was developed against, which is still true and is no longer the point.
+
+   Landlock restricts a process's access to filesystem *objects*: "may read
+   under `/usr/share/fonts` and nothing else". seccomp cannot express that,
+   because a path is a pointer into user memory that can change between the
+   check and the kernel's use of it — so seccomp can say "no `openat` at all"
+   and never "`openat`, but only there". The two are complementary by design.
+
+   What Landlock was for here was the sentence this entry used to end with:
+   syscall filtering "covers opening but not every path to a descriptor". That
+   was the right worry about a **denylist**, which has to name every route to a
+   file descriptor — `openat`, `openat2`, `open_by_handle_at`, `open_tree`,
+   `fsopen`, `pidfd_getfd`, io_uring — and leaves a hole for each one missed.
+
+   ADR-0016 removed that class of miss. The allowlist's twenty-four calls
+   contain no way to obtain a descriptor: no `open*`, no `socket`, no `dup`, no
+   `fcntl`, no `memfd_create`, no `pidfd_getfd`, no `open_by_handle_at`. `close`
+   is there and nothing that creates one is. The renderer holds exactly the
+   pipes the parent gave it and can never acquire another — closed by
+   construction rather than by enumeration, which is the whole difference an
+   allowlist makes.
+
+   So what is left is defence in depth: a second, independent mechanism, so that
+   a mistake in how the seccomp filter is *built* does not leave the filesystem
+   open. Real, and modest. Against it: another dependency or another `unsafe`
+   exception, ABI negotiation across five versions with different capabilities,
+   a second policy to keep in step with the first, and one more thing that can
+   install successfully and restrict nothing — which is the failure this
+   milestone hit three times.
+
+   Revisit the moment the renderer has to be allowed `openat` — if the fonts
+   ever stop being embedded, say. At that point Landlock stops being a second
+   layer over a closed hole and becomes the only tool that can express what is
+   wanted.
 2. **Only loopback is probed on Windows.** Loopback and outbound are separate
    AppContainer rules, and reaching the internet from a test is not something to
    depend on. What rules out outbound is the capability set being empty, which

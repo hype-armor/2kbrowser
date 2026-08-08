@@ -79,10 +79,21 @@
 //! there is no call it can make to put itself in one. That half lives in
 //! [`crate::contain`], and on Windows [`apply`] correctly does nothing.
 //!
-//! Landlock would add filesystem confinement on top of seccomp and is not
-//! usable here — `landlock_create_ruleset` returns `ENOSYS` on this kernel — so
-//! filesystem access is denied at the syscall level instead, which covers
-//! opening but not every path to a file descriptor.
+//! Landlock is not used, and the reason is worth stating because it stopped
+//! being the obvious one. It restricts access to filesystem *objects* — "may
+//! read under this directory and nothing else" — which seccomp cannot express
+//! at all, since a path is a pointer that can change between the check and the
+//! use of it. It was wanted here to cover the gap a denylist leaves: every
+//! route to a file descriptor has to be named, and each one missed is a hole.
+//!
+//! [`allowed`] closed that gap by inverting the filter rather than by listing
+//! better. Nothing in it can obtain a descriptor — no `open*`, no `socket`, no
+//! `dup`, no `fcntl`, no `memfd_create`, no `pidfd_getfd`. The renderer holds
+//! the pipes it was given and can never acquire another. What Landlock would
+//! still add is a second, independent mechanism in case this one is built
+//! wrong, which is real and is not worth a second policy to keep in step and
+//! one more thing that can install successfully and restrict nothing. Revisit
+//! if `openat` ever has to be allowed.
 //!
 //! macOS *is* self-restriction, like Linux: `sandbox_init` applies a profile to
 //! the calling process and cannot be undone. So [`apply`] does the work here
@@ -809,6 +820,69 @@ mod tests {
             assert!(
                 allowed.contains(&essential),
                 "syscall {essential} is needed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_renderer_cannot_obtain_a_new_descriptor() {
+        // The claim the Landlock decision rests on, so it is a test rather than
+        // a sentence in three documents. Landlock exists to say "this file and
+        // not that one"; it is not used here because the renderer cannot reach
+        // *any* file, having no way to turn anything into a descriptor. That is
+        // true by construction under an allowlist and would stop being true the
+        // moment one of these was added for some unrelated reason.
+        //
+        // Wider than `must_stay_denied`, deliberately. That list is about
+        // families a denylist had to name because they are dangerous; this one
+        // is about anything at all that hands back a descriptor, including the
+        // dull ones. `eventfd2` is not a security problem, and it is a
+        // descriptor, and the argument here is about the whole category.
+        //
+        // Every name checked to exist on x86_64, aarch64, and riscv64, so there
+        // is no `cfg` in it and nothing silently absent on an architecture.
+        let allowed = allowed();
+        for opens in [
+            // From a path, a handle, or a mount.
+            libc::SYS_openat,
+            libc::SYS_openat2,
+            libc::SYS_name_to_handle_at,
+            libc::SYS_open_by_handle_at,
+            libc::SYS_open_tree,
+            libc::SYS_fsopen,
+            libc::SYS_fsmount,
+            // From a descriptor the process already has.
+            libc::SYS_dup,
+            libc::SYS_dup3,
+            libc::SYS_fcntl,
+            // From the network.
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            // From another process.
+            libc::SYS_pidfd_open,
+            libc::SYS_pidfd_getfd,
+            // From the kernel, out of nothing.
+            libc::SYS_memfd_create,
+            libc::SYS_memfd_secret,
+            libc::SYS_pipe2,
+            libc::SYS_eventfd2,
+            libc::SYS_epoll_create1,
+            libc::SYS_timerfd_create,
+            libc::SYS_signalfd4,
+            libc::SYS_inotify_init1,
+            libc::SYS_userfaultfd,
+            libc::SYS_perf_event_open,
+            libc::SYS_bpf,
+            libc::SYS_io_uring_setup,
+        ] {
+            assert!(
+                !allowed.contains(&opens),
+                "syscall {opens} hands back a descriptor and is allowed. The \
+                 renderer holding only the pipes it was given is what makes \
+                 Landlock unnecessary here; adding this means revisiting that.",
             );
         }
     }
