@@ -328,7 +328,8 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, dashed and dotted borders painting solid, `inline-block` laid out as
+layout, the three-dimensional border styles (`double`, `groove`, `ridge`,
+`inset`, `outset`) painting solid, `inline-block` laid out as
 plain `inline` — and counted as unsupported layout for that reason, so a page
 depending on it falls back to a document rather than failing quietly — and
 proper block-in-inline splitting — an inline element containing a block is
@@ -789,10 +790,17 @@ no: there is no sandbox, the parsers have never been fuzzed, and the TLS
 configuration has not been reviewed. Issue #3 blocks part of it; nothing else
 in §9 does.
 
-The engine's known gaps — collapsed borders, fixed table layout, dashed and
-dotted borders, `inline-block`, proper block-in-inline splitting — are listed
+The engine's known gaps — collapsed borders, fixed table layout, the
+three-dimensional border styles, `inline-block`, proper block-in-inline
+splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
+
+Dotted and dashed borders came off that list too, which was a smaller job than
+it looked: the pattern is UA-defined, so the only real decision was to stretch
+each run to a whole number of dashes so it starts and ends flush with the
+corner. A half dash at one end is what makes a hand-rolled dashed border look
+wrong.
 
 `background-position` came off that list. It was the most self-contained of
 them and it paid for itself twice over: implementing it needed the tiling code

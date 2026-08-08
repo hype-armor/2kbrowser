@@ -59,7 +59,9 @@ percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
-text decorations; tiled background images; external stylesheets, including
+text decorations; tiled background images; dotted and dashed borders, whose
+runs are stretched to start and end flush with the corners rather than leaving
+half a dash there; external stylesheets, including
 `@import` chains and `@media` blocks; and legacy
 character encodings, which most of the surviving old web needs — a page in
 windows-1252 read as UTF-8 is replacement characters where every accented
@@ -76,7 +78,8 @@ The window opens on a virtual display in CI and is checked to survive
 loop, and the rendering it drives is covered by the reference tests.
 
 Known to be missing or wrong, rather than hidden: collapsed borders, fixed
-table layout, dashed and dotted borders painting solid, and `inline-block`,
+table layout, the three-dimensional border styles (`double`, `groove`, `ridge`,
+`inset`, `outset`) painting solid, and `inline-block`,
 which is recognised and then laid out as though it were plain `inline` — an
 empty one with a width and a height collapses to nothing at all. That last one
 now counts as layout this engine does not implement, alongside flex and grid,

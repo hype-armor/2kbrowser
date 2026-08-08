@@ -246,49 +246,141 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
     let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(box_.style.color);
 
     if border.top.style.is_visible() && top > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x,
                 y,
                 width,
                 height: top,
             },
-            color: color_of(&border.top),
-        });
+            border.top.style,
+            top,
+            Axis::Horizontal,
+            color_of(&border.top),
+        );
     }
     if border.bottom.style.is_visible() && bottom > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x,
                 y: y + height - bottom,
                 width,
                 height: bottom,
             },
-            color: color_of(&border.bottom),
-        });
+            border.bottom.style,
+            bottom,
+            Axis::Horizontal,
+            color_of(&border.bottom),
+        );
     }
     let side_height = (height - top - bottom).max(0.0);
     if border.left.style.is_visible() && left > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x,
                 y: y + top,
                 width: left,
                 height: side_height,
             },
-            color: color_of(&border.left),
-        });
+            border.left.style,
+            left,
+            Axis::Vertical,
+            color_of(&border.left),
+        );
     }
     if border.right.style.is_visible() && right > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x: x + width - right,
                 y: y + top,
                 width: right,
                 height: side_height,
             },
-            color: color_of(&border.right),
-        });
+            border.right.style,
+            right,
+            Axis::Vertical,
+            color_of(&border.right),
+        );
+    }
+}
+
+/// Which way a border side runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// How long a dash or a dot wants to be, as a multiple of the border's width.
+///
+/// CSS 2.1 §8.5.3 says a dotted border is "a series of dots" and a dashed one
+/// "a series of short line segments", and stops there — the pattern is the UA's
+/// to choose, which is why no two browsers match. Square dots the width of the
+/// border, and dashes three times that, are what the era's browsers converged
+/// on closely enough that a page authored against one does not look broken
+/// under this.
+const DOT_PERIOD: f32 = 1.0;
+const DASH_PERIOD: f32 = 3.0;
+
+/// Pushes one side of a border, as one rectangle or as a row of them.
+fn push_border_side(
+    list: &mut DisplayList,
+    side: &Rect,
+    style: css::style::BorderStyle,
+    thickness: f32,
+    axis: Axis,
+    color: Color,
+) {
+    use css::style::BorderStyle;
+
+    let wanted = match style {
+        BorderStyle::Dotted => DOT_PERIOD * thickness,
+        BorderStyle::Dashed => DASH_PERIOD * thickness,
+        // Everything else is still drawn as one solid run, including `double`,
+        // `groove`, `ridge`, `inset`, and `outset`. Recorded in the README
+        // rather than hidden.
+        _ => {
+            list.items.push(DisplayItem::Rect { rect: *side, color });
+            return;
+        }
+    };
+
+    let length = match axis {
+        Axis::Horizontal => side.width,
+        Axis::Vertical => side.height,
+    };
+    if !(length.is_finite() && length > 0.0 && wanted.is_finite() && wanted > 0.0) {
+        return;
+    }
+
+    // `n` dashes with `n - 1` equal gaps between them, which is what makes the
+    // run start and end flush with the corners. Solving `length = n·d + (n−1)·d`
+    // for the dash size gives `d = length / (2n − 1)`, so the pattern is
+    // stretched a little rather than leaving a ragged end — the thing that
+    // makes a hand-rolled dashed border look wrong is a half dash at one end.
+    let count = (((length + wanted) / (2.0 * wanted)).round() as i32).max(1);
+    let dash = length / (2 * count - 1) as f32;
+    // One dash spanning the whole side is a solid line, which is the honest
+    // degradation for a side too short to show a pattern at all.
+    for index in 0..count {
+        let offset = index as f32 * 2.0 * dash;
+        let rect = match axis {
+            Axis::Horizontal => Rect {
+                x: side.x + offset,
+                width: dash,
+                ..*side
+            },
+            Axis::Vertical => Rect {
+                y: side.y + offset,
+                height: dash,
+                ..*side
+            },
+        };
+        list.items.push(DisplayItem::Rect { rect, color });
     }
 }
 
@@ -1047,6 +1139,105 @@ mod tests {
                 .unwrap_or(width)
         };
         assert!(leftmost_ink("p { text-align: center }") > leftmost_ink("p { text-align: left }"));
+    }
+}
+
+#[cfg(test)]
+mod border_tests {
+    use super::*;
+    use css::style::BorderStyle;
+
+    fn side(style: BorderStyle, length: f32, thickness: f32) -> Vec<Rect> {
+        let mut list = DisplayList::default();
+        push_border_side(
+            &mut list,
+            &Rect {
+                x: 10.0,
+                y: 20.0,
+                width: length,
+                height: thickness,
+            },
+            style,
+            thickness,
+            Axis::Horizontal,
+            Color::BLACK,
+        );
+        list.items
+            .into_iter()
+            .map(|item| match item {
+                DisplayItem::Rect { rect, .. } => rect,
+                other => panic!("a border drew {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_solid_border_is_still_one_rectangle() {
+        let segments = side(BorderStyle::Solid, 100.0, 2.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].width, 100.0);
+    }
+
+    #[test]
+    fn a_dotted_border_is_a_row_of_squares_the_border_wide() {
+        let segments = side(BorderStyle::Dotted, 100.0, 2.0);
+        assert!(segments.len() > 10, "got {} dots", segments.len());
+        // Square, or as near as stretching to fit allows.
+        for dot in &segments {
+            assert!(
+                (dot.width - 2.0).abs() < 0.5,
+                "a dot is {} wide against a 2px border",
+                dot.width
+            );
+        }
+    }
+
+    #[test]
+    fn a_dashed_border_uses_longer_segments_than_a_dotted_one() {
+        let dashes = side(BorderStyle::Dashed, 100.0, 2.0);
+        let dots = side(BorderStyle::Dotted, 100.0, 2.0);
+        assert!(
+            dashes.len() * 2 < dots.len(),
+            "{} dashes against {} dots is not a visible difference",
+            dashes.len(),
+            dots.len()
+        );
+    }
+
+    #[test]
+    fn a_pattern_starts_and_ends_flush_with_the_corners() {
+        // The thing that makes a hand-rolled dashed border look wrong is half a
+        // dash at one end, so the run is stretched to fit a whole number.
+        for style in [BorderStyle::Dotted, BorderStyle::Dashed] {
+            for length in [7.0, 31.0, 100.0, 253.0] {
+                let segments = side(style, length, 3.0);
+                let first = segments.first().expect("at least one segment");
+                let last = segments.last().expect("at least one segment");
+                assert_eq!(first.x, 10.0, "{style:?} at {length} starts short");
+                assert!(
+                    ((last.x + last.width) - (10.0 + length)).abs() < 0.01,
+                    "{style:?} at {length} ends at {} rather than {}",
+                    last.x + last.width,
+                    10.0 + length,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_side_too_short_for_a_pattern_degrades_to_a_solid_run() {
+        // Two dots on a six-pixel side is not a pattern, it is noise. One run
+        // is the honest answer, and it is what the arithmetic already gives.
+        let segments = side(BorderStyle::Dashed, 4.0, 3.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].width, 4.0);
+    }
+
+    #[test]
+    fn a_zero_length_side_draws_nothing_rather_than_dividing_by_it() {
+        assert!(side(BorderStyle::Dotted, 0.0, 2.0).is_empty());
+        assert!(side(BorderStyle::Dotted, 100.0, 0.0).is_empty());
+        assert!(side(BorderStyle::Dashed, f32::INFINITY, 2.0).is_empty());
     }
 }
 

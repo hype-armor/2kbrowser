@@ -8,6 +8,16 @@
   .partial{ border-left: 6px solid #999999; padding-left: 10px; margin-bottom: 10px; }
   .nostyle{ border-width: 20px; padding: 4px; margin-bottom: 10px; }
   .fixed  { width: 150px; border: 2px solid #000000; padding: 10px; }
+  /* Dotted and dashed, at a thin width and a thick one. The pattern scales
+     with the border, and each run is stretched to start and end flush with the
+     corner rather than leaving half a dash there. */
+  .dotted { border: 1px dotted #cc0000; padding: 6px; margin: 10px 0; }
+  .dotted-thick { border: 5px dotted #0055aa; padding: 6px; margin-bottom: 10px; }
+  .dashed { border: 1px dashed #cc0000; padding: 6px; margin-bottom: 10px; }
+  .dashed-thick { border: 4px dashed #007700; padding: 6px; margin-bottom: 10px; }
+  /* Too short to hold a pattern: degrades to a solid run rather than to a
+     ragged one. */
+  .tiny   { width: 6px; height: 6px; border: 3px dotted #333333; }
 </style></head><body>
 <div class="plain">A uniform solid border.</div>
 <div class="thick">A thicker border with less padding.</div>
@@ -15,4 +25,9 @@
 <div class="partial">Only a left border, as used for blockquotes.</div>
 <div class="nostyle">border-width with no border-style occupies nothing.</div>
 <div class="fixed">Explicit width is the content width.</div>
+<div class="dotted">A dotted border, one pixel wide.</div>
+<div class="dotted-thick">A dotted border, five pixels wide.</div>
+<div class="dashed">A dashed border, one pixel wide.</div>
+<div class="dashed-thick">A dashed border, four pixels wide.</div>
+<div class="tiny"></div>
 </body></html>
