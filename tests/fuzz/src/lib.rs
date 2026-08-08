@@ -560,10 +560,16 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             body: b"<html><body><p>a page</p></body></html>".to_vec(),
             content_type: Some("text/html; charset=utf-8".to_owned()),
             width: 800,
-            max_height: 2000,
+            top: 0,
+            height: 2000,
             origin: origin.ok(),
             path: "/a/b.html".to_owned(),
             force_authored: false,
+        }
+        .encode(),
+        sandbox::ToChild::Band {
+            top: 4096,
+            height: 300,
         }
         .encode(),
         sandbox::ToChild::Resource {
@@ -602,6 +608,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             }],
             can_toggle_layout: true,
             images_loaded: 2,
+            top: 0,
         }))
         .encode(),
     ];

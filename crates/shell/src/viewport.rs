@@ -92,14 +92,15 @@ impl Viewport {
         renderer: &Renderer,
         document: Document,
         width: u32,
-        max_height: u32,
+        band_height: u32,
         force_authored: bool,
     ) -> Result<Self, Error> {
         let (session, page) = renderer.open(
             document.body.clone(),
             document.content_type.clone(),
             width,
-            max_height,
+            0,
+            band_height,
             Some(document.origin.clone()),
             document.path.clone(),
             force_authored,
@@ -268,12 +269,16 @@ impl Viewport {
     ///
     /// Cheaper than a fresh page — the document is already parsed — and it is
     /// what stops a resize re-fetching every image.
-    pub fn resize(&mut self, width: u32, max_height: u32) -> Result<(), Error> {
+    pub fn resize(&mut self, width: u32, band_height: u32) -> Result<(), Error> {
+        // Back to the top of the document. A resize re-flows everything, so the
+        // row that was on screen is not the row that will be, and pretending
+        // otherwise would land the reader somewhere arbitrary.
         self.page = self.session.render(
             self.document.body.clone(),
             self.document.content_type.clone(),
             width,
-            max_height,
+            0,
+            band_height,
             Some(self.document.origin.clone()),
             self.document.path.clone(),
             self.force_authored,

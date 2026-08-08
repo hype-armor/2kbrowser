@@ -53,6 +53,12 @@ pub struct PageRenderer {
     /// and the box tree a find query searches never cross the boundary, so the
     /// only thing that can answer is the process holding them.
     page: Option<crate::render::Page>,
+    /// Whether the reader overruled the document fallback for this page.
+    ///
+    /// Remembered because a band has to describe the page the same way the
+    /// render did, and whether there is a decision to overrule depends on a
+    /// choice the parent made rather than on anything in the pixels.
+    force_authored: bool,
 }
 
 impl Default for PageRenderer {
@@ -67,8 +73,46 @@ impl PageRenderer {
         Self {
             fonts: FontStore::new(),
             page: None,
+            force_authored: false,
         }
     }
+
+    /// Whether there is a fallback decision the reader could overrule.
+    fn can_toggle_layout(&self, page: &crate::render::Page) -> bool {
+        self.force_authored || !matches!(page.mode, layout::RenderMode::Authored)
+    }
+}
+
+/// How the page was rendered, in the protocol's terms.
+///
+/// The wire type deliberately mirrors `RenderMode` rather than being it, so a
+/// new variant on either side is a compile error instead of a wire format that
+/// quietly changed shape.
+fn mode_of(page: &crate::render::Page) -> Mode {
+    match &page.mode {
+        layout::RenderMode::Authored => Mode::Authored,
+        layout::RenderMode::Document { unsupported_share } => Mode::Document {
+            unsupported_share: *unsupported_share,
+        },
+        layout::RenderMode::RequiresScripting => Mode::RequiresScripting,
+    }
+}
+
+/// Every link on the page, flattened with its group so the parent can put the
+/// pieces of a wrapped link back together.
+fn links_of(page: &crate::render::Page) -> Vec<Link> {
+    page.link_groups()
+        .into_iter()
+        .enumerate()
+        .flat_map(|(group, link)| {
+            let url = link.url;
+            link.rects.into_iter().map(move |rect| Link {
+                rect,
+                url: url.clone(),
+                group: group as u32,
+            })
+        })
+        .collect()
 }
 
 impl Render for PageRenderer {
@@ -81,7 +125,8 @@ impl Render for PageRenderer {
             body,
             content_type,
             width,
-            max_height,
+            top,
+            height,
             origin,
             path,
             force_authored,
@@ -102,7 +147,8 @@ impl Render for PageRenderer {
             crate::render::render_as_authored_with(
                 &html,
                 *width,
-                *max_height,
+                *top,
+                *height,
                 &mut self.fonts,
                 &mut loader,
                 base,
@@ -111,50 +157,58 @@ impl Render for PageRenderer {
             crate::render::render_with_base_and_loader(
                 &html,
                 *width,
-                *max_height,
+                *top,
+                *height,
                 &mut self.fonts,
                 &mut loader,
                 base,
             )
         };
 
-        let mode = match &page.mode {
-            layout::RenderMode::Authored => Mode::Authored,
-            layout::RenderMode::Document { unsupported_share } => Mode::Document {
-                unsupported_share: *unsupported_share,
-            },
-            layout::RenderMode::RequiresScripting => Mode::RequiresScripting,
-        };
-        let can_toggle_layout =
-            *force_authored || !matches!(page.mode, layout::RenderMode::Authored);
-
+        self.force_authored = *force_authored;
         let rendered = Rendered {
             pixels: page.pixmap.data().to_vec(),
             width: page.pixmap.width(),
             height: page.pixmap.height(),
+            top: page.band_top,
             content_height: page.content_height,
-            mode,
+            mode: mode_of(&page),
             title: page.title.clone(),
-            links: page
-                .link_groups()
-                .into_iter()
-                .enumerate()
-                .flat_map(|(group, link)| {
-                    let url = link.url;
-                    link.rects.into_iter().map(move |rect| Link {
-                        rect,
-                        url: url.clone(),
-                        group: group as u32,
-                    })
-                })
-                .collect(),
-            can_toggle_layout,
+            links: links_of(&page),
+            can_toggle_layout: self.can_toggle_layout(&page),
             images_loaded: page.images_loaded as u32,
         };
         // Kept for the questions that come after: find, and re-rendering at a
         // new width without re-fetching anything.
         self.page = Some(page);
         Ok(rendered)
+    }
+
+    fn band(&mut self, top: u32, height: u32) -> Result<Rendered, String> {
+        let Some(page) = &self.page else {
+            return Err("no page to paint a band of".to_owned());
+        };
+        // A frameset has no display list to repaint from, and needs none: its
+        // canvas is its viewport, so there are no rows below the ones it holds.
+        let Some(pixmap) = page.paint_band(&mut self.fonts, top, height) else {
+            return Err("this page cannot be repainted a band at a time".to_owned());
+        };
+        Ok(Rendered {
+            pixels: pixmap.data().to_vec(),
+            width: pixmap.width(),
+            height: pixmap.height(),
+            top,
+            content_height: page.content_height,
+            // Unchanged by moving down the page, and re-sent because the
+            // message is one shape: the parent replaces what it holds rather
+            // than merging, so a band that omitted these would blank the tab's
+            // title and every link on it.
+            mode: mode_of(page),
+            title: page.title.clone(),
+            links: links_of(page),
+            can_toggle_layout: self.can_toggle_layout(page),
+            images_loaded: page.images_loaded as u32,
+        })
     }
 
     fn find(&mut self, query: &str) -> Vec<layout::Rect> {
@@ -214,7 +268,8 @@ mod tests {
             body: body.to_vec(),
             content_type: None,
             width,
-            max_height: 2000,
+            top: 0,
+            height: 2000,
             origin: None,
             path: String::new(),
             force_authored: false,
@@ -338,7 +393,8 @@ mod tests {
                     body: html.as_bytes().to_vec(),
                     content_type: None,
                     width: 300,
-                    max_height: 2000,
+                    top: 0,
+                    height: 2000,
                     origin: Some(origin),
                     path: at,
                     force_authored: false,
@@ -402,7 +458,8 @@ mod tests {
                     body: html.as_bytes().to_vec(),
                     content_type: None,
                     width: 300,
-                    max_height: 600,
+                    top: 0,
+                    height: 600,
                     origin: Some(origin),
                     path: at,
                     force_authored: false,
@@ -456,7 +513,8 @@ mod tests {
                     body: html.as_bytes().to_vec(),
                     content_type: None,
                     width: 200,
-                    max_height: 200,
+                    top: 0,
+                    height: 200,
                     origin: Some(origin),
                     path: at,
                     force_authored: false,

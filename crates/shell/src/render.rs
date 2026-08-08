@@ -7,7 +7,7 @@
 use css::Stylesheet;
 use layout::{IntrinsicSizes, RenderMode};
 use net::{Fetcher, Origin, RequestKind};
-use paint::{ImageStore, Pixmap, build_display_list, rasterise};
+use paint::{ImageStore, Pixmap, build_display_list};
 use text::FontStore;
 
 /// One document occupying a rectangle of the canvas.
@@ -47,9 +47,57 @@ pub struct Page {
     /// and on anything hand-written — the caller falls back to the URL rather
     /// than showing an empty tab.
     pub title: Option<String>,
+    /// The document row `pixmap` starts at.
+    pub band_top: u32,
+    /// What another band would be painted from, when this page can paint one.
+    ///
+    /// Kept so that scrolling costs a paint rather than a re-layout: the
+    /// display list is in document coordinates and does not change between
+    /// bands. `None` for a frameset, whose canvas is composited from its
+    /// frames rather than built from one list — and which is never taller than
+    /// its own viewport, so no band beyond the one it has is ever asked for.
+    source: Option<Box<BandSource>>,
+}
+
+/// Everything painting a band of a page needs.
+struct BandSource {
+    list: paint::DisplayList,
+    images: paint::ImageStore,
 }
 
 impl Page {
+    /// Paints a different band of this page, without laying it out again.
+    ///
+    /// This is what makes a long page affordable: the parse, the cascade, and
+    /// the layout all stay done, and moving down the document costs only the
+    /// pixels asked for.
+    ///
+    /// `None` when this page cannot repaint — a frameset — which is safe
+    /// because a frameset's canvas is its viewport and never has rows beyond
+    /// the ones it already holds.
+    pub fn paint_band(&self, fonts: &mut FontStore, top: u32, height: u32) -> Option<Pixmap> {
+        let source = self.source.as_ref()?;
+        // Clipped to what the document has below `top`, the same way a first
+        // render is clipped to its content. A band running off the bottom
+        // otherwise comes back padded with canvas colour, and those rows are
+        // not rows of the document — they would scroll past the end.
+        let content_rows = self.content_height.ceil().max(1.0) as u32;
+        let height = height.min(content_rows.saturating_sub(top)).max(1);
+        paint::rasterise_band(
+            &source.list,
+            fonts,
+            &source.images,
+            self.pixmap.width(),
+            top as f32,
+            height,
+        )
+    }
+
+    /// Whether this page can paint a band other than the one it holds.
+    pub fn can_paint_bands(&self) -> bool {
+        self.source.is_some()
+    }
+
     /// The absolute URL of the link at a point, in canvas coordinates.
     ///
     /// Resolved here rather than handed back raw because the answer depends on
@@ -259,6 +307,7 @@ pub fn render_with_base(
     render_with_base_and_loader(
         html,
         width,
+        0,
         max_height,
         fonts,
         &mut DirectLoader::default(),
@@ -273,7 +322,8 @@ pub fn render_with_base(
 pub fn render_with_base_and_loader(
     html: &str,
     width: u32,
-    max_height: u32,
+    band_top: u32,
+    band_height: u32,
     fonts: &mut FontStore,
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
@@ -281,7 +331,8 @@ pub fn render_with_base_and_loader(
     render_sized(
         html,
         width,
-        max_height,
+        band_top,
+        band_height,
         Settings::default(),
         fonts,
         loader,
@@ -325,6 +376,7 @@ fn render_in_viewport_with(
     render_sized(
         html,
         width,
+        0,
         height,
         Settings {
             fill_height: true,
@@ -352,6 +404,7 @@ pub fn render_as_authored(
     render_as_authored_with(
         html,
         width,
+        0,
         max_height,
         fonts,
         &mut DirectLoader::default(),
@@ -363,7 +416,8 @@ pub fn render_as_authored(
 pub fn render_as_authored_with(
     html: &str,
     width: u32,
-    max_height: u32,
+    band_top: u32,
+    band_height: u32,
     fonts: &mut FontStore,
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
@@ -371,7 +425,8 @@ pub fn render_as_authored_with(
     render_sized(
         html,
         width,
-        max_height,
+        band_top,
+        band_height,
         Settings {
             force_authored: true,
             ..Settings::default()
@@ -391,10 +446,16 @@ struct Settings {
     force_authored: bool,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
+              nothing else would use"
+)]
 fn render_sized(
     html: &str,
     width: u32,
-    max_height: u32,
+    band_top: u32,
+    band_height: u32,
     settings: Settings,
     fonts: &mut FontStore,
     loader: &mut dyn Loader,
@@ -409,7 +470,15 @@ fn render_sized(
         && let Some((origin, path)) = base
     {
         return render_frameset(
-            &doc, frameset, width, max_height, fonts, loader, origin, path, 0,
+            &doc,
+            frameset,
+            width,
+            band_height,
+            fonts,
+            loader,
+            origin,
+            path,
+            0,
         );
     }
 
@@ -456,12 +525,19 @@ fn render_sized(
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
+    // The band asked for, clipped to what the document actually has below it.
+    // A page shorter than the band gets a canvas its own height, which is what
+    // every page did before bands existed and is why a short page still paints
+    // exactly as it used to.
+    let content_rows = laid_out.height.ceil().max(1.0) as u32;
     let height = if settings.fill_height {
-        max_height.max(1)
+        band_height.max(1)
     } else {
-        (laid_out.height.ceil().max(1.0) as u32).min(max_height)
+        band_height
+            .min(content_rows.saturating_sub(band_top))
+            .max(1)
     };
-    let pixmap = rasterise(&list, fonts, &images, width, height)
+    let pixmap = paint::rasterise_band(&list, fonts, &images, width, band_top as f32, height)
         .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
     // The whole canvas is one document. `base` is what a link inside it
@@ -496,6 +572,8 @@ fn render_sized(
         images_loaded: images.len(),
         title,
         frames,
+        band_top,
+        source: Some(Box::new(BandSource { list, images })),
     }
 }
 
@@ -644,6 +722,12 @@ fn render_frameset(
 
     Page {
         pixmap,
+        band_top: 0,
+        // A frameset's canvas is composited from its frames rather than built
+        // from one display list, so there is nothing to repaint a band from —
+        // and nothing needs one, because a frameset is its viewport and never
+        // has rows below the ones it holds.
+        source: None,
         mode: RenderMode::Authored,
         content_height: height as f32,
         images_loaded: loaded,

@@ -275,7 +275,8 @@ impl Renderer {
         body: Vec<u8>,
         content_type: Option<String>,
         width: u32,
-        max_height: u32,
+        top: u32,
+        height: u32,
         origin: Option<Origin>,
         path: String,
         force_authored: bool,
@@ -290,7 +291,8 @@ impl Renderer {
             body,
             content_type,
             width,
-            max_height,
+            top,
+            height,
             origin,
             path,
             force_authored,
@@ -313,7 +315,8 @@ impl Renderer {
         body: Vec<u8>,
         content_type: Option<String>,
         width: u32,
-        max_height: u32,
+        top: u32,
+        height: u32,
         origin: Option<Origin>,
         path: String,
         force_authored: bool,
@@ -322,7 +325,8 @@ impl Renderer {
             body,
             content_type,
             width,
-            max_height,
+            top,
+            height,
             origin,
             path,
             force_authored,
@@ -363,7 +367,8 @@ impl Session {
         body: Vec<u8>,
         content_type: Option<String>,
         width: u32,
-        max_height: u32,
+        top: u32,
+        height: u32,
         origin: Option<Origin>,
         path: String,
         force_authored: bool,
@@ -373,7 +378,8 @@ impl Session {
             body,
             content_type,
             width,
-            max_height,
+            top,
+            height,
             origin,
             path,
             force_authored,
@@ -390,6 +396,22 @@ impl Session {
     /// path was repeatable rather than that the child was gone.
     pub fn child_id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Repaints a different band of the page this child is holding.
+    ///
+    /// No fetching and no layout: the document is already parsed and laid out,
+    /// so this costs the pixels and the pipe. That is what makes scrolling a
+    /// long page affordable, and it is why it is not a `render` — a render can
+    /// ask the parent for resources and this deliberately cannot.
+    pub fn band(&mut self, top: u32, height: u32) -> Result<Rendered, Error> {
+        self.send(&ToChild::Band { top, height })?;
+        let frame = self.read()?;
+        match ToParent::decode(&frame)? {
+            ToParent::Rendered(page) => Ok(*page),
+            ToParent::Failed { message } => Err(Error::Render(message)),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
     }
 
     /// Asks where `query` appears on the page this child is holding.
@@ -501,6 +523,7 @@ mod tests {
             b"<p>x</p>".to_vec(),
             None,
             100,
+            0,
             100,
             None,
             String::new(),
@@ -524,6 +547,7 @@ mod tests {
             b"<p>x</p>".to_vec(),
             None,
             100,
+            0,
             100,
             None,
             String::new(),

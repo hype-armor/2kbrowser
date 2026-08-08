@@ -48,6 +48,14 @@ pub trait Render {
     /// box tree it searches never cross the boundary, so the only thing that
     /// can answer is the process holding them.
     fn find(&mut self, query: &str) -> Vec<layout::Rect>;
+
+    /// Paints a different band of the page most recently rendered.
+    ///
+    /// Never fetches: the document is already parsed and laid out, and a band
+    /// is only pixels. That is the whole reason a long page is affordable, and
+    /// it is why this is not simply another `render` — a render can talk to the
+    /// parent and this cannot.
+    fn band(&mut self, top: u32, height: u32) -> Result<Rendered, String>;
 }
 
 /// Runs the child's side of the conversation until the parent goes away.
@@ -80,6 +88,13 @@ pub fn serve(
             ToChild::Find { query } => {
                 let rects = renderer.find(query);
                 write_frame(output, &ToParent::Matches { rects }.encode())?;
+            }
+            ToChild::Band { top, height } => {
+                let answer = match renderer.band(*top, *height) {
+                    Ok(page) => ToParent::Rendered(Box::new(page)),
+                    Err(message) => ToParent::Failed { message },
+                };
+                write_frame(output, &answer.encode())?;
             }
             // A `Resource` with nothing outstanding means the parent is not
             // what we think it is. Refusing beats guessing.
@@ -213,7 +228,12 @@ mod tests {
                 links: Vec::new(),
                 can_toggle_layout: false,
                 images_loaded: 0,
+                top: 0,
             })
+        }
+
+        fn band(&mut self, _top: u32, _height: u32) -> Result<Rendered, String> {
+            Err("the stub renderer paints no bands".to_owned())
         }
 
         fn find(&mut self, query: &str) -> Vec<layout::Rect> {
@@ -232,7 +252,8 @@ mod tests {
             body: b"<p>x</p>".to_vec(),
             content_type: None,
             width: 1,
-            max_height: 1,
+            top: 0,
+            height: 1,
             origin: None,
             path: String::new(),
             force_authored: false,

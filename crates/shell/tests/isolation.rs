@@ -30,7 +30,8 @@ fn request(html: &str, width: u32) -> ToChild {
         body: html.as_bytes().to_vec(),
         content_type: None,
         width,
-        max_height: 2000,
+        top: 0,
+        height: 2000,
         origin: None,
         path: String::new(),
         force_authored: false,
@@ -170,6 +171,7 @@ fn session(html: &str, width: u32) -> (sandbox::Session, sandbox::Rendered) {
             html.as_bytes().to_vec(),
             None,
             width,
+            0,
             2000,
             Some(origin),
             at,
@@ -220,6 +222,7 @@ fn the_same_child_re_renders_at_a_new_width() {
             html.as_bytes().to_vec(),
             None,
             600,
+            0,
             2000,
             Some(origin),
             at,
@@ -747,6 +750,7 @@ fn renderers_built_at_the_same_time_all_start() {
                         format!("<body><p>thread {index}</p></body>").into_bytes(),
                         None,
                         200,
+                        0,
                         400,
                         None,
                         String::new(),
@@ -772,4 +776,85 @@ fn renderers_built_at_the_same_time_all_start() {
         failures.len(),
         outcomes.len()
     );
+}
+
+#[test]
+fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
+    // The same property `paint` asserts of `rasterise_band`, demanded of the
+    // whole arrangement: parent asks a live child for rows it does not have,
+    // and gets exactly the rows it would have got from one enormous canvas.
+    //
+    // This is what makes banding a fix for long pages rather than a rendering
+    // change wearing one as a disguise.
+    let html = format!(
+        "<body bgcolor=\"#eef\">{}</body>",
+        (0..120)
+            .map(|n| format!("<p>line {n} with some words on it</p>"))
+            .collect::<String>()
+    );
+    let dir = std::env::temp_dir().join("2kbrowser-band-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall.html");
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let (mut session, whole) = renderer
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            300,
+            0,
+            8000,
+            Some(origin),
+            at,
+            false,
+        )
+        .expect("the renderer opens the page");
+    assert!(
+        whole.height > 600,
+        "the fixture is too short to band: {}",
+        whole.height
+    );
+    assert_eq!(whole.top, 0);
+
+    let row = |page: &sandbox::Rendered, n: u32| {
+        let stride = (page.width * 4) as usize;
+        page.pixels[n as usize * stride..(n as usize + 1) * stride].to_vec()
+    };
+
+    for (top, height) in [
+        (0u32, 90u32),
+        (137, 90),
+        (400, 250),
+        (whole.height - 30, 90),
+    ] {
+        let band = session.band(top, height).expect("the child paints a band");
+        assert_eq!(band.top, top);
+        assert_eq!(band.width, whole.width);
+        // Clipped to what the document has below `top`, exactly as a first
+        // render is clipped to the content.
+        assert_eq!(band.height, height.min(whole.height - top));
+        assert_eq!(
+            band.content_height, whole.content_height,
+            "moving down the page changed how tall it is"
+        );
+        for n in 0..band.height {
+            assert_eq!(
+                row(&band, n),
+                row(&whole, top + n),
+                "band at {top}: row {n} is not document row {}",
+                top + n
+            );
+        }
+    }
+
+    // A band is pixels, not a re-render: what the parent knows about the page
+    // must survive one. A band that blanked the title or the links would empty
+    // the tab strip and every keyboard target on the page.
+    let band = session.band(0, 100).expect("paints");
+    assert_eq!(band.links.len(), whole.links.len());
+    assert_eq!(band.title, whole.title);
+    assert_eq!(band.can_toggle_layout, whole.can_toggle_layout);
 }

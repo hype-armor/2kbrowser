@@ -128,14 +128,29 @@ pub enum ToChild {
         content_type: Option<String>,
         /// Viewport width.
         width: u32,
-        /// Maximum canvas height.
-        max_height: u32,
+        /// First document row to paint.
+        top: u32,
+        /// How many rows to paint, clipped to what the document has below
+        /// `top`. A page shorter than this gets a canvas its own height, which
+        /// is what every page got before bands existed.
+        height: u32,
         /// The document's own origin, for resolving what it references.
         origin: Option<Origin>,
         /// The document's path within that origin.
         path: String,
         /// Whether to overrule the document fallback (ADR-0009).
         force_authored: bool,
+    },
+    /// Paint a different band of the page already held.
+    ///
+    /// The point of the whole arrangement: the parse, the cascade, and the
+    /// layout stay done, so moving down a long document costs only the pixels
+    /// asked for. A band request never fetches anything.
+    Band {
+        /// First document row to paint.
+        top: u32,
+        /// How many rows to paint.
+        height: u32,
     },
     /// The answer to a [`ToParent::Fetch`].
     ///
@@ -176,7 +191,8 @@ impl ToChild {
                 body,
                 content_type,
                 width,
-                max_height,
+                top,
+                height,
                 origin,
                 path,
                 force_authored,
@@ -188,7 +204,8 @@ impl ToChild {
                     writer.str(content_type);
                 }
                 writer.u32(*width);
-                writer.u32(*max_height);
+                writer.u32(*top);
+                writer.u32(*height);
                 writer.some(origin.is_some());
                 if let Some(origin) = origin {
                     write_origin(&mut writer, origin);
@@ -199,6 +216,11 @@ impl ToChild {
             ToChild::Find { query } => {
                 writer.tag(2);
                 writer.str(query);
+            }
+            ToChild::Band { top, height } => {
+                writer.tag(3);
+                writer.u32(*top);
+                writer.u32(*height);
             }
             ToChild::Resource {
                 body,
@@ -229,7 +251,8 @@ impl ToChild {
                     None
                 };
                 let width = reader.u32()?;
-                let max_height = reader.u32()?;
+                let top = reader.u32()?;
+                let height = reader.u32()?;
                 let origin = if reader.some()? {
                     Some(read_origin(&mut reader)?)
                 } else {
@@ -239,7 +262,8 @@ impl ToChild {
                     body,
                     content_type,
                     width,
-                    max_height,
+                    top,
+                    height,
                     origin,
                     path: reader.str()?,
                     force_authored: reader.some()?,
@@ -260,6 +284,10 @@ impl ToChild {
             }
             2 => ToChild::Find {
                 query: reader.str()?,
+            },
+            3 => ToChild::Band {
+                top: reader.u32()?,
+                height: reader.u32()?,
             },
             _ => return Err(WireError::Unknown),
         };
@@ -308,8 +336,10 @@ pub struct Rendered {
     pub pixels: Vec<u8>,
     /// Canvas width.
     pub width: u32,
-    /// Canvas height.
+    /// Canvas height: how many document rows `pixels` holds.
     pub height: u32,
+    /// The document row `pixels` starts at.
+    pub top: u32,
     /// Height of the content, which may exceed the canvas.
     pub content_height: f32,
     /// How it was rendered (ADR-0009).
@@ -346,6 +376,7 @@ impl ToParent {
                 writer.bytes(&page.pixels);
                 writer.u32(page.width);
                 writer.u32(page.height);
+                writer.u32(page.top);
                 writer.f32(page.content_height);
                 page.mode.write(&mut writer);
                 writer.some(page.title.is_some());
@@ -392,6 +423,7 @@ impl ToParent {
                 let pixels = reader.bytes()?.to_vec();
                 let width = reader.u32()?;
                 let height = reader.u32()?;
+                let top = reader.u32()?;
                 let content_height = reader.f32()?;
                 let mode = Mode::read(&mut reader)?;
                 let title = if reader.some()? {
@@ -428,6 +460,7 @@ impl ToParent {
                     pixels,
                     width,
                     height,
+                    top,
                     content_height,
                     mode,
                     title,
@@ -465,6 +498,7 @@ mod tests {
             pixels: vec![0; (width * height * 4) as usize],
             width,
             height,
+            top: 0,
             content_height: 123.5,
             mode: Mode::Document {
                 unsupported_share: 0.42,
@@ -491,7 +525,8 @@ mod tests {
             body: b"<p>hello</p>".to_vec(),
             content_type: Some("text/html; charset=utf-8".to_owned()),
             width: 800,
-            max_height: 2000,
+            top: 0,
+            height: 2000,
             origin: Some(
                 net::parse_url("https://example.com/a.html")
                     .expect("parses")
@@ -509,7 +544,8 @@ mod tests {
             body: Vec::new(),
             content_type: None,
             width: 1,
-            max_height: 1,
+            top: 0,
+            height: 1,
             origin: None,
             path: String::new(),
             force_authored: false,
@@ -529,7 +565,8 @@ mod tests {
                 body: Vec::new(),
                 content_type: None,
                 width: 10,
-                max_height: 10,
+                top: 0,
+                height: 10,
                 origin: Some(origin),
                 path,
                 force_authored: false,
@@ -600,7 +637,8 @@ mod tests {
                 body: b"<p>x</p>".to_vec(),
                 content_type: Some("text/html".to_owned()),
                 width: 800,
-                max_height: 600,
+                top: 0,
+                height: 600,
                 origin: Some(net::parse_url("https://example.com/").expect("parses").0),
                 path: "/".to_owned(),
                 force_authored: false,
@@ -627,6 +665,7 @@ mod tests {
         let mut writer = Writer::new();
         writer.tag(1);
         writer.bytes(&[]);
+        writer.u32(0);
         writer.u32(0);
         writer.u32(0);
         writer.f32(0.0);
