@@ -482,7 +482,11 @@ fn must_stay_denied() -> Vec<i64> {
 /// (ADR-0012); `process-exec*`; and `mach-lookup`, which is the macOS-shaped
 /// hole equivalent to io_uring — a channel to other processes that would make
 /// the rest of this decorative.
-#[cfg(target_os = "macos")]
+/// Compiled in for tests everywhere, not just on macOS. The profile is a string
+/// that only one platform ever parses, so on the other two an edit to it is
+/// invisible — no compiler sees inside it and nothing runs it. The structural
+/// test below is what a Linux or Windows machine can still say about it.
+#[cfg(any(target_os = "macos", test))]
 const PROFILE: &str = "\
 (version 1)
 (deny default)
@@ -861,6 +865,53 @@ mod tests {
             assert_eq!(apply(), Confinement::Unavailable);
         } else {
             assert_ne!(apply(), Confinement::Unavailable);
+        }
+    }
+
+    #[test]
+    fn the_macos_profile_denies_by_default_and_allows_nothing_that_matters() {
+        // Runs on every platform, and is written for the two that never parse
+        // this string. `sandbox_init` is the only thing that reads it, so on
+        // Linux and Windows an edit to the profile compiles, passes, and means
+        // nothing — the mistake would surface on a Mac, which neither author
+        // has.
+        assert!(PROFILE.starts_with("(version 1)"), "{PROFILE}");
+        assert!(PROFILE.contains("(deny default)"), "{PROFILE}");
+
+        // Unbalanced parentheses are the failure worth catching cheaply: SBPL
+        // refuses to parse, `sandbox_init` fails, and the renderer runs
+        // unconfined. Loud at run time — `apply` reports it — and this catches
+        // it before anyone ships.
+        let mut depth = 0i32;
+        for character in PROFILE.chars() {
+            match character {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "a `)` with nothing open:\n{PROFILE}");
+        }
+        assert_eq!(depth, 0, "unbalanced parentheses:\n{PROFILE}");
+
+        // The same job `must_stay_denied` does for Linux, one platform over:
+        // an allowlist does not name these, so nothing stops someone widening
+        // it until one is reachable. `mach-lookup` is the entry that matters
+        // most here — it is a channel to other processes, and the macOS-shaped
+        // equivalent of io_uring in that granting it makes the rest decorative.
+        for reachable in [
+            "file-read",
+            "file-write",
+            "network",
+            "process-exec",
+            "process-fork",
+            "mach-lookup",
+            "mach-register",
+            "iokit-open",
+        ] {
+            assert!(
+                !PROFILE.contains(&format!("(allow {reachable}")),
+                "the profile allows {reachable}:\n{PROFILE}"
+            );
         }
     }
 

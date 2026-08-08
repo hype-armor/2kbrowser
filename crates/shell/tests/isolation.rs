@@ -444,9 +444,26 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
     let report = String::from_utf8_lossy(&output.stdout);
 
     // Skipped rather than failed where the sandbox is unavailable — an old
-    // kernel, a container that forbids installing a filter, macOS. A check that
-    // cannot run must not look like a check that passed, so it says so.
+    // kernel, a container that forbids installing a filter. A check that cannot
+    // run must not look like a check that passed, so it says so.
+    //
+    // Except that it did look like one, for as long as the skip was only an
+    // `eprintln!`. `cargo test` captures the output of a test that passes, so a
+    // skipped run and a verified one both printed `... ok` and nothing else —
+    // the third time this project has produced a check that could not fail, and
+    // the worst of the three, because it covered the other two.
+    //
+    // So: a skip is legitimate on a developer's machine and never in CI. CI is
+    // where the claim gets made, and a sandbox that could not be installed
+    // there is the finding, not a reason to say nothing. The distinction is the
+    // `CI` variable every runner sets.
     if report.contains("confinement=Failed") || report.contains("confinement=Unavailable") {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no sandbox was installed, and this is CI — where a skip is a \
+             failure, because a green run here is what the README's claims \
+             rest on:\n{report}"
+        );
         eprintln!("SKIP: no sandbox is available here\n{report}");
         return;
     }
