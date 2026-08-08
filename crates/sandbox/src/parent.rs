@@ -281,12 +281,7 @@ impl Renderer {
         path: String,
         force_authored: bool,
     ) -> Result<(Session, Rendered), Error> {
-        let mut session = Session {
-            child: self.spawn()?,
-            fetcher: self.fetcher.clone(),
-            timeout: self.timeout,
-            document: origin.clone(),
-        };
+        let mut session = Session::new(self.spawn()?, self.fetcher.clone(), self.timeout)?;
         let page = session.render(
             body,
             content_type,
@@ -335,25 +330,129 @@ impl Renderer {
     }
 }
 
+/// What the worker is asked to do.
+enum Job {
+    Render(Box<RenderJob>),
+    Band { top: u32, height: u32 },
+    Find(String),
+}
+
+/// A render request, boxed because it carries the whole document.
+struct RenderJob {
+    body: Vec<u8>,
+    content_type: Option<String>,
+    width: u32,
+    top: u32,
+    height: u32,
+    origin: Option<Origin>,
+    path: String,
+    force_authored: bool,
+}
+
+/// Which request an answer belongs to.
+///
+/// Answers come back in the order they were asked for, because the worker is
+/// serial, so the oldest outstanding request is whose answer this is. That is
+/// all the matching this needs — no request ids, no map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Page,
+    Band,
+    Find,
+}
+
+/// What came back.
+enum Answer {
+    Rendered(Box<Rendered>),
+    Matches(Vec<layout::Rect>),
+    Failed(Error),
+}
+
+/// Called when an answer is ready, so an event loop can be woken.
+type Wake = Box<dyn Fn() + Send + Sync>;
+
 /// A live renderer holding one page.
 ///
 /// Dropping it kills the child. That is the mechanism that keeps "one page per
 /// process" true: the caller drops the session when the page is replaced, and
 /// nothing a page accumulated — caches, font state, whatever an exploit left
 /// behind — survives into the next one.
+///
+/// The conversation happens on a thread rather than here. That is what lets a
+/// band be asked for and collected later instead of blocking whoever asked:
+/// scrolling a long page can fetch the rows ahead of the reader while the
+/// window keeps drawing, which is the whole point of doing it speculatively.
+/// The pipes, the fetcher, and the policy all move onto that thread with the
+/// conversation, because the child asks the parent for subresources *during* a
+/// render and there is nobody else to answer.
 pub struct Session {
-    child: Spawned,
-    fetcher: Fetcher,
-    timeout: Duration,
-    /// The origin the parent asked for a render of.
-    ///
-    /// Kept here rather than taken from the child's requests. The child could
-    /// claim any origin it liked, and the policy would then be applied to a
-    /// document that does not exist.
-    document: Option<Origin>,
+    /// `None` once dropped, which closes the channel and ends the worker.
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    answers: std::sync::mpsc::Receiver<Answer>,
+    /// What has been asked for and not yet answered, oldest first.
+    outstanding: std::collections::VecDeque<Kind>,
+    /// A band that arrived while something else was being waited for.
+    band: Option<Result<Rendered, Error>>,
+    child_id: u32,
+    wake: std::sync::Arc<std::sync::OnceLock<Wake>>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
+    /// Starts the worker for a freshly spawned child.
+    fn new(child: Spawned, fetcher: Fetcher, timeout: Duration) -> Result<Self, Error> {
+        let child_id = child.id();
+        let (jobs, work) = std::sync::mpsc::channel::<Job>();
+        let (replies, answers) = std::sync::mpsc::channel::<Answer>();
+        let wake: std::sync::Arc<std::sync::OnceLock<Wake>> = std::sync::Arc::default();
+        let woken = std::sync::Arc::clone(&wake);
+
+        let worker = std::thread::Builder::new()
+            .name("renderer-session".to_owned())
+            .spawn(move || {
+                let mut conversation = Conversation {
+                    child,
+                    fetcher,
+                    timeout,
+                    document: None,
+                };
+                // Ends when the handle is dropped and the channel closes, which
+                // is what kills the child: `Conversation` owns it.
+                while let Ok(job) = work.recv() {
+                    let answer = conversation.perform(job);
+                    if replies.send(answer).is_err() {
+                        break;
+                    }
+                    if let Some(wake) = woken.get() {
+                        wake();
+                    }
+                }
+            })
+            .map_err(|error| Error::Spawn(format!("cannot start a renderer thread: {error}")))?;
+
+        Ok(Self {
+            jobs: Some(jobs),
+            answers,
+            outstanding: std::collections::VecDeque::new(),
+            band: None,
+            child_id,
+            wake,
+            worker: Some(worker),
+        })
+    }
+
+    /// Sets what to call when an answer is ready.
+    ///
+    /// How a speculative band reaches a window that is otherwise asleep: winit
+    /// waits for events rather than polling, so a band arriving has to be an
+    /// event. Takes a callback rather than anything winit-shaped, because this
+    /// crate has no business knowing what a window is.
+    ///
+    /// Only the first call counts. There is one owner of a session.
+    pub fn set_wake(&self, wake: Wake) {
+        let _ = self.wake.set(wake);
+    }
+
     /// Renders, or re-renders at a new width.
     ///
     /// Re-rendering in the same child is not only cheaper — the document is
@@ -373,17 +472,24 @@ impl Session {
         path: String,
         force_authored: bool,
     ) -> Result<Rendered, Error> {
-        self.document = origin.clone();
-        self.converse(ToChild::Render {
-            body,
-            content_type,
-            width,
-            top,
-            height,
-            origin,
-            path,
-            force_authored,
-        })
+        self.submit(
+            Job::Render(Box::new(RenderJob {
+                body,
+                content_type,
+                width,
+                top,
+                height,
+                origin,
+                path,
+                force_authored,
+            })),
+            Kind::Page,
+        )?;
+        match self.wait_for(Kind::Page)? {
+            Answer::Rendered(page) => Ok(*page),
+            Answer::Failed(error) => Err(error),
+            Answer::Matches(_) => Err(Error::Wire(crate::WireError::Unknown)),
+        }
     }
 
     /// The renderer's process id.
@@ -395,37 +501,152 @@ impl Session {
     /// test that used to cover this said in its own comment that it checked the
     /// path was repeatable rather than that the child was gone.
     pub fn child_id(&self) -> u32 {
-        self.child.id()
+        self.child_id
     }
 
-    /// Repaints a different band of the page this child is holding.
+    /// Repaints a different band of the page this child is holding, and waits.
     ///
     /// No fetching and no layout: the document is already parsed and laid out,
     /// so this costs the pixels and the pipe. That is what makes scrolling a
     /// long page affordable, and it is why it is not a `render` — a render can
     /// ask the parent for resources and this deliberately cannot.
     pub fn band(&mut self, top: u32, height: u32) -> Result<Rendered, Error> {
-        self.send(&ToChild::Band { top, height })?;
-        let frame = self.read()?;
-        match ToParent::decode(&frame)? {
-            ToParent::Rendered(page) => Ok(*page),
-            ToParent::Failed { message } => Err(Error::Render(message)),
-            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        self.request_band(top, height)?;
+        match self.wait_for(Kind::Band)? {
+            Answer::Rendered(page) => Ok(*page),
+            Answer::Failed(error) => Err(error),
+            Answer::Matches(_) => Err(Error::Wire(crate::WireError::Unknown)),
         }
+    }
+
+    /// Asks for a band without waiting for it.
+    ///
+    /// The speculative half: a reader approaching the edge of what has been
+    /// painted should not have to stop there, so the rows ahead are asked for
+    /// while the window carries on drawing the rows it has. Collect it with
+    /// [`Session::take_band`], or be told by the callback given to
+    /// [`Session::set_wake`].
+    pub fn request_band(&mut self, top: u32, height: u32) -> Result<(), Error> {
+        self.submit(Job::Band { top, height }, Kind::Band)
+    }
+
+    /// Whether a band has been asked for and not yet collected.
+    pub fn band_outstanding(&self) -> bool {
+        self.band.is_none() && self.outstanding.contains(&Kind::Band)
+    }
+
+    /// Takes a band that has arrived, if one has. Never blocks.
+    pub fn take_band(&mut self) -> Option<Result<Rendered, Error>> {
+        while self.band.is_none() {
+            match self.answers.try_recv() {
+                Ok(answer) => self.stash(answer),
+                Err(_) => break,
+            }
+        }
+        self.band.take()
     }
 
     /// Asks where `query` appears on the page this child is holding.
     pub fn find(&mut self, query: &str) -> Result<Vec<layout::Rect>, Error> {
-        let request = ToChild::Find {
-            query: query.to_owned(),
-        };
-        self.send(&request)?;
-        let frame = self.read()?;
-        match ToParent::decode(&frame)? {
-            ToParent::Matches { rects } => Ok(rects),
-            ToParent::Failed { message } => Err(Error::Render(message)),
-            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        self.submit(Job::Find(query.to_owned()), Kind::Find)?;
+        match self.wait_for(Kind::Find)? {
+            Answer::Matches(rects) => Ok(rects),
+            Answer::Failed(error) => Err(error),
+            Answer::Rendered(_) => Err(Error::Wire(crate::WireError::Unknown)),
         }
+    }
+
+    fn submit(&mut self, job: Job, kind: Kind) -> Result<(), Error> {
+        let jobs = self.jobs.as_ref().ok_or(Error::Died)?;
+        jobs.send(job).map_err(|_| Error::Died)?;
+        self.outstanding.push_back(kind);
+        Ok(())
+    }
+
+    /// Files an answer against the oldest outstanding request.
+    fn stash(&mut self, answer: Answer) {
+        match self.outstanding.pop_front() {
+            // A band nobody is waiting for is kept rather than dropped: it was
+            // asked for on purpose and the window still wants it.
+            Some(Kind::Band) => {
+                self.band = Some(match answer {
+                    Answer::Rendered(page) => Ok(*page),
+                    Answer::Failed(error) => Err(error),
+                    Answer::Matches(_) => Err(Error::Wire(crate::WireError::Unknown)),
+                });
+            }
+            _ => drop(answer),
+        }
+    }
+
+    /// Waits for the answer to the most recent request of `kind`.
+    ///
+    /// Anything that arrives first belongs to an earlier request; a band among
+    /// them is kept for the window rather than thrown away.
+    fn wait_for(&mut self, kind: Kind) -> Result<Answer, Error> {
+        loop {
+            let answer = self.answers.recv().map_err(|_| Error::Died)?;
+            if self.outstanding.front() == Some(&kind) {
+                self.outstanding.pop_front();
+                return Ok(answer);
+            }
+            self.stash(answer);
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Closing the channel is what ends the worker, and the worker owns the
+        // child — so this is also what kills it. Unconditional, including after
+        // a clean render: a renderer whose page is gone has nothing left to do,
+        // and one that is wedged must not outlive the tab that started it.
+        self.jobs = None;
+        if let Some(worker) = self.worker.take() {
+            // Joined rather than detached, so that when this returns the child
+            // is gone rather than probably-gone. A test can then look for the
+            // process, which is the only way "dropping kills it" is checkable.
+            let _ = worker.join();
+        }
+    }
+}
+
+/// The child, the pipes, and the conversation — all on the worker thread.
+struct Conversation {
+    child: Spawned,
+    fetcher: Fetcher,
+    timeout: Duration,
+    /// The origin the parent asked for a render of.
+    ///
+    /// Kept here rather than taken from the child's requests. The child could
+    /// claim any origin it liked, and the policy would then be applied to a
+    /// document that does not exist.
+    document: Option<Origin>,
+}
+
+impl Conversation {
+    fn perform(&mut self, job: Job) -> Answer {
+        let outcome = match job {
+            Job::Render(request) => {
+                self.document = request.origin.clone();
+                self.converse(ToChild::Render {
+                    body: request.body,
+                    content_type: request.content_type,
+                    width: request.width,
+                    top: request.top,
+                    height: request.height,
+                    origin: request.origin,
+                    path: request.path,
+                    force_authored: request.force_authored,
+                })
+                .map(|page| Answer::Rendered(Box::new(page)))
+            }
+            Job::Band { top, height } => self
+                .converse(ToChild::Band { top, height })
+                .map(|page| Answer::Rendered(Box::new(page))),
+            Job::Find(query) => self.ask(&ToChild::Find { query }),
+        };
+        outcome.unwrap_or_else(Answer::Failed)
     }
 
     fn send(&mut self, message: &ToChild) -> Result<(), Error> {
@@ -438,6 +659,18 @@ impl Session {
         read_frame(stdout)
     }
 
+    /// One question, one answer, no resource requests in between.
+    fn ask(&mut self, request: &ToChild) -> Result<Answer, Error> {
+        self.send(request)?;
+        let frame = self.read()?;
+        match ToParent::decode(&frame)? {
+            ToParent::Matches { rects } => Ok(Answer::Matches(rects)),
+            ToParent::Rendered(page) => Ok(Answer::Rendered(page)),
+            ToParent::Failed { message } => Err(Error::Render(message)),
+            ToParent::Fetch { .. } => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
     fn converse(&mut self, request: ToChild) -> Result<Rendered, Error> {
         self.send(&request)?;
 
@@ -447,9 +680,9 @@ impl Session {
             // Checked between messages rather than during a read. A child that
             // is silently spinning is caught the moment it next speaks or its
             // pipe closes; one that is spinning *and* silent is caught by the
-            // caller's own deadline. Interrupting a blocked read needs either a
-            // thread per child or platform-specific polling, and neither buys
-            // enough to be worth the complexity here.
+            // caller's own deadline. Interrupting a blocked read needs
+            // platform-specific polling, and now that the conversation is on a
+            // thread of its own a stuck one no longer takes the window with it.
             if started.elapsed() > self.timeout {
                 return Err(Error::Render(format!(
                     "the page took longer than {}s to render",
@@ -503,14 +736,28 @@ impl Session {
     }
 }
 
-impl Drop for Session {
+impl Drop for Conversation {
     fn drop(&mut self) {
-        // Unconditional, including after a clean render. A renderer whose page
-        // is gone has nothing left to do, and one that is wedged must not
-        // outlive the tab that started it.
+        // The worker owns the child, so this is where it dies — when the
+        // channel closes because the `Session` handle was dropped. Unconditional,
+        // including after a clean render: a renderer whose page is gone has
+        // nothing left to do, and one that is wedged must not outlive the tab
+        // that started it.
         self.child.kill();
     }
 }
+
+/// The worker moves a spawned child onto a thread, so it has to be able to go.
+///
+/// Asserted rather than assumed because half of it is a dependency's type on
+/// Windows: `Contained` holds `rappct`'s handles, and if a future version made
+/// one of them thread-bound this would stop compiling instead of quietly
+/// forcing the conversation back onto the caller's thread.
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<Spawned>();
+    is_send::<Fetcher>();
+};
 
 #[cfg(test)]
 mod tests {

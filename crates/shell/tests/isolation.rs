@@ -858,3 +858,93 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
     assert_eq!(band.title, whole.title);
     assert_eq!(band.can_toggle_layout, whole.can_toggle_layout);
 }
+
+/// A tall page in a live session, for the band tests.
+fn tall_session(lines: usize, width: u32) -> (sandbox::Session, sandbox::Rendered) {
+    let html = format!(
+        "<body bgcolor=\"#eef\">{}</body>",
+        (0..lines)
+            .map(|n| format!("<p>line {n} with some words on it</p>"))
+            .collect::<String>()
+    );
+    let dir = std::env::temp_dir().join("2kbrowser-band-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall.html");
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")))
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            width,
+            0,
+            8000,
+            Some(origin),
+            at,
+            false,
+        )
+        .expect("the renderer opens the page")
+}
+
+#[test]
+fn a_band_asked_for_speculatively_arrives_without_being_waited_on() {
+    // The point of putting the conversation on a thread. A reader approaching
+    // the edge of what has been painted should not have to stop there, so the
+    // rows ahead are asked for while the window carries on drawing — which
+    // only works if asking does not block and arriving is announced.
+    let (mut session, whole) = tall_session(120, 300);
+
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&woken);
+    session.set_wake(Box::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    session.request_band(200, 150).expect("asks");
+    assert!(session.band_outstanding(), "the band should be in flight");
+
+    let band = loop {
+        if let Some(band) = session.take_band() {
+            break band.expect("the band paints");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(band.top, 200);
+    assert!(
+        !session.band_outstanding(),
+        "nothing should be left in flight"
+    );
+    assert!(
+        woken.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the wake callback never fired, so a window would never redraw"
+    );
+
+    let stride = (whole.width * 4) as usize;
+    for n in 0..band.height {
+        let from_band = &band.pixels[n as usize * stride..(n as usize + 1) * stride];
+        let document_row = (200 + n) as usize;
+        let from_whole = &whole.pixels[document_row * stride..(document_row + 1) * stride];
+        assert_eq!(from_band, from_whole, "row {n} of the band");
+    }
+}
+
+#[test]
+fn a_blocking_question_does_not_swallow_a_band_in_flight() {
+    // Answers come back in the order they were asked for, so waiting for a find
+    // means reading past the band that was asked for first. Dropping it there
+    // would leave the window waiting for pixels that already came and went —
+    // and it would happen exactly when the reader is scrolling *and* searching,
+    // which is not a rare combination.
+    let (mut session, _) = tall_session(120, 300);
+
+    session.request_band(300, 120).expect("asks for a band");
+    let matches = session.find("line 7").expect("the child answers");
+    assert!(!matches.is_empty(), "the fixture should contain the query");
+
+    let band = session
+        .take_band()
+        .expect("the band asked for before the find was kept")
+        .expect("the band paints");
+    assert_eq!(band.top, 300);
+}
