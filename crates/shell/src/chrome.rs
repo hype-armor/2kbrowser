@@ -175,6 +175,8 @@ pub struct State<'a> {
     pub finding: Option<(&'a crate::field::Field, usize, usize)>,
     /// Whether this page is in the saved list.
     pub saved: bool,
+    /// Whether the certificate chain verified only against a local root.
+    pub local_root: bool,
 }
 
 /// A control in the bar.
@@ -303,6 +305,13 @@ pub fn scheme_notice(url: &str) -> Option<&'static str> {
 pub fn status(state: &State<'_>) -> Option<String> {
     if let Some(error) = state.error {
         return Some(error.to_owned());
+    }
+    // Above the rendering mode. Who can read this connection outranks how the
+    // page was laid out, and unlike the scheme notice it applies whichever mode
+    // the page ended up in — an intercepted page rendered as a document is
+    // still intercepted.
+    if state.local_root {
+        return Some("local certificate — readable in transit".to_owned());
     }
     match state.mode {
         RenderMode::Authored => scheme_notice(state.url).map(str::to_owned),
@@ -506,7 +515,21 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     );
 
     if let Some(text) = &status {
-        let color = if state.error.is_some() || !matches!(state.mode, RenderMode::Authored) {
+        // Grey for the quiet facts, amber for the ones that contradict what the
+        // rest of the screen implies.
+        //
+        // Plain HTTP is grey on purpose: it is already visible in the URL, and
+        // a browser that shouts about it teaches people to ignore the shouting.
+        // An intercepted connection is the opposite case — the URL says
+        // `https://`, which actively suggests privacy, so a grey note would be
+        // competing with the padlock-shaped intuition rather than correcting
+        // it. Same reasoning ADR-0013 used to refuse marked TLS downgrades,
+        // applied to the one place a marking can still work: here the reader
+        // learns something the address bar was implying the opposite of.
+        let color = if state.error.is_some()
+            || state.local_root
+            || !matches!(state.mode, RenderMode::Authored)
+        {
             NOTICE
         } else {
             DIM
@@ -723,7 +746,39 @@ mod tests {
             editing: None,
             finding: None,
             saved: false,
+            local_root: false,
         }
+    }
+
+    #[test]
+    fn a_connection_verified_only_by_a_local_root_says_so() {
+        // The marking ADR-0015 exists for. Trusting this computer's own roots
+        // is what makes the browser usable behind an intercepting proxy;
+        // trusting them *silently* would make an intercepted page and an
+        // ordinary one look identical, which is the thing this project marks
+        // everywhere else.
+        let mut plain = state("https://example.com/a.html", &RenderMode::Authored);
+        assert_eq!(status(&plain), None, "an ordinary page says nothing");
+        plain.local_root = true;
+        let said = status(&plain).expect("says something");
+        assert!(said.contains("local certificate"), "{said}");
+
+        // Whichever mode the page ended up in: an intercepted page rendered as
+        // a document is still intercepted.
+        let document = RenderMode::Document {
+            unsupported_share: 1.0,
+        };
+        let mut fallen_back = state("https://example.com/a.html", &document);
+        fallen_back.local_root = true;
+        assert!(
+            status(&fallen_back)
+                .expect("says something")
+                .contains("local certificate")
+        );
+
+        // Below an error, which is about whether the page loaded at all.
+        fallen_back.error = Some("server returned 500");
+        assert_eq!(status(&fallen_back).as_deref(), Some("server returned 500"));
     }
 
     #[test]

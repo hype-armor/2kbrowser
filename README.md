@@ -157,9 +157,12 @@ old sites that offer nothing newer do not load, and that is the intended
 outcome. The bar says so in those words rather than showing a network error: a
 refusal nobody can recognise is indistinguishable from a bug, and a bad
 certificate says something different again, because the two mean opposite
-things. There is no relaxed-certificate escape hatch. Roots come from Mozilla
-rather than the platform, so a corporate root in the system store cannot quietly
-read this browser's traffic. All of it is asserted in tests rather than
+things. There is no relaxed-certificate escape hatch. Certificates are
+checked against Mozilla's roots first; a chain nobody public signed is retried
+against this computer's own trust store and, if that works, the bar says
+"local certificate — readable in transit" for as long as the page is up
+(ADR-0015). That is what makes the browser usable behind an intercepting proxy
+without making an intercepted page look like an ordinary one. All of it is asserted in tests rather than
 inherited from a library default, because "happens to be true" does not survive
 a dependency bump.
 

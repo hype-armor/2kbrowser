@@ -20,3 +20,4 @@ that ADRs are superseded rather than edited.
 | [0012](0012-process-isolation.md) | Render in a separate process | accepted |
 | [0013](0013-modern-security-only.md) | Period engine, present-day security | accepted |
 | [0014](0014-appcontainer-through-a-dependency.md) | The Windows sandbox comes through a dependency | accepted |
+| [0015](0015-local-roots-marked.md) | Accept this computer's roots, and say when they were needed | accepted |

@@ -32,6 +32,15 @@
 //! 1.0. It can also be told to skip certificate verification entirely. Both are
 //! one line away by default, so both are asserted here.
 //!
+//! # Whose roots
+//!
+//! Mozilla's, first and by default. Then — and only when nothing in that store
+//! signed the chain — this computer's own, with the result marked in the chrome
+//! for as long as the page is on screen (ADR-0015). That second attempt exists
+//! because refusing every chain a proxy signed did not make anyone safer: it
+//! made the browser unusable on a corporate network, and an unusable browser is
+//! one people close.
+//!
 //! Nothing in this file relaxes anything. If a future change wants to, it has
 //! to edit these tests, which is a reviewable diff rather than a quiet default.
 
@@ -48,6 +57,21 @@ pub fn agent() -> Agent {
         // Redirects are followed, but a redirect chain is also a way to make a
         // browser walk somewhere it was never pointed at. A handful is every
         // legitimate use.
+        .max_redirects(8)
+        .build()
+        .into()
+}
+
+/// An agent that will also accept this computer's own trust store.
+///
+/// Never used first. A request goes out against Mozilla's roots, and only a
+/// refusal of the specific shape "nothing I trust signed this" is retried here
+/// — see [`crate::FetchError::LocalRoot`] and ADR-0015. Everything else about
+/// the posture is identical, including that certificates are still *verified*:
+/// this widens who may sign, not whether anyone need bother.
+pub fn platform_agent() -> Agent {
+    Agent::config_builder()
+        .tls_config(platform_tls_config())
         .max_redirects(8)
         .build()
         .into()
@@ -72,6 +96,20 @@ pub fn tls_config() -> TlsConfig {
         .build()
 }
 
+/// The same, checked against this computer's trust store instead.
+///
+/// The *only* difference is where the roots come from. Verification is still
+/// on, legacy versions are still absent, and the provider is still rustls — a
+/// connection that gets here is not a connection with the checks turned off,
+/// it is one checked against a different set of signers.
+pub fn platform_tls_config() -> TlsConfig {
+    TlsConfig::builder()
+        .provider(TlsProvider::Rustls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .disable_verification(false)
+        .build()
+}
+
 /// Why a secure connection could not be established.
 ///
 /// ADR-0013 decided that legacy TLS is refused rather than downgraded to. That
@@ -83,7 +121,15 @@ pub fn tls_config() -> TlsConfig {
 pub enum Handshake {
     /// The server offered no protocol version this browser accepts.
     LegacyVersion,
-    /// The certificate did not check out.
+    /// Nothing in the trust store signed this chain.
+    ///
+    /// Kept apart from the rest because it is the one certificate failure that
+    /// is *routinely* not the site's fault: it is what a network doing TLS
+    /// interception looks like, and what a private certificate authority looks
+    /// like. It is also the only one worth retrying against this computer's own
+    /// trust store — an expired certificate is expired whoever signed it.
+    UntrustedRoot,
+    /// The certificate did not check out for some other reason.
     Certificate(String),
 }
 
@@ -106,6 +152,9 @@ pub fn classify(error: &ureq::Error) -> Option<Handshake> {
         // rustls' own conclusion that there is no common ground — a server that
         // never offers a version it can use, rather than one that objects.
         rustls::Error::PeerIncompatible(_) => Some(Handshake::LegacyVersion),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer) => {
+            Some(Handshake::UntrustedRoot)
+        }
         rustls::Error::InvalidCertificate(reason) => {
             Some(Handshake::Certificate(format!("{reason:?}")))
         }
@@ -116,6 +165,17 @@ pub fn classify(error: &ureq::Error) -> Option<Handshake> {
         // a wrong explanation.
         _ => None,
     }
+}
+
+/// Whether a failed attempt is worth retrying against this computer's roots.
+///
+/// Exactly one shape of failure, and the narrowness is the point (ADR-0015). An
+/// expired certificate is expired whoever signed it; a certificate for the
+/// wrong name is for the wrong name. Retrying either against a wider set of
+/// signers would be looking for someone willing to say yes, which is not what
+/// this is for.
+pub fn worth_local_retry(error: &ureq::Error) -> bool {
+    matches!(classify(error), Some(Handshake::UntrustedRoot))
 }
 
 #[cfg(test)]
@@ -138,6 +198,45 @@ mod tests {
             ))),
             Some(Handshake::LegacyVersion)
         );
+    }
+
+    #[test]
+    fn only_an_untrusted_root_is_retried_against_this_computer() {
+        // The narrowness ADR-0015 depends on. Widening who may sign is
+        // defensible for a chain nobody public vouched for; doing it because a
+        // certificate expired would be shopping for a signer willing to agree.
+        assert!(worth_local_retry(&as_ureq(
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+        )));
+
+        for settled in [
+            rustls::CertificateError::Expired,
+            rustls::CertificateError::NotValidForName,
+            rustls::CertificateError::Revoked,
+        ] {
+            assert!(
+                !worth_local_retry(&as_ureq(rustls::Error::InvalidCertificate(settled.clone()))),
+                "{settled:?} should be final"
+            );
+        }
+        // And a site that is simply too old is not a trust question at all.
+        assert!(!worth_local_retry(&as_ureq(rustls::Error::AlertReceived(
+            rustls::AlertDescription::ProtocolVersion
+        ))));
+        assert!(!worth_local_retry(&ureq::Error::ConnectionFailed));
+    }
+
+    #[test]
+    fn the_local_root_agent_still_verifies_everything_else() {
+        // The second attempt widens *who may sign* and nothing else. If it ever
+        // came to mean "and skip the checks", this is the test that says so.
+        assert!(!platform_tls_config().disable_verification());
+        assert_eq!(platform_tls_config().provider(), TlsProvider::Rustls);
+        assert!(matches!(
+            platform_tls_config().root_certs(),
+            RootCerts::PlatformVerifier
+        ));
+        assert!(!agent().config().tls_config().disable_verification());
     }
 
     #[test]
@@ -194,11 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn the_roots_are_mozillas_rather_than_the_platforms() {
-        // Same reasoning as ADR-0005 applies to rendering: the same input
-        // should behave the same on all three platforms. It also means a
-        // corporate root installed in the system store cannot quietly
-        // intercept this browser.
+    fn the_roots_tried_first_are_mozillas_rather_than_the_platforms() {
+        // Still first, and still the default. ADR-0015 added a second attempt
+        // against this computer's own roots; it did not make them the starting
+        // point. A site that verifies publicly must never take the other path,
+        // or the marking would appear on pages nothing is intercepting.
         assert!(matches!(tls_config().root_certs(), RootCerts::WebPki));
     }
 

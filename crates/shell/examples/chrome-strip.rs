@@ -45,6 +45,7 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "http://example.org/an-old-page.html",
@@ -57,6 +58,22 @@ fn main() {
             editing: None,
             finding: None,
             saved: true,
+            local_root: false,
+        },
+        // A connection an intercepting proxy signed. Marked, because trusting
+        // this computer's roots silently would make it look ordinary.
+        chrome::State {
+            url: "https://example.com/behind-a-proxy.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: None,
+            saved: false,
+            local_root: true,
         },
         chrome::State {
             url: "file:///home/user/pages/index.html",
@@ -69,6 +86,7 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/something-modern",
@@ -81,6 +99,7 @@ fn main() {
             editing: None,
             finding: None,
             saved: true,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/app",
@@ -93,6 +112,7 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/gone.html",
@@ -105,6 +125,7 @@ fn main() {
             editing: None,
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/a-page.html",
@@ -117,6 +138,7 @@ fn main() {
             editing: Some(&selected),
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/",
@@ -129,6 +151,7 @@ fn main() {
             editing: Some(&typing),
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -141,6 +164,7 @@ fn main() {
             editing: Some(&partial),
             finding: None,
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -153,6 +177,7 @@ fn main() {
             editing: None,
             finding: Some((&searching, 2, 7)),
             saved: false,
+            local_root: false,
         },
         chrome::State {
             url: "https://example.com/index.html",
@@ -165,6 +190,7 @@ fn main() {
             editing: None,
             finding: Some((&fruitless, 0, 0)),
             saved: false,
+            local_root: false,
         },
     ];
 

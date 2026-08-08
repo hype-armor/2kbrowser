@@ -158,6 +158,12 @@ struct Tab {
     forcing_authored: bool,
     /// Whether this page had a fallback decision to overrule.
     can_toggle_layout: bool,
+    /// Whether this page's certificate verified only against a local root.
+    ///
+    /// A property of the connection that fetched it, so it is remembered per
+    /// tab rather than recomputed: the page is on screen long after the
+    /// handshake is over.
+    local_root: bool,
     /// The find field when find-in-page is open in this tab.
     finding: Option<crate::field::Field>,
     /// Where the current query matches, in canvas coordinates.
@@ -187,6 +193,7 @@ impl Tab {
             error: None,
             forcing_authored: false,
             can_toggle_layout: false,
+            local_root: false,
             finding: None,
             matches: Vec::new(),
             current_match: 0,
@@ -412,12 +419,13 @@ impl App {
             .fetcher
             .fetch_raw(url, None, net::RequestKind::Navigation)
         {
-            Ok((body, content_type, origin, path)) => {
+            Ok(fetched) => {
+                self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
-                    body,
-                    content_type,
-                    origin,
-                    path,
+                    body: fetched.body,
+                    content_type: fetched.content_type,
+                    origin: fetched.origin,
+                    path: fetched.path,
                 };
                 // A fresh document means a fresh renderer: the old child holds
                 // the page that just left, and dropping it kills that process.
@@ -498,6 +506,7 @@ impl App {
                     .as_ref()
                     .map(|field| (field, tab.current_match, tab.matches.len())),
                 saved: bookmarks.contains(tab.history.current()),
+                local_root: tab.local_root,
             },
             size.0,
             fonts,
@@ -540,14 +549,17 @@ impl App {
             .fetcher
             .fetch_raw(url, None, net::RequestKind::Navigation)
         {
-            Ok((body, content_type, origin, path)) => {
+            Ok(fetched) => {
+                let local_root = fetched.trust == net::Trust::LocalRoot;
                 let loaded = Loaded {
-                    body,
-                    content_type,
-                    origin,
-                    path,
+                    body: fetched.body,
+                    content_type: fetched.content_type,
+                    origin: fetched.origin,
+                    path: fetched.path,
                 };
-                self.tabs.open(Tab::new(loaded, url.to_owned()));
+                let mut tab = Tab::new(loaded, url.to_owned());
+                tab.local_root = local_root;
+                self.tabs.open(tab);
             }
             Err(error) => {
                 // A tab that failed still opens, showing nothing and saying
@@ -924,6 +936,7 @@ impl App {
                     .as_ref()
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
                 saved: self.bookmarks.contains(self.tab().history.current()),
+                local_root: self.tab().local_root,
             },
             self.size.0 as f32,
             self.pointer.0,

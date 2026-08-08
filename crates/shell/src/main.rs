@@ -303,15 +303,24 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
 fn load_from(input: &str) -> Result<(shell::viewport::Document, String), String> {
     let fetcher = net::Fetcher::default();
     let url = absolute_url(input)?;
-    let (body, content_type, origin, path) = fetcher
+    let fetched = fetcher
         .fetch_raw(&url, None, net::RequestKind::Navigation)
         .map_err(|error| format!("{url}: {error}"))?;
+    if fetched.trust == net::Trust::LocalRoot {
+        // ADR-0015: usable behind an intercepting proxy, and never quiet about
+        // it. The window marks this in the bar; the command line has only
+        // stderr to say it in.
+        eprintln!(
+            "2kbrowser: {url}: verified only by a certificate this computer trusts — \
+             something on this network can read it"
+        );
+    }
     Ok((
         shell::viewport::Document {
-            body,
-            content_type,
-            origin,
-            path,
+            body: fetched.body,
+            content_type: fetched.content_type,
+            origin: fetched.origin,
+            path: fetched.path,
         },
         url,
     ))
