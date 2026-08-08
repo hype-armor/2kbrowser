@@ -295,6 +295,27 @@ pub fn rasterise(
     width: u32,
     height: u32,
 ) -> Option<Pixmap> {
+    rasterise_band(list, fonts, images, width, 0.0, height)
+}
+
+/// Rasterises the rows `[top, top + height)` of a document.
+///
+/// The display list is in document coordinates and does not change between
+/// bands — it is built once from the layout, and drawing a band is a matter of
+/// where the rows are taken from. That is what makes a band cheap: no parse, no
+/// cascade, no layout, just paint.
+///
+/// Items are shifted by `top` as they are drawn rather than the list being
+/// rewritten, so nothing is allocated per band and the drawable-range check
+/// still sees the coordinate that actually reaches the rasteriser.
+pub fn rasterise_band(
+    list: &DisplayList,
+    fonts: &mut FontStore,
+    images: &ImageStore,
+    width: u32,
+    top: f32,
+    height: u32,
+) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
     // Clearing to the canvas colour rather than white is what carries the
     // page's background down past the end of its content.
@@ -307,13 +328,18 @@ pub fn rasterise(
     if let Some((node, repeat)) = list.canvas_image
         && let Some(image) = images.get(&ImageKey::background(node))
     {
+        // Anchored at the top of the *document*, not of the band, or the tiling
+        // phase would jump every time the band moved.
         let full = Rect {
             x: 0.0,
             y: 0.0,
             width: pixmap.width() as f32,
-            height: pixmap.height() as f32,
+            height: top + pixmap.height() as f32,
         };
-        tile_image(&mut pixmap, image, &full, repeat);
+        if let Some(slice) = tiled_band(&full, image.height(), repeat, top, pixmap.height() as f32)
+        {
+            tile_image(&mut pixmap, image, &shifted(&slice, top), repeat);
+        }
     }
 
     for item in &list.items {
@@ -322,22 +348,28 @@ pub fn rasterise(
         // place the check has to be.
         match item {
             DisplayItem::Rect { rect, color } => {
-                if drawable(rect) {
-                    fill_rect(&mut pixmap, rect, *color);
+                let rect = shifted(rect, top);
+                if drawable(&rect) {
+                    fill_rect(&mut pixmap, &rect, *color);
                 }
             }
             DisplayItem::Image { node, rect } => {
-                if drawable(rect)
+                let rect = shifted(rect, top);
+                if drawable(&rect)
                     && let Some(image) = images.get(&ImageKey::content(*node))
                 {
-                    draw_image(&mut pixmap, image, rect);
+                    draw_image(&mut pixmap, image, &rect);
                 }
             }
             DisplayItem::Tile { node, rect, repeat } => {
-                if drawable(rect)
-                    && let Some(image) = images.get(&ImageKey::background(*node))
+                if let Some(image) = images.get(&ImageKey::background(*node))
+                    && let Some(slice) =
+                        tiled_band(rect, image.height(), *repeat, top, pixmap.height() as f32)
                 {
-                    tile_image(&mut pixmap, image, rect, *repeat);
+                    let slice = shifted(&slice, top);
+                    if drawable(&slice) {
+                        tile_image(&mut pixmap, image, &slice, *repeat);
+                    }
                 }
             }
             DisplayItem::Glyph {
@@ -346,13 +378,68 @@ pub fn rasterise(
                 origin_y,
                 color,
             } => {
-                if in_range(*origin_x) && in_range(*origin_y) {
-                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, *origin_y, *color);
+                let origin_y = *origin_y - top;
+                if in_range(*origin_x) && in_range(origin_y) {
+                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, origin_y, *color);
                 }
             }
         }
     }
     Some(pixmap)
+}
+
+/// The same rectangle, moved into a band's coordinates.
+fn shifted(rect: &Rect, top: f32) -> Rect {
+    Rect {
+        y: rect.y - top,
+        ..*rect
+    }
+}
+
+/// The part of a tiled rectangle a band needs, still in document coordinates.
+///
+/// Two things have to survive being cut down to a band. The *phase* — where the
+/// tile boundaries fall — belongs to the element's own box, so the slice starts
+/// at a whole number of tiles below the box's top rather than wherever the band
+/// happens to begin. And the *cost*: `tile_image` steps one image at a time, so
+/// handing it a rectangle as tall as the document is how a 1-pixel tile on a
+/// long page becomes millions of draws. Clipping to the band bounds that by the
+/// band's height however tall the element is.
+///
+/// Only when the background actually repeats downwards. A tile drawn once sits
+/// at the top of its box, and moving that origin to a tile boundary would move
+/// the tile.
+fn tiled_band(
+    rect: &Rect,
+    tile_height: f32,
+    repeat: css::style::BackgroundRepeat,
+    top: f32,
+    band_height: f32,
+) -> Option<Rect> {
+    let (_, tiles_down) = repeat.axes();
+    if !tiles_down || tile_height <= 0.0 || !tile_height.is_finite() {
+        return Some(*rect);
+    }
+    let (band_top, band_bottom) = (top, top + band_height);
+    let (box_top, box_bottom) = (rect.y, rect.y + rect.height);
+    let visible_top = box_top.max(band_top);
+    let visible_bottom = box_bottom.min(band_bottom);
+    if visible_bottom <= visible_top {
+        return None;
+    }
+    // Down to the tile boundary at or above the first visible row, so the
+    // pattern lands where it would have without banding.
+    let whole_tiles = ((visible_top - box_top) / tile_height).floor();
+    if !whole_tiles.is_finite() {
+        return Some(*rect);
+    }
+    let start = box_top + whole_tiles * tile_height;
+    Some(Rect {
+        x: rect.x,
+        y: start,
+        width: rect.width,
+        height: visible_bottom - start,
+    })
 }
 
 /// Furthest from the canvas a coordinate may be and still be worth drawing.
@@ -520,42 +607,70 @@ fn draw_glyph(
         return;
     };
 
-    // The shaper gives 8-bit coverage; colour is applied here. Premultiplied,
-    // because that is what tiny-skia composites in.
-    let mut glyph_pixmap = match Pixmap::new(width as u32, height as u32) {
-        Some(pixmap) => pixmap,
-        None => return,
-    };
-    for (index, pixel) in glyph_pixmap.pixels_mut().iter_mut().enumerate() {
-        let alpha = u32::from(coverage[index]) * u32::from(color.a) / 255;
-        let scale = |channel: u8| (u32::from(channel) * alpha / 255) as u8;
-        *pixel = tiny_skia::PremultipliedColorU8::from_rgba(
-            scale(color.r),
-            scale(color.g),
-            scale(color.b),
-            alpha as u8,
-        )
-        .unwrap_or_else(|| {
-            tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent")
-        });
-    }
-
-    // Checked rather than trusted even after the range guard above: `left`,
-    // `top`, and the bitmap's own size come from the rasteriser rather than
-    // from us, and what tiny-skia actually panics on is `x + width` leaving
-    // `i32` — so that is the sum to prove cannot.
-    let (Some(x), Some(y)) = ((x as i32).checked_add(left), (y as i32).checked_sub(top)) else {
-        return;
-    };
-    let (Some(_), Some(_)) = (
-        i32::try_from(width).ok().and_then(|w| x.checked_add(w)),
-        i32::try_from(height).ok().and_then(|h| y.checked_add(h)),
+    // `floor`, not a cast. A cast truncates toward zero, so -0.5 becomes 0
+    // while -1.5 becomes -1 — the rounding changes direction at zero. Nothing
+    // noticed while every canvas began at document row 0; a band's coordinates
+    // go negative above it.
+    //
+    // Checked rather than trusted: `left` and `top` come from the rasteriser
+    // rather than from us.
+    let (Some(x), Some(y)) = (
+        (x.floor() as i32).checked_add(left),
+        (y.floor() as i32).checked_sub(top),
     ) else {
         return;
     };
+
+    // The part of the glyph that lands on this canvas, cropped out of the
+    // coverage buffer rather than drawn at a negative offset and left to the
+    // rasteriser to clip.
+    //
+    // That distinction is not pedantry. `draw_pixmap` fills a rectangle with
+    // the bitmap as a *pattern*, and a pattern sampled outside its bounds pads
+    // with its edge — so a glyph straddling the top of a band came out with a
+    // duplicated row, and a band was not the rows it claimed. Cropping here
+    // means every draw lands at a non-negative offset and no sampling happens
+    // outside the bitmap at all.
+    let (glyph_width, glyph_height) = (width as i32, height as i32);
+    let (canvas_width, canvas_height) = (pixmap.width() as i32, pixmap.height() as i32);
+    let from_x = (-x).max(0);
+    let from_y = (-y).max(0);
+    let to_x = (canvas_width - x).min(glyph_width);
+    let to_y = (canvas_height - y).min(glyph_height);
+    if to_x <= from_x || to_y <= from_y {
+        return;
+    }
+    let (visible_width, visible_height) = ((to_x - from_x) as u32, (to_y - from_y) as u32);
+
+    // The shaper gives 8-bit coverage; colour is applied here. Premultiplied,
+    // because that is what tiny-skia composites in.
+    let mut glyph_pixmap = match Pixmap::new(visible_width, visible_height) {
+        Some(pixmap) => pixmap,
+        None => return,
+    };
+    let transparent =
+        tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent is valid");
+    for row in 0..visible_height {
+        for column in 0..visible_width {
+            let source =
+                (from_y as usize + row as usize) * width + from_x as usize + column as usize;
+            let alpha =
+                u32::from(coverage.get(source).copied().unwrap_or(0)) * u32::from(color.a) / 255;
+            let scale = |channel: u8| (u32::from(channel) * alpha / 255) as u8;
+            glyph_pixmap.pixels_mut()[(row * visible_width + column) as usize] =
+                tiny_skia::PremultipliedColorU8::from_rgba(
+                    scale(color.r),
+                    scale(color.g),
+                    scale(color.b),
+                    alpha as u8,
+                )
+                .unwrap_or(transparent);
+        }
+    }
+
     pixmap.draw_pixmap(
-        x,
-        y,
+        x + from_x,
+        y + from_y,
         glyph_pixmap.as_ref(),
         &PixmapPaint::default(),
         Transform::identity(),
@@ -579,6 +694,70 @@ mod tests {
         let height = layout.height.ceil().max(1.0) as u32;
         let images = ImageStore::new();
         rasterise(&list, &mut fonts, &images, width, height).expect("pixmap")
+    }
+
+    /// The display list, images, and height for a page, so a test can rasterise
+    /// it whole and in pieces and compare.
+    fn scene(html: &str, css_text: &str, width: u32) -> (DisplayList, FontStore, u32) {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css_text)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        let sizes = layout::IntrinsicSizes::new();
+        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
+        let height = layout.height.ceil().max(1.0) as u32;
+        (build_display_list(&layout), fonts, height)
+    }
+
+    #[test]
+    fn a_band_is_exactly_the_rows_it_names_from_the_whole_page() {
+        // The property banded rendering rests on, and the reason it is safe to
+        // stop rendering whole documents: a reader scrolling through bands must
+        // see the same pixels they would have seen from one canvas. Anything
+        // less and the fix for long pages is a rendering change in disguise.
+        //
+        // The fixture is chosen for the things that could go wrong rather than
+        // for looking like a page: a tiled background whose phase must not jump
+        // between bands, borders that straddle band edges, and enough text that
+        // glyphs land in every band.
+        let html = "<body><div class=tiled><p>one</p><p>two</p><p>three</p>\
+             <p>four</p><p>five</p><p>six</p><p>seven</p><p>eight</p></div></body>";
+        let css_text = "body { background: #eef; margin: 0 }
+             .tiled { border: 3px solid #333; padding: 7px }
+             p { margin: 9px 0; border-bottom: 1px solid #999 }";
+        let width = 120;
+
+        let (list, mut fonts, height) = scene(html, css_text, width);
+        assert!(height > 60, "the fixture is too short to band: {height}");
+        let images = ImageStore::new();
+        let whole = rasterise(&list, &mut fonts, &images, width, height).expect("whole page");
+
+        // Band heights that do and do not divide the page, and a band running
+        // off the bottom, because the last band of a real page always does.
+        for band_height in [7u32, 16, 23] {
+            let mut top = 0u32;
+            while top < height {
+                let band =
+                    rasterise_band(&list, &mut fonts, &images, width, top as f32, band_height)
+                        .expect("band");
+                for row in 0..band_height {
+                    let document_row = top + row;
+                    if document_row >= height {
+                        break;
+                    }
+                    let from_band =
+                        &band.pixels()[(row * width) as usize..((row + 1) * width) as usize];
+                    let from_whole = &whole.pixels()
+                        [(document_row * width) as usize..((document_row + 1) * width) as usize];
+                    assert_eq!(
+                        from_band, from_whole,
+                        "band of {band_height} at {top}: row {row} is not document row \
+                         {document_row}"
+                    );
+                }
+                top += band_height;
+            }
+        }
     }
 
     fn count_non_white(pixmap: &Pixmap) -> usize {
