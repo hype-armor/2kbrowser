@@ -11,8 +11,15 @@ license = "GPL-3.0-or-later"
 #
 # `unsafe_code = "forbid"` is deliberate and load-bearing: this program's entire
 # job is parsing hostile bytes from the open internet. `forbid` cannot be
-# overridden by an `#[allow]` in source, so relaxing it requires editing this
-# file — a reviewable diff rather than a quiet local exception. See ADR-0002.
+# overridden by an `#[allow]` in source, so relaxing it requires editing a
+# manifest — a reviewable diff rather than a quiet local exception. See
+# ADR-0002.
+#
+# Exactly one crate does not inherit these: `crates/seatbelt`, which holds the
+# single foreign call that confines the renderer on macOS (ADR-0017). It is a
+# page long, contains no policy and no parsing, and
+# `crates/seatbelt/tests/quarantine.rs` fails if a second crate opts out or if
+# that one grows. Adding another exception is an ADR, not a manifest edit.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

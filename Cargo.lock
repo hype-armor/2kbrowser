@@ -1837,6 +1837,7 @@ dependencies = [
  "libc",
  "net",
  "rappct",
+ "seatbelt",
  "seccompiler",
 ]
 
@@ -1873,6 +1874,10 @@ dependencies = [
  "smithay-client-toolkit",
  "tiny-skia",
 ]
+
+[[package]]
+name = "seatbelt"
+version = "0.0.0"
 
 [[package]]
 name = "seccompiler"

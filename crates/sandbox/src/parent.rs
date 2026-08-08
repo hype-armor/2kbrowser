@@ -175,6 +175,8 @@ impl Renderer {
         // own failure — the parent cannot see it from here.
         let (confinement, failure) = if cfg!(target_os = "linux") {
             (Confinement::Seccomp, None)
+        } else if cfg!(target_os = "macos") {
+            (Confinement::AppSandbox, None)
         } else {
             (Confinement::Unavailable, None)
         };

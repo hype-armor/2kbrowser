@@ -23,6 +23,13 @@ seccompiler = "0.5"
 [target.'cfg(target_os = "windows")'.dependencies]
 rappct = "=0.13.3"
 
+# The App Sandbox half (ADR-0017), and the exception to the pattern above: the
+# other two platforms had a crate holding the `unsafe` for us, and macOS has
+# none — `sandbox_init` has no safe wrapper on crates.io. So this one is ours,
+# quarantined to a page of code in the only crate here that may write `unsafe`.
+[target.'cfg(target_os = "macos")'.dependencies]
+seatbelt = { path = "../seatbelt" }
+
 
 [lints]
 workspace = true

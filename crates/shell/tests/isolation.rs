@@ -453,6 +453,8 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
 
     let expected = if cfg!(target_os = "windows") {
         "confinement=AppContainer"
+    } else if cfg!(target_os = "macos") {
+        "confinement=AppSandbox"
     } else {
         "confinement=Seccomp"
     };

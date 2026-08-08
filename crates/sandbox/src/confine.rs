@@ -84,11 +84,15 @@
 //! filesystem access is denied at the syscall level instead, which covers
 //! opening but not every path to a file descriptor.
 //!
-//! macOS has an equivalent (the App Sandbox) and it is not implemented. It is
-//! *not* stubbed out to look done: [`Confinement::Unavailable`] is what is
-//! reported there, and the README says which platforms are actually confined. A
-//! sandbox that claims to work and does not is worse than one that says it is
-//! missing.
+//! macOS *is* self-restriction, like Linux: `sandbox_init` applies a profile to
+//! the calling process and cannot be undone. So [`apply`] does the work here
+//! too, and the profile it applies lives in this file with the other two
+//! platforms' policy. What does not live here is the call, which is C and needs
+//! `unsafe`: that is [`seatbelt`], the one crate in this workspace exempt from
+//! ADR-0002, kept to a page so the exception stays as small as the argument for
+//! it ([ADR-0017]).
+//!
+//! [ADR-0017]: ../../../docs/adr/0017-one-unsafe-crate-for-macos.md
 
 /// What confinement was actually applied.
 ///
@@ -100,6 +104,8 @@ pub enum Confinement {
     Seccomp,
     /// The renderer is running in an AppContainer with no capabilities.
     AppContainer,
+    /// A macOS sandbox profile denying everything is in force.
+    AppSandbox,
     /// This platform has no implementation here yet.
     Unavailable,
     /// The platform has one and it could not be installed.
@@ -113,7 +119,10 @@ pub enum Confinement {
 impl Confinement {
     /// Whether the renderer is actually confined.
     pub fn is_confined(self) -> bool {
-        matches!(self, Confinement::Seccomp | Confinement::AppContainer)
+        matches!(
+            self,
+            Confinement::Seccomp | Confinement::AppContainer | Confinement::AppSandbox
+        )
     }
 
     /// A phrase for a log line or a status message.
@@ -125,6 +134,9 @@ impl Confinement {
             }
             Confinement::AppContainer => {
                 "confined: an AppContainer with no capabilities — no network, no filesystem"
+            }
+            Confinement::AppSandbox => {
+                "confined: a sandbox profile denying everything — no network, no filesystem"
             }
             Confinement::Unavailable => "NOT confined: no sandbox is implemented on this platform",
             Confinement::Failed => "NOT confined: the sandbox could not be installed",
@@ -437,12 +449,72 @@ fn must_stay_denied() -> Vec<i64> {
     denied
 }
 
+/// The macOS profile: everything denied, and two things named.
+///
+/// Sandbox Policy Language, passed to `sandbox_init` in full rather than by
+/// naming one of Apple's canned profiles, which are coarser and even more
+/// deprecated than the call itself.
+///
+/// `(deny default)` is the whole policy. Unlike the Linux filter this is an
+/// allowlist from the first line — there is no seccomp-shaped choice to make
+/// here, because SBPL has no other sensible default and no `EPERM`-instead-of-
+/// kill escape either. What that costs is the softening the Linux side has:
+/// a resource this profile forgot is refused outright.
+///
+/// Two allowances, each for a reason found the hard way on another platform:
+///
+/// * **Signalling itself.** `abort` raises a signal at its own process, and
+///   `panic = "abort"` in the release profile means every panic goes through
+///   it. Denying that does not stop the abort — it changes how the process
+///   dies, and a panic that reports itself as something else is a false alarm
+///   about memory safety in a project whose central claim is that it has none.
+///   That is not a guess: it is exactly what refusing `tkill` did to a musl
+///   renderer on Linux, found by measurement, and this is the same lesson
+///   applied one platform over.
+/// * **Reading sysctls.** How the standard library answers "how many
+///   processors" and how the allocator sizes itself. Read-only, reaches nothing
+///   outside this machine's own description of itself, and its absence would
+///   surface as a renderer that fails to start for no visible reason.
+///
+/// Not allowed, and worth naming because a reader will look for them:
+/// `file-read*` of any kind, because the fonts are in the binary (ADR-0010);
+/// `network*`, because every subresource is a request the parent answers
+/// (ADR-0012); `process-exec*`; and `mach-lookup`, which is the macOS-shaped
+/// hole equivalent to io_uring — a channel to other processes that would make
+/// the rest of this decorative.
+#[cfg(target_os = "macos")]
+const PROFILE: &str = "\
+(version 1)
+(deny default)
+(allow signal (target self))
+(allow sysctl-read)
+";
+
+/// Drops the privileges the renderer does not need.
+///
+/// Call once, in the child, *before* reading anything the parent sends. macOS
+/// is self-restriction like Linux and unlike Windows: `sandbox_init` applies to
+/// the calling process and cannot be undone, so the child does it to itself.
+#[cfg(target_os = "macos")]
+pub fn apply() -> Confinement {
+    match seatbelt::confine(PROFILE) {
+        Ok(()) => Confinement::AppSandbox,
+        // Reported rather than swallowed, and the reason survives: a profile
+        // that fails to install leaves the renderer with no sandbox at all, and
+        // the only sign of it is this.
+        Err(reason) => {
+            eprintln!("2kbrowser: the renderer could not be confined: {reason}");
+            Confinement::Failed
+        }
+    }
+}
+
 /// Drops the privileges the renderer does not need.
 ///
 /// Not implemented on this platform. Deliberately not a silent success — see
 /// the note in this module's header about why a sandbox that claims to work is
 /// worse than one that says it is missing.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn apply() -> Confinement {
     Confinement::Unavailable
 }
@@ -454,10 +526,14 @@ pub fn apply() -> Confinement {
 /// That distinction matters: a warning printed twenty times in one test run is
 /// a warning people learn to scroll past.
 ///
-/// True on Linux and Windows by two different mechanisms — see this module's
-/// header for why they are not interchangeable.
+/// True on all three, by three different mechanisms — see this module's header
+/// for why they are not interchangeable.
 pub const fn available() -> bool {
-    cfg!(any(target_os = "linux", target_os = "windows"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ))
 }
 
 /// Argument that makes the binary check its own confinement and report.
@@ -669,12 +745,13 @@ mod tests {
 
     #[test]
     fn self_confinement_is_only_claimed_where_it_is_the_mechanism() {
-        // `apply` is the child restricting itself, which is Linux only. On
-        // Windows the answer here is `Unavailable` *and the platform still has*
-        // *a sandbox* — the parent builds it. Asserted because the obvious
-        // shortcut, `available() implies apply() != Unavailable`, was true until
-        // Windows landed and is now wrong.
-        if cfg!(target_os = "linux") {
+        // `apply` is the child restricting itself, which is what seccomp and
+        // `sandbox_init` both are. On Windows the answer here is `Unavailable`
+        // *and the platform still has a sandbox* — the parent builds it, and
+        // the child cannot put itself in one. Asserted because the obvious
+        // shortcut, `available() implies apply() != Unavailable`, was true
+        // until Windows landed and has been wrong ever since.
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert_ne!(apply(), Confinement::Unavailable);
         } else {
             assert_eq!(apply(), Confinement::Unavailable);
@@ -783,7 +860,11 @@ mod tests {
     fn the_description_says_plainly_whether_it_is_confined() {
         // The word "NOT" is load-bearing: this string ends up where someone
         // decides whether to trust the browser with a strange page.
-        for confined in [Confinement::Seccomp, Confinement::AppContainer] {
+        for confined in [
+            Confinement::Seccomp,
+            Confinement::AppContainer,
+            Confinement::AppSandbox,
+        ] {
             assert!(confined.is_confined());
             assert!(!confined.describe().contains("NOT"));
         }
