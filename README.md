@@ -210,6 +210,19 @@ installed by the process being confined, an AppContainer restricts resources and
 is built by the parent, so nothing the child does can undo it. Both were reached
 without writing any `unsafe` (ADR-0014).
 
+On macOS the child applies a sandbox profile to itself, as on Linux, and the
+profile is `(deny default)` with two exceptions: reading sysctls, and signalling
+itself so that a panic can still abort. That one needed an exception to the
+no-`unsafe` rule, because `sandbox_init` is a C function with no safe wrapper
+anywhere. It is a single crate, a page long, holding one call and no policy, and
+two tests keep it that way — one fails if it grows past 200 lines, the other if
+any second crate stops inheriting the workspace lints (ADR-0017). Nothing that
+parses a byte from the network is in it.
+
+All three are checked from inside, in CI, on every push. A machine where the
+sandbox cannot be installed is a skip on a laptop and a failure on a runner,
+because a runner is where these claims get made.
+
 A syscall the allowlist forgot returns `EPERM` rather than killing the process.
 That is a deliberate softening: a call nobody measured costs a page, which the
 parent already reports, rather than a renderer that dies where a reader sees it.
@@ -221,15 +234,21 @@ and reports what it can still reach — from inside, because a sandbox that
 installs successfully and confines nothing would pass any check written from
 the outside.
 
-> **Not safe for browsing untrusted sites.** On macOS the renderer is a separate
-> process but an otherwise unconfined one, and on Windows a machine that refuses
-> to launch the container falls back to one, saying so on stderr and in
-> `--confine-selftest` — the App Sandbox equivalent is not
-> implemented, and the browser says so on stderr rather than pretending. The
-> Linux allowlist was measured on two libcs and two architectures, so a
-> toolchain bump could still refuse something the renderer needs. Neither the
-> parser fuzzing nor any of this has been reviewed by anyone but its authors.
-> Until that changes this is a tool for its authors.
+> **Not safe for browsing untrusted sites.** All three platforms confine the
+> renderer now, and that is not the same as this being safe. **None of it has
+> been reviewed by anyone but its authors** — not the sandboxes, not the parser
+> fuzzing, not the TLS configuration. That is the reason this warning is here,
+> and the only one that a further push cannot remove.
+>
+> The rest is specific and worth knowing. The Linux allowlist was measured on
+> two libcs and two architectures, so a toolchain bump could still refuse
+> something the renderer needs. On Windows, a machine that cannot launch the
+> container falls back to an unconfined renderer, saying so on stderr and in
+> `--confine-selftest` — a fallback that stayed silently broken in CI for weeks,
+> because the test that should have caught it was skipping rather than failing.
+> Only loopback is probed there; what rules out outbound is the capability set
+> being empty, asserted directly. Until an outside reader has been through this,
+> it is a tool for its authors.
 
 ## Building
 

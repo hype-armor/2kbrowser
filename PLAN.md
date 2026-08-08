@@ -388,6 +388,16 @@ item in this milestone that is not itself security work, which is what made it
 the one to move.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
+Where that stands: the work in this milestone is done. All three platforms
+confine the renderer, each is checked from inside on every push, the parsers are
+fuzzed continuously and a hang is now a finding rather than a hang, and the TLS
+configuration is asserted rather than inherited. What is left is not a task on
+this list — **nobody outside this project has read any of it.** The milestone's
+test is whether we would tell a stranger to browse untrusted sites with it, and
+the honest answer stays no while we are the only people who have looked. That is
+the sentence the README should keep, with the reason narrowed to the one that is
+still true.
+
 **Fuzzing — done, and it found things.** `tests/fuzz` mutates the reference
 fixtures into the HTML parser, the CSS parser, image decoding, URL parsing, and
 the whole render pipeline. Written here rather than taken from `cargo-fuzz`:
@@ -600,21 +610,42 @@ seccomp (it fails the syscall) and wrong for AppContainer (the firewall resets
 the connection, so blocked and dead are indistinguishable). It now connects to a
 listener the parent binds, and both sides echo what they aimed at.
 
+**macOS is confined too, and it needed the exception ADR-0002 anticipated.**
+`sandbox_init` is a C function with no safe wrapper anywhere, so unlike Linux
+and Windows there was no crate holding the `unsafe` for us. `crates/seatbelt` is
+that crate now: one call, no policy, a page long, and two tests keeping it that
+way — one fails if it grows past 200 lines, the other if any second crate stops
+inheriting the workspace lints ([ADR-0017](docs/adr/0017-one-unsafe-crate-for-macos.md)).
+The profile is `(deny default)` with two exceptions, one of which is a lesson
+imported rather than guessed: refusing a process the ability to signal itself
+does not stop it aborting, it changes how it dies, which the musl measurement
+had already shown one platform over.
+
+**And the check that says all this is true stopped being able to lie.** The
+self-test skipped when no sandbox had installed, and the skip was an `eprintln!`
+— captured by `cargo test` on a passing test. So a verified sandbox and a silent
+skip printed the same thing, which is the third check-that-cannot-fail in this
+milestone's work and the worst, because it covered the other two. A skip is now
+legitimate on a laptop and a failure in CI, which is where the claim is made.
+
+It found something on its first run: **Windows CI had never verified the
+AppContainer.** It was failing to launch one on every push, with the
+`ERROR_ENVVAR_NOT_FOUND` a user had reported from their own machine and this
+repository believed fixed. It was not fixed; the explicit environment block
+meant to cure it was causing it. Windows needs `USERPROFILE`, `LOCALAPPDATA`,
+and `APPDATA` in that block to work out where an AppContainer's package profile
+lives, because it redirects `TEMP` into it as the process starts. Three attempts
+went into that, two of them guesses; what ended it was making the failure print
+what the launch had actually been handed.
+
 Still not done:
 
-1. **macOS is unconfined.** The App Sandbox is not implemented, and it is not
-   stubbed to look done — the parent reports `Unavailable` and says so on
-   stderr. A sandbox that claims to work and does not is worse than one that
-   says it is missing. Unlike Windows there is no third way round ADR-0002:
-   Seatbelt has no safe wrapper on crates.io, only raw FFI bindings, so it needs
-   either a lint exception or a quarantined crate — and neither of us can test
-   it. See [issue #4](https://github.com/hype-armor/2kbrowser/issues/4).
-2. **Landlock is not used.** It would add filesystem confinement beyond
+1. **Landlock is not used.** It would add filesystem confinement beyond
    "cannot call `open`", and `landlock_create_ruleset` returns `ENOSYS` on the
    kernel this was developed against, so it could not be tested. Filesystem
    access is denied at the syscall level instead, which covers opening but not
    every path to a descriptor.
-3. **Only loopback is probed on Windows.** Loopback and outbound are separate
+2. **Only loopback is probed on Windows.** Loopback and outbound are separate
    AppContainer rules, and reaching the internet from a test is not something to
    depend on. What rules out outbound is the capability set being empty, which
    is asserted directly instead.

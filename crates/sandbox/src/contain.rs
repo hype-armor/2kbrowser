@@ -140,7 +140,14 @@ static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new(
 /// skipping silently because no sandbox had been installed. The explicit block
 /// did not fix the error — it was the error, and nothing was watching.
 ///
-/// Two things were missing from it, and both are named by `rappct` itself.
+/// What was missing was the three variables Windows needs to work out where an
+/// AppContainer's package profile lives — `USERPROFILE`, `LOCALAPPDATA`, and
+/// `APPDATA`. It redirects `TEMP` into that profile as the process starts, and
+/// cannot when the block it was handed does not say where the user's is. The
+/// error is not as unhelpful as it looks once you know which option it means.
+///
+/// Two other things were wrong with the block, found first because `rappct`
+/// names them both, and fixed here despite being innocent of this bug:
 ///
 /// **`PATH`.** Its `merge_parent_env` exists for exactly this, and its comment
 /// says so — these are the keys "whose absence causes common failures (e.g.,
@@ -178,15 +185,18 @@ fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
         // leak nothing and their absence surprises anything that assumes them.
         "TEMP",
         "TMP",
-        // The same argument, one step back, and a hypothesis under test rather
-        // than a known cure. Redirecting `TEMP` into the package profile means
-        // *computing* where that profile is, which Windows does from these; an
-        // explicit block that omits them is a plausible reading of "the system
-        // could not find the environment option that was entered". They name
-        // the user's own directories, which the first version of this list
-        // avoided on purpose — acceptable only because the container cannot
-        // open any of them, and to be taken out again if it turns out not to be
-        // the cause.
+        // The same argument one step back, and the actual cause of the launch
+        // failure this function spent three attempts on. Redirecting `TEMP`
+        // into the package profile means *computing* where that profile is, and
+        // Windows does that from these. An explicit block that omits them is
+        // precisely what "the system could not find the environment option that
+        // was entered" is complaining about — the error names the problem, in
+        // its way, and reads as nonsense until you know which option it means.
+        //
+        // They name the user's own directories, which the first version of this
+        // list avoided on purpose. Kept because the alternative is no
+        // AppContainer at all, and safe because the container cannot open any
+        // of them: a path it may not follow is a string.
         "USERPROFILE",
         "LOCALAPPDATA",
         "APPDATA",
