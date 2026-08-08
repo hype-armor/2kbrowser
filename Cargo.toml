@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "tests/budgets", "tests/fuzz", "tests/ref"]
+members = ["crates/*", "tests/budgets", "tests/conformance", "tests/fuzz", "tests/ref"]
 
 [workspace.package]
 version = "0.0.0"
@@ -26,6 +26,14 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Release, but unwinding. The conformance runner renders thousands of documents
+# it has never seen in one process, and `panic = "abort"` would end the whole
+# run on the first one that panics — losing the measurement *and* the finding.
+# It catches panics and counts them instead, which needs unwinding.
+[profile.conformance]
+inherits = "release"
+panic = "unwind"
 
 # Size is a tracked budget (see tests/budgets), so the release profile is tuned
 # for it rather than left at defaults.

@@ -1,1 +1,5 @@
 /target
+
+# Written by `tests/conformance`, and derived from whichever revision of the
+# CSS 2.1 suite it was pointed at. Regenerate it rather than reading an old one.
+/conformance-failures.txt

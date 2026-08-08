@@ -790,9 +790,57 @@ no: there is no sandbox, the parsers have never been fuzzed, and the TLS
 configuration has not been reviewed. Issue #3 blocks part of it; nothing else
 in §9 does.
 
-The engine's known gaps — collapsed borders, fixed table layout, the
-three-dimensional border styles, `inline-block`, proper block-in-inline
-splitting — are listed
+### What the CSS 2.1 test suite says
+
+§2 rests this project's entire scope boundary on one fact: CSS 2.1 is a
+completed specification *with an official test suite*, which is what gives the
+work a finish line. That argument had never been checked against the suite it
+names. It has now — `tests/conformance`, pointed at web-platform-tests
+`css/CSS2` (revision `54f8f93`, the suite's current home; the old
+`test.csswg.org` URLs now serve a wiki page for every path).
+
+**941 of 4578 reference tests pass — 20.6%.** Zero panics across roughly nine
+thousand renders of CSS this engine had never seen, which is the fuzzing in M4
+earning its place.
+
+Three things about that number, in the order they matter.
+
+**It is an upper bound, not a score.** A reftest passes when a test and its
+reference render the same, and an engine that ignores a property draws both
+sides the same way. Reftests find inconsistency, not absence.
+
+**Most of the failures are real.** That was not obvious and had to be checked:
+a reftest can also fail because the pair was loosely matched during the suite's
+import into wpt, which is nothing to do with us. Running the same pairs through
+headless Chromium on a random sample of 150 failures: **140 render identically
+there**. So roughly 93% of the ~3,500 failures are this engine's, not the
+suite's.
+
+**The harness was wrong twice before the number meant anything**, and both
+errors flattered nobody — they just added noise. Ahem-flagged tests were being
+counted as failures when they cannot be run here at all: the suite uses that
+font to draw a block of known size, and a test rendering `X` at `100px/1 Ahem`
+against a 100×100 `div` is not a colour test we fail but a test we cannot
+perform, since fonts are compiled in and never loaded from a document
+(ADR-0010). And references named with a server-absolute path — `/css/CSS2/…` —
+were being looked for relative to the test, which made 268 present files look
+missing.
+
+**The biggest single finding is one the known-gaps list did not contain:
+adjacent sibling margins do not collapse** (§8.3.1). Two blocks with 40px
+margins between them get 80px of space where they should get 40. It is not
+implemented, it was not written down as missing, and it affects essentially
+every page with more than one paragraph. It was found by pulling on one
+selector test that should have passed and did not — the test used a `div` where
+its reference used a `p`, which in a browser is the *same* rendering precisely
+because the margins collapse.
+
+That is what a conformance run is for. The known-wrong list was the list of
+things we had noticed; this is the list.
+
+The engine's known gaps — margin collapsing, collapsed borders, fixed table
+layout, the three-dimensional border styles, `inline-block`, proper
+block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
 

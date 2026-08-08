@@ -77,9 +77,19 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-Known to be missing or wrong, rather than hidden: collapsed borders, fixed
-table layout, the three-dimensional border styles (`double`, `groove`, `ridge`,
-`inset`, `outset`) painting solid, and `inline-block`,
+The CSS 2.1 suite has been run against it: **941 of 4578 reference tests pass,
+20.6%**, with no panics across roughly nine thousand renders. That is an upper
+bound rather than a score — a reftest passes when both sides look the same, and
+an engine that ignores a property draws both sides the same way — but the
+failures are largely real: on a random sample of 150 of them, headless Chromium
+renders 140 identically. `cargo run --profile conformance -p conformance` does
+it; the suite is not vendored.
+
+Known to be missing or wrong, rather than hidden: **adjacent sibling margins do
+not collapse**, which the conformance run found and this list did not previously
+contain; collapsed borders; fixed
+table layout; the three-dimensional border styles (`double`, `groove`, `ridge`,
+`inset`, `outset`) painting solid; and `inline-block`,
 which is recognised and then laid out as though it were plain `inline` — an
 empty one with a width and a height collapses to nothing at all. That last one
 now counts as layout this engine does not implement, alongside flex and grid,
