@@ -65,7 +65,8 @@ letter and curly quote should be.
 
 Rendering is deterministic across Linux, macOS, and Windows, checked by
 reference tests against one shared baseline set — verified, not assumed: all
-three platforms have rendered it byte for byte in CI.
+three have rendered it byte for byte in CI, and so has a fourth target,
+aarch64 Linux, against the same baselines.
 
 The window opens on a virtual display in CI and is checked to survive
 (`scripts/smoke-window.sh`) — which catches a panic or a bad index, though not
@@ -195,6 +196,11 @@ did not hang a musl renderer — it made one die of `SIGSEGV` instead, so a pani
 reported itself as a memory fault in a codebase that forbids `unsafe`. Both are
 allowed now, and neither reaches further than the other.
 
+And on two architectures, in CI, on every push: the aarch64 Linux job runs the
+suite and the measurement rather than only cross-compiling. aarch64 needs
+nothing x86_64 did not — its set is a strict subset — which is worth having as
+evidence precisely because musl had already shown the set can differ.
+
 On Windows the *parent* builds an AppContainer with no capabilities at all and
 launches the child into it, because there is no call a running process can make
 to put itself in one. Capabilities are the holes deliberately left in a
@@ -220,7 +226,7 @@ the outside.
 > to launch the container falls back to one, saying so on stderr and in
 > `--confine-selftest` — the App Sandbox equivalent is not
 > implemented, and the browser says so on stderr rather than pretending. The
-> Linux allowlist was measured on two libcs and one architecture, so a
+> Linux allowlist was measured on two libcs and two architectures, so a
 > toolchain bump could still refuse something the renderer needs. Neither the
 > parser fuzzing nor any of this has been reviewed by anyone but its authors.
 > Until that changes this is a tool for its authors.

@@ -38,13 +38,17 @@
 //! browser that opened its own fonts, resolved its own hostnames, or ran a
 //! thread pool.
 //!
-//! **Measured twice, on two C libraries**, because one measurement of a set
-//! decided by the libc is not evidence about the libc. The rendering set is
-//! identical under glibc and musl. Failing is not: glibc's `abort` raises its
-//! signal with `tgkill` and musl's with `tkill`, and the first version of this
-//! list named only the one it had seen. That is what a second measurement is
-//! for, and it is the shape of what a third would find — the *failure* paths
-//! vary between libcs where the working path does not.
+//! **Measured on two C libraries and two architectures**, because one
+//! measurement of a set decided by the libc is not evidence about the libc. The
+//! rendering set is identical under glibc and musl. Failing is not: glibc's
+//! `abort` raises its signal with `tgkill` and musl's with `tkill`, and the
+//! first version of this list named only the one it had seen. That is what a
+//! second measurement is for, and it is the shape of the difference to expect —
+//! the *failure* paths vary where the working path does not.
+//!
+//! aarch64 then needed nothing x86_64 did not; its set is a strict subset,
+//! short by `futex`, which the x86_64 panic path takes and the aarch64 one does
+//! not. CI measures it on every push, so this is a check rather than a claim.
 //!
 //! What is *not* in the list is the point. No `socket`, no `openat`, no
 //! `execve`, no `ptrace`, no `io_uring` — and no `open_by_handle_at`, `fsopen`,

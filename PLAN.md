@@ -548,10 +548,23 @@ it would claim support that is not offered. The script takes a target directory
 so the probe can be repeated:
 `scripts/renderer-syscalls.sh target/x86_64-unknown-linux-musl/release`.
 
-What remains unproven is architecture. Everything so far is x86_64. The syscall
-*numbers* are already handled per-architecture and each name in the list was
-checked to exist on all three; whether the *set* is the same on aarch64 has not
-been measured, because running an aarch64 renderer needs an aarch64 machine.
+**And on a second architecture, in CI, on every push.** The aarch64 job used to
+be a cross-compile that said so — "a check, not a build; nothing here runs" —
+which was enough when the question was whether `sandbox` compiled and stopped
+being enough when the filter became an allowlist. Which syscalls *exist* on an
+architecture is a compile-time fact; which ones the renderer *makes* is not.
+GitHub's aarch64 Linux runners are free for public repositories, so it runs the
+tests, the reference baselines, the budgets, and the measurement itself.
+
+aarch64 needs nothing x86_64 did not: its set is a strict *subset* of the glibc
+x86_64 one — fourteen calls against fifteen, the difference being `futex`, which
+the x86_64 panic path takes and the aarch64 one does not. Which is the outcome
+worth having and not the one to have assumed: musl's `tkill` proved the set can
+differ, so aarch64 agreeing is evidence rather than a formality.
+
+Two C libraries, two architectures, and the measurement runs on every push. What
+is still not covered is a toolchain bump changing the set under all of them at
+once, which is what the `EPERM` default is for.
 
 **Windows is confined too, by a different mechanism.** seccomp is
 self-restriction; an AppContainer is not. The parent creates a package profile,
