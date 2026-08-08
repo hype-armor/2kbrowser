@@ -439,9 +439,21 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
     // there is no call a process can make to put *itself* in one.
     let output = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
         .arg(sandbox::confine::SELFTEST_ARGUMENT)
+        // `rappct`'s own diagnostic, which prints what it handed `CreateProcessW`
+        // — the flags, whether a command line and a working directory were
+        // present, and the raw last-error. Asked for here rather than in the CI
+        // workflow so that a developer reproducing a Windows failure gets the
+        // same detail without having to know the variable exists. It prints
+        // only when a launch fails, so it costs nothing the rest of the time.
+        .env("RAPPCT_DEBUG_LAUNCH", "1")
         .output()
         .expect("the selftest runs");
     let report = String::from_utf8_lossy(&output.stdout);
+    // Everything the selftest said that was not the report. On the failure path
+    // this is where the useful part is: `os error 203` on its own is not
+    // something anyone can act on, and two pushes were spent guessing at it
+    // before this was here to read.
+    let aside = String::from_utf8_lossy(&output.stderr);
 
     // Skipped rather than failed where the sandbox is unavailable — an old
     // kernel, a container that forbids installing a filter. A check that cannot
@@ -462,9 +474,9 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
             std::env::var_os("CI").is_none(),
             "no sandbox was installed, and this is CI — where a skip is a \
              failure, because a green run here is what the README's claims \
-             rest on:\n{report}"
+             rest on:\n{report}\n--- stderr ---\n{aside}"
         );
-        eprintln!("SKIP: no sandbox is available here\n{report}");
+        eprintln!("SKIP: no sandbox is available here\n{report}\n{aside}");
         return;
     }
 

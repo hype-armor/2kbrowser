@@ -178,6 +178,18 @@ fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
         // leak nothing and their absence surprises anything that assumes them.
         "TEMP",
         "TMP",
+        // The same argument, one step back, and a hypothesis under test rather
+        // than a known cure. Redirecting `TEMP` into the package profile means
+        // *computing* where that profile is, which Windows does from these; an
+        // explicit block that omits them is a plausible reading of "the system
+        // could not find the environment option that was entered". They name
+        // the user's own directories, which the first version of this list
+        // avoided on purpose — acceptable only because the container cannot
+        // open any of them, and to be taken out again if it turns out not to be
+        // the cause.
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
         // Only when the operator asked for it.
         "RUST_BACKTRACE",
     ];
