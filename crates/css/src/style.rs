@@ -215,6 +215,41 @@ pub fn parse_vertical_align(name: &str) -> Option<VerticalAlign> {
     Some(value)
 }
 
+/// The `overflow` property, as far as layout needs it.
+///
+/// **The visual effect is not implemented** — content that overflows a box
+/// still paints outside it. This is here for the other thing `overflow` does,
+/// which is structural rather than visual: any value but `visible` makes a box
+/// establish a block formatting context, and margins do not collapse through
+/// one (CSS 2.1 §8.3.1).
+///
+/// Recognising a property for one of its effects while not implementing the
+/// other is worth being uneasy about, and it is still the better of the two
+/// options: ignoring `overflow` entirely does not make the clipping appear, it
+/// just also gets the margins wrong. The suite caught exactly that — a
+/// container with `overflow: hidden` whose last child had a negative bottom
+/// margin, which must not escape and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overflow {
+    /// Content is visible outside the box. The initial value.
+    #[default]
+    Visible,
+    /// Anything but `visible`. The distinction between `hidden`, `scroll` and
+    /// `auto` matters only to clipping and scrollbars, neither of which exists
+    /// here, so they are one value rather than three that behave identically.
+    Clipped,
+}
+
+/// Parses an `overflow` keyword.
+pub fn parse_overflow(name: &str) -> Option<Overflow> {
+    let value = match name {
+        "visible" => Overflow::Visible,
+        "hidden" | "scroll" | "auto" => Overflow::Clipped,
+        _ => return None,
+    };
+    Some(value)
+}
+
 /// The `background-repeat` property.
 ///
 /// Tiling is the point: the era's pages were built on small images repeated
@@ -840,6 +875,8 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     /// `background-repeat`.
     pub background_repeat: BackgroundRepeat,
+    /// `overflow`, used for formatting-context effects only.
+    pub overflow: Overflow,
     /// `background-position`.
     pub background_position: BackgroundPosition,
     /// `vertical-align`, as it applies to a table cell.
@@ -908,6 +945,7 @@ impl Default for ComputedStyle {
             background_image: None,
             background_repeat: BackgroundRepeat::Repeat,
             background_position: BackgroundPosition::default(),
+            overflow: Overflow::Visible,
             vertical_align: VerticalAlign::Middle,
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             font_family: FontStack::default(),

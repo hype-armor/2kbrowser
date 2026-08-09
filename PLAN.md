@@ -799,7 +799,7 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**1384 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
+**1385 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
@@ -873,10 +873,28 @@ harness. That is a limit of reftests rather than a reason to skip the rules,
 but it does mean the conformance number cannot be the only thing steering this
 work.
 
-Still missing: an empty block collapsing through itself, and two edge cases the
-suite names — `normal-flow/negative-margin-shrinking-container-size-002` and
-`visuren/right-offset-position-fixed-001`, both of which the parent/child rules
-regressed and neither of which is understood yet.
+Both regressions were then chased rather than absorbed into the net figure, and
+they turned out to be different in kind.
+
+`normal-flow/negative-margin-shrinking-container-size-002` was real, and found
+something absent rather than something wrong: `overflow` was **not modelled at
+all**. Any value but `visible` makes a box establish a block formatting context,
+and a margin cannot escape one — the test has a container with
+`overflow: hidden` whose last child carries `margin-bottom: -200px`, sized so
+the margin cancels the child exactly if it stays inside and reveals a red block
+if it does not. It escaped. `overflow` is parsed now and used for that effect
+only; the clipping is still not implemented, which is worth being uneasy about
+and is still better than ignoring the property, since ignoring it does not make
+the clipping appear and also gets the margins wrong.
+
+`visuren/right-offset-position-fixed-001` was not real. It combines
+`direction: rtl` with `position: fixed`, neither of which this engine
+implements, so it had been passing because both sides were wrong in the same
+way — the reftest weakness this section opens with, met in person. Changing the
+margins broke the coincidence. Left failing, because the honest fix is to
+implement `direction` and fixed positioning, not to restore the accident.
+
+Still missing: an empty block collapsing through itself.
 
 That is what a conformance run is for. The known-wrong list was the list of
 things we had noticed; this is the list.

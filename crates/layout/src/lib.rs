@@ -11,7 +11,9 @@ pub mod frameset;
 pub mod table;
 
 use css::cascade::StyleMap;
-use css::style::{ComputedStyle, Display, Float, Position, TextAlign, VerticalAlign, WhiteSpace};
+use css::style::{
+    ComputedStyle, Display, Float, Overflow, Position, TextAlign, VerticalAlign, WhiteSpace,
+};
 use css::value::Length;
 use dom::{Document, NodeId};
 use floats::FloatContext;
@@ -227,14 +229,23 @@ fn collapse(first: f32, second: f32) -> f32 {
 ///
 /// A margin collapses *through* a box's top edge only when nothing separates
 /// them — no top border, no top padding — and only when the box is part of its
-/// parent's flow. A float, an absolutely positioned box, and a table cell each
-/// establish a formatting context of their own, and a margin cannot escape one:
-/// letting a float's first child pull the float upwards would move it out from
-/// under the text flowing beside it.
+/// parent's flow. A float, an absolutely positioned box, a table cell, and
+/// anything with `overflow` other than `visible` each establish a formatting
+/// context of their own, and a margin cannot escape one: letting a float's
+/// first child pull the float upwards would move it out from under the text
+/// flowing beside it.
+///
+/// `overflow` is in that list for a reason found rather than remembered. The
+/// CSS 2.1 suite has a container with `overflow: hidden` whose last child
+/// carries `margin-bottom: -200px`, sized so that the negative margin exactly
+/// cancels the child if it stays inside and reveals a red block if it escapes.
+/// It escaped. The property was not modelled at all until then, so the box did
+/// not know it was a formatting context.
 fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.display == Display::TableCell
+        || style.overflow != Overflow::Visible
 }
 
 /// What laying out one block cost its parent, with its margins kept apart.
@@ -3473,6 +3484,45 @@ mod tests {
         assert_eq!(collapse(-10.0, -30.0), -30.0);
         assert_eq!(collapse(40.0, -15.0), 25.0);
         assert_eq!(collapse(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn overflow_stops_a_margin_escaping_its_container() {
+        // Anything but `overflow: visible` establishes a block formatting
+        // context, and a margin cannot escape one. The CSS 2.1 suite tests it
+        // with a negative margin sized to cancel the child exactly if it stays
+        // inside, which is what makes the difference visible at all.
+        let clipped = run(
+            "<body><div class=\"box\"><div class=\"tall\"></div></div></body>",
+            "body { margin: 0 } \
+             .box { overflow: hidden; width: 200px } \
+             .tall { height: 200px; margin-bottom: -100px }",
+            400.0,
+        );
+        let visible = run(
+            "<body><div class=\"box\"><div class=\"tall\"></div></div></body>",
+            "body { margin: 0 } \
+             .box { width: 200px } \
+             .tall { height: 200px; margin-bottom: -100px }",
+            400.0,
+        );
+        let container = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .find(|b| b.rect.width == 200.0)
+                .map(|b| b.rect.height)
+                .expect("the container")
+        };
+        assert_eq!(
+            container(&clipped),
+            100.0,
+            "the negative margin stays inside and shortens the container",
+        );
+        assert_eq!(
+            container(&visible),
+            200.0,
+            "with `overflow: visible` it escapes and the container keeps its height",
+        );
     }
 
     #[test]

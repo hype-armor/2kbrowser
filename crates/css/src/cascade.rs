@@ -9,7 +9,7 @@ use crate::style::{
     DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
     parse_border_style, parse_clear, parse_display, parse_float, parse_list_style_type,
-    parse_position, parse_text_decoration, parse_vertical_align,
+    parse_overflow, parse_position, parse_text_decoration, parse_vertical_align,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -273,6 +273,13 @@ fn apply(
                 && let Some(repeat) = parse_background_repeat(name)
             {
                 style.background_repeat = repeat;
+            }
+        }
+        "overflow" => {
+            if let Raw::Ident(name) = first
+                && let Some(overflow) = parse_overflow(name)
+            {
+                style.overflow = overflow;
             }
         }
         "background-position" => {
