@@ -774,11 +774,39 @@ mod tests {
         // the child cannot put itself in one. Asserted because the obvious
         // shortcut, `available() implies apply() != Unavailable`, was true
         // until Windows landed and has been wrong ever since.
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
-            assert_ne!(apply(), Confinement::Unavailable);
-        } else {
-            assert_eq!(apply(), Confinement::Unavailable);
-        }
+        //
+        // **Not run on macOS**, and the asymmetry is the point rather than an
+        // oversight. Calling `apply` here really does confine whatever is
+        // running it, and the two platforms differ in how far that reaches:
+        // `seccompiler::apply_filter` restricts the calling *thread*, so a test
+        // that installs a filter takes only its own thread down with it, while
+        // `sandbox_init` restricts the whole *process*, permanently. Since the
+        // macOS profile denies `process-exec*`, one unit test calling `apply`
+        // left every later test in the binary unable to spawn a child — which
+        // is exactly how it surfaced: a sandbox test that spawns a renderer
+        // failing with `Operation not permitted`, on macOS only, in one CI run
+        // and not the one before, because libtest's thread ordering decides
+        // whether the confining test goes first.
+        //
+        // macOS is covered where it should be, in a subprocess: the self-test
+        // applies the profile and then probes it, and the isolation tests fail
+        // the build if that reports anything but `AppSandbox`.
+        // Written per-platform with `cfg` rather than as one `if cfg!()` chain
+        // so that no platform ends up in a branch that asserts nothing. A macOS
+        // arm that quietly did nothing would be the same shape of mistake as
+        // the skip this project has already had to fix twice.
+        #[cfg(target_os = "linux")]
+        assert_ne!(apply(), Confinement::Unavailable);
+
+        #[cfg(target_os = "macos")]
+        assert!(
+            available(),
+            "macOS claims a sandbox; that it installs is asserted by the \
+             self-test, which runs in a process it is allowed to confine"
+        );
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(apply(), Confinement::Unavailable);
     }
 
     #[cfg(target_os = "linux")]
