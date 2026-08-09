@@ -94,7 +94,9 @@ more instructive than the figure.
 Known to be missing or wrong, rather than hidden: margin collapsing does not
 handle an **empty block collapsing through itself**; `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
-not clipped; collapsed borders; fixed
+not clipped; an invalid selector does not invalidate its rule, so
+`[1digit], div { color: red }` styles the `div` where a browser would style
+nothing; collapsed borders; fixed
 table layout; and `inline-block`,
 which is recognised and then laid out as though it were plain `inline` — an
 empty one with a width and a height collapses to nothing at all. That last one

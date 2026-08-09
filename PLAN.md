@@ -893,13 +893,38 @@ way — the reftest weakness this section opens with, met in person. Changing th
 margins broke the coincidence. Left failing, because the honest fix is to
 implement `direction` and fixed positioning, not to restore the accident.
 
-Still missing: an empty block collapsing through itself.
+Still missing: an empty block collapsing through itself. That one needs the
+running collapsed margin kept *uncommitted* as the walk proceeds rather than
+added to the cursor as each child is placed — the proper adjoining-margins
+algorithm — because a self-collapsing box has one margin rather than two and
+joins a chain that may already be open. A larger restructure of block layout
+than the three rules that are done, and not one to start without room to finish
+it.
+
+**The conformance run's next finding, recorded rather than fixed: an invalid
+selector does not invalidate its rule.** CSS 2.1 §4.1.7 says a statement with an
+error anywhere in its selector is ignored entirely, so
+`[1digit], div { color: red }` must style nothing — the malformed attribute name
+takes the valid `div` with it. This engine keeps the `div` and applies the red.
+The suite catches it the way it catches everything: a page whose whole assertion
+is "no red". `selectors` is the worst-scoring chapter with content — 59 of 463 —
+and this looks like a large share of it.
+
+Being strict is not the fix, which is the interesting part. Two different
+failures reach the parser as the same "did not parse": syntax that is *invalid*,
+which no browser accepts and which must drop the rule, and syntax that is
+*unsupported here* but valid CSS 2.1 — `p:first-child`, `a::before` — which
+browsers apply. Dropping whole rules for the second kind would lose styling real
+browsers show, trading page rendering for test scores. The fix is to tell them
+apart, which wants a three-way result threaded through selector parsing and
+wants measuring against the reference baselines as well as the suite, since it
+can move real pages either way.
 
 That is what a conformance run is for. The known-wrong list was the list of
 things we had noticed; this is the list.
 
-The engine's known gaps — an empty block collapsing through itself,
-collapsed borders, fixed table
+The engine's known gaps — an empty block collapsing through itself, an invalid
+selector not invalidating its rule, collapsed borders, fixed table
 layout, `inline-block`, proper block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
