@@ -799,7 +799,7 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**1382 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
+**1384 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
@@ -854,11 +854,29 @@ browser is the *same* rendering precisely because the margins collapse.
 **Adjacent siblings collapse now**, which is the case that governs consecutive
 paragraphs and is therefore most of the value. Nineteen of the twenty-one
 reference baselines moved, all of them tighter and all of them closer to what
-Chromium draws for the same fixture. What is still missing is a parent
-collapsing with its first or last child, and an empty block collapsing through
-itself; those need `layout_block` to return the margins it collapsed at each
-end rather than a single height, which is a larger change to a function with
-many callers.
+Chromium draws for the same fixture.
+
+**A parent collapses with its first and last child too** — §8.3.1's second and
+third rules — which needed `layout_block` to return the margins it collapsed at
+each end rather than one height. Worth recording what that bought, because it is
+not what the effort suggested: **four tests**, against two it broke. The reason
+is that collapsing a margin out of a parent usually moves it from inside the box
+to outside without moving anything a reader can see; the child ends up in the
+same place and only the *parent's* box changes size. That is invisible until the
+parent has a background or a border, which most of the suite's boxes do not —
+and very visible on real pages, which are full of bordered panels sized to their
+content.
+
+So the honest summary is that the second and third rules are correct, are
+verified against a browser, are worth having, and are not measurable by this
+harness. That is a limit of reftests rather than a reason to skip the rules,
+but it does mean the conformance number cannot be the only thing steering this
+work.
+
+Still missing: an empty block collapsing through itself, and two edge cases the
+suite names — `normal-flow/negative-margin-shrinking-container-size-002` and
+`visuren/right-offset-position-fixed-001`, both of which the parent/child rules
+regressed and neither of which is understood yet.
 
 That is what a conformance run is for. The known-wrong list was the list of
 things we had noticed; this is the list.

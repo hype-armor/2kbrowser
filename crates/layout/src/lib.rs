@@ -223,12 +223,43 @@ fn collapse(first: f32, second: f32) -> f32 {
     first.max(second).max(0.0) + first.min(second).min(0.0)
 }
 
-impl LayoutBox {
-    /// Total height of this box including its margins.
-    fn outer_height(&self, font_size: f32) -> f32 {
-        self.rect.height
-            + self.style.margin.top.to_px(font_size, 0.0)
-            + self.style.margin.bottom.to_px(font_size, 0.0)
+/// Whether a box's children's margins stay inside it.
+///
+/// A margin collapses *through* a box's top edge only when nothing separates
+/// them — no top border, no top padding — and only when the box is part of its
+/// parent's flow. A float, an absolutely positioned box, and a table cell each
+/// establish a formatting context of their own, and a margin cannot escape one:
+/// letting a float's first child pull the float upwards would move it out from
+/// under the text flowing beside it.
+fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
+    style.float != Float::None
+        || style.position.is_out_of_flow()
+        || style.display == Display::TableCell
+}
+
+/// What laying out one block cost its parent, with its margins kept apart.
+///
+/// A single "outer height" was enough while margins only ever added up. It is
+/// not enough to collapse them: a parent has to know its child's *top* margin
+/// separately, because a first child's top margin can escape the parent
+/// entirely and become the parent's own (§8.3.1), and a caller placing the next
+/// sibling has to collapse against the previous one's bottom margin rather than
+/// against a total it can no longer take apart.
+#[derive(Debug, Clone, Copy)]
+struct Consumed {
+    /// Border-box height, margins excluded.
+    height: f32,
+    /// Top margin, after collapsing with anything inside the box.
+    margin_top: f32,
+    /// Bottom margin, after collapsing with anything inside the box.
+    margin_bottom: f32,
+}
+
+impl Consumed {
+    /// Everything the box occupies, which is what a caller that does not
+    /// collapse still wants.
+    fn outer(self) -> f32 {
+        self.margin_top + self.height + self.margin_bottom
     }
 }
 
@@ -502,7 +533,7 @@ pub fn layout(
         ContainingBlock::viewport(viewport_width, viewport_width),
         &mut root,
     );
-    root.rect.height = height;
+    root.rect.height = height.outer();
 
     // §14.2: the root element's background paints the canvas, and only when it
     // has none does the body's get used in its place.
@@ -533,7 +564,7 @@ pub fn layout(
 
     Layout {
         root,
-        height,
+        height: height.outer(),
         canvas_background,
         canvas_image,
     }
@@ -989,7 +1020,8 @@ fn flush_inline(
 }
 
 /// Lays out `node` as a block box at `(x, y)` within `available_width`,
-/// appending it to `parent`. Returns the outer height consumed.
+/// appending it to `parent`. Returns what it consumed, with its margins kept
+/// separate so a caller can collapse against them.
 #[expect(
     clippy::too_many_arguments,
     reason = "layout context, threaded explicitly for clarity"
@@ -1007,7 +1039,7 @@ fn layout_block(
     inherited: FloatContext,
     containing: ContainingBlock,
     parent: &mut LayoutBox,
-) -> f32 {
+) -> Consumed {
     let font_size = style.font_size;
     let mut margin_left = style.margin.left.to_px(font_size, available_width);
     let mut margin_right = style.margin.right.to_px(font_size, available_width);
@@ -1076,9 +1108,13 @@ fn layout_block(
             replaced: Some(node),
             node: Some(node),
         };
-        let outer = box_.outer_height(font_size);
+        let consumed = Consumed {
+            height: box_.rect.height,
+            margin_top,
+            margin_bottom: style.margin.bottom.to_px(font_size, available_width),
+        };
         parent.children.push(box_);
-        return outer;
+        return consumed;
     }
 
     let mut box_ = LayoutBox {
@@ -1247,9 +1283,13 @@ fn layout_block(
             }
             box_.rect.x = x + left;
         }
-        let outer = box_.outer_height(font_size);
+        let consumed = Consumed {
+            height: box_.rect.height,
+            margin_top,
+            margin_bottom: style.margin.bottom.to_px(font_size, available_width),
+        };
         parent.children.push(box_);
-        return outer;
+        return consumed;
     }
 
     let mut absolutes: Vec<(NodeId, ComputedStyle, f32)> = Vec::new();
@@ -1262,6 +1302,13 @@ fn layout_block(
     // nothing to collapse with — either nothing has been placed yet, or
     // something in between separated them.
     let mut previous_bottom: Option<f32> = None;
+    // The first in-flow child's top margin, once it has escaped this box —
+    // `None` until that happens, and it can happen at most once.
+    let mut escaped_top: Option<f32> = None;
+    // The bottom margin of the last in-flow block placed, as that child
+    // collapsed it. Cleared by anything laid out after it, since that is
+    // something between the margin and this box's bottom edge.
+    let mut trailing_bottom: Option<f32> = None;
 
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
@@ -1399,12 +1446,38 @@ fn layout_block(
             child_containing,
             &mut box_,
         );
-        cursor_y += consumed;
+        // §8.3.1's second rule: with nothing between them — no top border, no
+        // top padding, and nothing already laid out above — a first child's top
+        // margin is adjoining its parent's, and the two collapse into one
+        // *outside* the parent. So the child does not get that margin inside
+        // the box; the box gets it, and moves down by it.
+        //
+        // Recognised by the cursor still sitting exactly where it started: any
+        // inline content, any earlier block, or any float would have moved it,
+        // and each of those is something between the two margins.
+        let adjoining = escaped_top.is_none()
+            && padding_top == 0.0
+            && border_top == 0.0
+            && cursor_y == padding_top + border_top
+            && !keeps_its_childrens_margins(style);
+
+        if adjoining && consumed.margin_top != 0.0 {
+            // Pull the child, and everything laid out within it, back up by the
+            // margin it is giving away.
+            if let Some(placed) = box_.children.last_mut() {
+                placed.rect.y -= consumed.margin_top;
+            }
+            escaped_top = Some(consumed.margin_top);
+            cursor_y += consumed.height + consumed.margin_bottom;
+        } else {
+            cursor_y += consumed.outer();
+        }
         previous_bottom = Some(child_margins.1);
+        trailing_bottom = Some(consumed.margin_bottom);
     }
 
     // Trailing inline content, after the last block child.
-    cursor_y += flush_inline(
+    let trailing = flush_inline(
         doc,
         styles,
         fonts,
@@ -1418,9 +1491,38 @@ fn layout_block(
         padding_top + border_top,
         &mut box_,
     );
+    cursor_y += trailing;
+    if trailing > 0.0 {
+        // Text after the last block child stands between that child's bottom
+        // margin and this box's bottom edge, so they are no longer adjoining
+        // and nothing escapes.
+        trailing_bottom = None;
+    }
 
     // A block must be tall enough to contain its own floats, or the next
     // block would start beside one and overlap it.
+    // §8.3.1's third rule, the mirror of the first: with no bottom padding, no
+    // bottom border and no height of its own, a box's bottom edge adjoins its
+    // last child's bottom margin, and the two collapse into one outside the
+    // box. A declared height separates them — the box ends where it was told
+    // to, whatever its last child wanted.
+    //
+    // Also skipped where floats reach lower than the content, since then the
+    // bottom edge is decided by a float rather than by that margin.
+    let escaped_bottom = match trailing_bottom {
+        Some(child_bottom)
+            if padding_bottom == 0.0
+                && border_bottom == 0.0
+                && style.height == Length::Auto
+                && !keeps_its_childrens_margins(style)
+                && cursor_y >= padding_top + border_top + context.lowest_edge() =>
+        {
+            cursor_y -= child_bottom;
+            Some(child_bottom)
+        }
+        _ => None,
+    };
+
     let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
         + padding_bottom
         + border_bottom;
@@ -1538,9 +1640,29 @@ fn layout_block(
         box_.rect.y += dy;
     }
 
-    let outer = box_.outer_height(font_size);
+    // Computed here rather than taken from `outer_height`, which resolves
+    // percentages against a basis of zero — harmless while the answer was only
+    // ever summed, wrong the moment the two ends are told apart.
+    // Whatever escaped from the first child is this box's margin now. The box
+    // was positioned with its own margin long before that was known, so it
+    // moves by the difference rather than being placed again.
+    let collapsed_top = match escaped_top {
+        Some(escaped) => collapse(margin_top, escaped),
+        None => margin_top,
+    };
+    box_.rect.y += collapsed_top - margin_top;
+
+    let own_bottom = style.margin.bottom.to_px(font_size, available_width);
+    let consumed = Consumed {
+        height: box_.rect.height,
+        margin_top: collapsed_top,
+        margin_bottom: match escaped_bottom {
+            Some(escaped) => collapse(own_bottom, escaped),
+            None => own_bottom,
+        },
+    };
     parent.children.push(box_);
-    outer
+    consumed
 }
 
 /// Lays out a table's rows and cells, appending them to `parent`.
@@ -1733,7 +1855,7 @@ fn layout_table(
                     box_,
                     row: index,
                     rowspan: cell.rowspan,
-                    height: consumed,
+                    height: consumed.outer(),
                 });
             }
         }
@@ -1924,7 +2046,7 @@ fn place_float(
     let (left, top) = context.place(
         child_style.float,
         float_width + margin_x,
-        float_height + margin_y,
+        float_height.outer() + margin_y,
         y,
     );
 
@@ -2235,10 +2357,68 @@ mod tests {
         );
         let div = content_boxes(&rendered)[0];
         assert_eq!(div.rect.x, 20.0);
-        assert_eq!(div.rect.y, 10.0);
         assert_eq!(
             div.rect.width, 460.0,
             "width shrinks by both horizontal margins"
+        );
+
+        // The vertical margin is no longer *inside* the body. `body` has no top
+        // padding or border, so its first child's top margin collapses out of
+        // it (§8.3.1) — the div sits at the body's content edge and the body
+        // moved down instead. This assertion used to read `div.rect.y == 10`
+        // and was measuring which box holds the margin rather than where the
+        // div ends up.
+        assert_eq!(div.rect.y, 0.0, "the top margin escaped to the body");
+
+        // What a reader sees is unchanged, which is the part worth asserting:
+        // the margin still separates, it is just owned by the other box now.
+        let without = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { margin: 0 20px }",
+            500.0,
+        );
+        assert_eq!(
+            rendered.layout.height - without.layout.height,
+            20.0,
+            "10px above and below still occupy the page",
+        );
+    }
+
+    #[test]
+    fn a_first_childs_top_margin_escapes_a_parent_with_no_border_or_padding() {
+        // §8.3.1's second rule. Visible in the *parent's* box rather than the
+        // child's position: the child does not move, the container shrinks to
+        // fit it exactly and moves down by the margin it took on.
+        let bare = run(
+            "<body><div class=\"box\"><p></p></div></body>",
+            "body { margin: 0 } .box { background: #eee } \
+             p { margin: 30px 0; height: 20px }",
+            200.0,
+        );
+        let separated = run(
+            "<body><div class=\"box\"><p></p></div></body>",
+            "body { margin: 0 } .box { background: #eee; border-top: 1px solid #000 } \
+             p { margin: 30px 0; height: 20px }",
+            200.0,
+        );
+        let container = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .find(|b| !b.style.background_color.is_transparent())
+                .map(|b| b.rect.height)
+                .expect("the container box")
+        };
+        assert_eq!(
+            container(&bare),
+            20.0,
+            "with nothing between them the margins escape and the box wraps the child",
+        );
+        // A single pixel of border is enough to stop it, which is the rule
+        // being tested rather than a coincidence of this markup.
+        assert!(
+            container(&separated) > 20.0,
+            "a top border separates the margins: {}",
+            container(&separated),
         );
     }
 
