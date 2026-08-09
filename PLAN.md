@@ -328,8 +328,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, the three-dimensional border styles (`double`, `groove`, `ridge`,
-`inset`, `outset`) painting solid, `inline-block` laid out as
+layout, `inline-block` laid out as
 plain `inline` — and counted as unsupported layout for that reason, so a page
 depending on it falls back to a document rather than failing quietly — and
 proper block-in-inline splitting — an inline element containing a block is
@@ -899,12 +898,19 @@ Still missing: an empty block collapsing through itself.
 That is what a conformance run is for. The known-wrong list was the list of
 things we had noticed; this is the list.
 
-The engine's known gaps — margin collapsing between a parent and its children,
+The engine's known gaps — an empty block collapsing through itself,
 collapsed borders, fixed table
-layout, the three-dimensional border styles, `inline-block`, proper
-block-in-inline splitting — are listed
+layout, `inline-block`, proper block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
+
+The three-dimensional border styles came off it as well — `double`, `groove`,
+`ridge`, `inset`, `outset` — and they are the most era-appropriate thing on the
+list: `outset` is what a button looked like before anyone had a gradient. The
+whole effect is one predicate and two shades, since the pattern is UA-defined
+here too: an edge a light source above and to the left would strike keeps the
+declared colour, the opposite edge is halved, and a groove is a ridge with its
+two halves exchanged. Checked against Chromium, which lights them the same way.
 
 Dotted and dashed borders came off that list too, which was a smaller job than
 it looked: the pattern is UA-defined, so the only real decision was to stretch

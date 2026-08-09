@@ -256,7 +256,7 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
             },
             border.top.style,
             top,
-            Axis::Horizontal,
+            Side::Top,
             color_of(&border.top),
         );
     }
@@ -271,7 +271,7 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
             },
             border.bottom.style,
             bottom,
-            Axis::Horizontal,
+            Side::Bottom,
             color_of(&border.bottom),
         );
     }
@@ -287,7 +287,7 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
             },
             border.left.style,
             left,
-            Axis::Vertical,
+            Side::Left,
             color_of(&border.left),
         );
     }
@@ -302,17 +302,88 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
             },
             border.right.style,
             right,
-            Axis::Vertical,
+            Side::Right,
             color_of(&border.right),
         );
     }
 }
 
-/// Which way a border side runs.
+/// Which edge of the box a border side is.
+///
+/// More than the axis, because the three-dimensional styles need to know which
+/// edge they are on: what makes `outset` look raised is that the top and left
+/// catch the light while the bottom and right fall into shadow, and an engine
+/// that only knew "horizontal" would light both ends of the box the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Axis {
-    Horizontal,
-    Vertical,
+enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl Side {
+    /// Whether the side runs left-to-right.
+    fn is_horizontal(self) -> bool {
+        matches!(self, Side::Top | Side::Bottom)
+    }
+
+    /// Whether this edge is the one a light source above and to the left would
+    /// strike. `inset` and `outset` are this predicate and a pair of shades.
+    fn faces_the_light(self) -> bool {
+        matches!(self, Side::Top | Side::Left)
+    }
+}
+
+/// A shade of the border's colour, for the styles that fake a light source.
+///
+/// The specification says only that `inset` "looks as though it were embedded
+/// in the canvas" and leaves the rest to the UA, so the two shades are a
+/// choice: the declared colour for the lit edges, and half of each channel for
+/// the shadowed ones. Half is what makes the era's default grey `outset` button
+/// look like a button rather than like a slightly uneven rectangle.
+fn shaded(color: Color, factor: f32) -> Color {
+    let channel = |value: u8| (value as f32 * factor).clamp(0.0, 255.0) as u8;
+    Color {
+        r: channel(color.r),
+        g: channel(color.g),
+        b: channel(color.b),
+        a: color.a,
+    }
+}
+
+/// How much darker a shadowed edge is drawn.
+const SHADOW: f32 = 0.5;
+
+/// A band across a side's *thickness*, measured from its outer edge.
+///
+/// `from` and `to` are fractions, so `(0.0, 0.5)` is the outer half of the
+/// side whichever edge it is — the outer half of a bottom border is its lower
+/// half, and of a top border its upper one.
+fn band(side: &Rect, edge: Side, thickness: f32, from: f32, to: f32) -> Rect {
+    let (near, far) = (thickness * from, thickness * to);
+    match edge {
+        Side::Top => Rect {
+            y: side.y + near,
+            height: far - near,
+            ..*side
+        },
+        Side::Bottom => Rect {
+            y: side.y + side.height - far,
+            height: far - near,
+            ..*side
+        },
+        Side::Left => Rect {
+            x: side.x + near,
+            width: far - near,
+            ..*side
+        },
+        Side::Right => Rect {
+            x: side.x + side.width - far,
+            width: far - near,
+            ..*side
+        },
+    }
 }
 
 /// How long a dash or a dot wants to be, as a multiple of the border's width.
@@ -332,26 +403,68 @@ fn push_border_side(
     side: &Rect,
     style: css::style::BorderStyle,
     thickness: f32,
-    axis: Axis,
+    edge: Side,
     color: Color,
 ) {
     use css::style::BorderStyle;
 
+    let lit = color;
+    let dark = shaded(color, SHADOW);
+
     let wanted = match style {
         BorderStyle::Dotted => DOT_PERIOD * thickness,
         BorderStyle::Dashed => DASH_PERIOD * thickness,
-        // Everything else is still drawn as one solid run, including `double`,
-        // `groove`, `ridge`, `inset`, and `outset`. Recorded in the README
-        // rather than hidden.
+        // Two lines with a gap, each a third of the border. Below three pixels
+        // there is no room for that, and the honest answer is the solid line
+        // the author would otherwise have got.
+        BorderStyle::Double if thickness >= 3.0 => {
+            for (from, to) in [(0.0, 1.0 / 3.0), (2.0 / 3.0, 1.0)] {
+                list.items.push(DisplayItem::Rect {
+                    rect: band(side, edge, thickness, from, to),
+                    color,
+                });
+            }
+            return;
+        }
+        // Embedded or raised: one flat shade per edge, lit from above and left.
+        BorderStyle::Inset | BorderStyle::Outset => {
+            let raised = style == BorderStyle::Outset;
+            let light = edge.faces_the_light() == raised;
+            list.items.push(DisplayItem::Rect {
+                rect: *side,
+                color: if light { lit } else { dark },
+            });
+            return;
+        }
+        // Carved or proud: the same idea twice across the thickness, with the
+        // halves the other way round. A groove is an inset outer half around an
+        // outset inner one, which is what gives it its lip; a ridge is the
+        // reverse. Needs two pixels to show at all.
+        BorderStyle::Groove | BorderStyle::Ridge if thickness >= 2.0 => {
+            let proud = style == BorderStyle::Ridge;
+            for (from, to, outer) in [(0.0, 0.5, true), (0.5, 1.0, false)] {
+                // The outer half is lit when this edge faces the light and the
+                // border stands proud; every other combination flips it, which
+                // is the whole of the effect.
+                let light = edge.faces_the_light() == (proud == outer);
+                list.items.push(DisplayItem::Rect {
+                    rect: band(side, edge, thickness, from, to),
+                    color: if light { lit } else { dark },
+                });
+            }
+            return;
+        }
+        // `solid`, and anything too thin to show the pattern it asked for.
         _ => {
             list.items.push(DisplayItem::Rect { rect: *side, color });
             return;
         }
     };
 
-    let length = match axis {
-        Axis::Horizontal => side.width,
-        Axis::Vertical => side.height,
+    let length = if edge.is_horizontal() {
+        side.width
+    } else {
+        side.height
     };
     if !(length.is_finite() && length > 0.0 && wanted.is_finite() && wanted > 0.0) {
         return;
@@ -368,17 +481,18 @@ fn push_border_side(
     // degradation for a side too short to show a pattern at all.
     for index in 0..count {
         let offset = index as f32 * 2.0 * dash;
-        let rect = match axis {
-            Axis::Horizontal => Rect {
+        let rect = if edge.is_horizontal() {
+            Rect {
                 x: side.x + offset,
                 width: dash,
                 ..*side
-            },
-            Axis::Vertical => Rect {
+            }
+        } else {
+            Rect {
                 y: side.y + offset,
                 height: dash,
                 ..*side
-            },
+            }
         };
         list.items.push(DisplayItem::Rect { rect, color });
     }
@@ -1159,7 +1273,7 @@ mod border_tests {
             },
             style,
             thickness,
-            Axis::Horizontal,
+            Side::Top,
             Color::BLACK,
         );
         list.items
@@ -1222,6 +1336,77 @@ mod border_tests {
                 );
             }
         }
+    }
+
+    fn colours(style: BorderStyle, edge: Side, thickness: f32) -> Vec<Color> {
+        let mut list = DisplayList::default();
+        push_border_side(
+            &mut list,
+            &Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: thickness,
+            },
+            style,
+            thickness,
+            edge,
+            Color::rgb(200, 200, 200),
+        );
+        list.items
+            .into_iter()
+            .map(|item| match item {
+                DisplayItem::Rect { color, .. } => color,
+                other => panic!("a border drew {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outset_lights_the_top_and_shadows_the_bottom() {
+        // The whole of the effect: an edge that a light source above and to the
+        // left would strike keeps the declared colour, and the opposite edge is
+        // darkened. Reversed for `inset`, which is what makes one look raised
+        // and the other pressed in.
+        let top = colours(BorderStyle::Outset, Side::Top, 4.0);
+        let bottom = colours(BorderStyle::Outset, Side::Bottom, 4.0);
+        assert_eq!(top.len(), 1);
+        assert!(top[0].r > bottom[0].r, "{:?} vs {:?}", top[0], bottom[0]);
+
+        let top = colours(BorderStyle::Inset, Side::Top, 4.0);
+        let bottom = colours(BorderStyle::Inset, Side::Bottom, 4.0);
+        assert!(
+            top[0].r < bottom[0].r,
+            "inset is outset the other way up: {:?} vs {:?}",
+            top[0],
+            bottom[0],
+        );
+    }
+
+    #[test]
+    fn groove_and_ridge_split_the_thickness_into_two_shades() {
+        // Two bands across the border rather than one, and a ridge is a groove
+        // with the halves exchanged — which is the whole difference between
+        // carved and proud.
+        let groove = colours(BorderStyle::Groove, Side::Top, 4.0);
+        let ridge = colours(BorderStyle::Ridge, Side::Top, 4.0);
+        assert_eq!(groove.len(), 2, "an outer half and an inner one");
+        assert_eq!(ridge.len(), 2);
+        assert_ne!(groove[0], groove[1], "the two halves must differ");
+        assert_eq!(groove[0], ridge[1], "a ridge is a groove reversed");
+        assert_eq!(groove[1], ridge[0]);
+    }
+
+    #[test]
+    fn double_draws_two_lines_and_falls_back_when_there_is_no_room() {
+        let wide = colours(BorderStyle::Double, Side::Top, 6.0);
+        assert_eq!(wide.len(), 2, "two lines with a gap between them");
+
+        // Under three pixels there is nowhere to put a gap, so the author gets
+        // the solid line they would have got anyway rather than two lines
+        // rounded into one.
+        let thin = colours(BorderStyle::Double, Side::Top, 2.0);
+        assert_eq!(thin.len(), 1);
     }
 
     #[test]
