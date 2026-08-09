@@ -9,16 +9,32 @@
 # the opposite — quick to build and different on every commit, so caching them
 # stores a copy that the next run must invalidate anyway.
 #
-# It is also what keeps the cache inside GitHub's 10 GB per-repository budget.
-# An untrimmed `target/` for this workspace is ~8 GB on its own, and four jobs
-# each saving one would evict each other on every push, which is the same as
-# having no cache while paying to upload one.
+# The one-shot saving is small: a fresh CI build measured 3306 MiB before and
+# 3141 MiB after, because 318 dependencies dwarf 14 crates, and the compressed
+# archive GitHub actually stores is 441 MB on Linux against a 10 GB budget. What
+# this is really for is the sweep at the bottom — without it the cache grows
+# every time it is restored and saved, and that has no ceiling.
+#
+# Nothing here fails the job. It runs with `if: always()`, so a non-zero exit
+# would turn a red build's diagnosis into two failures, or fail a green build
+# over a caching detail. Problems are reported as warnings — visible in the run
+# summary, and visible here rather than swallowed, which is the point: a trim
+# that quietly stopped working would look exactly like a trim that had nothing
+# to do.
 #
 # Safe to run when the build failed, and safe to run twice: every step tolerates
 # what it was going to remove being absent already.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+warn() {
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        printf '::warning title=trim-target-dir::%s\n' "$*"
+    else
+        printf 'WARNING: %s\n' "$*" >&2
+    fi
+}
 
 if [ ! -d target ]; then
     echo "no target/ to trim"
@@ -30,23 +46,46 @@ before=$(du -sk target 2>/dev/null | cut -f1 || echo 0)
 # Package names, not directory names — `tests/ref` builds `reftests`, and
 # `cargo clean -p` wants what the manifest says. Asking cargo rather than
 # hard-coding the list means a new crate is covered the day it is added.
-members=$(cargo metadata --no-deps --format-version 1 --offline 2>/dev/null \
-    | jq -r '.packages[].name' \
-    || true)
+if ! members_json=$(cargo metadata --no-deps --format-version 1 --offline 2>&1); then
+    warn "cargo metadata failed, so no workspace crate could be identified and target/ is being left alone: $(printf '%s' "$members_json" | head -1)"
+    exit 0
+fi
+
+if ! members=$(printf '%s' "$members_json" | jq -r '.packages[].name' 2>&1); then
+    warn "could not parse cargo metadata (is jq present?), leaving target/ alone: $(printf '%s' "$members" | head -1)"
+    exit 0
+fi
 
 if [ -z "$members" ]; then
-    echo "WARNING: could not read workspace members; leaving target/ alone"
+    warn "cargo metadata named no workspace packages, which should be impossible; leaving target/ alone"
     exit 0
 fi
 
 # `--profile` covers `conformance`, which inherits release but is a separate
-# directory. A package that was never built under a given profile makes
-# `cargo clean` complain, and that is not a failure of anything.
+# directory. A package that was never built under a given profile is not an
+# error — cargo reports "Removed 0 files" and exits 0 — so anything that does
+# exit non-zero here is a real problem worth naming.
+attempted=0
+failed=0
+failures=""
+
 for package in $members; do
     for profile in dev release conformance; do
-        cargo clean --offline --profile "$profile" -p "$package" >/dev/null 2>&1 || true
+        attempted=$((attempted + 1))
+        if ! output=$(cargo clean --offline --profile "$profile" -p "$package" 2>&1); then
+            failed=$((failed + 1))
+            failures="${failures}  ${package} (${profile}): $(printf '%s' "$output" | head -1)"$'\n'
+        fi
     done
 done
+
+if [ "$failed" -eq "$attempted" ]; then
+    warn "every one of the ${attempted} cargo clean calls failed — the cache is about to store this workspace's own artifacts in full. First few:"
+    printf '%s' "$failures" | head -5 >&2
+elif [ "$failed" -gt 0 ]; then
+    warn "${failed} of ${attempted} cargo clean calls failed; those crates' artifacts will be cached and go stale:"
+    printf '%s' "$failures" | head -5 >&2
+fi
 
 # Incremental state is disabled in CI (CARGO_INCREMENTAL=0), so these are only
 # ever left by a local run that shares the directory. Cheap to be sure.
@@ -71,8 +110,10 @@ rm -rf target/conformance
 sweep_stale() {
     directory="$1"
     [ -d "$directory" ] || return 0
+
     # Newest first, so anything past the keep count is the older copy.
-    ls -t "$directory" 2>/dev/null | awk -v keep=2 '
+    local stale_list
+    stale_list=$(ls -t "$directory" 2>/dev/null | awk -v keep=2 '
         {
             name = $0
             extension = ""
@@ -80,9 +121,24 @@ sweep_stale() {
             stem = name
             sub(/-[0-9a-f]+(\.[A-Za-z0-9]+)?$/, "", stem)
             if (++seen[stem extension] > keep) print name
-        }' | while IFS= read -r stale; do
-        rm -rf "${directory:?}/${stale}"
-    done
+        }') || {
+        warn "could not list ${directory}; leaving it alone"
+        return 0
+    }
+
+    [ -n "$stale_list" ] || return 0
+
+    local swept=0
+    local stale
+    while IFS= read -r stale; do
+        if rm -rf "${directory:?}/${stale}"; then
+            swept=$((swept + 1))
+        else
+            warn "could not remove stale artifact ${directory}/${stale}"
+        fi
+    done <<< "$stale_list"
+
+    printf '  swept %s stale artifact(s) from %s\n' "$swept" "$directory"
 }
 
 for profile_dir in target/*/; do
@@ -90,4 +146,5 @@ for profile_dir in target/*/; do
 done
 
 after=$(du -sk target 2>/dev/null | cut -f1 || echo 0)
-printf 'trimmed target/: %s MiB -> %s MiB\n' "$((before / 1024))" "$((after / 1024))"
+printf 'trimmed target/: %s MiB -> %s MiB (%s cargo clean calls, %s failed)\n' \
+    "$((before / 1024))" "$((after / 1024))" "$attempted" "$failed"
