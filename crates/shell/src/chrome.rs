@@ -20,7 +20,7 @@ use css::style::{ComputedStyle, FontStack, GenericFamily};
 use css::value::Color;
 
 /// Height of the URL bar, in pixels.
-pub const HEIGHT: u32 = 34;
+pub const HEIGHT: u32 = 46;
 
 /// Height of the tab strip, shown only when there is more than one tab.
 ///
@@ -36,25 +36,75 @@ const TAB_MAX_WIDTH: f32 = 200.0;
 const TAB_MIN_WIDTH: f32 = 70.0;
 
 /// Width of the back and forward buttons.
-const BUTTON: f32 = 30.0;
+const BUTTON: f32 = 40.0;
 /// Gap between the buttons and the URL.
 const PADDING: f32 = 8.0;
 
-const BAR: Color = Color::rgb(0xf2, 0xf2, 0xf0);
-const RULE: Color = Color::rgb(0xcf, 0xcf, 0xcb);
-const INK: Color = Color::rgb(0x22, 0x22, 0x22);
-/// Used for a control that cannot be used, and for the parts of a URL that are
-/// not its host.
-const DIM: Color = Color::rgb(0x8a, 0x8a, 0x88);
-/// Warnings. Not red: nothing here is an error, and a browser that shouts at
-/// people about plain HTTP teaches them to ignore it.
-const NOTICE: Color = Color::rgb(0x8a, 0x5a, 0x10);
-/// Behind selected text in the URL bar.
-const SELECTION: Color = Color::rgb(0xb4, 0xd0, 0xf0);
-/// The focused field's surround, so it is obvious where the typing goes.
-const FOCUS: Color = Color::rgb(0x3a, 0x6e, 0xa5);
-/// A tab that is not the one being shown.
-const INACTIVE_TAB: Color = Color::rgb(0xdf, 0xdf, 0xdb);
+/// Every colour the chrome draws with, so that the two schemes are one
+/// substitution rather than a branch at each use site.
+///
+/// Only the chrome is themed. The page below it is the author's, and repainting
+/// their colours is a decision about someone else's document — the same class
+/// of decision ADR-0009 requires the browser to say out loud before making. A
+/// dark bar above a white page is honest about that; an inverted page would not
+/// be.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Theme {
+    /// The bar's own surface.
+    pub bar: Color,
+    /// Hairlines, outlines, and the gap between tabs.
+    pub rule: Color,
+    /// Text and enabled controls.
+    pub ink: Color,
+    /// A control that cannot be used, and the parts of a URL that are not its
+    /// host.
+    pub dim: Color,
+    /// Warnings. Not red: nothing here is an error, and a browser that shouts
+    /// at people about plain HTTP teaches them to ignore it.
+    pub notice: Color,
+    /// Behind selected text in the URL bar.
+    pub selection: Color,
+    /// The focused field's surround, so it is obvious where the typing goes.
+    pub focus: Color,
+    /// A tab that is not the one being shown.
+    pub inactive_tab: Color,
+}
+
+impl Theme {
+    /// The default scheme.
+    pub const LIGHT: Self = Self {
+        bar: Color::rgb(0xf2, 0xf2, 0xf0),
+        rule: Color::rgb(0xcf, 0xcf, 0xcb),
+        ink: Color::rgb(0x22, 0x22, 0x22),
+        dim: Color::rgb(0x8a, 0x8a, 0x88),
+        notice: Color::rgb(0x8a, 0x5a, 0x10),
+        selection: Color::rgb(0xb4, 0xd0, 0xf0),
+        focus: Color::rgb(0x3a, 0x6e, 0xa5),
+        inactive_tab: Color::rgb(0xdf, 0xdf, 0xdb),
+    };
+
+    /// The dark scheme.
+    ///
+    /// Not an inversion of the light one: the warning colour has to stay
+    /// legible against a dark bar and stay distinct from ordinary ink, and
+    /// inverting `theme.notice` would have given a pale blue that reads as a link.
+    pub const DARK: Self = Self {
+        bar: Color::rgb(0x24, 0x24, 0x26),
+        rule: Color::rgb(0x3d, 0x3d, 0x41),
+        ink: Color::rgb(0xe9, 0xe9, 0xe7),
+        dim: Color::rgb(0x92, 0x92, 0x96),
+        notice: Color::rgb(0xe3, 0xb0, 0x4b),
+        selection: Color::rgb(0x2d, 0x4f, 0x74),
+        focus: Color::rgb(0x6f, 0xa8, 0xdc),
+        inactive_tab: Color::rgb(0x1b, 0x1b, 0x1d),
+    };
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::LIGHT
+    }
+}
 
 /// Total height of the chrome, given how many tabs there are.
 pub fn total_height(tab_count: usize) -> u32 {
@@ -95,9 +145,15 @@ pub fn tab_at(tab_count: usize, width: f32, x: f32, y: f32) -> Option<(usize, bo
 const CLOSE_WIDTH: f32 = 22.0;
 
 /// Draws the tab strip. Empty when there is only one tab.
-pub fn render_tabs(labels: &[&str], active: usize, width: u32, fonts: &mut FontStore) -> Pixmap {
+pub fn render_tabs(
+    labels: &[&str],
+    active: usize,
+    width: u32,
+    fonts: &mut FontStore,
+    theme: Theme,
+) -> Pixmap {
     let mut list = DisplayList {
-        canvas: RULE,
+        canvas: theme.rule,
         ..DisplayList::default()
     };
     let style = ui_style(12.0);
@@ -108,7 +164,11 @@ pub fn render_tabs(labels: &[&str], active: usize, width: u32, fonts: &mut FontS
     {
         // The active tab is the colour of the bar below it, so the two read as
         // one surface and the tab looks attached to what it shows.
-        let background = if index == active { BAR } else { INACTIVE_TAB };
+        let background = if index == active {
+            theme.bar
+        } else {
+            theme.inactive_tab
+        };
         list.items.push(DisplayItem::Rect {
             rect: Rect {
                 x: rect.x,
@@ -127,7 +187,11 @@ pub fn render_tabs(labels: &[&str], active: usize, width: u32, fonts: &mut FontS
             &style,
             rect.x + PADDING,
             TAB_HEIGHT as f32 / 2.0 - 8.0,
-            if index == active { INK } else { DIM },
+            if index == active {
+                theme.ink
+            } else {
+                theme.dim
+            },
             rect.width - PADDING * 2.0 - CLOSE_WIDTH,
         );
         draw_text(
@@ -137,7 +201,7 @@ pub fn render_tabs(labels: &[&str], active: usize, width: u32, fonts: &mut FontS
             &ui_style(14.0),
             rect.x + rect.width - CLOSE_WIDTH + 5.0,
             TAB_HEIGHT as f32 / 2.0 - 9.0,
-            DIM,
+            theme.dim,
             CLOSE_WIDTH,
         );
     }
@@ -177,6 +241,8 @@ pub struct State<'a> {
     pub saved: bool,
     /// Whether the certificate chain verified only against a local root.
     pub local_root: bool,
+    /// Which colour scheme to draw in.
+    pub theme: Theme,
 }
 
 /// A control in the bar.
@@ -186,6 +252,8 @@ pub enum Control {
     Back,
     /// Go forward.
     Forward,
+    /// Fetch this page again.
+    Reload,
     /// Show the author's layout instead of the document fallback, or return to
     /// the fallback from it.
     ToggleLayout,
@@ -224,6 +292,7 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
     let mut out = vec![
         (Control::Back, button(PADDING, BUTTON)),
         (Control::Forward, button(PADDING + BUTTON, BUTTON)),
+        (Control::Reload, button(PADDING + BUTTON * 2.0, BUTTON)),
     ];
     // Not while editing: the bar gives its right-hand side over to the field,
     // so these are not drawn — and a control that is not drawn must not still
@@ -329,8 +398,9 @@ pub fn status(state: &State<'_>) -> Option<String> {
 
 /// Draws the bar.
 pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
+    let theme = state.theme;
     let mut list = DisplayList {
-        canvas: BAR,
+        canvas: theme.bar,
         ..DisplayList::default()
     };
     let width_f = width as f32;
@@ -344,7 +414,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             width: width_f,
             height: 1.0,
         },
-        color: RULE,
+        color: theme.rule,
     });
 
     // Where the right-hand controls start, which is where the status has to
@@ -359,18 +429,23 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     };
     for (control, rect) in nav_controls {
         match control {
-            Control::Back | Control::Forward => {
-                let enabled = if control == Control::Back {
-                    state.can_go_back
-                } else {
-                    state.can_go_forward
+            Control::Back | Control::Forward | Control::Reload => {
+                let enabled = match control {
+                    Control::Back => state.can_go_back,
+                    Control::Forward => state.can_go_forward,
+                    // Always available: reloading is how you recover from a
+                    // failed navigation, which is exactly when the other two
+                    // are least useful.
+                    _ => true,
                 };
                 // Arrows rather than words: the one piece of browser
-                // iconography nobody has to learn.
-                let glyph = if control == Control::Back {
-                    "\u{2190}"
-                } else {
-                    "\u{2192}"
+                // iconography nobody has to learn. U+21BB is in the bundled
+                // families (ADR-0008); a glyph that fell back to a hollow box
+                // would be worse than a word.
+                let glyph = match control {
+                    Control::Back => "\u{2190}",
+                    Control::Forward => "\u{2192}",
+                    _ => "\u{21bb}",
                 };
                 draw_text(
                     &mut list,
@@ -379,7 +454,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
                     &ui_style(15.0),
                     rect.x + BUTTON / 2.0 - 5.0,
                     baseline(),
-                    if enabled { INK } else { DIM },
+                    if enabled { theme.ink } else { theme.dim },
                     BUTTON,
                 );
             }
@@ -387,13 +462,16 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
                 right_edge = right_edge.min(rect.x);
                 // Outlined rather than filled: these are escape hatches, not
                 // the thing the reader came here to press.
-                outline(&mut list, &rect);
+                outline(&mut list, &rect, theme);
                 let (label, ink) = if control == Control::ToggleLayout {
-                    (toggle_label(state), INK)
+                    (toggle_label(state), theme.ink)
                 } else {
                     // Dimmed until the page is saved, so the two states differ
                     // at a glance and not only by reading the word.
-                    (bookmark_label(state), if state.saved { INK } else { DIM })
+                    (
+                        bookmark_label(state),
+                        if state.saved { theme.ink } else { theme.dim },
+                    )
                 };
                 let label_style = ui_style(12.0);
                 let text_width = measure(fonts, label, &label_style);
@@ -411,7 +489,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         }
     }
 
-    let url_x = PADDING * 2.0 + BUTTON * 2.0;
+    let url_x = PADDING * 2.0 + BUTTON * 3.0;
 
     // Find takes the bar over while it is open, the same way editing does, and
     // for the same reason: what you are doing is more important than where you
@@ -444,10 +522,10 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             &label_style,
             PADDING,
             baseline(),
-            DIM,
+            theme.dim,
             label_width,
         );
-        draw_field(&mut list, fonts, field, &style, &box_);
+        draw_field(theme, &mut list, fonts, field, &style, &box_);
         draw_text(
             &mut list,
             fonts,
@@ -456,9 +534,9 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             width_f - count_width - PADDING,
             baseline(),
             if total == 0 && !field.text().is_empty() {
-                NOTICE
+                theme.notice
             } else {
-                DIM
+                theme.dim
             },
             count_width,
         );
@@ -482,7 +560,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             width: (width_f - url_x - PADDING / 2.0).max(0.0),
             height: HEIGHT as f32 - 9.0,
         };
-        draw_field(&mut list, fonts, field, &style, &box_);
+        draw_field(theme, &mut list, fonts, field, &style, &box_);
         return rasterise(
             &list,
             fonts,
@@ -510,7 +588,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         &ui_style(14.0),
         url_x,
         baseline(),
-        INK,
+        theme.ink,
         url_width,
     );
 
@@ -530,9 +608,9 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             || state.local_root
             || !matches!(state.mode, RenderMode::Authored)
         {
-            NOTICE
+            theme.notice
         } else {
-            DIM
+            theme.dim
         };
         draw_text(
             &mut list,
@@ -558,13 +636,14 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
 
 /// Draws the URL bar in its editing state.
 fn draw_field(
+    theme: Theme,
     list: &mut DisplayList,
     fonts: &mut FontStore,
     field: &crate::field::Field,
     style: &ComputedStyle,
     box_: &Rect,
 ) {
-    outline_in(list, box_, FOCUS);
+    outline_in(list, box_, theme.focus);
 
     let text_x = box_.x + PADDING / 2.0;
     let max_width = (box_.width - PADDING).max(0.0);
@@ -585,7 +664,7 @@ fn draw_field(
                 width: (to - from).max(0.0),
                 height: box_.height - 6.0,
             },
-            color: SELECTION,
+            color: theme.selection,
         });
     }
 
@@ -596,7 +675,7 @@ fn draw_field(
         style,
         text_x,
         baseline(),
-        INK,
+        theme.ink,
         max_width,
     );
 
@@ -609,12 +688,12 @@ fn draw_field(
             width: 1.0,
             height: box_.height - 6.0,
         },
-        color: INK,
+        color: theme.ink,
     });
 }
 
 /// Draws a one-pixel outline around a control.
-fn outline(list: &mut DisplayList, rect: &Rect) {
+fn outline(list: &mut DisplayList, rect: &Rect, theme: Theme) {
     let inset = 5.0;
     outline_in(
         list,
@@ -624,7 +703,7 @@ fn outline(list: &mut DisplayList, rect: &Rect) {
             width: rect.width,
             height: rect.height - inset * 2.0,
         },
-        RULE,
+        theme.rule,
     );
 }
 
@@ -747,6 +826,7 @@ mod tests {
             finding: None,
             saved: false,
             local_root: false,
+            theme: Theme::LIGHT,
         }
     }
 
@@ -837,7 +917,7 @@ mod tests {
         let mode = RenderMode::Authored;
         let state = state("https://example.com/", &mode);
         let placed = controls(&state);
-        assert_eq!(placed.len(), 3, "back, forward, save — no toggle");
+        assert_eq!(placed.len(), 4, "back, forward, reload, save — no toggle");
 
         assert_eq!(
             control_at(&state, 600.0, placed[0].1.x + 1.0, 5.0),
@@ -846,6 +926,10 @@ mod tests {
         assert_eq!(
             control_at(&state, 600.0, placed[1].1.x + 1.0, 5.0),
             Some(Control::Forward)
+        );
+        assert_eq!(
+            control_at(&state, 600.0, placed[2].1.x + 1.0, 5.0),
+            Some(Control::Reload)
         );
         // Past the buttons is the URL, which is not a control.
         assert_eq!(control_at(&state, 600.0, 300.0, 5.0), None);
@@ -929,6 +1013,48 @@ mod tests {
     }
 
     #[test]
+    fn the_dark_theme_actually_reaches_the_pixels() {
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let mut state = state("https://example.com/", &mode);
+        let light = render(&state, 600, &mut fonts);
+        state.theme = Theme::DARK;
+        let dark = render(&state, 600, &mut fonts);
+        assert_ne!(light.data(), dark.data(), "the theme changed nothing");
+
+        // Not just different — actually dark. A theme that swapped two pale
+        // colours would pass the comparison above and fail every reader.
+        let corner = &dark.data()[..4];
+        assert!(
+            corner[0] < 0x60 && corner[1] < 0x60 && corner[2] < 0x60,
+            "the dark bar is not dark: {corner:?}"
+        );
+    }
+
+    #[test]
+    fn reload_is_offered_on_every_page_and_sits_beside_forward() {
+        let mode = RenderMode::Authored;
+        let state = state("https://example.com/", &mode);
+        let placed = controls(&state);
+        let (_, forward) = placed
+            .iter()
+            .find(|(control, _)| *control == Control::Forward)
+            .expect("a forward button");
+        let (_, reload) = placed
+            .iter()
+            .find(|(control, _)| *control == Control::Reload)
+            .expect("a reload button");
+        assert_eq!(reload.x, forward.x + BUTTON, "reload is not beside forward");
+        // Unlike back and forward it is never greyed out, so it must always be
+        // present to click — including on a page that failed to load, which is
+        // exactly when it is wanted.
+        assert_eq!(
+            control_at(&state, 600.0, reload.x + 1.0, 5.0),
+            Some(Control::Reload)
+        );
+    }
+
+    #[test]
     fn the_saved_state_actually_reaches_the_pixels() {
         let mut fonts = FontStore::new();
         let mode = RenderMode::Authored;
@@ -955,7 +1081,11 @@ mod tests {
         let placed = placed_controls(&state, 600.0);
         let leftmost = placed
             .iter()
-            .filter(|(control, _)| *control != Control::Back && *control != Control::Forward)
+            // The right-hand controls only. The nav buttons sit at the left
+            // edge and are not what the status has to stop short of.
+            .filter(|(control, _)| {
+                !matches!(control, Control::Back | Control::Forward | Control::Reload)
+            })
             .map(|(_, rect)| rect.x)
             .fold(f32::MAX, f32::min);
         assert!(leftmost < 600.0 - BOOKMARK, "{leftmost}");
@@ -1128,8 +1258,8 @@ mod tab_strip_tests {
     fn the_active_tab_is_drawn_differently() {
         let mut fonts = FontStore::new();
         let labels = ["First page", "Second page"];
-        let first = render_tabs(&labels, 0, 600, &mut fonts);
-        let second = render_tabs(&labels, 1, 600, &mut fonts);
+        let first = render_tabs(&labels, 0, 600, &mut fonts, Theme::LIGHT);
+        let second = render_tabs(&labels, 1, 600, &mut fonts, Theme::LIGHT);
         assert_ne!(first.data(), second.data());
         assert_eq!((first.width(), first.height()), (600, TAB_HEIGHT));
     }

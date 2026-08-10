@@ -229,6 +229,8 @@ struct App {
     pointer: (f32, f32),
     /// Whether the pointer is over a link, so the cursor can say so.
     over_link: bool,
+    /// Which colour scheme the chrome draws in.
+    theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
     modifiers: winit::event::Modifiers,
     /// The chrome bar, redrawn whenever what it says changes.
@@ -455,6 +457,29 @@ impl App {
         self.show(&target);
     }
 
+    /// Fetches the current page again.
+    ///
+    /// Deliberately not routed through `navigate`: reloading is not a
+    /// navigation, and pushing the same URL again would leave Back appearing
+    /// to do nothing.
+    fn reload(&mut self) {
+        let url = self.tab().history.current().to_owned();
+        self.show(&url);
+    }
+
+    /// Switches between the light and dark chrome.
+    fn toggle_theme(&mut self) {
+        self.theme = if self.theme == crate::chrome::Theme::DARK {
+            crate::chrome::Theme::LIGHT
+        } else {
+            crate::chrome::Theme::DARK
+        };
+        self.refresh_chrome();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn go_back(&mut self) {
         if let Some(url) = self.tab_mut().history.back().map(str::to_owned) {
             self.show(&url);
@@ -482,6 +507,7 @@ impl App {
             editing,
             size,
             bookmarks,
+            theme,
             ..
         } = self;
         let tab = tabs.active();
@@ -492,6 +518,7 @@ impl App {
             .unwrap_or(layout::RenderMode::Authored);
         *chrome = crate::chrome::render(
             &crate::chrome::State {
+                theme: *theme,
                 url: tab.history.current(),
                 mode: &mode,
                 error: tab.error.as_deref(),
@@ -517,10 +544,11 @@ impl App {
             fonts,
             strip,
             size,
+            theme,
             ..
         } = self;
         let labels: Vec<&str> = tabs.iter().map(Tab::label).collect();
-        *strip = crate::chrome::render_tabs(&labels, tabs.active_index(), size.0, fonts);
+        *strip = crate::chrome::render_tabs(&labels, tabs.active_index(), size.0, fonts, *theme);
 
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -921,6 +949,7 @@ impl App {
         let mode = mode.unwrap_or(layout::RenderMode::Authored);
         crate::chrome::control_at(
             &crate::chrome::State {
+                theme: self.theme,
                 url: self.tab().history.current(),
                 mode: &mode,
                 error: self.tab().error.as_deref(),
@@ -1307,6 +1336,7 @@ impl ApplicationHandler<BandReady> for App {
                         match self.control_under_pointer() {
                             Some(crate::chrome::Control::Back) => self.go_back(),
                             Some(crate::chrome::Control::Forward) => self.go_forward(),
+                            Some(crate::chrome::Control::Reload) => self.reload(),
                             Some(crate::chrome::Control::Bookmark) => self.toggle_bookmark(),
                             Some(crate::chrome::Control::ToggleLayout) => {
                                 self.tab_mut().forcing_authored = !self.tab().forcing_authored;
@@ -1379,12 +1409,24 @@ impl ApplicationHandler<BandReady> for App {
                         }
                         // Ctrl+D saves and Ctrl+B shows the list, which is
                         // where every browser has put them for twenty years.
-                        Key::Character(c) if c == "d" => {
+                        Key::Character(c) if c == "d" && !shift => {
                             self.toggle_bookmark();
                             return;
                         }
                         Key::Character(c) if c == "b" => {
                             self.open_bookmarks();
+                            return;
+                        }
+                        // Ctrl+R reloads, as it has everywhere since Netscape.
+                        Key::Character(c) if c == "r" => {
+                            self.reload();
+                            return;
+                        }
+                        // Ctrl+Shift+D rather than Ctrl+D, which is taken by
+                        // saving — and taken by saving in every other browser
+                        // too, so it is not a key this one gets to reassign.
+                        Key::Character(c) if c.eq_ignore_ascii_case("d") && shift => {
+                            self.toggle_theme();
                             return;
                         }
                         Key::Named(NamedKey::Tab) => {
@@ -1543,6 +1585,7 @@ pub fn open(
         size: (width.max(1), height.max(1)),
         pointer: (0.0, 0.0),
         over_link: false,
+        theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         strip: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),

@@ -129,6 +129,15 @@ The URL bar is editable: Ctrl+L (or F6, or clicking it) focuses it with the
 URL selected, Enter navigates, Escape gives up. A bare host gets `https://`,
 because that is what typing `example.com` means.
 
+Reload is the third button and Ctrl+R, and unlike back and forward it is never
+greyed out — a page that failed to load is exactly when it is wanted, and that
+is the moment the other two are least use.
+
+Ctrl+Shift+D switches the chrome between light and dark. Only the chrome: the
+page below it is the author's, and repainting their colours is a decision about
+someone else's document, which is the kind of thing ADR-0009 requires this
+browser to say out loud rather than do quietly.
+
 Find-in-page is on Ctrl+F: matches highlight as you type, Enter and F3 step
 through them (Shift to go back), and the bar counts them. A match already on
 screen is not scrolled to — moving the page under someone who can see what

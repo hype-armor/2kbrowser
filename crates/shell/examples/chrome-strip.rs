@@ -35,6 +35,7 @@ fn main() {
 
     let cases: Vec<chrome::State> = vec![
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/a-perfectly-ordinary-page.html",
             mode: &authored,
             error: None,
@@ -48,6 +49,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "http://example.org/an-old-page.html",
             mode: &authored,
             error: None,
@@ -63,6 +65,7 @@ fn main() {
         // A connection an intercepting proxy signed. Marked, because trusting
         // this computer's roots silently would make it look ordinary.
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/behind-a-proxy.html",
             mode: &authored,
             error: None,
@@ -76,6 +79,7 @@ fn main() {
             local_root: true,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "file:///home/user/pages/index.html",
             mode: &authored,
             error: None,
@@ -89,6 +93,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/something-modern",
             mode: &document,
             error: None,
@@ -102,6 +107,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/app",
             mode: &scripting,
             error: None,
@@ -115,6 +121,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/gone.html",
             mode: &authored,
             error: Some("server returned 404"),
@@ -128,6 +135,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/a-page.html",
             mode: &authored,
             error: None,
@@ -141,6 +149,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/",
             mode: &authored,
             error: None,
@@ -154,6 +163,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/index.html",
             mode: &authored,
             error: None,
@@ -167,6 +177,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/index.html",
             mode: &authored,
             error: None,
@@ -180,6 +191,7 @@ fn main() {
             local_root: false,
         },
         chrome::State {
+            theme: chrome::Theme::LIGHT,
             url: "https://example.com/index.html",
             mode: &authored,
             error: None,
@@ -234,7 +246,7 @@ fn main() {
         place(&mut sheet, &bar, &mut y);
     }
     for (labels, active) in &strips {
-        let strip = chrome::render_tabs(labels, *active, width, &mut fonts);
+        let strip = chrome::render_tabs(labels, *active, width, &mut fonts, chrome::Theme::LIGHT);
         place(&mut sheet, &strip, &mut y);
     }
 
