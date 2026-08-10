@@ -261,6 +261,13 @@ pub enum Control {
     Bookmark,
 }
 
+/// Width of the reload control.
+///
+/// A word, for the same reason the bookmark control is one: U+21BB is not in
+/// any of the four bundled families (ADR-0008), so it drew as a hollow box —
+/// which is how it reached a screenshot before anyone noticed. Back and forward
+/// keep their arrows because U+2190 and U+2192 are actually there.
+const RELOAD: f32 = 58.0;
 /// Width of the layout toggle, which carries a word rather than an arrow.
 const TOGGLE: f32 = 96.0;
 /// Width of the bookmark control, which also carries a word.
@@ -292,7 +299,7 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
     let mut out = vec![
         (Control::Back, button(PADDING, BUTTON)),
         (Control::Forward, button(PADDING + BUTTON, BUTTON)),
-        (Control::Reload, button(PADDING + BUTTON * 2.0, BUTTON)),
+        (Control::Reload, button(PADDING + BUTTON * 2.0, RELOAD)),
     ];
     // Not while editing: the bar gives its right-hand side over to the field,
     // so these are not drawn — and a control that is not drawn must not still
@@ -429,23 +436,36 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
     };
     for (control, rect) in nav_controls {
         match control {
-            Control::Back | Control::Forward | Control::Reload => {
-                let enabled = match control {
-                    Control::Back => state.can_go_back,
-                    Control::Forward => state.can_go_forward,
-                    // Always available: reloading is how you recover from a
-                    // failed navigation, which is exactly when the other two
-                    // are least useful.
-                    _ => true,
+            Control::Reload => {
+                // A word, and never dimmed: reloading is how you recover from
+                // a failed navigation, which is exactly when back and forward
+                // are least use.
+                let label_style = ui_style(12.0);
+                let text_width = measure(fonts, "reload", &label_style);
+                draw_text(
+                    &mut list,
+                    fonts,
+                    "reload",
+                    &label_style,
+                    rect.x + (rect.width - text_width) / 2.0,
+                    baseline() + 1.0,
+                    theme.ink,
+                    rect.width,
+                );
+            }
+            Control::Back | Control::Forward => {
+                let enabled = if control == Control::Back {
+                    state.can_go_back
+                } else {
+                    state.can_go_forward
                 };
                 // Arrows rather than words: the one piece of browser
-                // iconography nobody has to learn. U+21BB is in the bundled
-                // families (ADR-0008); a glyph that fell back to a hollow box
-                // would be worse than a word.
-                let glyph = match control {
-                    Control::Back => "\u{2190}",
-                    Control::Forward => "\u{2192}",
-                    _ => "\u{21bb}",
+                // iconography nobody has to learn, and both are in the bundled
+                // families.
+                let glyph = if control == Control::Back {
+                    "\u{2190}"
+                } else {
+                    "\u{2192}"
                 };
                 draw_text(
                     &mut list,
@@ -489,7 +509,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         }
     }
 
-    let url_x = PADDING * 2.0 + BUTTON * 3.0;
+    let url_x = PADDING * 2.0 + BUTTON * 2.0 + RELOAD;
 
     // Find takes the bar over while it is open, the same way editing does, and
     // for the same reason: what you are doing is more important than where you
@@ -1045,6 +1065,7 @@ mod tests {
             .find(|(control, _)| *control == Control::Reload)
             .expect("a reload button");
         assert_eq!(reload.x, forward.x + BUTTON, "reload is not beside forward");
+        assert_eq!(reload.width, RELOAD, "reload carries a word, not a glyph");
         // Unlike back and forward it is never greyed out, so it must always be
         // present to click — including on a page that failed to load, which is
         // exactly when it is wanted.
