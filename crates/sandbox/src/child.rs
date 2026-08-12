@@ -257,6 +257,7 @@ mod tests {
             origin: None,
             path: String::new(),
             force_authored: false,
+            force_document: false,
         }
         .encode()
     }

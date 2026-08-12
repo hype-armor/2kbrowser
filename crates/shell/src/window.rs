@@ -197,7 +197,11 @@ struct Tab {
     /// Whether the reader has overruled the document fallback here (ADR-0009).
     /// Reset on navigation: it is a decision about a page, not a setting.
     forcing_authored: bool,
-    /// Whether this page had a fallback decision to overrule.
+    /// Whether the reader has asked for the document fallback on a page that
+    /// classification did not give one to (ADR-0009). Reset on navigation for
+    /// the same reason, and never true at the same time as `forcing_authored`.
+    forcing_document: bool,
+    /// Whether this page is in a layout decision the reader can change.
     can_toggle_layout: bool,
     /// Whether this page's certificate verified only against a local root.
     ///
@@ -233,6 +237,7 @@ impl Tab {
             scroll: 0.0,
             error: None,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             local_root: false,
             finding: None,
@@ -240,6 +245,33 @@ impl Tab {
             current_match: 0,
             focused_link: None,
             focused_rects: Vec::new(),
+        }
+    }
+
+    /// What pressing the layout toggle does here (ADR-0009).
+    ///
+    /// The same three cases the bar's wording distinguishes, in the same order,
+    /// because they have to agree: the button says where it leads, and this is
+    /// where it leads. Kept beside the state it changes rather than inline in
+    /// the click handler so that the two flags cannot both end up set — the
+    /// child resolves that in favour of the author's layout, which would look
+    /// like a press that did nothing.
+    fn toggle_layout(&mut self) {
+        if self.forcing_authored {
+            // Overruling a fallback. Back to the fallback.
+            self.forcing_authored = false;
+        } else if self.forcing_document {
+            // Showing a fallback nobody classified. Back to the page as it is.
+            self.forcing_document = false;
+        } else if self.can_toggle_layout {
+            // Classification chose the fallback and the reader wants to see
+            // what the author actually wrote.
+            self.forcing_authored = true;
+        } else {
+            // An ordinary page, asked for the plain view it did not need. Not
+            // the absence of the case above: there is no fallback here to
+            // return to, so this is its own request.
+            self.forcing_document = true;
         }
     }
 
@@ -387,13 +419,20 @@ impl App {
         // one — a resize is not a fresh page, and re-opening would re-fetch
         // every image on it.
         let outcome = match tab.page.as_mut() {
-            Some(page) => page.resize(width, band),
+            // The tab holds the reader's choice of layout; the child holds the
+            // page. Pushing the choice across on every re-render, rather than
+            // only where it changes, is what makes pressing the toggle do
+            // anything at all: `resize` renders with whatever the viewport was
+            // last told, so a press that updated only the tab moved the word on
+            // the button and nothing else.
+            Some(page) => page.set_forcing(tab.forcing_authored, tab.forcing_document, width, band),
             None => match crate::viewport::Viewport::open(
                 renderer,
                 tab.loaded.clone(),
                 width,
                 band,
                 tab.forcing_authored,
+                tab.forcing_document,
             ) {
                 Ok(page) => {
                     // How a band painted on another thread reaches a window
@@ -475,8 +514,11 @@ impl App {
                 self.tab_mut().page = None;
                 self.tab_mut().error = None;
                 self.tab_mut().scroll = 0.0;
-                // A decision about the previous page, not a setting.
+                // A decision about the previous page, not a setting. Both of
+                // them: a reader who asked one page for a plain view has not
+                // asked for one of every page they go on to visit.
                 self.tab_mut().forcing_authored = false;
+                self.tab_mut().forcing_document = false;
                 // Focus belonged to a link on the page that just left.
                 self.tab_mut().focused_link = None;
                 self.tab_mut().focused_rects.clear();
@@ -567,6 +609,7 @@ impl App {
                 can_go_back: tab.history.can_go_back(),
                 can_go_forward: tab.history.can_go_forward(),
                 forcing_authored: tab.forcing_authored,
+                forcing_document: tab.forcing_document,
                 can_toggle_layout: tab.can_toggle_layout,
                 editing: editing.as_ref(),
                 finding: tab
@@ -998,6 +1041,7 @@ impl App {
                 can_go_back: self.tab().history.can_go_back(),
                 can_go_forward: self.tab().history.can_go_forward(),
                 forcing_authored: self.tab().forcing_authored,
+                forcing_document: self.tab().forcing_document,
                 can_toggle_layout: self.tab().can_toggle_layout,
                 editing: self.editing.as_ref(),
                 finding: self
@@ -1390,7 +1434,7 @@ impl ApplicationHandler<BandReady> for App {
                             Some(crate::chrome::Control::Reload) => self.reload(),
                             Some(crate::chrome::Control::Bookmark) => self.toggle_bookmark(),
                             Some(crate::chrome::Control::ToggleLayout) => {
-                                self.tab_mut().forcing_authored = !self.tab().forcing_authored;
+                                self.tab_mut().toggle_layout();
                                 self.rerender();
                                 if let Some(window) = &self.window {
                                     window.request_redraw();

@@ -125,6 +125,19 @@ a document, with a control to overrule that and see the author's layout
 (ADR-0009). An ordinary page over HTTPS says nothing at all.
 `cargo run -p shell --example chrome-strip` draws every state of it.
 
+That control goes both ways, and the second direction is not the first one
+inverted. On a page sent to the fallback it says *as authored* and gives back
+what the author wrote. On an ordinary page it says *simplify* and hands the
+page the reader sheet anyway — which is a different request, not the absence of
+the other one, because a page that renders fine has no fallback to return to.
+That is what wanting a plain view of a busy but working page amounts to, so the
+control is now on every page rather than appearing only where the browser had
+already made a decision. Classification still runs either way, so the bar goes
+on saying how much of the page actually needed newer layout; on a page you
+simplified yourself that is usually none of it, and reporting *0%* is the
+honest answer rather than an awkward one. Both directions are forgotten on
+navigation: they are decisions about a page, not settings.
+
 The URL bar is editable: Ctrl+L (or F6, or clicking it) focuses it with the
 URL selected, Enter navigates, Escape gives up. A bare host gets `https://`,
 because that is what typing `example.com` means.

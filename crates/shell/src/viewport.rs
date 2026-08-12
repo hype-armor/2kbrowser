@@ -68,6 +68,7 @@ pub struct Viewport {
     document: Document,
     page: Rendered,
     force_authored: bool,
+    force_document: bool,
 }
 
 impl Viewport {
@@ -78,6 +79,7 @@ impl Viewport {
         width: u32,
         band_height: u32,
         force_authored: bool,
+        force_document: bool,
     ) -> Result<Self, Error> {
         let (session, page) = renderer.open(
             document.body.clone(),
@@ -88,12 +90,14 @@ impl Viewport {
             Some(document.origin.clone()),
             document.path.clone(),
             force_authored,
+            force_document,
         )?;
         Ok(Self {
             session,
             document,
             page,
             force_authored,
+            force_document,
         })
     }
 
@@ -217,6 +221,12 @@ impl Viewport {
         self.force_authored
     }
 
+    /// Whether the reader is currently asking for the fallback on a page that
+    /// classification did not give one to.
+    pub fn forcing_document(&self) -> bool {
+        self.force_document
+    }
+
     /// How the page was rendered.
     ///
     /// Translated back from the wire type rather than shared with it: the
@@ -297,6 +307,7 @@ impl Viewport {
             Some(self.document.origin.clone()),
             self.document.path.clone(),
             self.force_authored,
+            self.force_document,
         )?;
         Ok(())
     }
@@ -308,7 +319,36 @@ impl Viewport {
         width: u32,
         max_height: u32,
     ) -> Result<(), Error> {
-        self.force_authored = forcing;
+        self.set_forcing(forcing, false, width, max_height)
+    }
+
+    /// Asks for the document fallback on a page that classified as authored,
+    /// or gives it back (ADR-0009).
+    pub fn set_forcing_document(
+        &mut self,
+        forcing: bool,
+        width: u32,
+        max_height: u32,
+    ) -> Result<(), Error> {
+        self.set_forcing(false, forcing, width, max_height)
+    }
+
+    /// Both overrides at once, which is how the window pushes what the tab
+    /// holds into the child that is going to act on it.
+    ///
+    /// Taken together rather than one at a time because they are two halves of
+    /// one answer to "what layout is this page in": setting either without
+    /// clearing the other would leave a tab claiming both, and the child
+    /// resolves that in favour of the author — silently undoing a press.
+    pub fn set_forcing(
+        &mut self,
+        authored: bool,
+        document: bool,
+        width: u32,
+        max_height: u32,
+    ) -> Result<(), Error> {
+        self.force_authored = authored;
+        self.force_document = document;
         self.resize(width, max_height)
     }
 }

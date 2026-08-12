@@ -230,7 +230,11 @@ pub struct State<'a> {
     pub can_go_forward: bool,
     /// Whether the reader is currently overruling the fallback.
     pub forcing_authored: bool,
-    /// Whether there is a fallback decision to overrule at all.
+    /// Whether the reader has asked for the fallback on a page that
+    /// classification did not give one to.
+    pub forcing_document: bool,
+    /// Whether this page is in a layout decision rather than the plain answer —
+    /// either one classification made, or one the reader asked for.
     pub can_toggle_layout: bool,
     /// The URL bar's editing state, when it has focus. `None` means the bar is
     /// showing where you are rather than where you are going.
@@ -254,8 +258,14 @@ pub enum Control {
     Forward,
     /// Fetch this page again.
     Reload,
-    /// Show the author's layout instead of the document fallback, or return to
-    /// the fallback from it.
+    /// Switch between the author's layout and the document fallback, whichever
+    /// way round this page currently is.
+    ///
+    /// On a page classification sent to the fallback this offers the author's
+    /// layout, and offers the fallback back afterwards. On an ordinary page it
+    /// offers the fallback, which is a different request rather than the same
+    /// one inverted: a page that classified as `Authored` has no fallback to
+    /// return to (ADR-0009).
     ToggleLayout,
     /// Save this page, or forget it if it is already saved.
     Bookmark,
@@ -285,9 +295,12 @@ const BOOKMARK: f32 = 56.0;
 /// that depended on measured text could not be computed without a font store,
 /// and a click would have to guess at what a redraw decided.
 ///
-/// The toggle appears only when there is a decision to overrule. On an ordinary
-/// page there is nothing for it to do, and a control that does nothing is worse
-/// than no control.
+/// The toggle is on every page. It used to appear only where classification had
+/// made a decision, because on an ordinary page it had nothing to do; now it
+/// does — a page that renders perfectly well can still be handed the document
+/// fallback, which is what a reader wanting a plain view of a busy page is
+/// asking for. So it no longer comes and goes with the page, and the reader who
+/// wants it does not have to learn which pages have it.
 pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
     let full = HEIGHT as f32;
     let button = |x: f32, width: f32| Rect {
@@ -307,13 +320,10 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
     if state.editing.is_some() || state.finding.is_some() {
         return out;
     }
-    // Outermost, because it is there on every page; the toggle appears beside
-    // it only when there is a decision to overrule, and a control that moved
-    // depending on the page would be one you had to look for every time.
+    // Both on every page, and always in this order, so neither is somewhere
+    // different depending on what the page turned out to be.
     out.push((Control::Bookmark, button(-BOOKMARK, BOOKMARK)));
-    if state.can_toggle_layout {
-        out.push((Control::ToggleLayout, button(-(BOOKMARK + TOGGLE), TOGGLE)));
-    }
+    out.push((Control::ToggleLayout, button(-(BOOKMARK + TOGGLE), TOGGLE)));
     out
 }
 
@@ -343,12 +353,26 @@ pub fn control_at(state: &State<'_>, width: f32, x: f32, y: f32) -> Option<Contr
         })
 }
 
-/// The word on the layout toggle.
+/// The word on the layout toggle: where pressing it leads, not where you are.
+///
+/// Three wordings for what looks like two states, because "show me the
+/// fallback" is two different offers depending on the page. On a page
+/// classification sent to the fallback, the way back is a return to a decision
+/// the browser already made and stated. On an ordinary page there is no such
+/// decision, and the button is asking whether to impose one — so it says what
+/// pressing it *does* rather than naming a state the page was never in.
 pub fn toggle_label(state: &State<'_>) -> &'static str {
     if state.forcing_authored {
+        // Overruling a fallback: the way back is the fallback.
         "as document"
-    } else {
+    } else if state.can_toggle_layout {
+        // Showing a document, whether classification chose it or the reader
+        // asked for it. Either way out is the author's layout.
         "as authored"
+    } else {
+        // An ordinary page, in no decision at all. Imperative, like `save`,
+        // because there is nothing here to go back to.
+        "simplify"
     }
 }
 
@@ -841,6 +865,7 @@ mod tests {
             can_go_back: false,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: None,
@@ -937,7 +962,11 @@ mod tests {
         let mode = RenderMode::Authored;
         let state = state("https://example.com/", &mode);
         let placed = controls(&state);
-        assert_eq!(placed.len(), 4, "back, forward, reload, save — no toggle");
+        assert_eq!(
+            placed.len(),
+            5,
+            "back, forward, reload, toggle, save — the toggle is on every page now"
+        );
 
         assert_eq!(
             control_at(&state, 600.0, placed[0].1.x + 1.0, 5.0),
@@ -961,19 +990,23 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_toggle_appears_only_when_there_is_a_decision_to_overrule() {
-        // ADR-0009 requires the override. A control that does nothing on every
-        // ordinary page is worse than no control, so it is not there.
+    fn the_layout_toggle_is_on_every_page_and_never_moves() {
+        // It used to be there only where classification had made a decision,
+        // because on an ordinary page it had nothing to do. It has something to
+        // do now: an ordinary page can be handed the document fallback, which
+        // is what a reader wanting a plain view of a busy page asks for, and
+        // which is not the absence of overruling a fallback (ADR-0009).
+        //
+        // "Never moves" is the half worth pinning. A control that appeared and
+        // disappeared with the page would be one you had to look for each time,
+        // and the reader who wants a plain view is looking for it *because* the
+        // page in front of them is not plain.
         let authored = RenderMode::Authored;
+        let ordinary = state("https://example.com/", &authored);
         assert_eq!(
-            control_at(
-                &state("https://example.com/", &authored),
-                600.0,
-                460.0,
-                17.0
-            ),
-            None,
-            "nothing there on an ordinary page"
+            control_at(&ordinary, 600.0, 460.0, 17.0),
+            Some(Control::ToggleLayout),
+            "an ordinary page can be asked for the fallback too"
         );
 
         let mode = RenderMode::Document {
@@ -986,6 +1019,21 @@ mod tests {
             Some(Control::ToggleLayout),
             "the toggle sits beside the save control"
         );
+
+        // The same rectangle in both, which is what "never moves" means.
+        let toggle_of = |state: &State<'_>| {
+            controls(state)
+                .into_iter()
+                .find(|(control, _)| *control == Control::ToggleLayout)
+                .expect("a toggle")
+                .1
+        };
+        let (plain, decided) = (toggle_of(&ordinary), toggle_of(&fallback));
+        assert_eq!((plain.x, plain.width), (decided.x, decided.width));
+
+        // And it says different things in the two, because pressing it means
+        // different things: one imposes a decision, the other overrules one.
+        assert_ne!(toggle_label(&ordinary), toggle_label(&fallback));
     }
 
     #[test]
@@ -1060,10 +1108,25 @@ mod tests {
             state.saved = saved;
             wanted.push(bookmark_label(&state).to_owned());
         }
-        for forcing in [false, true] {
-            state.forcing_authored = forcing;
-            wanted.push(toggle_label(&state).to_owned());
+        // All three of the toggle's wordings, which needs both flags walked
+        // rather than one: `simplify` only appears on a page in no decision,
+        // and it is the one a bundled family has never had to draw before.
+        let mut toggle_words: Vec<String> = Vec::new();
+        for (forcing_authored, can_toggle_layout) in [(false, false), (false, true), (true, true)] {
+            state.forcing_authored = forcing_authored;
+            state.can_toggle_layout = can_toggle_layout;
+            toggle_words.push(toggle_label(&state).to_owned());
         }
+        state.forcing_authored = false;
+        state.can_toggle_layout = false;
+        toggle_words.sort();
+        toggle_words.dedup();
+        assert_eq!(
+            toggle_words.len(),
+            3,
+            "these flags no longer reach all three wordings, so one goes unchecked: {toggle_words:?}"
+        );
+        wanted.extend(toggle_words);
         for url in ["http://example.com/", "file:///tmp/a.html"] {
             if let Some(notice) = scheme_notice(url) {
                 wanted.push(notice.to_owned());
@@ -1151,39 +1214,74 @@ mod tests {
     fn the_status_stops_short_of_the_controls() {
         // A status that ran under the buttons would be unreadable exactly when
         // it matters, which is when there is something to warn about.
-        let mode = RenderMode::Document {
+        //
+        // Checked on an ordinary page as well as a fallback one, because the
+        // toggle is now drawn on both: the right-hand controls used to give
+        // 96px back on a page with no decision to overrule, and every status
+        // that fitted did so with that margin in hand.
+        let fallback = RenderMode::Document {
             unsupported_share: 0.9,
         };
-        let mut state = state("http://example.com/", &mode);
-        state.can_toggle_layout = true;
-        let placed = placed_controls(&state, 600.0);
-        let leftmost = placed
-            .iter()
-            // The right-hand controls only. The nav buttons sit at the left
-            // edge and are not what the status has to stop short of.
-            .filter(|(control, _)| {
-                !matches!(control, Control::Back | Control::Forward | Control::Reload)
-            })
-            .map(|(_, rect)| rect.x)
-            .fold(f32::MAX, f32::min);
-        assert!(leftmost < 600.0 - BOOKMARK, "{leftmost}");
+        let authored = RenderMode::Authored;
 
-        let text = status(&state).expect("a status");
-        let width = measure(&mut FontStore::new(), &text, &ui_style(13.0)).min(300.0);
-        assert!(leftmost - PADDING - width > 0.0, "no room left for the URL");
+        let mut decided = state("http://example.com/", &fallback);
+        decided.can_toggle_layout = true;
+        // The longest thing the bar ever says about an ordinary page.
+        let mut intercepted = state("http://example.com/", &authored);
+        intercepted.local_root = true;
+
+        for state in [&decided, &intercepted] {
+            let placed = placed_controls(state, 600.0);
+            let leftmost = placed
+                .iter()
+                // The right-hand controls only. The nav buttons sit at the left
+                // edge and are not what the status has to stop short of.
+                .filter(|(control, _)| {
+                    !matches!(control, Control::Back | Control::Forward | Control::Reload)
+                })
+                .map(|(_, rect)| rect.x)
+                .fold(f32::MAX, f32::min);
+            assert!(leftmost < 600.0 - BOOKMARK, "{leftmost}");
+
+            let text = status(state).expect("a status");
+            let width = measure(&mut FontStore::new(), &text, &ui_style(13.0)).min(300.0);
+            assert!(
+                leftmost - PADDING - width > 0.0,
+                "no room left for the URL beside {text:?}"
+            );
+        }
     }
 
     #[test]
     fn the_toggle_says_where_it_leads() {
-        let mode = RenderMode::Document {
+        let authored = RenderMode::Authored;
+        let document = RenderMode::Document {
             unsupported_share: 0.9,
         };
-        let mut state = state("https://example.com/", &mode);
-        state.can_toggle_layout = true;
-        assert_eq!(toggle_label(&state), "as authored");
-        state.forcing_authored = true;
+
+        // An ordinary page, in no decision at all. There is nothing here to
+        // overrule and nothing to return to, so the word says what pressing it
+        // does rather than naming a state the page was never in.
+        let mut ordinary = state("https://example.com/", &authored);
+        assert_eq!(toggle_label(&ordinary), "simplify");
+
+        // Once pressed, it is in a decision like any other, and the way out is
+        // the author's layout — the same word the automatic fallback offers,
+        // because it is the same offer.
+        ordinary.forcing_document = true;
+        ordinary.can_toggle_layout = true;
         assert_eq!(
-            toggle_label(&state),
+            toggle_label(&ordinary),
+            "as authored",
+            "a reader who asked for this needs the way back"
+        );
+
+        let mut fallback = state("https://example.com/", &document);
+        fallback.can_toggle_layout = true;
+        assert_eq!(toggle_label(&fallback), "as authored");
+        fallback.forcing_authored = true;
+        assert_eq!(
+            toggle_label(&fallback),
             "as document",
             "once overruling, it has to offer the way back"
         );

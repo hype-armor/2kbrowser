@@ -36,6 +36,15 @@ height=900
 # the screen. `window.rs` pins this against what `draw` does; what it cannot
 # pin is that the number here matches the browser being run.
 chrome=46
+# The right-hand controls, from `chrome.rs`: PADDING, then the save control,
+# then the layout toggle beside it. Same caveat as `chrome` above — these are
+# pinned against `controls()` by its own tests, and repeated here because a
+# pointer has to be told a number.
+padding=8
+bookmark=56
+toggle=96
+toggle_x=$((width - padding - bookmark - toggle / 2))
+toggle_y=$((chrome / 2))
 
 fail() {
     echo "FAIL: $*" >&2
@@ -165,6 +174,22 @@ after=$(click_and_read "$click_x" $((chrome / 2)))
 case "$after" in
     *Departure*) echo "ok: clicking the chrome did not follow a link" ;;
     *) fail "a click on the bar navigated to: $after" ;;
+esac
+stop
+
+# 4. The layout toggle re-renders the page rather than only relabelling itself.
+#    This fixture classifies as authored, so pressing the toggle is the request
+#    that has no automatic counterpart: give this page the document fallback
+#    (ADR-0009). The title is the only place the answer shows, which is the
+#    point — the tab holds the reader's choice and the child holds the page, and
+#    a press that updated the first without reaching the second would leave the
+#    button saying one thing and the window showing another. That is exactly
+#    what it did before this check existed.
+start
+after=$(click_and_read "$toggle_x" "$toggle_y")
+case "$after" in
+    *"rendered as document"*) echo "ok: the layout toggle reached the renderer" ;;
+    *) fail "pressing the layout toggle left the window on: $after" ;;
 esac
 stop
 

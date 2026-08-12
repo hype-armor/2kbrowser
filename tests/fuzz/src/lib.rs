@@ -750,6 +750,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             origin: origin.ok(),
             path: "/a/b.html".to_owned(),
             force_authored: false,
+            force_document: false,
         }
         .encode(),
         sandbox::ToChild::Band {

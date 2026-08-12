@@ -18,6 +18,13 @@ fn main() {
     let document = RenderMode::Document {
         unsupported_share: 0.87,
     };
+    // A page that classified as authored and was handed the fallback anyway.
+    // Classification still ran, and none of this page wanted newer layout —
+    // reporting zero is the honest answer rather than an awkward one
+    // (ADR-0009).
+    let asked_for = RenderMode::Document {
+        unsupported_share: 0.0,
+    };
     let scripting = RenderMode::RequiresScripting;
 
     // Three editing states, so the caret and selection are visible.
@@ -42,6 +49,7 @@ fn main() {
             can_go_back: false,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: None,
@@ -56,6 +64,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: None,
@@ -72,6 +81,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: None,
@@ -86,6 +96,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: true,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: None,
@@ -100,10 +111,30 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: true,
             editing: None,
             finding: None,
             saved: true,
+            local_root: false,
+        },
+        // The other direction: an ordinary page the reader asked to simplify.
+        // Not the absence of the state above — that one is a fallback being
+        // overruled, and this one is a fallback being asked for by a page that
+        // had none to overrule.
+        chrome::State {
+            theme: chrome::Theme::LIGHT,
+            url: "https://example.com/a-busy-but-working-page.html",
+            mode: &asked_for,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            forcing_document: true,
+            can_toggle_layout: true,
+            editing: None,
+            finding: None,
+            saved: false,
             local_root: false,
         },
         chrome::State {
@@ -114,6 +145,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: true,
+            forcing_document: false,
             can_toggle_layout: true,
             editing: None,
             finding: None,
@@ -128,6 +160,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: None,
@@ -142,6 +175,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: Some(&selected),
             finding: None,
@@ -156,6 +190,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: Some(&typing),
             finding: None,
@@ -170,6 +205,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: Some(&partial),
             finding: None,
@@ -184,6 +220,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: Some((&searching, 2, 7)),
@@ -198,6 +235,7 @@ fn main() {
             can_go_back: true,
             can_go_forward: false,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
             editing: None,
             finding: Some((&fruitless, 0, 0)),

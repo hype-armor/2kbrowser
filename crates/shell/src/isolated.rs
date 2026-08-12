@@ -59,6 +59,9 @@ pub struct PageRenderer {
     /// render did, and whether there is a decision to overrule depends on a
     /// choice the parent made rather than on anything in the pixels.
     force_authored: bool,
+    /// Whether the reader asked for the document fallback on a page that did
+    /// not need one. Remembered for the same reason as `force_authored`.
+    force_document: bool,
 }
 
 impl Default for PageRenderer {
@@ -74,12 +77,25 @@ impl PageRenderer {
             fonts: FontStore::new(),
             page: None,
             force_authored: false,
+            force_document: false,
         }
     }
 
-    /// Whether there is a fallback decision the reader could overrule.
+    /// Whether this page is showing a layout decision rather than the plain
+    /// answer — either one classification made, or one the reader asked for.
+    ///
+    /// Both overrides count, and neither is redundant. `force_authored` is the
+    /// case classification wanted a fallback and the reader said no, so the
+    /// page reports `Authored` and nothing in the mode records that a decision
+    /// was made. `force_document` is the reverse, and it is named rather than
+    /// inferred from the mode so that a page whose forced render comes back
+    /// `Authored` anyway — a frameset has no fallback to give — still offers
+    /// the way back instead of stranding the reader with a button that has
+    /// vanished under their pointer.
     fn can_toggle_layout(&self, page: &crate::render::Page) -> bool {
-        self.force_authored || !matches!(page.mode, layout::RenderMode::Authored)
+        self.force_authored
+            || self.force_document
+            || !matches!(page.mode, layout::RenderMode::Authored)
     }
 }
 
@@ -130,6 +146,7 @@ impl Render for PageRenderer {
             origin,
             path,
             force_authored,
+            force_document,
         } = request
         else {
             return Err("expected a render request".to_owned());
@@ -143,8 +160,23 @@ impl Render for PageRenderer {
         // goes over the pipe. Nothing in this process opens a socket or a file.
         let mut loader = PipeLoader { fetch };
         let base = origin.as_ref().map(|origin| (origin, path.as_str()));
+        // Both set is a request the parent never makes, and this side is where
+        // messages from a stranger arrive — so it is decided rather than
+        // assumed away. The author's layout wins, because it is the one that
+        // shows the page as written; a reader given the wrong one of these can
+        // at least see what they were denied.
         let page = if *force_authored {
             crate::render::render_as_authored_with(
+                &html,
+                *width,
+                *top,
+                *height,
+                &mut self.fonts,
+                &mut loader,
+                base,
+            )
+        } else if *force_document {
+            crate::render::render_as_document_with(
                 &html,
                 *width,
                 *top,
@@ -166,6 +198,7 @@ impl Render for PageRenderer {
         };
 
         self.force_authored = *force_authored;
+        self.force_document = *force_document && !*force_authored;
         let rendered = Rendered {
             pixels: page.pixmap.data().to_vec(),
             width: page.pixmap.width(),
@@ -273,6 +306,33 @@ mod tests {
             origin: None,
             path: String::new(),
             force_authored: false,
+            force_document: false,
+        }
+    }
+
+    /// The same request, with one of the two layout overrides set.
+    fn overriding(body: &[u8], width: u32, authored: bool, document: bool) -> ToChild {
+        match request(body, width) {
+            ToChild::Render {
+                body,
+                content_type,
+                top,
+                height,
+                origin,
+                path,
+                ..
+            } => ToChild::Render {
+                body,
+                content_type,
+                width,
+                top,
+                height,
+                origin,
+                path,
+                force_authored: authored,
+                force_document: document,
+            },
+            other => other,
         }
     }
 
@@ -349,6 +409,137 @@ mod tests {
     }
 
     #[test]
+    fn an_ordinary_page_can_be_asked_for_the_document_fallback() {
+        // The request that had nowhere to travel. `force_authored` returns a
+        // fallback page to the author's layout; this is the other direction,
+        // and it is not the absence of that one — an ordinary page classifies
+        // as `Authored` and has no fallback to return to.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+
+        let mut plain = PageRenderer::new();
+        let ordinary = plain
+            .render(&request(html.as_bytes(), 300), &mut no_fetch)
+            .expect("renders");
+        assert_eq!(
+            ordinary.mode,
+            Mode::Authored,
+            "this fixture is only useful while it needs no fallback"
+        );
+
+        let mut forcing = PageRenderer::new();
+        let forced = forcing
+            .render(
+                &overriding(html.as_bytes(), 300, false, true),
+                &mut no_fetch,
+            )
+            .expect("renders");
+        assert!(
+            matches!(forced.mode, Mode::Document { .. }),
+            "asking for the fallback across the boundary did not produce one: {:?}",
+            forced.mode
+        );
+        // Not the same rendering wearing a different label: the reader sheet
+        // replaces the author's, so the pixels have to differ.
+        assert_ne!(
+            ordinary.pixels, forced.pixels,
+            "the forced fallback rendered identically to the author's layout"
+        );
+        assert!(
+            forced.can_toggle_layout,
+            "a reader who asked for this needs the way back"
+        );
+    }
+
+    #[test]
+    fn a_band_of_a_forced_page_still_offers_the_way_back() {
+        // A band re-sends everything the bar reads, and the bar decides what
+        // the toggle says. A band that forgot the override would blank the
+        // control the moment the reader scrolled.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+        let mut renderer = PageRenderer::new();
+        renderer
+            .render(
+                &overriding(html.as_bytes(), 300, false, true),
+                &mut no_fetch,
+            )
+            .expect("renders");
+        let band = renderer.band(0, 200).expect("paints a band");
+        assert!(
+            band.can_toggle_layout,
+            "the band lost the reader's override"
+        );
+    }
+
+    #[test]
+    fn a_forced_page_with_no_fallback_to_give_still_offers_the_way_back() {
+        // A frameset is its own viewport and has no document fallback: it comes
+        // back `Authored` however it was asked for. So the mode records nothing
+        // about the reader having asked, and if the override is not remembered
+        // separately the bar has no way to know there is anything to undo — it
+        // goes on offering to simplify a page it has already been told to
+        // simplify, and every press does nothing.
+        let dir = std::env::temp_dir().join("2kbrowser-forced-frameset");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (origin, at) = net::parse_url(&net::file_url(&dir.join("page.html"))).expect("parses");
+        let html = "<frameset cols=\"50%,50%\">\
+                    <frame src=\"a.html\"><frame src=\"b.html\"></frameset>";
+
+        let mut fetch = |_url: &str, _kind: net::RequestKind| -> Fetched {
+            Some(sandbox::child::Resource {
+                bytes: b"<body><p>a frame</p></body>".to_vec(),
+                content_type: Some("text/html".to_owned()),
+            })
+        };
+
+        let mut renderer = PageRenderer::new();
+        let page = renderer
+            .render(
+                &ToChild::Render {
+                    body: html.as_bytes().to_vec(),
+                    content_type: None,
+                    width: 300,
+                    top: 0,
+                    height: 400,
+                    origin: Some(origin),
+                    path: at,
+                    force_authored: false,
+                    force_document: true,
+                },
+                &mut fetch,
+            )
+            .expect("renders");
+
+        assert_eq!(
+            page.mode,
+            Mode::Authored,
+            "a frameset has no fallback to give, which is what makes this the case worth pinning"
+        );
+        assert!(
+            page.can_toggle_layout,
+            "the reader's request left no trace, so the bar cannot offer to undo it"
+        );
+    }
+
+    #[test]
+    fn asking_for_both_layouts_at_once_gets_the_authors() {
+        // The parent never sends this, and that is exactly why it is decided
+        // here: the frame arrives on the untrusted side, and "cannot happen" is
+        // not a property of a message somebody else wrote. The author's layout
+        // wins, and the reported state has to agree with what was drawn rather
+        // than with what was asked for.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+        let mut renderer = PageRenderer::new();
+        let page = renderer
+            .render(&overriding(html.as_bytes(), 300, true, true), &mut no_fetch)
+            .expect("renders");
+        assert_eq!(page.mode, Mode::Authored, "the author's layout lost");
+        assert!(
+            !renderer.force_document,
+            "the losing override was still recorded, so the band would disagree"
+        );
+    }
+
+    #[test]
     fn the_bytes_are_decoded_on_the_child_side() {
         // A page declaring nothing is windows-1252, and the sniffer belongs
         // with every other parser — on the far side of the boundary.
@@ -398,6 +589,7 @@ mod tests {
                     origin: Some(origin),
                     path: at,
                     force_authored: false,
+                    force_document: false,
                 },
                 &mut no_fetch,
             )
@@ -463,6 +655,7 @@ mod tests {
                     origin: Some(origin),
                     path: at,
                     force_authored: false,
+                    force_document: false,
                 },
                 &mut fetch,
             )
@@ -518,6 +711,7 @@ mod tests {
                     origin: Some(origin),
                     path: at,
                     force_authored: false,
+                    force_document: false,
                 },
                 &mut fetch,
             )

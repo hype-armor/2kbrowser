@@ -140,6 +140,16 @@ pub enum ToChild {
         path: String,
         /// Whether to overrule the document fallback (ADR-0009).
         force_authored: bool,
+        /// Whether to ask for the document fallback on a page that classified
+        /// as authored (ADR-0009).
+        ///
+        /// Not the absence of `force_authored`, which is why it is a second
+        /// field rather than the other value of one: a page with no fallback
+        /// has nothing to return to, so wanting one is its own request. The two
+        /// are never both true, but that is the parent's business — the child
+        /// reads whatever arrives, and `render` gives `force_authored`
+        /// precedence rather than trusting a stranger to have kept the rule.
+        force_document: bool,
     },
     /// Paint a different band of the page already held.
     ///
@@ -196,6 +206,7 @@ impl ToChild {
                 origin,
                 path,
                 force_authored,
+                force_document,
             } => {
                 writer.tag(0);
                 writer.bytes(body);
@@ -212,6 +223,7 @@ impl ToChild {
                 }
                 writer.str(path);
                 writer.some(*force_authored);
+                writer.some(*force_document);
             }
             ToChild::Find { query } => {
                 writer.tag(2);
@@ -267,6 +279,7 @@ impl ToChild {
                     origin,
                     path: reader.str()?,
                     force_authored: reader.some()?,
+                    force_document: reader.some()?,
                 }
             }
             1 => {
@@ -534,8 +547,39 @@ mod tests {
             ),
             path: "/a.html".to_owned(),
             force_authored: true,
+            force_document: false,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
+    }
+
+    #[test]
+    fn the_two_layout_overrides_do_not_cross_on_the_wire() {
+        // Adjacent fields of the same shape, written and read by position. A
+        // decoder that took them in the other order would round-trip both-false
+        // and both-true unchanged, so the only case that catches the swap is
+        // the one where they differ — which is also the only case either field
+        // is ever set in.
+        //
+        // Worth its own test because the two mean opposite things: one asks for
+        // the author's layout over the fallback, the other for the fallback
+        // over the author's layout. Crossed, the reader presses a button and
+        // gets the page they already had, with the bar saying they asked for
+        // the other one.
+        for (force_authored, force_document) in [(true, false), (false, true)] {
+            let message = ToChild::Render {
+                body: b"<p>hello</p>".to_vec(),
+                content_type: None,
+                width: 800,
+                top: 0,
+                height: 2000,
+                origin: None,
+                path: "/a.html".to_owned(),
+                force_authored,
+                force_document,
+            };
+            let decoded = ToChild::decode(&message.encode());
+            assert_eq!(decoded, Ok(message), "{force_authored} {force_document}");
+        }
     }
 
     #[test]
@@ -549,6 +593,7 @@ mod tests {
             origin: None,
             path: String::new(),
             force_authored: false,
+            force_document: false,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
     }
@@ -570,6 +615,7 @@ mod tests {
                 origin: Some(origin),
                 path,
                 force_authored: false,
+                force_document: false,
             };
             assert_eq!(ToChild::decode(&message.encode()), Ok(message), "{url}");
         }
@@ -642,6 +688,7 @@ mod tests {
                 origin: Some(net::parse_url("https://example.com/").expect("parses").0),
                 path: "/".to_owned(),
                 force_authored: false,
+                force_document: true,
             }
             .encode(),
             ToParent::Rendered(Box::new(rendered(3, 2))).encode(),

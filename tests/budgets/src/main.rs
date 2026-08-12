@@ -187,6 +187,8 @@ fn resident_memory() -> Check {
         },
         800,
         2400,
+        // Neither layout override: what is being measured is an ordinary page.
+        false,
         false,
     );
     let page = match page {

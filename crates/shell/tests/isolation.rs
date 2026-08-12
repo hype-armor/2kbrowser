@@ -35,6 +35,7 @@ fn request(html: &str, width: u32) -> ToChild {
         origin: None,
         path: String::new(),
         force_authored: false,
+        force_document: false,
     }
 }
 
@@ -176,6 +177,7 @@ fn session(html: &str, width: u32) -> (sandbox::Session, sandbox::Rendered) {
             Some(origin),
             at,
             false,
+            false,
         )
         .expect("the renderer opens the page")
 }
@@ -226,6 +228,7 @@ fn the_same_child_re_renders_at_a_new_width() {
             2000,
             Some(origin),
             at,
+            false,
             false,
         )
         .expect("re-renders");
@@ -335,6 +338,7 @@ fn viewport(html: &str, width: u32) -> shell::viewport::Viewport {
         width,
         2000,
         false,
+        false,
     )
     .expect("the page opens")
 }
@@ -426,6 +430,55 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
         page.can_toggle_layout(),
         "once overruling, there has to be a way back"
     );
+}
+
+#[test]
+fn an_ordinary_page_can_be_asked_for_the_fallback_and_given_it_back() {
+    // The other direction of the same override, across the same boundary. Not
+    // the absence of the test above: an ordinary page classifies as `Authored`
+    // and has no fallback to return to, so wanting one is its own request
+    // (ADR-0009).
+    let mut page = viewport(
+        "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>",
+        300,
+    );
+    assert!(
+        matches!(page.mode(), layout::RenderMode::Authored),
+        "this fixture is only useful while it needs no fallback: {:?}",
+        page.mode()
+    );
+    assert!(
+        !page.can_toggle_layout(),
+        "nothing has been decided about this page yet"
+    );
+    assert!(!page.forcing_document());
+    let plain = page.pixels().to_vec();
+
+    page.set_forcing_document(true, 300, 2000)
+        .expect("re-renders");
+    assert!(
+        matches!(page.mode(), layout::RenderMode::Document { .. }),
+        "asking for the fallback across the boundary did not produce one: {:?}",
+        page.mode()
+    );
+    assert!(page.forcing_document());
+    assert!(
+        page.can_toggle_layout(),
+        "a reader who asked for this needs the way back"
+    );
+    assert_ne!(
+        plain,
+        page.pixels(),
+        "the forced fallback rendered identically to the author's layout"
+    );
+
+    // And the way back actually goes back, rather than leaving the reader in a
+    // rendering they cannot get out of.
+    page.set_forcing_document(false, 300, 2000)
+        .expect("re-renders");
+    assert!(matches!(page.mode(), layout::RenderMode::Authored));
+    assert!(!page.can_toggle_layout());
+    assert_eq!(plain, page.pixels(), "going back did not go back");
 }
 
 #[test]
@@ -585,6 +638,7 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
         800,
         4000,
         false,
+        false,
     )
     .expect("the confined renderer opens the page");
 
@@ -629,8 +683,9 @@ fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
         path: at,
     };
 
-    let mut page = shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false)
-        .expect("the page opens");
+    let mut page =
+        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false, false)
+            .expect("the page opens");
     assert!(
         page.content_height() > page.height() as f32,
         "the fixture is too short to band: {} content, {} band",
@@ -748,6 +803,7 @@ fn renderers_built_at_the_same_time_all_start() {
                         None,
                         String::new(),
                         false,
+                        false,
                     )
                     .map(|page| page.width)
                     .map_err(|error| format!("thread {index}: {error}"))
@@ -802,6 +858,7 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
             8000,
             Some(origin),
             at,
+            false,
             false,
         )
         .expect("the renderer opens the page");
@@ -875,6 +932,7 @@ fn tall_session(lines: usize, width: u32) -> (sandbox::Session, sandbox::Rendere
             8000,
             Some(origin),
             at,
+            false,
             false,
         )
         .expect("the renderer opens the page")
@@ -973,6 +1031,7 @@ fn a_charset_that_only_the_header_knows_still_reaches_the_renderer() {
                 400,
                 None,
                 String::new(),
+                false,
                 false,
             )
             .expect("renders")

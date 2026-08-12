@@ -296,6 +296,9 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
         document,
         width,
         height.min(sandbox::max_canvas_height(width)),
+        // Neither layout override: the command line has no chrome to press,
+        // so it gets whatever classification decided (ADR-0009).
+        false,
         false,
     )
     .map_err(|error| error.to_string())
