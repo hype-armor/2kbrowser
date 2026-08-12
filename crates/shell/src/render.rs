@@ -416,11 +416,6 @@ pub fn render_as_authored(
 ///
 /// The counterpart to `render_as_authored_with`, for a reader who wants the
 /// simplified layout on a page that renders perfectly well without it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
-              nothing else would use"
-)]
 pub fn render_as_document_with(
     html: &str,
     width: u32,
