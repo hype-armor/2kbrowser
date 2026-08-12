@@ -110,10 +110,22 @@ fn run_open(args: &[String]) -> Result<String, String> {
         document.origin,
         document.path,
         options.width,
-        options.height.min(2000),
+        if options.height_given {
+            options.height
+        } else {
+            // `render` writes a PNG, so its 4000px default is a canvas that
+            // shrinks to the content. A window is not a canvas: asking for one
+            // 2000px tall — as this did — puts most of it below the bottom of
+            // an ordinary screen, and the browser then believes the whole page
+            // is visible and refuses to scroll to the part that is not.
+            WINDOW_HEIGHT
+        },
     )?;
     Ok(String::new())
 }
+
+/// Height of a window that nobody asked to be a particular size.
+const WINDOW_HEIGHT: u32 = 800;
 
 /// Options shared by both commands.
 struct Options {
@@ -121,6 +133,9 @@ struct Options {
     output: String,
     width: u32,
     height: u32,
+    /// Whether `--height` was given, so `open` can tell a deliberate window
+    /// height from `render`'s canvas default.
+    height_given: bool,
 }
 
 impl Options {
@@ -130,6 +145,7 @@ impl Options {
             output: "page.png".to_owned(),
             width: 800,
             height: 4000,
+            height_given: false,
         };
         let mut index = 0;
         while index < args.len() {
@@ -141,6 +157,7 @@ impl Options {
                         .map_err(|_| "--width must be a number".to_owned())?;
                 }
                 "--height" => {
+                    options.height_given = true;
                     options.height = take(args, &mut index, "--height")?
                         .parse()
                         .map_err(|_| "--height must be a number".to_owned())?;

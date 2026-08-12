@@ -125,6 +125,32 @@ fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Optio
     (y >= 0.0).then_some((pointer.0, y + scroll))
 }
 
+/// Shrinks a requested window to something the screen can actually show.
+///
+/// A window taller than the display is not merely awkward: the browser sizes
+/// its viewport from `inner_size`, so it believes every row it was given is
+/// visible. A page that fits in that imaginary viewport is a page it will not
+/// scroll — leaving the rows below the bottom of the monitor unreachable
+/// rather than just off-screen.
+///
+/// The margin is for whatever the desktop keeps at the edges: a title bar it
+/// adds itself, a taskbar, a dock. Winit has no work-area query, so this is an
+/// allowance rather than a measurement, and it is only ever a shrink — a
+/// monitor smaller than the floor leaves the request alone rather than
+/// producing a window too small to use.
+fn clamp_to_monitor(requested: (u32, u32), monitor: (u32, u32)) -> (u32, u32) {
+    const EDGES: u32 = 96;
+    const FLOOR: (u32, u32) = (360, 320);
+    let fit = |want: u32, screen: u32, floor: u32| {
+        let room = screen.saturating_sub(EDGES);
+        if room < floor { want } else { want.min(room) }
+    };
+    (
+        fit(requested.0, monitor.0, FLOOR.0),
+        fit(requested.1, monitor.1, FLOOR.1),
+    )
+}
+
 fn clamp_scroll(offset: f32, scrollable_height: f32, viewport_height: f32) -> f32 {
     let max = (scrollable_height - viewport_height).max(0.0);
     offset.clamp(0.0, max)
@@ -1253,9 +1279,22 @@ impl ApplicationHandler<BandReady> for App {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // In logical pixels, because that is what the requested size is in.
+        let monitor = event_loop.primary_monitor().map(|monitor| {
+            let scale = monitor.scale_factor();
+            let size = monitor.size();
+            (
+                (f64::from(size.width) / scale) as u32,
+                (f64::from(size.height) / scale) as u32,
+            )
+        });
+        let wanted = match monitor {
+            Some(monitor) => clamp_to_monitor(self.size, monitor),
+            None => self.size,
+        };
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
-            .with_inner_size(winit::dpi::LogicalSize::new(self.size.0, self.size.1));
+            .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
             return;
@@ -1613,6 +1652,31 @@ pub fn open(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_window_is_never_asked_to_be_taller_than_the_screen() {
+        // The case that shipped: `open` asked for 2000px on a 1080p display.
+        let (_, height) = clamp_to_monitor((800, 2000), (1920, 1080));
+        assert!(
+            height < 1080,
+            "{height} still does not fit on a 1080p screen"
+        );
+        // and it leaves room for whatever the desktop keeps at the edges
+        assert!(height <= 1080 - 96);
+    }
+
+    #[test]
+    fn a_window_that_already_fits_is_left_alone() {
+        assert_eq!(clamp_to_monitor((800, 800), (1920, 1080)), (800, 800));
+        assert_eq!(clamp_to_monitor((1200, 900), (2560, 1440)), (1200, 900));
+    }
+
+    #[test]
+    fn a_tiny_monitor_does_not_produce_an_unusable_window() {
+        // Shrinking to fit is only worth doing while what is left is usable; a
+        // 200px-tall screen is not a reason to hand back a 104px window.
+        assert_eq!(clamp_to_monitor((800, 800), (300, 200)), (800, 800));
+    }
 
     #[test]
     fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
