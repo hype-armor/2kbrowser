@@ -1033,6 +1033,63 @@ mod tests {
     }
 
     #[test]
+    fn every_glyph_the_bar_draws_exists_in_the_bundled_fonts() {
+        // Glyph 0 is `.notdef` by definition, and `.notdef` in these families
+        // is the hollow box that shipped in a screenshot: the reload control
+        // was given U+21BB, which is in none of the four ADR-0008 bundles, and
+        // 124 tests passed over it because a box has a position like any other
+        // glyph and differs from what was there before like any other change.
+        //
+        // Asking the font store directly is the check none of them were. It
+        // costs nothing and it is the only one that would have failed.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let mut state = state("http://example.com/", &mode);
+
+        let mut wanted = vec![
+            // The arrows, which are real.
+            "\u{2190}".to_owned(),
+            "\u{2192}".to_owned(),
+            "reload".to_owned(),
+            "Find:".to_owned(),
+        ];
+        // Taken from the label functions rather than copied out of them, so a
+        // control whose word changes is covered without anyone remembering to
+        // come back here.
+        for saved in [false, true] {
+            state.saved = saved;
+            wanted.push(bookmark_label(&state).to_owned());
+        }
+        for forcing in [false, true] {
+            state.forcing_authored = forcing;
+            wanted.push(toggle_label(&state).to_owned());
+        }
+        for url in ["http://example.com/", "file:///tmp/a.html"] {
+            if let Some(notice) = scheme_notice(url) {
+                wanted.push(notice.to_owned());
+            }
+        }
+        state.local_root = true;
+        if let Some(text) = status(&state) {
+            wanted.push(text);
+        }
+
+        for text in wanted {
+            for size in [12.0, 13.0, 15.0] {
+                let layout = fonts.layout(&text, &ui_style(size), 10_000.0);
+                for line in &layout.lines {
+                    for glyph in &line.glyphs {
+                        assert_ne!(
+                            glyph.glyph_id, 0,
+                            "{text:?} at {size}px draws a .notdef box — no bundled family has it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_dark_theme_actually_reaches_the_pixels() {
         let mut fonts = FontStore::new();
         let mode = RenderMode::Authored;
