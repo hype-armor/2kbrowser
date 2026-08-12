@@ -615,28 +615,24 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
     }
 
-    let status = status(state);
-    // The status takes what it needs from the right; the URL gets the rest,
-    // because a truncated URL is survivable and a truncated warning is not.
-    let status_width = status
-        .as_ref()
-        .map(|text| measure(fonts, text, &ui_style(13.0)).min(width_f * 0.5))
-        .unwrap_or(0.0);
-    let status_x = right_edge - PADDING - status_width;
-    let url_width = (status_x - PADDING - url_x).max(0.0);
+    // Everything between the reload button and the right-hand controls, which
+    // the URL and the status divide between them.
+    let shared = (right_edge - PADDING * 2.0 - url_x).max(0.0);
+    let fit = fitted(fonts, state.url, status(state).as_deref(), shared);
+    let status_x = right_edge - PADDING - fit.status_width;
 
     draw_text(
         &mut list,
         fonts,
-        state.url,
+        &fit.url,
         &ui_style(14.0),
         url_x,
         baseline(),
         theme.ink,
-        url_width,
+        fit.url_width,
     );
 
-    if let Some(text) = &status {
+    if let Some(text) = &fit.status {
         // Grey for the quiet facts, amber for the ones that contradict what the
         // rest of the screen implies.
         //
@@ -664,7 +660,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             status_x,
             baseline(),
             color,
-            status_width,
+            fit.status_width,
         );
     }
 
@@ -805,6 +801,127 @@ fn ui_style(size: f32) -> ComputedStyle {
 
 fn measure(fonts: &mut FontStore, text: &str, style: &ComputedStyle) -> f32 {
     fonts.layout(text, style, f32::MAX).width
+}
+
+/// The part of a URL that is not its path: scheme, host, and any port.
+///
+/// What the bar protects when there is not room for everything. A reader
+/// deciding whether to trust a page is deciding whether to trust its host, and
+/// the scheme is what the rest of the bar's marking is about; the path is the
+/// part they can read the page itself to learn.
+fn origin_prefix(url: &str) -> &str {
+    let Some(mark) = url.find("://") else {
+        return url;
+    };
+    let host_at = mark + 3;
+    match url[host_at..].find('/') {
+        // Including the slash, so it is visibly the end of a host rather than a
+        // host that might have had more to it.
+        Some(slash) => &url[..host_at + slash + 1],
+        None => url,
+    }
+}
+
+/// How the URL and the status divide the space between the buttons.
+///
+/// Returns their widths in that order, always summing to `shared`.
+///
+/// The status outranks the URL — a truncated warning is worse than a truncated
+/// address, and its wording is front-loaded so that what goes is the least of
+/// it — but no longer to the point of crowding the URL out. It used to be
+/// capped at half the *bar*, which is a share of the wrong thing: half of a
+/// 600px bar is 300px, and the buttons either side had already spent 314 of it,
+/// so the URL was handed a negative width and drew nothing whatsoever. The one
+/// field a reader is being asked to make a judgement about vanished on exactly
+/// the pages that gave them something to judge.
+///
+/// So the cap is now what is really there to share, less what the URL is
+/// guaranteed: its origin, plus the marker saying a path was cut off it. A host
+/// cut short is the one truncation with nothing to recommend it — it is the
+/// part being vouched for. That guarantee stops at half of what there is, so a
+/// page with an enormous host cannot annihilate the warning the way the warning
+/// used to annihilate it.
+fn share(fonts: &mut FontStore, url: &str, status: Option<&str>, shared: f32) -> (f32, f32) {
+    let url_style = ui_style(14.0);
+    let origin = origin_prefix(url);
+    let floor = if origin.len() == url.len() {
+        // Nothing to elide, so nothing to leave room for.
+        measure(fonts, url, &url_style)
+    } else {
+        measure(fonts, origin, &url_style) + measure(fonts, ELLIPSIS, &url_style)
+    }
+    .min(shared / 2.0)
+    .max(0.0);
+    let status_width = status
+        .map(|text| measure(fonts, text, &ui_style(13.0)).min(shared - floor))
+        .unwrap_or(0.0)
+        .max(0.0);
+    (shared - status_width, status_width)
+}
+
+/// What the bar puts between its buttons, once the space has been divided.
+struct Fitted {
+    /// The URL as it will be drawn, marked if it had to be cut.
+    url: String,
+    url_width: f32,
+    /// The status as it will be drawn, marked if it had to be cut.
+    status: Option<String>,
+    status_width: f32,
+}
+
+/// Divides the space and cuts both fields to what they got.
+///
+/// One function rather than two steps at the call site, because the division
+/// and the cutting have to agree: a width worked out to guarantee the host is
+/// worth nothing if what is drawn in it was cut by some other rule.
+fn fitted(fonts: &mut FontStore, url: &str, status: Option<&str>, shared: f32) -> Fitted {
+    let (url_width, status_width) = share(fonts, url, status, shared);
+    Fitted {
+        url: elided(fonts, url, &ui_style(14.0), url_width),
+        url_width,
+        status: status.map(|text| elided(fonts, text, &ui_style(13.0), status_width)),
+        status_width,
+    }
+}
+
+/// The marker for text that did not fit.
+///
+/// U+2026, which is in the bundled families — checked by the same test that
+/// caught the reload control drawing as a hollow box (ADR-0008).
+const ELLIPSIS: &str = "\u{2026}";
+
+/// `text`, cut to fit `max_width` and marked where it was cut.
+///
+/// The bar had no such marking, and silence here is the failure this project
+/// spends most of its restraint avoiding: `https://example.com/behind-a-proxy`
+/// clipped to `https://example.com/behi` does not look clipped, it looks like a
+/// URL whose path is `behi`. A reader cannot tell they are missing something
+/// unless they are told, and the address bar is the last place to be quietly
+/// approximate.
+fn elided(fonts: &mut FontStore, text: &str, style: &ComputedStyle, max_width: f32) -> String {
+    if measure(fonts, text, style) <= max_width {
+        return text.to_owned();
+    }
+    let marker = measure(fonts, ELLIPSIS, style);
+    // Not even room for the marker, so there is nothing honest to draw. Better
+    // an empty space than one character standing in for an address. This is
+    // also the zero-and-below case, which is the caller saying there is no room
+    // at all rather than a little — answering that with the untouched text
+    // would hand `draw_text` a string to clip silently, which is the whole
+    // thing being fixed.
+    if marker > max_width {
+        return String::new();
+    }
+    // Character boundaries, not bytes: this runs over URLs, which can be any
+    // encoding a host is willing to serve.
+    let mut kept = text;
+    for (at, _) in text.char_indices().rev() {
+        kept = &text[..at];
+        if measure(fonts, kept, style) + marker <= max_width {
+            break;
+        }
+    }
+    format!("{kept}{ELLIPSIS}")
 }
 
 /// Appends one line of text, clipped to `max_width` by dropping what overflows.
@@ -1100,6 +1217,9 @@ mod tests {
             "\u{2192}".to_owned(),
             "reload".to_owned(),
             "Find:".to_owned(),
+            // The cut marker. Drawn over a URL, which is the last place in the
+            // browser that can afford a hollow box.
+            ELLIPSIS.to_owned(),
         ];
         // Taken from the label functions rather than copied out of them, so a
         // control whose word changes is covered without anyone remembering to
@@ -1208,6 +1328,216 @@ mod tests {
             saved.data(),
             "saving a page changed nothing on screen"
         );
+    }
+
+    #[test]
+    fn a_long_status_never_leaves_the_url_with_nothing() {
+        // The regression this rule exists for. The status used to be capped at
+        // half the *bar* rather than half of what was left of it, so on a
+        // narrow window the buttons and a long warning between them spent more
+        // than the whole width and the URL was handed a negative one. It drew
+        // nothing at all — no truncation, no marker, no address — on precisely
+        // the pages that had given the reader something to judge.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Document {
+            unsupported_share: 0.87,
+        };
+        let mut busiest = state("https://example.com/something-modern", &mode);
+        busiest.can_toggle_layout = true;
+        let longest = status(&busiest).expect("a status");
+
+        for width in [480.0f32, 600.0, 700.0, 900.0, 1400.0] {
+            let url = "https://example.com/something-modern";
+            let shared = (width
+                - PADDING
+                - BOOKMARK
+                - TOGGLE
+                - PADDING * 2.0
+                - (PADDING * 2.0 + BUTTON * 2.0 + RELOAD))
+                .max(0.0);
+            let (url_width, status_width) = share(&mut fonts, url, Some(&longest), shared);
+
+            assert!(
+                url_width > 0.0,
+                "the URL was crowded out entirely at {width}px"
+            );
+            assert!(status_width >= 0.0, "negative status at {width}px");
+            assert!(
+                (url_width + status_width - shared).abs() < 0.01,
+                "the two do not add up at {width}px: {url_width} + {status_width} != {shared}"
+            );
+            // And what is drawn in that width actually says something: at least
+            // the scheme and the beginning of the host, never a bare marker.
+            let drawn = elided(&mut fonts, url, &ui_style(14.0), url_width);
+            assert!(
+                drawn.trim_end_matches(ELLIPSIS).len() > "https://".len(),
+                "nothing of the host survived at {width}px: {drawn:?}"
+            );
+        }
+    }
+
+    /// What the bar has between its buttons at a given overall width.
+    fn shared_at(width: f32) -> f32 {
+        (width
+            - PADDING
+            - BOOKMARK
+            - TOGGLE
+            - PADDING * 2.0
+            - (PADDING * 2.0 + BUTTON * 2.0 + RELOAD))
+            .max(0.0)
+    }
+
+    #[test]
+    fn where_the_url_is_squeezed_to_its_floor_the_whole_host_survives() {
+        // The floor is the point of the rule, and it only bites in a band of
+        // widths: wide enough that the URL is not simply taking half, narrow
+        // enough that the status wants more than what is left. Inside that band
+        // the URL gets exactly what it was guaranteed, so this is where a floor
+        // measured a few pixels short shows up — as a host with its last
+        // characters shaved off, which is the one cut with nothing to be said
+        // for it.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Document {
+            unsupported_share: 0.87,
+        };
+        let mut busy = state("https://example.com/a/deep/path/page.html", &mode);
+        busy.can_toggle_layout = true;
+        let long = status(&busy).expect("a status");
+
+        for width in [640.0f32, 680.0, 700.0, 740.0, 770.0] {
+            let fit = fitted(&mut fonts, busy.url, Some(&long), shared_at(width));
+            assert_eq!(
+                fit.url, "https://example.com/\u{2026}",
+                "the host did not survive intact at {width}px"
+            );
+            assert!(
+                fit.status.as_deref().is_some_and(|s| s.ends_with(ELLIPSIS)),
+                "this band is only interesting while the status is the one being cut: {:?}",
+                fit.status
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_cut_for_space_says_so_too() {
+        // The status is front-loaded so that a cut costs the least, which is a
+        // reason to cut it and not a reason to hide that it was. Without this
+        // the reader is told the page needs newer layout and never learns that
+        // the sentence had a number on the end of it.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Document {
+            unsupported_share: 0.87,
+        };
+        let mut busy = state("https://example.com/something-modern", &mode);
+        busy.can_toggle_layout = true;
+        let long = status(&busy).expect("a status");
+
+        let cramped = fitted(&mut fonts, busy.url, Some(&long), shared_at(600.0));
+        let status_text = cramped.status.expect("a status");
+        assert!(
+            status_text.ends_with(ELLIPSIS),
+            "a cut status has to say it was cut: {status_text:?}"
+        );
+        assert!(
+            long.starts_with(status_text.trim_end_matches(ELLIPSIS)),
+            "what survived is not the front of the message: {status_text:?}"
+        );
+
+        // And where it fits, it is left alone — a marker on every status would
+        // stop meaning anything.
+        let roomy = fitted(&mut fonts, busy.url, Some(&long), shared_at(1400.0));
+        assert_eq!(roomy.status.as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn a_url_with_room_keeps_its_host_and_says_a_path_was_cut() {
+        // Where the toggle's 96px actually bites: a page with a long warning on
+        // an ordinary-width window. The host is what a reader is being asked to
+        // trust, so it is what survives — and the cut is marked, because
+        // `https://example.com/behi` does not look cut, it looks like a page
+        // whose path is `behi`.
+        let mut fonts = FontStore::new();
+        let url = "https://example.com/behind-a-proxy.html";
+        let authored = RenderMode::Authored;
+        let mut proxied = state(url, &authored);
+        proxied.local_root = true;
+        let notice = status(&proxied).expect("a status");
+
+        let shared = (700.0
+            - PADDING
+            - BOOKMARK
+            - TOGGLE
+            - PADDING * 2.0
+            - (PADDING * 2.0 + BUTTON * 2.0 + RELOAD))
+            .max(0.0);
+        let (url_width, _) = share(&mut fonts, url, Some(&notice), shared);
+        let drawn = elided(&mut fonts, url, &ui_style(14.0), url_width);
+
+        assert!(
+            drawn.starts_with("https://example.com/"),
+            "the host did not survive: {drawn:?}"
+        );
+        assert!(
+            drawn.ends_with(ELLIPSIS),
+            "a cut URL has to say it was cut: {drawn:?}"
+        );
+        assert!(
+            !drawn.contains("proxy.html"),
+            "this case is only interesting while the URL does not fit: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn a_url_that_fits_is_left_exactly_alone() {
+        // The marker must not appear where nothing was lost, or it stops
+        // meaning anything and every URL looks approximate.
+        let mut fonts = FontStore::new();
+        let url = "https://example.com/";
+        let drawn = elided(&mut fonts, url, &ui_style(14.0), 600.0);
+        assert_eq!(drawn, url);
+        assert!(!drawn.contains(ELLIPSIS));
+    }
+
+    #[test]
+    fn eliding_cuts_on_characters_and_gives_up_rather_than_lying() {
+        let mut fonts = FontStore::new();
+        let style = ui_style(14.0);
+
+        // Multi-byte text, cut at every width there is. A byte-indexed cut
+        // would panic here rather than merely look wrong, and a URL can carry
+        // whatever encoding a host is willing to serve.
+        let wide = "https://пример.рф/путь/страница.html";
+        for width in 0..240 {
+            let drawn = elided(&mut fonts, wide, &style, width as f32);
+            assert!(
+                wide.starts_with(drawn.trim_end_matches(ELLIPSIS)),
+                "the cut text is not a prefix of the original: {drawn:?}"
+            );
+        }
+
+        // Narrower than the marker itself. There is nothing honest to draw, and
+        // a lone marker would be a URL bar claiming a URL it cannot show.
+        assert_eq!(elided(&mut fonts, wide, &style, 1.0), "");
+        assert_eq!(elided(&mut fonts, wide, &style, 0.0), "");
+    }
+
+    #[test]
+    fn the_origin_is_what_the_url_is_guaranteed() {
+        assert_eq!(
+            origin_prefix("https://example.com/behind-a-proxy.html"),
+            "https://example.com/"
+        );
+        assert_eq!(
+            origin_prefix("http://example.com:8080/a/b?c=d"),
+            "http://example.com:8080/"
+        );
+        // No path at all, so the whole thing is the origin.
+        assert_eq!(origin_prefix("https://example.com"), "https://example.com");
+        assert_eq!(origin_prefix("file:///home/user/a.html"), "file:///");
+        // Not a URL this browser would ever be showing, but the bar draws what
+        // it is given and must not index into the middle of a character.
+        assert_eq!(origin_prefix("nonsense"), "nonsense");
+        assert_eq!(origin_prefix(""), "");
     }
 
     #[test]

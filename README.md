@@ -138,6 +138,16 @@ simplified yourself that is usually none of it, and reporting *0%* is the
 honest answer rather than an awkward one. Both directions are forgotten on
 navigation: they are decisions about a page, not settings.
 
+Five controls, a URL, and a warning do not always fit in one bar, so the bar
+says which of them it had to cut. Text that did not fit ends in an ellipsis
+rather than simply stopping, because `https://example.com/behi` does not look
+cut — it looks like a page whose path is `behi`, and an address bar is the last
+place in a browser that should be quietly approximate. What a URL is guaranteed
+is its origin: the scheme and the host are what a reader is being asked to
+trust, so the path is what gives way. The warning still outranks the URL for
+whatever is left over, and its wording is front-loaded so that being cut costs
+it the least.
+
 The URL bar is editable: Ctrl+L (or F6, or clicking it) focuses it with the
 URL selected, Enter navigates, Escape gives up. A bare host gets `https://`,
 because that is what typing `example.com` means.
