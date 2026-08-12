@@ -109,6 +109,22 @@ fn pack(pixel: &paint::PremultipliedColor) -> u32 {
 /// when a page stopped at one and scrolling past it showed white that looked
 /// exactly like the document ending — banded rendering removed that, and this
 /// comment with it.
+/// Where a pointer in window coordinates falls in the document, or `None` if
+/// it is over the chrome rather than the page.
+///
+/// Pulled out of `link_under_pointer` so it can be tested without a window.
+/// Hit-testing has to agree with `draw`, which turns a screen row into a
+/// document row by exactly this arithmetic in the other direction — and until
+/// now nothing checked that they agreed. They quietly did not have to: the
+/// chrome's height is a constant, and when it changed from 34 to 46 the two
+/// sites were updated by hand and nothing would have said so if only one had
+/// been.
+fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Option<(f32, f32)> {
+    let y = pointer.1 - chrome_height as f32;
+    // Above the page is the bar, which owns its own clicks.
+    (y >= 0.0).then_some((pointer.0, y + scroll))
+}
+
 fn clamp_scroll(offset: f32, scrollable_height: f32, viewport_height: f32) -> f32 {
     let max = (scrollable_height - viewport_height).max(0.0);
     offset.clamp(0.0, max)
@@ -981,12 +997,8 @@ impl App {
     /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
         let page = self.tab().page.as_ref()?;
-        let y = self.pointer.1 - self.chrome_height() as f32;
-        if y < 0.0 {
-            return None;
-        }
-        page.link_at(self.pointer.0, y + self.tab().scroll)
-            .map(str::to_owned)
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
+        page.link_at(x, y).map(str::to_owned)
     }
 
     /// Total chrome height: the URL bar, plus the tab strip when there is one.
@@ -1601,6 +1613,66 @@ pub fn open(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
+        let chrome = crate::chrome::total_height(1);
+        assert_eq!(document_point((10.0, 0.0), chrome, 0.0), None);
+        assert_eq!(
+            document_point((10.0, chrome as f32 - 1.0), chrome, 0.0),
+            None
+        );
+        // The first row of the page is the first row of the document.
+        assert_eq!(
+            document_point((10.0, chrome as f32), chrome, 0.0),
+            Some((10.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn scrolling_moves_the_document_under_the_pointer() {
+        let chrome = crate::chrome::total_height(1);
+        let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, scroll);
+        assert_eq!(at(0.0), Some((0.0, 100.0)));
+        assert_eq!(at(973.0), Some((0.0, 1073.0)));
+        // x is never touched: nothing is scrolled sideways.
+        assert_eq!(
+            document_point((42.0, chrome as f32), chrome, 500.0)
+                .unwrap()
+                .0,
+            42.0
+        );
+    }
+
+    #[test]
+    fn hit_testing_agrees_with_what_was_drawn() {
+        // `draw` turns a screen row into a document row; `document_point` turns
+        // a screen y into a document y. They are the same conversion, and a
+        // browser where they disagree paints a link in one place and follows it
+        // from another. This is the check that was missing when the bar grew
+        // from 34 pixels to 46.
+        for tabs in [1_usize, 2, 5] {
+            let chrome = crate::chrome::total_height(tabs);
+            // Exactly how `draw` computes it, from the same constants.
+            let strip = if tabs > 1 {
+                crate::chrome::TAB_HEIGHT
+            } else {
+                0
+            };
+            let bar = strip + crate::chrome::HEIGHT;
+            for row in [bar, bar + 1, bar + 250, bar + 4000] {
+                for scroll in [0_u32, 1, 973, 10_000] {
+                    let drawn = row - bar + scroll;
+                    let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
+                        .expect("a row at or below the bar is on the page");
+                    assert_eq!(
+                        hit as u32, drawn,
+                        "tabs={tabs} row={row} scroll={scroll}: drawn {drawn}, hit {hit}"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     #[test]
