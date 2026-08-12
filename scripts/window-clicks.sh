@@ -94,11 +94,26 @@ start() {
 click below would have meant anything"
 }
 
+# Stops the browser and waits for its window to actually go, which is not the
+# same thing. `kill` returns as soon as the signal is sent; the window survives
+# it by however long the process takes to tear down. A `start` that ran in that
+# gap found the *previous* window — still mapped, still showing the page the
+# last click navigated to — and then waited for a title it was never going to
+# show. Fast enough to pass here and slow enough to fail on CI, which is the
+# signature of every clock this harness has already been bitten by.
 stop() {
     kill "$app" 2>/dev/null || true
     wait "$app" 2>/dev/null || true
     app=""
-    sleep 1
+    local waited=0 remaining
+    while [ "$waited" -lt 40 ]; do
+        remaining=$(DISPLAY=$display xdotool search --onlyvisible --name . 2>/dev/null | head -1 || true)
+        [ -z "$remaining" ] && return 0
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    fail "a window outlived the browser it belonged to, so the next check would \
+have been driving a dead one"
 }
 
 # Clicks a point and returns the title once it has settled, waiting for a change
