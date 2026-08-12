@@ -131,6 +131,15 @@ jobs:
           cargo build -p shell
           ./scripts/smoke-window.sh
 
+      # The smoke test proves a window opens and survives. This proves it
+      # answers a pointer — the part `cargo test` cannot reach, and the part
+      # that was broken for a reader while every check here stayed green.
+      - name: Window click test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get install -y -qq xvfb xdotool libxkbcommon-x11-0
+          ./scripts/window-clicks.sh
+
       - name: Trim the cache
         if: always()
         run: bash scripts/trim-target-dir.sh
