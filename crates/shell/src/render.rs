@@ -412,6 +412,39 @@ pub fn render_as_authored(
     )
 }
 
+/// Renders as the document fallback whatever classification decided.
+///
+/// The counterpart to `render_as_authored_with`, for a reader who wants the
+/// simplified layout on a page that renders perfectly well without it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
+              nothing else would use"
+)]
+pub fn render_as_document_with(
+    html: &str,
+    width: u32,
+    band_top: u32,
+    band_height: u32,
+    fonts: &mut FontStore,
+    loader: &mut dyn Loader,
+    base: Option<(&Origin, &str)>,
+) -> Page {
+    render_sized(
+        html,
+        width,
+        band_top,
+        band_height,
+        Settings {
+            force_document: true,
+            ..Settings::default()
+        },
+        fonts,
+        loader,
+        base,
+    )
+}
+
 /// The same, with the caller supplying where subresources come from.
 pub fn render_as_authored_with(
     html: &str,
@@ -444,6 +477,13 @@ struct Settings {
     fill_height: bool,
     /// Use the author's layout whatever classification decided.
     force_authored: bool,
+    /// Use the document fallback whatever classification decided.
+    ///
+    /// The other direction of `force_authored`, and not reachable by inverting
+    /// it: a page that classifies as `Authored` has no fallback to return to,
+    /// so asking for one is a different request rather than the absence of
+    /// this one.
+    force_document: bool,
 }
 
 #[expect(
@@ -491,6 +531,18 @@ fn render_sized(
         // The reader asked to see what the author wrote. Classification still
         // ran — the answer is just not being acted on.
         RenderMode::Authored
+    } else if settings.force_document {
+        // The reader asked for the fallback on a page that did not need one.
+        // Classification still runs and its measurement is kept, so the bar can
+        // go on saying how much of this page actually wanted newer layout —
+        // which on a page in this branch is usually none of it, and saying so
+        // is the honest answer rather than an embarrassing one.
+        match layout::classify(&doc, &styles) {
+            RenderMode::Authored => RenderMode::Document {
+                unsupported_share: 0.0,
+            },
+            already_a_fallback => already_a_fallback,
+        }
     } else {
         layout::classify(&doc, &styles)
     };
@@ -917,6 +969,45 @@ fn collect_stylesheets(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_page_that_needs_no_fallback_can_still_be_given_one() {
+        // The capability `force_authored` had no counterpart. Inverting it does
+        // not produce this: an ordinary page classifies as `Authored`, so there
+        // was no way to ask for the document fallback on one, which is exactly
+        // what a reader wanting a simplified view of a working page asks for.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+        let mut fonts = FontStore::new();
+
+        let ordinary = render(html, 800, 2000, &mut fonts);
+        assert!(
+            matches!(ordinary.mode, RenderMode::Authored),
+            "this fixture is only useful while it needs no fallback: {:?}",
+            ordinary.mode
+        );
+
+        let forced = render_as_document_with(
+            html,
+            800,
+            0,
+            2000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        assert!(
+            matches!(forced.mode, RenderMode::Document { .. }),
+            "asking for the fallback did not produce one: {:?}",
+            forced.mode
+        );
+        // And it is not the same rendering wearing a different label: the
+        // reader sheet replaces the author's, so the pixels have to differ.
+        assert_ne!(
+            ordinary.pixmap.data(),
+            forced.pixmap.data(),
+            "the forced fallback rendered identically to the author's layout"
+        );
+    }
+
     use super::*;
 
     #[test]
