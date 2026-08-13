@@ -44,22 +44,37 @@
 //! Nothing in this file relaxes anything. If a future change wants to, it has
 //! to edit these tests, which is a reviewable diff rather than a quiet default.
 
+use std::sync::OnceLock;
+
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 /// The agent every request goes through.
 ///
+/// One for the process, not one per request. An `Agent` owns the connection
+/// pool, so building a fresh one each time threw the pool away before anything
+/// could use it twice: every subresource paid its own TCP connection and its
+/// own TLS handshake to a host the previous one had just finished talking to.
+/// A page with twenty images meant twenty handshakes.
+///
+/// Shared across threads deliberately. Each session's conversation runs on a
+/// thread of its own and they all fetch through here, which is the arrangement
+/// a connection pool exists for.
+///
 /// Built explicitly rather than using `ureq::get`, which picks up whatever the
 /// library's defaults happen to be at the version we are pinned to.
-pub fn agent() -> Agent {
-    Agent::config_builder()
-        .tls_config(tls_config())
-        // Redirects are followed, but a redirect chain is also a way to make a
-        // browser walk somewhere it was never pointed at. A handful is every
-        // legitimate use.
-        .max_redirects(8)
-        .build()
-        .into()
+pub fn agent() -> &'static Agent {
+    static AGENT: OnceLock<Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        Agent::config_builder()
+            .tls_config(tls_config())
+            // Redirects are followed, but a redirect chain is also a way to
+            // make a browser walk somewhere it was never pointed at. A handful
+            // is every legitimate use.
+            .max_redirects(8)
+            .build()
+            .into()
+    })
 }
 
 /// An agent that will also accept this computer's own trust store.
@@ -69,12 +84,20 @@ pub fn agent() -> Agent {
 /// — see [`crate::FetchError::LocalRoot`] and ADR-0015. Everything else about
 /// the posture is identical, including that certificates are still *verified*:
 /// this widens who may sign, not whether anyone need bother.
-pub fn platform_agent() -> Agent {
-    Agent::config_builder()
-        .tls_config(platform_tls_config())
-        .max_redirects(8)
-        .build()
-        .into()
+///
+/// Kept for the process like [`agent`], and separate from it for the same
+/// reason it always was: these are two different answers to "whose signature
+/// counts", and a page retried against this one is marked in the chrome for as
+/// long as it is up.
+pub fn platform_agent() -> &'static Agent {
+    static PLATFORM_AGENT: OnceLock<Agent> = OnceLock::new();
+    PLATFORM_AGENT.get_or_init(|| {
+        Agent::config_builder()
+            .tls_config(platform_tls_config())
+            .max_redirects(8)
+            .build()
+            .into()
+    })
 }
 
 /// The TLS configuration, spelled out.
@@ -313,6 +336,20 @@ mod tests {
     #[test]
     fn redirects_are_bounded() {
         assert!(agent().config().max_redirects() <= 8);
+    }
+
+    #[test]
+    fn every_request_goes_through_the_same_agent() {
+        // The agent owns the connection pool, so a fresh one per request is a
+        // pool that is never used twice — a TCP connection and a TLS handshake
+        // per subresource, to a host the last one had just been talking to.
+        // Identity is the checkable half of that: whether the pool then gets
+        // reused is `ureq`'s business, but throwing it away was ours.
+        assert!(std::ptr::eq(agent(), agent()));
+        assert!(std::ptr::eq(platform_agent(), platform_agent()));
+        // And the two are still distinct, because they answer different
+        // questions about whose signature counts (ADR-0015).
+        assert!(!std::ptr::eq(agent(), platform_agent()));
     }
 
     #[test]

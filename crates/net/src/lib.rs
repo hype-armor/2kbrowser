@@ -290,14 +290,14 @@ pub enum Trust {
 /// chrome can say so. Any other certificate failure — expired, wrong name — is
 /// final, because those are wrong whoever signed them.
 fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
-    match get(&tls::agent(), url) {
+    match get(tls::agent(), url) {
         Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
         Err(error) => {
             if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
                 return Err(into_fetch_error(error));
             }
             let (bytes, content_type) =
-                get(&tls::platform_agent(), url).map_err(into_fetch_error)?;
+                get(tls::platform_agent(), url).map_err(into_fetch_error)?;
             Ok((bytes, content_type, Trust::LocalRoot))
         }
     }
