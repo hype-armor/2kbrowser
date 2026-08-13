@@ -432,6 +432,112 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
     );
 }
 
+/// A one-request HTTP server answering a fixed path, counting what it served.
+///
+/// Written out rather than pulled in, and used by exactly one test. The
+/// question below is what the *parent* does with a `Content-Type`, and only a
+/// real header off a real socket can ask it: a `file:` URL has none, so nothing
+/// on disk poses the question at all.
+fn serve_once(
+    path: &'static str,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = [0u8; 2048];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+        let wanted = request
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        let response = if wanted == path {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut out = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            out.extend_from_slice(&body);
+            out
+        } else {
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        };
+        let _ = stream.write_all(&response);
+        let _ = stream.flush();
+    });
+    (port, served)
+}
+
+#[test]
+fn a_stylesheets_charset_survives_the_trip_from_the_transport_to_the_child() {
+    // The parent used to build every answer with `content_type: None`, throwing
+    // away what the transport said — while `ToChild::Resource` documented the
+    // field as existing precisely so "a stylesheet's character set can come
+    // from the header". A sheet declared only in its header decoded as
+    // something else, silently, which on the old web is most of them.
+    //
+    // The selector is the instrument. `.café` is written in UTF-8 and the
+    // header says so; read as windows-1252 — the fallback when nothing says
+    // otherwise — those two bytes are `Ã©` and the rule matches nothing at all.
+    let css = ".caf\u{e9} { background-color: #00ff00 }"
+        .as_bytes()
+        .to_vec();
+    let (port, served) = serve_once("/s.css", "text/css; charset=utf-8", css);
+
+    let html = "<html><head><link rel=stylesheet href=\"s.css\"></head>\
+                <body><p class=\"caf\u{e9}\">green if the header arrived</p></body></html>";
+    let (origin, at) = net::parse_url(&format!("http://127.0.0.1:{port}/p.html")).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+    )
+    .expect("the page opens");
+
+    // Skipped rather than failed when the request never reached the server. A
+    // machine with a proxy in the environment sends this somewhere else
+    // entirely, and a check that could not run must not look like one that
+    // passed — the same rule `legacy_tls.rs` follows for the same reason.
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+
+    let green = page
+        .pixels()
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
+        .count();
+    assert!(
+        green > 0,
+        "the sheet was decoded as something other than the charset it was served with"
+    );
+}
+
 #[test]
 fn an_ordinary_page_can_be_asked_for_the_fallback_and_given_it_back() {
     // The other direction of the same override, across the same boundary. Not

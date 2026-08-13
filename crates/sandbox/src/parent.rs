@@ -730,11 +730,14 @@ impl Conversation {
     /// telling it would leak the parent's configuration to the untrusted side —
     /// which is exactly the sort of thing a compromised renderer would probe
     /// for.
+    /// `fetch_raw` rather than anything that decodes: the parent hands over the
+    /// bytes and the header saying how to read them, and the reading happens on
+    /// the far side with every other parser (ADR-0012).
     fn fetch(&self, url: &str, kind: RequestKind) -> ToChild {
-        match self.fetcher.fetch_bytes(url, self.document.as_ref(), kind) {
-            Ok(body) => ToChild::Resource {
-                body,
-                content_type: None,
+        match self.fetcher.fetch_raw(url, self.document.as_ref(), kind) {
+            Ok(fetched) => ToChild::Resource {
+                body: fetched.body,
+                content_type: fetched.content_type,
                 ok: true,
             },
             Err(_) => ToChild::Resource {

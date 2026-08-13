@@ -244,27 +244,6 @@ impl Fetcher {
             trust,
         })
     }
-
-    /// Fetches a URL, keeping only the raw bytes.
-    pub fn fetch_bytes(
-        &self,
-        url: &str,
-        document: Option<&Origin>,
-        kind: RequestKind,
-    ) -> Result<Vec<u8>, FetchError> {
-        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        self.policy
-            .check(document, &origin, kind)
-            .map_err(FetchError::Refused)?;
-        count_if_third_party(document, &origin, kind);
-
-        match origin.scheme {
-            Scheme::File => read_file(&path),
-            // The content type is irrelevant here: bytes fetched as bytes are
-            // images, and an image's encoding is its own format's business.
-            Scheme::Http | Scheme::Https => fetch_http(url).map(|(bytes, ..)| bytes),
-        }
-    }
 }
 
 fn read_file(url_path: &str) -> Result<Vec<u8>, FetchError> {
