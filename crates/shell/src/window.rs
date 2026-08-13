@@ -288,6 +288,50 @@ impl Tab {
     }
 }
 
+/// A window size that has arrived and not yet been rendered at.
+///
+/// Dragging a window edge produces a resize event per frame, and rendering a
+/// page costs far more than a frame — 64ms for an ordinary page against a 16ms
+/// budget, measured. Servicing them one for one meant the work arrived about
+/// four times faster than it could be done, so the backlog grew for as long as
+/// the drag lasted and every render in it was for a window that had already
+/// stopped being that size. The event loop was blocked throughout.
+///
+/// So the size is recorded here and rendered once, when the queue drains. Every
+/// resize but the last describes a window that no longer exists, and the last
+/// one is the only one anybody can see.
+///
+/// Deliberately not a timer. A delay would need a number nobody can justify and
+/// would add latency to a single resize, which is the common case — a maximise,
+/// a tiling keystroke, one drag that stops. Draining is self-limiting instead:
+/// it renders as fast as rendering can go and no faster, and always at the size
+/// that arrived most recently.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PendingResize {
+    /// The newest size seen, if it has not been rendered at yet.
+    wanted: Option<(u32, u32)>,
+}
+
+impl PendingResize {
+    /// Records a size the window has become.
+    fn note(&mut self, size: (u32, u32)) {
+        self.wanted = Some(size);
+    }
+
+    /// The size to render at, if there is one worth rendering at.
+    ///
+    /// `rendered` is the size the page on screen was laid out for. A resize
+    /// back to that — a drag that returns where it started, or the event a
+    /// window manager sends confirming a size we asked for — has nothing to do,
+    /// and doing it anyway would be a 64ms stall for an identical picture.
+    fn take(&mut self, rendered: (u32, u32)) -> Option<(u32, u32)> {
+        match self.wanted.take() {
+            Some(size) if size != rendered => Some(size),
+            _ => None,
+        }
+    }
+}
+
 /// Everything the event loop needs between frames.
 struct App {
     tabs: crate::tabs::Tabs<Tab>,
@@ -299,6 +343,18 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     size: (u32, u32),
+    /// A size the window has become that the page has not been laid out for.
+    ///
+    /// Updated on every resize event and acted on once the queue drains, so a
+    /// drag costs one render rather than one per frame.
+    pending_resize: PendingResize,
+    /// The size the page on screen was laid out for.
+    ///
+    /// Not the same as `size`, and the difference is the point: during a drag
+    /// `size` is where the window is now and this is what it last showed. What
+    /// is between them is a page drawn at the wrong width for a moment, which
+    /// is what makes the window keep answering instead of freezing.
+    rendered_size: (u32, u32),
     /// Last known pointer position, in window coordinates.
     pointer: (f32, f32),
     /// Whether the pointer is over a link, so the cursor can say so.
@@ -396,6 +452,18 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
+        // Recorded before the work rather than after it, and recorded even if
+        // the render below fails: this says what the page on screen was laid
+        // out for, and a failed render leaves the previous page there. Setting
+        // it only on success would have every later resize event to the same
+        // size retry a render that is not going to work.
+        //
+        // Nothing is done to `pending_resize` here, deliberately. It is emptied
+        // by the `take` that asked for this render, and emptying it a second
+        // time would mean nothing could tell whether that `take` still did.
+        // A resize arriving while this one renders stays queued in the
+        // operating system and is coalesced into the next drain.
+        self.rendered_size = self.size;
         let viewport = self.viewport_height();
         // A band several windows tall rather than the whole document: scrolling
         // within it costs a blit offset, and leaving it costs a paint of the
@@ -1313,6 +1381,26 @@ fn highlight_matches(
 }
 
 impl ApplicationHandler<BandReady> for App {
+    /// Every event that had arrived has been handled, so the loop is about to
+    /// sleep. The last thing to do before that is lay the page out for whatever
+    /// size the window ended up.
+    ///
+    /// This is where a resize is paid for, and it is why a drag no longer
+    /// blocks: while events keep arriving they are only recorded, and the
+    /// render happens once the burst is over. If the drag is still going by
+    /// then, the events that arrived during the render coalesce into the next
+    /// one — so rendering runs as often as it can finish rather than as often
+    /// as the compositor asks, and the backlog cannot grow.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.pending_resize.take(self.rendered_size).is_none() {
+            return;
+        }
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// A band painted on a renderer thread has arrived.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: BandReady) {
         if self.accept_band()
@@ -1371,10 +1459,13 @@ impl ApplicationHandler<BandReady> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.size = (size.width.max(1), size.height.max(1));
-                self.rerender();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.pending_resize.note(self.size);
+                // The bar is redrawn now and the page is not. It costs 0.44ms
+                // against the page's 64ms, and it is the part that would look
+                // broken if it were left alone: a bar that does not reach the
+                // edge of its own window reads as a hung program, where a page
+                // still laid out for the old width reads as one mid-resize.
+                self.refresh_chrome();
             }
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
@@ -1678,6 +1769,10 @@ pub fn open(
         window: None,
         surface: None,
         size: (width.max(1), height.max(1)),
+        pending_resize: PendingResize::default(),
+        // Nothing has been rendered yet, and no window is this size, so the
+        // first resize to arrive is never mistaken for one already shown.
+        rendered_size: (0, 0),
         pointer: (0.0, 0.0),
         over_link: false,
         theme: crate::chrome::Theme::LIGHT,
@@ -1696,6 +1791,71 @@ pub fn open(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_drag_full_of_resizes_costs_one_render_at_the_last_size() {
+        // The whole point. A drag delivers a resize per frame and a render
+        // costs several frames, so servicing them one for one meant the backlog
+        // grew for as long as the drag lasted — and every render in it was for
+        // a window that had already stopped being that size.
+        let mut pending = PendingResize::default();
+        for width in 800..900 {
+            pending.note((width, 600));
+        }
+        assert_eq!(
+            pending.take((800, 600)),
+            Some((899, 600)),
+            "the render has to be for where the window ended up, not where it started"
+        );
+        assert_eq!(
+            pending.take((899, 600)),
+            None,
+            "one drag, one render — a second would be for a size already on screen"
+        );
+    }
+
+    #[test]
+    fn a_resize_to_the_size_already_on_screen_renders_nothing() {
+        // A drag that returns where it started, and the event a window manager
+        // sends back to confirm a size that was asked for. Rendering either
+        // would be a stall of tens of milliseconds for an identical picture.
+        let mut pending = PendingResize::default();
+        pending.note((1024, 768));
+        assert_eq!(pending.take((1024, 768)), None);
+
+        // But a real change still gets through, including one that only moves
+        // in one axis — a page laid out for a narrower window is wrong, and so
+        // is a band sized for a shorter one.
+        pending.note((1024, 900));
+        assert_eq!(pending.take((1024, 768)), Some((1024, 900)));
+        pending.note((900, 768));
+        assert_eq!(pending.take((1024, 768)), Some((900, 768)));
+    }
+
+    #[test]
+    fn a_size_is_handed_out_once_and_then_it_is_gone() {
+        // Taking is what consumes it, and nothing else does — the render it
+        // asks for deliberately leaves it alone, so that this stays checkable.
+        // Left in place, it would ask for a render on every drain of the event
+        // queue from then on, which is a resize storm with no resizing in it.
+        let mut pending = PendingResize::default();
+        pending.note((1024, 768));
+        assert_eq!(pending.take((800, 600)), Some((1024, 768)));
+        assert_eq!(
+            pending.take((800, 600)),
+            None,
+            "the size survived being taken, so every later drain re-renders"
+        );
+    }
+
+    #[test]
+    fn nothing_pending_asks_for_nothing() {
+        // `about_to_wait` runs after every batch of events there is, most of
+        // which are pointer moves. It has to be free when nothing resized.
+        let mut pending = PendingResize::default();
+        assert_eq!(pending.take((800, 600)), None);
+        assert_eq!(pending, PendingResize::default());
+    }
 
     #[test]
     fn a_window_is_never_asked_to_be_taller_than_the_screen() {

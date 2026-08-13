@@ -113,6 +113,17 @@ between bands, so moving down a long page costs only the pixels. A band is
 exactly the rows it names from a whole-page render, which is asserted at both
 levels: against the rasteriser directly, and across a real process boundary.
 
+Resizing the window is a different matter, because a resize changes the width
+everything was laid out for and a band cannot help. A drag delivers a resize
+per frame and laying a page out again costs several frames' worth, so the
+events are recorded and acted on once the queue drains rather than serviced one
+apiece. On a long page that is the difference between 97 renders and 4, and
+between a window that answers again 28 seconds after the drag stops and one
+that answers in under a second — measured, on a 119 KB page, by sending 96
+resizes and timing how long until a click was noticed. It is still one render
+too many in the sense that matters: laying out a page is expensive, and the
+work to make it less so has not been done yet.
+
 Links work in the window: click to follow, Alt+Left/Right or Backspace for
 back and forward, and the cursor changes over a link. `2kbrowser links <page>`
 prints every link rectangle and where it leads, and

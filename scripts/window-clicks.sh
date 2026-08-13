@@ -127,6 +127,28 @@ have been driving a dead one"
 
 # Clicks a point and returns the title once it has settled, waiting for a change
 # rather than assuming one: navigation is a fetch and a render, not an instant.
+# Clicks a point over and over until the window navigates, or gives up.
+#
+# The retry is not impatience. Unlike a click, a resize produces no signal this
+# harness can wait for — the title says nothing about how wide the page was laid
+# out — so the click itself is the probe: it misses while the old layout is
+# still up and lands once the new one is. Clicking a place with no link does
+# nothing, so probing costs nothing.
+click_until_navigated() {
+    local x=$1 y=$2 waited=0 title=""
+    while [ "$waited" -lt 40 ]; do
+        DISPLAY=$display xdotool mousemove "$x" "$y"
+        DISPLAY=$display xdotool click 1
+        sleep 0.5
+        title=$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)
+        case "$title" in
+            *Arrival*) echo "$title"; return 0 ;;
+        esac
+        waited=$((waited + 1))
+    done
+    echo "$title"
+}
+
 click_and_read() {
     local x=$1 y=$2 before waited title
     before=$(DISPLAY=$display xdotool getwindowname "$window")
@@ -190,6 +212,43 @@ after=$(click_and_read "$toggle_x" "$toggle_y")
 case "$after" in
     *"rendered as document"*) echo "ok: the layout toggle reached the renderer" ;;
     *) fail "pressing the layout toggle left the window on: $after" ;;
+esac
+stop
+
+# 5. A burst of resizes ends with the page laid out for the size the window
+#    actually finished at, and the window still answers.
+#
+#    Resizes arrive one per frame during a drag and a render costs several
+#    frames' worth, so they are recorded and rendered once the event queue
+#    drains rather than serviced one for one. Both halves of that need
+#    checking and neither is reachable from `cargo test`: that the coalescing
+#    does not swallow the last resize, and that the render it does reaches the
+#    child rather than only the chrome.
+#
+#    The link is the instrument. It sits at y=70 at the wide size and y=90 at
+#    the narrow one — no overlap — so a click at the narrow position proves the
+#    page was re-laid-out rather than merely repainted.
+narrow=420
+narrow_link=$("$browser" links "$page" --width "$narrow" | sed -n '2p')
+[ -n "$narrow_link" ] || fail "no link at ${narrow}px, so there is nothing to aim at"
+n_x=$(echo "$narrow_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\1/')
+n_y=$(echo "$narrow_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\2/')
+n_w=$(echo "$narrow_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\3/')
+n_h=$(echo "$narrow_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\4/')
+[ "$n_y" -ne "$link_y" ] || fail "the link is at the same row at both widths, so \
+this check could pass without the page ever having been laid out again"
+
+start
+# The burst. Every intermediate size is one the window really was, and every
+# one of them but the last is meant to be dropped.
+for w in 760 720 680 640 600 560 520 480 440 "$narrow"; do
+    DISPLAY=$display xdotool windowsize "$window" "$w" "$height"
+done
+after=$(click_until_navigated $((n_x + n_w / 2)) $((n_y + n_h / 2 + chrome)))
+case "$after" in
+    *Arrival*) echo "ok: a burst of resizes ended laid out for the last one" ;;
+    *) fail "after resizing to ${narrow}px the link was not where that width \
+puts it — the window is on: $after" ;;
 esac
 stop
 
