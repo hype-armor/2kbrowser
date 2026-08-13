@@ -570,7 +570,9 @@ fn render_sized(
         // the reader sheet is applied over the UA defaults instead.
         RenderMode::Document { .. } | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
-            css::cascade::cascade(&doc, &[reader])
+            let mut styles = css::cascade::cascade(&doc, &[reader]);
+            collapse_blank_lines(&doc, &mut styles);
+            styles
         }
     };
 
@@ -882,6 +884,52 @@ fn load_images(
 ///
 /// `<link rel=stylesheet>` is not followed here: fetching is the net crate's
 /// job, and same-origin policy (ADR-0006) applies to it.
+/// Keeps the first of every run of consecutive line breaks and drops the rest.
+///
+/// Only on the document fallback. A page that writes `<br><br><br><br>` between
+/// two paragraphs is using line breaks as a margin, which was how a great deal
+/// of the era's markup — and every WYSIWYG editor since — did its spacing. The
+/// author's layout is the place to honour that exactly; a document rendering
+/// has already thrown their stylesheet away on the grounds that it was not
+/// working, and reproducing their vertical spacing to the pixel while doing so
+/// only turns a page into a column of gaps with the occasional sentence in it.
+///
+/// One is kept rather than none, because a single break between two lines is
+/// almost always meant — an address, a verse, a signature — and a reader mode
+/// that ran those together would be destroying content rather than spacing.
+///
+/// Whitespace between the breaks does not interrupt a run: `<br>\n  <br>` is
+/// two breaks with a newline between them, and that newline collapses to
+/// nothing of its own.
+fn collapse_blank_lines(doc: &dom::Document, styles: &mut css::cascade::StyleMap) {
+    for node in doc.descendants(doc.root()) {
+        let mut breaks = 0usize;
+        for &child in doc.children(node) {
+            // Whitespace between two breaks is not content between them: it
+            // collapses away, so the breaks are still consecutive on the page
+            // even though they are not consecutive in the markup.
+            if let Some(text) = doc.text(child) {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                breaks = 0;
+                continue;
+            }
+            let is_break = doc
+                .element(child)
+                .is_some_and(|element| element.local_name() == "br");
+            if !is_break {
+                breaks = 0;
+                continue;
+            }
+            breaks += 1;
+            if breaks > 1 {
+                styles.hide(child);
+            }
+        }
+    }
+}
+
 /// How deeply `@import` may nest before we stop following it.
 ///
 /// A stylesheet can import itself, directly or through a cycle, and a browser
@@ -997,6 +1045,89 @@ fn collect_stylesheets(
 
 #[cfg(test)]
 mod tests {
+    /// The document fallback's height for a fragment, and the author's.
+    fn both_ways(html: &str) -> (f32, f32) {
+        let mut fonts = FontStore::new();
+        let document = render_as_document_with(
+            html,
+            600,
+            0,
+            9000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        let authored = render_as_authored_with(
+            html,
+            600,
+            0,
+            9000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        (document.content_height, authored.content_height)
+    }
+
+    #[test]
+    fn a_run_of_line_breaks_becomes_one_in_the_document_fallback() {
+        // Using `<br><br><br><br>` as a margin is how a great deal of the era's
+        // markup did its spacing, and how every WYSIWYG editor has done it
+        // since. Reproduced faithfully in a document rendering, it turns a page
+        // into a column of gaps with the occasional sentence in it — which is
+        // the complaint this exists for.
+        let one = both_ways("<body><p>one<br>two</p></body>");
+        let five = both_ways("<body><p>one<br><br><br><br><br>two</p></body>");
+        let twenty = both_ways(&format!("<body><p>one{}two</p></body>", "<br>".repeat(20)));
+
+        assert_eq!(
+            five.0, one.0,
+            "five breaks should read as one in the document fallback"
+        );
+        assert_eq!(twenty.0, one.0, "and so should twenty");
+
+        // The author's layout is left exactly alone. They asked for those
+        // breaks, and the authored rendering is where that is honoured.
+        assert!(
+            five.1 > one.1 && twenty.1 > five.1,
+            "the author's own layout lost breaks it asked for: {one:?} {five:?} {twenty:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_break_survives_and_so_does_one_with_words_around_it() {
+        // One break between two lines is almost always meant — an address, a
+        // verse, a signature — so collapsing to none would be destroying
+        // content rather than spacing. And two breaks with text between them
+        // are not a run at all.
+        let plain = both_ways("<body><p>one two</p></body>");
+        let broken = both_ways("<body><p>one<br>two</p></body>");
+        assert!(
+            broken.0 > plain.0,
+            "the one break a reader meant was dropped"
+        );
+
+        let apart = both_ways("<body><p>one<br>mid<br>two</p></body>");
+        assert!(
+            apart.0 > broken.0,
+            "two breaks with words between them are not a run"
+        );
+    }
+
+    #[test]
+    fn whitespace_between_two_breaks_does_not_keep_them_apart() {
+        // `<br>\n  <br>` is two breaks with a newline between them, and that
+        // newline collapses to nothing — so on the page they are consecutive
+        // even though they are not consecutive in the markup. Markup written by
+        // hand is full of this.
+        let tight = both_ways("<body><p>one<br><br><br>two</p></body>");
+        let spaced = both_ways("<body><p>one<br>\n  <br>\n\t<br>two</p></body>");
+        assert_eq!(
+            spaced.0, tight.0,
+            "newlines between the breaks stopped them being seen as a run"
+        );
+    }
+
     #[test]
     fn a_page_that_needs_no_fallback_can_still_be_given_one() {
         // The capability `force_authored` had no counterpart. Inverting it does

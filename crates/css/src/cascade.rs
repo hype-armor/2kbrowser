@@ -41,6 +41,23 @@ impl StyleMap {
     pub fn get(&self, node: NodeId) -> Option<&ComputedStyle> {
         self.styles.get(&node)
     }
+
+    /// Takes a node out of the flow, exactly as `display: none` does.
+    ///
+    /// For the document fallback, which drops the blank lines a page used as
+    /// spacing (ADR-0009). No selector can say "the second of two consecutive
+    /// line breaks", so this cannot be a rule in the reader sheet; it is
+    /// decided after the cascade and applied here.
+    ///
+    /// Deliberately the only way to change a computed style after the fact. A
+    /// general setter would be an invitation to patch the cascade from
+    /// anywhere, and then a stylesheet stops being the explanation for what a
+    /// page looks like.
+    pub fn hide(&mut self, node: NodeId) {
+        if let Some(style) = self.styles.get_mut(&node) {
+            style.display = crate::style::Display::None;
+        }
+    }
 }
 
 /// Sort key for a matched declaration, in increasing precedence order.
