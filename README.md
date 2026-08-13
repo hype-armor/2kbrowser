@@ -91,8 +91,7 @@ The first run of that reported 20.6%, and the number was wrong three times over
 before it was worth anything — see PLAN.md, because the harness's own bugs are
 more instructive than the figure.
 
-Known to be missing or wrong, rather than hidden: margin collapsing does not
-handle an **empty block collapsing through itself**; `overflow` is understood
+Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
 not clipped; an invalid selector does not invalidate its rule, so
 `[1digit], div { color: red }` styles the `div` where a browser would style
@@ -104,6 +103,15 @@ now counts as layout this engine does not implement, alongside flex and grid,
 so a page built on inline-blocks is re-rendered as a document and told so
 rather than coming out subtly wrong in silence (ADR-0009). It is a share and
 not a switch, so a navigation bar of them does not move an article.
+
+A document rendering also drops runs of line breaks, keeping one. Using
+`<br><br><br><br>` as a margin is how a great deal of the era's markup did its
+spacing, and how every WYSIWYG editor has done it since; reproduced faithfully
+once the author's stylesheet has been thrown away, it turns a page into a
+column of gaps with the occasional sentence in it. One break is kept, because a
+single one between two lines is almost always meant — an address, a verse, a
+signature. The author's own layout is left exactly as written: that is the
+rendering where what they asked for is honoured.
 
 Pages of any length work. The renderer paints a *band* — a few windows' worth
 of rows around where you are reading — rather than the whole document, and the
