@@ -432,13 +432,14 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
     );
 }
 
-/// A one-request HTTP server answering a fixed path, counting what it served.
+/// An HTTP server answering one path for as long as the test binary runs,
+/// counting how many times it was actually asked.
 ///
-/// Written out rather than pulled in, and used by exactly one test. The
-/// question below is what the *parent* does with a `Content-Type`, and only a
-/// real header off a real socket can ask it: a `file:` URL has none, so nothing
-/// on disk poses the question at all.
-fn serve_once(
+/// Written out rather than pulled in. The questions below need a real header
+/// off a real socket, and none of them can be asked of anything on disk: a
+/// `file:` URL carries no `Content-Type`, and reading a file again is not the
+/// cost that fetching one again is.
+fn serve(
     path: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
@@ -450,39 +451,210 @@ fn serve_once(
     let port = listener.local_addr().expect("has an address").port();
     let served = Arc::new(AtomicUsize::new(0));
     let counter = served.clone();
+    // Detached, and it never stops: the test binary exiting is what ends it.
+    // Joining would mean deciding in advance how many requests to expect, which
+    // is the thing being measured.
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut buffer = [0u8; 2048];
-        let read = stream.read(&mut buffer).unwrap_or(0);
-        let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
-        let wanted = request
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or_default()
-            .to_owned();
-        let response = if wanted == path {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let mut out = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let wanted = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let response = if wanted == path {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .into_bytes();
-            out.extend_from_slice(&body);
-            out
-        } else {
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-        };
-        let _ = stream.write_all(&response);
-        let _ = stream.flush();
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(&body);
+                out
+            } else {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            };
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        }
     });
     (port, served)
 }
 
+/// Opens a page served from `port` in a real child, at 200px.
+fn over_http(port: u16, html: &str) -> shell::viewport::Viewport {
+    let (origin, at) = net::parse_url(&format!("http://127.0.0.1:{port}/p.html")).expect("parses");
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+    )
+    .expect("the page opens")
+}
+
+/// How much green some pixels hold, which is how these tests tell a stylesheet
+/// arrived and was applied rather than merely asked for.
+fn green_in(pixels: &[u8]) -> usize {
+    pixels
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
+        .count()
+}
+
+fn green_pixels(page: &shell::viewport::Viewport) -> usize {
+    green_in(page.pixels())
+}
+
 #[test]
-fn a_stylesheets_charset_survives_the_trip_from_the_transport_to_the_child() {
+fn a_subresource_remembered_for_one_page_is_not_served_to_another() {
+    // The cache sits behind the policy, never in front of it. ADR-0006's rule
+    // is about who is asking as much as about what for, and a live child
+    // outlives the document it was started for — `Session::render` can be
+    // handed a new one. A cache consulted before the check would let a page ask
+    // once from somewhere it was allowed and be answered for ever after, from
+    // anywhere, which is the whole third-party rule undone by an optimisation.
+    let (port, served) = serve("/s.css", "text/css", GREEN_SHEET.to_vec());
+    let html = format!(
+        "<html><head><link rel=stylesheet href=\"http://127.0.0.1:{port}/s.css\">\
+         </head><body><p>green</p></body></html>"
+    );
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+
+    // First: the document and the sheet share a host, so it is first-party.
+    let (origin, at) = net::parse_url(&format!("http://127.0.0.1:{port}/p.html")).expect("parses");
+    let (mut session, first) = renderer
+        .open(
+            html.as_bytes().to_vec(),
+            Some("text/html".to_owned()),
+            200,
+            0,
+            200,
+            Some(origin),
+            at,
+            false,
+            false,
+        )
+        .expect("the renderer opens the page");
+
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+    assert!(
+        green_in(&first.pixels) > 0,
+        "a first-party sheet should have applied"
+    );
+
+    // Then the same live child renders a document from a different host.
+    // `localhost` and `127.0.0.1` are different hosts by `is_same_site`, so the
+    // very same stylesheet URL is now third-party and has to be refused.
+    let (other, other_at) =
+        net::parse_url(&format!("http://localhost:{port}/p.html")).expect("parses");
+    let second = session
+        .render(
+            html.as_bytes().to_vec(),
+            Some("text/html".to_owned()),
+            200,
+            0,
+            200,
+            Some(other),
+            other_at,
+            false,
+            false,
+        )
+        .expect("renders");
+
+    assert_eq!(
+        green_in(&second.pixels),
+        0,
+        "a sheet remembered for one document was handed to another that may not have it"
+    );
+}
+
+/// The stylesheet these tests serve, and the colour they look for.
+const GREEN_SHEET: &[u8] = b"p { background-color: #00ff00 }";
+
+#[test]
+fn re_rendering_a_page_does_not_fetch_its_subresources_again() {
+    // What a resize costs. Laying a page out again re-runs the whole pipeline
+    // in the child, subresource requests included, and the parent had no cache
+    // of any kind — so every stylesheet and every image went back to the
+    // network on every re-render, at whatever rate the window was resizing.
+    let (port, served) = serve("/s.css", "text/css", GREEN_SHEET.to_vec());
+    let mut page = over_http(
+        port,
+        "<html><head><link rel=stylesheet href=\"s.css\"></head>\
+         <body><p>green</p></body></html>",
+    );
+
+    // Skipped rather than failed when the request never reached the server: a
+    // machine with a proxy in its environment sends it somewhere else entirely,
+    // and a check that could not run must not look like one that passed.
+    let after_first = served.load(std::sync::atomic::Ordering::SeqCst);
+    if after_first == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+    assert_eq!(after_first, 1, "the first render fetches it once");
+
+    for width in [220, 240, 260] {
+        page.resize(width, 200).expect("re-renders");
+    }
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a re-render went back to the network for a stylesheet it already had"
+    );
+    assert!(
+        green_pixels(&page) > 0,
+        "the remembered stylesheet stopped reaching the paint"
+    );
+}
+
+#[test]
+fn the_same_subresource_twice_on_one_page_is_fetched_once() {
+    // The half that helps a page's *first* load rather than its second. The
+    // era's markup leans on one spacer image used all over a layout, and every
+    // use of it was its own trip to the network.
+    let (port, served) = serve("/s.css", "text/css", GREEN_SHEET.to_vec());
+    let page = over_http(
+        port,
+        "<html><head>\
+         <link rel=stylesheet href=\"s.css\"><link rel=stylesheet href=\"s.css\">\
+         <link rel=stylesheet href=\"s.css\"><link rel=stylesheet href=\"s.css\">\
+         </head><body><p>green</p></body></html>",
+    );
+
+    let count = served.load(std::sync::atomic::Ordering::SeqCst);
+    if count == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+    assert_eq!(count, 1, "one sheet, asked for four times, fetched {count}");
+    assert!(green_pixels(&page) > 0, "the sheet did not reach the paint");
+}
+
+#[test]
+fn a_subresource_keeps_the_charset_its_own_header_declared() {
+    // The sibling of `a_charset_that_only_the_header_knows_still_reaches_the_
+    // renderer`, which asks this of the *document*. That path kept its header
+    // and this one did not, which is exactly the sort of inconsistency nobody
+    // would think to look for — the same bug, one boundary further in.
+    //
     // The parent used to build every answer with `content_type: None`, throwing
     // away what the transport said — while `ToChild::Resource` documented the
     // field as existing precisely so "a stylesheet's character set can come
@@ -495,7 +667,7 @@ fn a_stylesheets_charset_survives_the_trip_from_the_transport_to_the_child() {
     let css = ".caf\u{e9} { background-color: #00ff00 }"
         .as_bytes()
         .to_vec();
-    let (port, served) = serve_once("/s.css", "text/css; charset=utf-8", css);
+    let (port, served) = serve("/s.css", "text/css; charset=utf-8", css);
 
     let html = "<html><head><link rel=stylesheet href=\"s.css\"></head>\
                 <body><p class=\"caf\u{e9}\">green if the header arrived</p></body></html>";

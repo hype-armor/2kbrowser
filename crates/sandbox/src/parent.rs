@@ -420,6 +420,7 @@ impl Session {
                 let mut conversation = Conversation {
                     child,
                     fetcher,
+                    fetched: Fetched::default(),
                     timeout,
                     document: None,
                 };
@@ -620,10 +621,70 @@ impl Drop for Session {
     }
 }
 
+/// Most a page may keep fetched subresources for, in bytes.
+///
+/// The era fixture peaks at around 27 MB across both processes against the
+/// budget harness's limit of 100, so this is sized to be a comfortable fraction
+/// of the room left rather than to hold everything: a page whose subresources
+/// exceed it goes on fetching, which is slow, where a page that could exhaust
+/// memory would be worse than slow.
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// What has already been fetched for the page this conversation is holding.
+///
+/// One page's worth, on the worker thread that does the fetching, dropped with
+/// the session — the same rule the child process follows, and for the same
+/// reason: a page's leftovers must not outlive the page.
+///
+/// That scope is deliberately narrow. It makes re-rendering cheap, which is
+/// what a resize is and what most of the cost of one was, and it makes a page
+/// that uses the same spacer image forty times fetch it once. It does nothing
+/// for navigating back to a page you were just on — that wants a cache which
+/// outlives a page, which in turn wants an answer about `Cache-Control` and
+/// about eviction, and neither is a decision to make in passing.
+#[derive(Debug, Default)]
+struct Fetched {
+    /// Answers ready to send, by URL.
+    answers: std::collections::HashMap<String, ToChild>,
+    /// How many bytes of body they hold between them.
+    bytes: usize,
+}
+
+impl Fetched {
+    fn get(&self, url: &str) -> Option<ToChild> {
+        self.answers.get(url).cloned()
+    }
+
+    /// Remembers an answer, if there is room.
+    ///
+    /// Full means stop rather than evict. Within one page's lifetime there is
+    /// no access pattern worth modelling and an eviction policy would be
+    /// machinery in service of a guess; stopping is predictable, and what it
+    /// costs is the speed this exists for rather than correctness.
+    fn put(&mut self, url: &str, answer: &ToChild) {
+        let size = match answer {
+            ToChild::Resource { body, .. } => body.len(),
+            _ => return,
+        };
+        if self.bytes.saturating_add(size) > MAX_CACHE_BYTES {
+            return;
+        }
+        if self
+            .answers
+            .insert(url.to_owned(), answer.clone())
+            .is_none()
+        {
+            self.bytes += size;
+        }
+    }
+}
+
 /// The child, the pipes, and the conversation — all on the worker thread.
 struct Conversation {
     child: Spawned,
     fetcher: Fetcher,
+    /// Subresources already fetched for this page.
+    fetched: Fetched,
     timeout: Duration,
     /// The origin the parent asked for a render of.
     ///
@@ -733,19 +794,48 @@ impl Conversation {
     /// `fetch_raw` rather than anything that decodes: the parent hands over the
     /// bytes and the header saying how to read them, and the reading happens on
     /// the far side with every other parser (ADR-0012).
-    fn fetch(&self, url: &str, kind: RequestKind) -> ToChild {
-        match self.fetcher.fetch_raw(url, self.document.as_ref(), kind) {
+    fn fetch(&mut self, url: &str, kind: RequestKind) -> ToChild {
+        let refused = ToChild::Resource {
+            body: Vec::new(),
+            content_type: None,
+            ok: false,
+        };
+
+        // The policy is applied before the cache is consulted, never after. A
+        // cached answer served without it would let a page ask once from a
+        // context where it was allowed and be answered for ever after —
+        // ADR-0006's rule is about who is asking as much as about what for, and
+        // the origin asking can change within one live child. `fetch_raw`
+        // checks again on a miss, which costs a URL parse and keeps the rule in
+        // one place rather than depending on this having got there first.
+        let allowed = net::parse_url(url).is_ok_and(|(origin, _)| {
+            self.fetcher
+                .policy
+                .check(self.document.as_ref(), &origin, kind)
+                .is_ok()
+        });
+        if !allowed {
+            return refused;
+        }
+
+        if let Some(answer) = self.fetched.get(url) {
+            return answer;
+        }
+
+        let answer = match self.fetcher.fetch_raw(url, self.document.as_ref(), kind) {
             Ok(fetched) => ToChild::Resource {
                 body: fetched.body,
                 content_type: fetched.content_type,
                 ok: true,
             },
-            Err(_) => ToChild::Resource {
-                body: Vec::new(),
-                content_type: None,
-                ok: false,
-            },
-        }
+            Err(_) => refused,
+        };
+        // Failures are remembered too. A page with a broken image would
+        // otherwise retry it on every re-render, which is the case this exists
+        // to make cheap, and a resize that quietly started succeeding would
+        // change what the page looks like halfway through reading it.
+        self.fetched.put(url, &answer);
+        answer
     }
 }
 
@@ -775,6 +865,51 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource(bytes: usize) -> ToChild {
+        ToChild::Resource {
+            body: vec![0; bytes],
+            content_type: None,
+            ok: true,
+        }
+    }
+
+    #[test]
+    fn what_a_page_has_fetched_is_bounded() {
+        // The cache is filled by whatever the page asks for, and a page is a
+        // stranger's. Without a ceiling, a document referencing enough large
+        // resources would have the *parent* hold all of them — the process that
+        // is supposed to be the trustworthy one, and the one the memory budget
+        // is measured against.
+        let mut fetched = Fetched::default();
+        let half = MAX_CACHE_BYTES / 2 + 1;
+        fetched.put("https://example.com/a", &resource(half));
+        fetched.put("https://example.com/b", &resource(half));
+
+        assert!(fetched.get("https://example.com/a").is_some());
+        assert!(
+            fetched.get("https://example.com/b").is_none(),
+            "the second one did not fit and should not have been kept"
+        );
+        assert!(
+            fetched.bytes <= MAX_CACHE_BYTES,
+            "{} bytes held against a limit of {MAX_CACHE_BYTES}",
+            fetched.bytes
+        );
+    }
+
+    #[test]
+    fn remembering_the_same_url_twice_counts_it_once() {
+        // A page that asks for the same sheet forty times is the case this
+        // exists for. Counting each answer again would have the cache believe
+        // it was full long before it was.
+        let mut fetched = Fetched::default();
+        for _ in 0..40 {
+            fetched.put("https://example.com/spacer.gif", &resource(1024));
+        }
+        assert_eq!(fetched.bytes, 1024);
+        assert!(fetched.get("https://example.com/spacer.gif").is_some());
+    }
 
     #[test]
     fn a_missing_program_fails_rather_than_hanging() {
