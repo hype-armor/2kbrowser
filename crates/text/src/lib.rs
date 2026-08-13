@@ -11,7 +11,8 @@
 //! is the difference between one set of reference baselines and three.
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache, Weight,
+    Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache,
+    Weight,
 };
 use css::style::{ComputedStyle, FontStyle, GenericFamily, TextDecoration, WhiteSpace};
 
@@ -304,10 +305,35 @@ struct Segment {
     color: Option<(u8, u8, u8, u8)>,
 }
 
+/// Most shaped segments one store will remember.
+///
+/// The cache is filled by whatever words a page contains, and a page is a
+/// stranger's, so it needs a ceiling. Eight thousand distinct segments is far
+/// past what ordinary prose reaches — the era's web repeats itself constantly,
+/// which is the whole reason this pays — while staying small enough to sit
+/// inside the memory budget the renderer is measured against.
+const MAX_SHAPED: usize = 8192;
+
 /// Owns the font database and the glyph raster cache.
 pub struct FontStore {
     system: FontSystem,
     cache: SwashCache,
+    /// Segments already shaped, by their text and the attributes they were
+    /// shaped under.
+    ///
+    /// Shaping is the bulk of layout — 84ms for 35 KB of plain paragraphs
+    /// measured, and laying the same document out twice cost the same both
+    /// times — and a document asks for the same short strings over and over:
+    /// the words in its navigation, the labels in its tables, every `the` on
+    /// the page. Each was shaped from nothing every time.
+    ///
+    /// Safe to reuse an answer here only because ADR-0005 already demands the
+    /// engine be deterministic: identical input must produce identical output,
+    /// so a cache can change how long a page takes and cannot change how it
+    /// looks. The reference tests are what hold that — they compare rendered
+    /// pages against baselines byte for byte, so a cache that returned the
+    /// wrong glyphs would fail them rather than pass quietly.
+    shaped: std::collections::HashMap<(AttrsOwned, String), Shaped>,
 }
 
 impl Default for FontStore {
@@ -344,6 +370,7 @@ impl FontStore {
         Self {
             system,
             cache: SwashCache::new(),
+            shaped: std::collections::HashMap::new(),
         }
     }
 
@@ -472,11 +499,29 @@ impl FontStore {
                 ..Shaped::default()
             };
         }
+        let attrs = Self::attrs_for(style);
+        // Keyed on the attributes themselves rather than on a list of the style
+        // properties that matter. `AttrsOwned` carries exactly what `Attrs`
+        // carries — the family, the weight, the slant, the colour, and the
+        // metrics folded in by `attrs_for` — so a property added there is in
+        // the key by construction. A hand-written key would be one someone
+        // could forget to extend, and the failure would be a page drawn with
+        // another style's glyphs.
+        //
+        // Below the guards above, deliberately. `metrics_for` floors a
+        // non-positive size to something visible while the guard returns early
+        // for one, so a zero size and a nearly-zero one share a key and mean
+        // different things. Only shaped text is ever stored or looked up here,
+        // and the zero-size path never reaches this.
+        let key = (AttrsOwned::new(&attrs), text.to_owned());
+        if let Some(shaped) = self.shaped.get(&key) {
+            return shaped.clone();
+        }
+
         let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style));
         let mut buffer = buffer.borrow_with(&mut self.system);
         // No width limit: a segment is by definition not broken further.
         buffer.set_size(None, None);
-        let attrs = Self::attrs_for(style);
         // Advanced shaping: required for correctness on anything beyond plain
         // Latin, and the cost is irrelevant next to being wrong.
         buffer.set_rich_text([(text, attrs.clone())], &attrs, Shaping::Advanced, None);
@@ -504,6 +549,12 @@ impl FontStore {
                     end: glyph.end,
                 })
                 .collect();
+        }
+        // Full means stop rather than evict, as elsewhere: within one page's
+        // life there is no access pattern worth modelling, and what stopping
+        // costs is the speed this exists for rather than correctness.
+        if self.shaped.len() < MAX_SHAPED {
+            self.shaped.insert(key, shaped.clone());
         }
         shaped
     }
@@ -1008,6 +1059,184 @@ mod tests {
             line_height: size * 1.2,
             ..Default::default()
         }
+    }
+
+    /// A glyph reduced to what a reader could tell apart, with the floats as
+    /// bits so comparing them is exact rather than approximate.
+    type VisibleGlyph = (u16, u32, u32, Option<(u8, u8, u8, u8)>);
+    /// A whole segment the same way: width, ascent, height, and its glyphs.
+    type Visible = (u32, u32, u32, Vec<VisibleGlyph>);
+
+    /// Everything about a shaped segment that a reader could see.
+    fn visible(shaped: &Shaped) -> Visible {
+        (
+            shaped.width.to_bits(),
+            shaped.ascent.to_bits(),
+            shaped.height.to_bits(),
+            shaped
+                .glyphs
+                .iter()
+                .map(|glyph| {
+                    (
+                        glyph.glyph_id,
+                        glyph.x.to_bits(),
+                        glyph.font_size.to_bits(),
+                        glyph.color,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_remembered_segment_is_never_handed_to_a_style_it_was_not_shaped_for() {
+        // The cache is keyed on the attributes a segment was shaped under, and
+        // `AttrsOwned` *is* those attributes rather than a hand-listed subset
+        // of the style — so a property added to `attrs_for` is in the key by
+        // construction. This is the test that would notice if that stopped
+        // being true: the same text under styles differing one property at a
+        // time, each asked of a store that has already shaped all the others.
+        //
+        // A key that could not tell two of them apart would hand back the
+        // first style's glyphs for the second, and the page would be drawn in
+        // somebody else's font, weight, size, or colour.
+        let text = "shape me";
+        let mut styles = vec![style(16.0), style(12.0), style(24.0), style(37.5)];
+        // Line height alone, with the size held still: it rides in the metrics
+        // `attrs_for` folds in, and nothing about the glyphs shows it.
+        let mut taller = style(16.0);
+        taller.line_height = 40.0;
+        styles.push(taller);
+        for weight in [300u16, 400, 700] {
+            let mut bold = style(16.0);
+            bold.font_weight = weight;
+            styles.push(bold);
+        }
+        let mut italic = style(16.0);
+        italic.font_style = FontStyle::Italic;
+        styles.push(italic);
+        for generic in [
+            GenericFamily::SansSerif,
+            GenericFamily::Serif,
+            GenericFamily::Monospace,
+        ] {
+            let mut family = style(16.0);
+            family.font_family = FontStack {
+                families: Vec::new(),
+                generic,
+            };
+            styles.push(family);
+        }
+        for named in ["Georgia", "Courier New", "Verdana"] {
+            let mut family = style(16.0);
+            family.font_family = FontStack {
+                families: vec![named.to_owned()],
+                generic: GenericFamily::SansSerif,
+            };
+            styles.push(family);
+        }
+        for (r, g, b) in [(255u8, 0u8, 0u8), (0, 128, 255)] {
+            let mut coloured = style(16.0);
+            coloured.color = css::value::Color::rgb(r, g, b);
+            styles.push(coloured);
+        }
+
+        let mut shared = FontStore::new();
+        // Warmed on every style first, so each lookup below is made against a
+        // cache holding all the others — which is when a key that cannot tell
+        // them apart returns the wrong one.
+        for style in &styles {
+            let _ = shared.shape_segment(text, style);
+        }
+        for (index, style) in styles.iter().enumerate() {
+            let alone = FontStore::new().shape_segment(text, style);
+            let remembered = shared.shape_segment(text, style);
+            assert_eq!(
+                visible(&alone),
+                visible(&remembered),
+                "style {index} was handed a segment shaped for another one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remembered_segment_is_actually_used() {
+        // A correct cache is invisible in its output, which is the point and
+        // also the problem: no comparison of what gets drawn can tell whether
+        // the lookup happened at all, so removing it would break nothing any
+        // other test asserts. The entry is poisoned instead — something that
+        // could never have come out of the shaper is put where the answer
+        // lives, and getting it back is proof the lookup is what answered.
+        let mut fonts = FontStore::new();
+        let ordinary = style(16.0);
+        let real = fonts.shape_segment("hello", &ordinary);
+        assert!(
+            !real.glyphs.is_empty(),
+            "the fixture has to shape to glyphs"
+        );
+        assert_eq!(fonts.shaped.len(), 1, "shaping remembered nothing");
+
+        let key = fonts
+            .shaped
+            .keys()
+            .next()
+            .cloned()
+            .expect("something was remembered");
+        fonts.shaped.insert(
+            key,
+            Shaped {
+                text: "hello".to_owned(),
+                width: 1234.0,
+                ..Shaped::default()
+            },
+        );
+        let again = fonts.shape_segment("hello", &ordinary);
+        assert_eq!(
+            again.width, 1234.0,
+            "the segment was shaped again rather than remembered"
+        );
+
+        // And asking a second time did not remember a second copy of it.
+        assert_eq!(fonts.shaped.len(), 1);
+    }
+
+    #[test]
+    fn what_a_store_remembers_is_bounded() {
+        // Filled by whatever words a page contains, and a page is a
+        // stranger's. Without a ceiling, a document of nothing but distinct
+        // words would grow this until the renderer ran out of memory — a
+        // denial of service reachable from ordinary markup.
+        let mut fonts = FontStore::new();
+        let ordinary = style(16.0);
+        for word in 0..MAX_SHAPED + 500 {
+            let _ = fonts.shape_segment(&format!("w{word}"), &ordinary);
+        }
+        assert!(
+            fonts.shaped.len() <= MAX_SHAPED,
+            "{} remembered against a limit of {MAX_SHAPED}",
+            fonts.shaped.len()
+        );
+    }
+
+    #[test]
+    fn text_at_no_size_is_never_answered_from_the_cache() {
+        // `metrics_for` floors a non-positive size to something visible, so a
+        // size of zero and a nearly-zero one share a key — while the guard
+        // above the cache returns early for the first and shapes the second.
+        // The lookup sits below that guard for exactly this reason.
+        let mut fonts = FontStore::new();
+        let mut nearly = style(16.0);
+        nearly.font_size = 0.005;
+        let shaped = fonts.shape_segment("invisible", &nearly);
+        assert!(!shaped.glyphs.is_empty(), "a nearly-zero size still shapes");
+
+        let mut none = style(16.0);
+        none.font_size = 0.0;
+        let nothing = fonts.shape_segment("invisible", &none);
+        assert!(
+            nothing.glyphs.is_empty(),
+            "zero-sized text was answered with glyphs shaped for another size"
+        );
     }
 
     #[test]

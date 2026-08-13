@@ -120,9 +120,27 @@ events are recorded and acted on once the queue drains rather than serviced one
 apiece. On a long page that is the difference between 97 renders and 4, and
 between a window that answers again 28 seconds after the drag stops and one
 that answers in under a second — measured, on a 119 KB page, by sending 96
-resizes and timing how long until a click was noticed. It is still one render
-too many in the sense that matters: laying out a page is expensive, and the
-work to make it less so has not been done yet.
+resizes and timing how long until a click was noticed.
+
+A render itself got cheaper too. Shaping text is most of what layout costs, and
+a document asks for the same short strings over and over — the words in its
+navigation, the labels in its tables, every *the* on the page — each of which
+was shaped from nothing every time. A store now remembers what it has shaped,
+which is safe here only because ADR-0005 already demands the engine be
+deterministic: identical input must produce identical output, so remembering an
+answer can change how long a page takes and cannot change how it looks. The
+reference tests are what hold that, comparing rendered pages against baselines
+byte for byte. Laying out Hacker News went from 37.7ms to 7.5ms, and rendering
+it whole from 61.0ms to 28.2ms.
+
+The parent also remembers what it has fetched, for as long as the page lasts,
+so re-rendering no longer sends every stylesheet and image back to the network
+— and one HTTP agent is kept for the process rather than built per request,
+which is what makes a connection pool worth having.
+
+None of that makes a page resize smoothly. What is left is that subresources
+are still fetched strictly one at a time, so a page with twenty images waits
+for twenty round trips in a row.
 
 Links work in the window: click to follow, Alt+Left/Right or Backspace for
 back and forward, and the cursor changes over a link. `2kbrowser links <page>`
