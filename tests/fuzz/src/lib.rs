@@ -758,14 +758,28 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             height: 300,
         }
         .encode(),
-        sandbox::ToChild::Resource {
-            body: vec![0x89, b'P', b'N', b'G'],
-            content_type: None,
-            ok: true,
+        sandbox::ToChild::Resources {
+            // Two, so a mutation that shortens the list has something to
+            // shorten and the positional matching has something to get wrong.
+            resources: vec![
+                sandbox::message::Supplied {
+                    body: vec![0x89, b'P', b'N', b'G'],
+                    content_type: None,
+                    ok: true,
+                },
+                sandbox::message::Supplied {
+                    body: Vec::new(),
+                    content_type: Some("text/css; charset=utf-8".to_owned()),
+                    ok: false,
+                },
+            ],
         }
         .encode(),
         sandbox::ToParent::Fetch {
-            url: "https://example.com/x.png".to_owned(),
+            urls: vec![
+                "https://example.com/x.png".to_owned(),
+                "https://example.com/y.css".to_owned(),
+            ],
             kind: net::RequestKind::Subresource,
         }
         .encode(),

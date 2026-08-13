@@ -21,26 +21,43 @@ use text::FontStore;
 /// applies ADR-0006's policy — which is the improvement worth having: the rule
 /// is now enforced in a process a compromised renderer cannot reach.
 struct PipeLoader<'a> {
-    fetch: &'a mut dyn FnMut(&str, net::RequestKind) -> Fetched,
+    fetch: &'a mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
 }
 
 impl crate::render::Loader for PipeLoader<'_> {
     fn load(
         &mut self,
         url: &str,
-        _document: Option<&net::Origin>,
+        document: Option<&net::Origin>,
         kind: net::RequestKind,
     ) -> Option<crate::render::Loaded> {
+        // One URL is a batch of one. There is no separate single-fetch path
+        // over the pipe, so there is no second path to drift.
+        self.load_many(&[url.to_owned()], document, kind)
+            .pop()
+            .flatten()
+    }
+
+    fn load_many(
+        &mut self,
+        urls: &[String],
+        _document: Option<&net::Origin>,
+        kind: net::RequestKind,
+    ) -> Vec<Option<crate::render::Loaded>> {
         // The document origin is dropped rather than sent. The parent already
         // knows it — it is what the parent asked for a render of — and taking
         // it from the untrusted side would let a compromised renderer claim to
         // be an origin it is not, which is the whole policy defeated in one
         // field.
-        let resource = (self.fetch)(url, kind)?;
-        Some(crate::render::Loaded {
-            bytes: resource.bytes,
-            content_type: resource.content_type,
-        })
+        (self.fetch)(urls, kind)
+            .into_iter()
+            .map(|resource| {
+                resource.map(|got| crate::render::Loaded {
+                    bytes: got.bytes,
+                    content_type: got.content_type,
+                })
+            })
+            .collect()
     }
 }
 
@@ -135,7 +152,7 @@ impl Render for PageRenderer {
     fn render(
         &mut self,
         request: &ToChild,
-        fetch: &mut dyn FnMut(&str, net::RequestKind) -> Fetched,
+        fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
     ) -> Result<Rendered, String> {
         let ToChild::Render {
             body,
@@ -336,8 +353,8 @@ mod tests {
         }
     }
 
-    fn no_fetch(_: &str, _: net::RequestKind) -> Fetched {
-        None
+    fn no_fetch(urls: &[String], _: net::RequestKind) -> Vec<Fetched> {
+        vec![None; urls.len()]
     }
 
     /// A real PNG, so a decode that succeeds means the bytes arrived intact.
@@ -484,11 +501,15 @@ mod tests {
         let html = "<frameset cols=\"50%,50%\">\
                     <frame src=\"a.html\"><frame src=\"b.html\"></frameset>";
 
-        let mut fetch = |_url: &str, _kind: net::RequestKind| -> Fetched {
-            Some(sandbox::child::Resource {
-                bytes: b"<body><p>a frame</p></body>".to_vec(),
-                content_type: Some("text/html".to_owned()),
-            })
+        let mut fetch = |urls: &[String], _kind: net::RequestKind| -> Vec<Fetched> {
+            urls.iter()
+                .map(|_| {
+                    Some(sandbox::child::Resource {
+                        bytes: b"<body><p>a frame</p></body>".to_vec(),
+                        content_type: Some("text/html".to_owned()),
+                    })
+                })
+                .collect()
         };
 
         let mut renderer = PageRenderer::new();
@@ -621,7 +642,7 @@ mod tests {
                     <body><img src=\"tile.png\"><p>text</p></body></html>";
 
         let mut asked: Vec<String> = Vec::new();
-        let mut fetch = |url: &str, _kind: net::RequestKind| -> Fetched {
+        let mut one = |url: &str| -> Fetched {
             asked.push(url.to_owned());
             if url.ends_with("site.css") {
                 return Some(sandbox::child::Resource {
@@ -642,6 +663,9 @@ mod tests {
                 });
             }
             None
+        };
+        let mut fetch = |urls: &[String], _kind: net::RequestKind| -> Vec<Fetched> {
+            urls.iter().map(|url| one(url)).collect()
         };
 
         let page = PageRenderer::new()
@@ -695,9 +719,9 @@ mod tests {
 
         let html = "<body><img src=\"https://tracker.example.net/pixel.gif\"><p>text</p></body>";
         let mut refused = 0usize;
-        let mut fetch = |_url: &str, _kind: net::RequestKind| -> Fetched {
-            refused += 1;
-            None
+        let mut fetch = |urls: &[String], _kind: net::RequestKind| -> Vec<Fetched> {
+            refused += urls.len();
+            vec![None; urls.len()]
         };
 
         let page = PageRenderer::new()

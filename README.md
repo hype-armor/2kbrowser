@@ -138,9 +138,16 @@ so re-rendering no longer sends every stylesheet and image back to the network
 — and one HTTP agent is kept for the process rather than built per request,
 which is what makes a connection pool worth having.
 
-None of that makes a page resize smoothly. What is left is that subresources
-are still fetched strictly one at a time, so a page with twenty images waits
-for twenty round trips in a row.
+Subresources are fetched several at a time rather than one after another. The
+child asks for as many as it knows about at once — every image on the page,
+once the cascade has run — and the parent fetches up to six of them together,
+so a page waits for the longest of its round trips instead of the sum of them.
+Against a server answering in 50ms: twenty-four images in 214ms rather than
+1.23s. Six at a time and not more, because the bound is about the server at the
+other end as much as about this process.
+
+A stylesheet is still asked for on its own, and honestly cannot be otherwise:
+an `@import` is only discoverable once the sheet importing it has arrived.
 
 Links work in the window: click to follow, Alt+Left/Right or Backspace for
 back and forward, and the cursor changes over a link. `2kbrowser links <page>`

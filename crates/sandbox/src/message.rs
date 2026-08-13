@@ -115,6 +115,26 @@ fn read_origin(reader: &mut Reader<'_>) -> Result<Origin, WireError> {
     })
 }
 
+/// One subresource the parent supplied, inside a [`ToChild::Resources`].
+///
+/// A refusal and a failure are the same shape on purpose: the child has no
+/// business knowing whether a resource was blocked by policy or merely
+/// missing, and telling it would leak the parent's configuration to the
+/// untrusted side.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Supplied {
+    /// The bytes, or empty when it could not be had.
+    pub body: Vec<u8>,
+    /// The `Content-Type` it was served with, when there was one.
+    ///
+    /// Carried because a stylesheet's character set can come from the header,
+    /// and dropping it here would silently change how a legacy stylesheet
+    /// decodes on the far side.
+    pub content_type: Option<String>,
+    /// Whether it was retrieved at all.
+    pub ok: bool,
+}
+
 /// Parent to child.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToChild {
@@ -162,23 +182,16 @@ pub enum ToChild {
         /// How many rows to paint.
         height: u32,
     },
-    /// The answer to a [`ToParent::Fetch`].
+    /// The answers to a [`ToParent::Fetch`], one per URL and in the same order.
     ///
-    /// A refusal and a failure are the same shape on purpose: the child has no
-    /// business knowing whether a resource was blocked by policy or merely
-    /// missing, and telling it would leak the parent's configuration to the
-    /// untrusted side.
-    Resource {
-        /// The bytes, or empty when it could not be had.
-        body: Vec<u8>,
-        /// The `Content-Type` it was served with, when there was one.
-        ///
-        /// Carried because a stylesheet's character set can come from the
-        /// header, and dropping it here would silently change how a legacy
-        /// stylesheet decodes on the far side.
-        content_type: Option<String>,
-        /// Whether it was retrieved at all.
-        ok: bool,
+    /// Order is the whole matching rule: the parent answers a batch with
+    /// exactly as many resources as were asked for, so nothing needs a request
+    /// id and neither side has to hold a map. A batch of one is an ordinary
+    /// single fetch, which is what a stylesheet is — its `@import` chain is
+    /// only discoverable a link at a time.
+    Resources {
+        /// One per URL asked for, positionally.
+        resources: Vec<Supplied>,
     },
     /// Asks where `query` appears on the page most recently rendered.
     ///
@@ -234,18 +247,17 @@ impl ToChild {
                 writer.u32(*top);
                 writer.u32(*height);
             }
-            ToChild::Resource {
-                body,
-                content_type,
-                ok,
-            } => {
+            ToChild::Resources { resources } => {
                 writer.tag(1);
-                writer.bytes(body);
-                writer.some(content_type.is_some());
-                if let Some(content_type) = content_type {
-                    writer.str(content_type);
+                writer.u32(resources.len() as u32);
+                for resource in resources {
+                    writer.bytes(&resource.body);
+                    writer.some(resource.content_type.is_some());
+                    if let Some(content_type) = &resource.content_type {
+                        writer.str(content_type);
+                    }
+                    writer.some(resource.ok);
                 }
-                writer.some(*ok);
             }
         }
         writer.finish()
@@ -283,17 +295,25 @@ impl ToChild {
                 }
             }
             1 => {
-                let body = reader.bytes()?.to_vec();
-                let content_type = if reader.some()? {
-                    Some(reader.str()?)
-                } else {
-                    None
-                };
-                ToChild::Resource {
-                    body,
-                    content_type,
-                    ok: reader.some()?,
+                // A count, not a plain `u32`: bounded by the bytes left, so a
+                // claim of four billion resources cannot reserve for four
+                // billion resources.
+                let count = reader.count()?;
+                let mut resources = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    let body = reader.bytes()?.to_vec();
+                    let content_type = if reader.some()? {
+                        Some(reader.str()?)
+                    } else {
+                        None
+                    };
+                    resources.push(Supplied {
+                        body,
+                        content_type,
+                        ok: reader.some()?,
+                    });
                 }
+                ToChild::Resources { resources }
             }
             2 => ToChild::Find {
                 query: reader.str()?,
@@ -312,15 +332,23 @@ impl ToChild {
 /// Child to parent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToParent {
-    /// Asks for a subresource.
+    /// Asks for subresources.
     ///
     /// The child cannot reach the network itself, so this is the only way it
     /// gets anything — and the parent applies ADR-0006's policy to every one of
     /// them, somewhere a compromised renderer cannot reach.
+    ///
+    /// Several at once rather than one, because the parent can then fetch them
+    /// concurrently. Asking one at a time made a page wait for the sum of every
+    /// subresource's latency rather than the longest, which on a page of twenty
+    /// images is twenty round trips in a row. The child asks for as many as it
+    /// knows about — every image on the page, once the cascade has run — and
+    /// asks for one where one is all it can know, which is a stylesheet, whose
+    /// `@import` chain is only discoverable a link at a time.
     Fetch {
-        /// Absolute URL, resolved by the child against the document.
-        url: String,
-        /// What it is for, so the policy can tell a navigation from a
+        /// Absolute URLs, resolved by the child against the document.
+        urls: Vec<String>,
+        /// What they are for, so the policy can tell a navigation from a
         /// subresource.
         kind: RequestKind,
     },
@@ -376,9 +404,12 @@ impl ToParent {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         match self {
-            ToParent::Fetch { url, kind } => {
+            ToParent::Fetch { urls, kind } => {
                 writer.tag(0);
-                writer.str(url);
+                writer.u32(urls.len() as u32);
+                for url in urls {
+                    writer.str(url);
+                }
                 writer.tag(match kind {
                     RequestKind::Navigation => 0,
                     RequestKind::Subresource => 1,
@@ -424,14 +455,23 @@ impl ToParent {
     pub fn decode(frame: &[u8]) -> Result<Self, WireError> {
         let mut reader = Reader::new(frame);
         let message = match reader.tag()? {
-            0 => ToParent::Fetch {
-                url: reader.str()?,
-                kind: match reader.tag()? {
-                    0 => RequestKind::Navigation,
-                    1 => RequestKind::Subresource,
-                    _ => return Err(WireError::Unknown),
-                },
-            },
+            0 => {
+                // A count, so a claim of four billion URLs cannot reserve for
+                // four billion URLs.
+                let count = reader.count()?;
+                let mut urls = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    urls.push(reader.str()?);
+                }
+                ToParent::Fetch {
+                    urls,
+                    kind: match reader.tag()? {
+                        0 => RequestKind::Navigation,
+                        1 => RequestKind::Subresource,
+                        _ => return Err(WireError::Unknown),
+                    },
+                }
+            }
             1 => {
                 let pixels = reader.bytes()?.to_vec();
                 let width = reader.u32()?;
@@ -631,12 +671,21 @@ mod tests {
     fn a_fetch_and_a_failure_round_trip() {
         for message in [
             ToParent::Fetch {
-                url: "https://example.com/x.png".to_owned(),
+                urls: vec![
+                    "https://example.com/x.png".to_owned(),
+                    "https://example.com/y.css".to_owned(),
+                ],
                 kind: RequestKind::Subresource,
             },
             ToParent::Fetch {
-                url: "https://example.com/".to_owned(),
+                urls: vec!["https://example.com/".to_owned()],
                 kind: RequestKind::Navigation,
+            },
+            // No URLs at all. The child does not send this, and the decoder
+            // still has to have an answer for it.
+            ToParent::Fetch {
+                urls: Vec::new(),
+                kind: RequestKind::Subresource,
             },
             ToParent::Failed {
                 message: "could not render".to_owned(),
@@ -693,8 +742,22 @@ mod tests {
             .encode(),
             ToParent::Rendered(Box::new(rendered(3, 2))).encode(),
             ToParent::Fetch {
-                url: "https://example.com/a".to_owned(),
+                urls: vec![
+                    "https://example.com/a".to_owned(),
+                    "https://example.com/b".to_owned(),
+                ],
                 kind: RequestKind::Subresource,
+            }
+            .encode(),
+            ToChild::Resources {
+                resources: vec![
+                    Supplied {
+                        body: b"one".to_vec(),
+                        content_type: Some("text/css".to_owned()),
+                        ok: true,
+                    },
+                    Supplied::default(),
+                ],
             }
             .encode(),
         ];

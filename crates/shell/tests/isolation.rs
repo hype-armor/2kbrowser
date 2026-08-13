@@ -109,10 +109,8 @@ fn a_child_given_nonsense_refuses_it_rather_than_crashing() {
         let mut stdin = process.stdin.take().expect("stdin");
         write_frame(
             &mut stdin,
-            &ToChild::Resource {
-                body: Vec::new(),
-                content_type: None,
-                ok: true,
+            &ToChild::Resources {
+                resources: Vec::new(),
             }
             .encode(),
         )
@@ -587,6 +585,259 @@ fn a_subresource_remembered_for_one_page_is_not_served_to_another() {
 
 /// The stylesheet these tests serve, and the colour they look for.
 const GREEN_SHEET: &[u8] = b"p { background-color: #00ff00 }";
+
+/// A server that answers any path slowly, one connection per thread, recording
+/// how many requests were in flight at once.
+///
+/// The delay is the instrument. Whether fetches overlap cannot be seen from
+/// their results — the page looks the same either way — so it has to be seen
+/// from the server's side, by asking how many were being served at the same
+/// moment.
+fn serve_slowly(
+    body: Vec<u8>,
+    delay: std::time::Duration,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let live = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let (live_here, most_here) = (live.clone(), most.clone());
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let (body, live, most) = (body.clone(), live_here.clone(), most_here.clone());
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(delay);
+                live.fetch_sub(1, Ordering::SeqCst);
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(&body);
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, most)
+}
+
+/// A solid PNG of one colour, as bytes.
+fn solid_png(width: u32, height: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
+    let mut pixmap = paint::Pixmap::new(width, height).expect("a pixmap");
+    pixmap.fill(paint::RasterColor::from_rgba8(rgb.0, rgb.1, rgb.2, 0xff));
+    let file = std::env::temp_dir().join(format!("2kbrowser-solid-{width}x{height}-{rgb:?}.png"));
+    pixmap.save_png(&file).expect("writes a png");
+    std::fs::read(&file).expect("reads it back")
+}
+
+/// A server that answers each path with its own body.
+fn serve_each(
+    routes: Vec<(&'static str, Vec<u8>)>,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let (routes, counter) = (routes.clone(), counter.clone());
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let wanted = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let response = match routes.iter().find(|(path, _)| *path == wanted) {
+                    Some((_, body)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(body);
+                        out
+                    }
+                    None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                };
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, served)
+}
+
+#[test]
+fn one_image_used_all_over_a_page_is_fetched_once() {
+    // The era's markup leans on a single spacer or bullet repeated everywhere,
+    // and now that images are asked for as a batch, the collapsing has to
+    // happen inside one — the cache is only written once the batch is done, so
+    // duplicates within it would all miss and all go to the network together.
+    let (port, served) = serve_each(vec![("/dot.png", solid_png(8, 8, (0, 0xff, 0)))]);
+    let images: String = std::iter::repeat_n("<img src=\"/dot.png\">", 8).collect();
+    let page = over_http(port, &format!("<html><body>{images}</body></html>"));
+
+    let count = served.load(std::sync::atomic::Ordering::SeqCst);
+    if count == 0 {
+        eprintln!("SKIP: the image requests never reached the test server");
+        return;
+    }
+    assert_eq!(
+        count, 1,
+        "one image, used eight times, fetched {count} times"
+    );
+    assert_eq!(
+        page.images_loaded(),
+        8,
+        "every use of it should still have got the image"
+    );
+}
+
+#[test]
+fn a_page_asking_for_more_resources_than_the_ceiling_is_refused() {
+    // The ceiling exists because the conversation is driven by the child: a
+    // compromised renderer that kept asking would have the parent fetching for
+    // ever, which is a denial of service against whatever it is pointed at.
+    //
+    // Batching is exactly how that bound could have been lost. Counting one per
+    // message rather than one per URL would let a page ask for any number of
+    // things in a single breath, so this asks for more than the ceiling in as
+    // few messages as possible.
+    let dir = std::env::temp_dir().join("2kbrowser-ceiling");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let (origin, at) = net::parse_url(&net::file_url(&dir.join("page.html"))).expect("parses");
+    let images: String = (0..sandbox::MAX_RESOURCES + 1)
+        .map(|n| format!("<img src=\"missing{n}.png\">"))
+        .collect();
+    let html = format!("<html><body>{images}</body></html>");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let outcome = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+    );
+
+    match outcome {
+        Err(error) => assert!(
+            error.to_string().contains("more than"),
+            "refused for the wrong reason: {error}"
+        ),
+        Ok(_) => panic!("a page asked for more than the ceiling and was allowed to"),
+    }
+}
+
+#[test]
+fn a_batch_of_images_lands_on_the_elements_that_asked_for_them() {
+    // Nothing in a batch carries an id: answers are matched to requests by
+    // position, all the way from the parent's fetch through the pipe to the
+    // element the image belongs to. Concurrency is exactly what makes that
+    // fragile — the fetches finish in whatever order the network decides — so
+    // this asks whether the *page* came out right rather than whether the
+    // requests did.
+    //
+    // Red above green in the markup, so red must be above green on the canvas.
+    // Swap any two answers anywhere along that path and this inverts.
+    let (port, served) = serve_each(vec![
+        ("/red.png", solid_png(40, 40, (0xff, 0, 0))),
+        ("/green.png", solid_png(40, 40, (0, 0xff, 0))),
+    ]);
+    let page = over_http(
+        port,
+        "<html><body><p><img src=\"/red.png\"></p><p><img src=\"/green.png\"></p></body></html>",
+    );
+
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the image requests never reached the test server");
+        return;
+    }
+    assert_eq!(page.images_loaded(), 2, "both images should have arrived");
+
+    // The topmost row holding each colour. Both must be found, and red's must
+    // come first.
+    let row_of = |wanted: (u8, u8)| -> Option<u32> {
+        let width = page.width() as usize;
+        page.pixels()
+            .chunks_exact(4)
+            .enumerate()
+            .find(|(_, pixel)| {
+                pixel[0] as i32 - i32::from(wanted.0) == 0 && pixel[1] == wanted.1 && pixel[2] == 0
+            })
+            .map(|(at, _)| (at / width) as u32)
+    };
+    let red = row_of((0xff, 0)).expect("the red image was never painted");
+    let green = row_of((0, 0xff)).expect("the green image was never painted");
+    assert!(
+        red < green,
+        "green was painted above red, so the answers landed on the wrong elements \
+         (red at row {red}, green at row {green})"
+    );
+}
+
+#[test]
+fn a_pages_images_are_fetched_at_the_same_time_rather_than_one_after_another() {
+    // The reason the protocol asks for several at once. Every subresource used
+    // to be its own request/response over the pipe, so a page waited for the
+    // sum of their latencies instead of the longest — twenty images meant
+    // twenty round trips one after another.
+    //
+    // Overlap is invisible in the result, so it is measured where it happens:
+    // the server counts how many requests it was serving at the same moment.
+    let tile = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/ref/fixtures/assets/tile.png"),
+    )
+    .expect("the reference fixture tile");
+    let (port, most_at_once) = serve_slowly(tile, std::time::Duration::from_millis(300));
+
+    // Distinct URLs, because identical ones are answered once by the cache and
+    // would prove nothing about concurrency.
+    let images: String = (0..6)
+        .map(|n| format!("<img src=\"/tile{n}.png\">"))
+        .collect();
+    let page = over_http(port, &format!("<html><body>{images}</body></html>"));
+
+    let most = most_at_once.load(std::sync::atomic::Ordering::SeqCst);
+    if most == 0 {
+        eprintln!("SKIP: the image requests never reached the test server");
+        return;
+    }
+    assert!(
+        most > 1,
+        "every image was fetched on its own, one after another: {most} at once"
+    );
+    assert_eq!(
+        page.images_loaded(),
+        6,
+        "the images did not all arrive and decode"
+    );
+}
 
 #[test]
 fn re_rendering_a_page_does_not_fetch_its_subresources_again() {

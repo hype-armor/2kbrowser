@@ -244,6 +244,27 @@ pub trait Loader {
     /// for all three and because telling the untrusted side which would leak
     /// the parent's configuration to it.
     fn load(&mut self, url: &str, document: Option<&Origin>, kind: RequestKind) -> Option<Loaded>;
+
+    /// Fetches several subresources at once, answering one per URL in order.
+    ///
+    /// Worth asking for as a group wherever the caller knows a group: across a
+    /// process boundary the parent can fetch them concurrently, which is the
+    /// difference between waiting for the sum of a page's latencies and waiting
+    /// for the longest of them.
+    ///
+    /// Defaults to asking one at a time, which is all an in-process loader can
+    /// usefully do — there is no boundary to overlap across, and the reference
+    /// tests and the command line go through this path.
+    fn load_many(
+        &mut self,
+        urls: &[String],
+        document: Option<&Origin>,
+        kind: RequestKind,
+    ) -> Vec<Option<Loaded>> {
+        urls.iter()
+            .map(|url| self.load(url, document, kind))
+            .collect()
+    }
 }
 
 /// A fetched subresource.
@@ -797,29 +818,12 @@ fn load_images(
     origin: &Origin,
     path: &str,
 ) -> ImageStore {
-    let mut store = ImageStore::new();
-    let mut cache: std::collections::HashMap<String, Option<paint::DecodedImage>> =
-        std::collections::HashMap::new();
-
-    // The same image often appears many times on a page — a tile appears on
-    // every cell of a table — so fetching each URL once matters more here than
-    // usual, since every fetch is synchronous.
-    let load =
-        |url: &str,
-         loader: &mut dyn Loader,
-         cache: &mut std::collections::HashMap<String, Option<paint::DecodedImage>>| {
-            if let Some(hit) = cache.get(url) {
-                return hit.clone();
-            }
-            // Subresource, so ADR-0006's third-party rule applies — wherever the
-            // loader chooses to apply it.
-            let decoded = loader
-                .load(url, Some(origin), RequestKind::Subresource)
-                .and_then(|resource| paint::decode(&resource.bytes));
-            cache.insert(url.to_owned(), decoded.clone());
-            decoded
-        };
-
+    // Two passes: every image the page refers to is found first, and only then
+    // asked for. Interleaving the two meant each image was requested where it
+    // was discovered, so they went out one at a time and the page waited for
+    // the sum of their latencies. Nothing here needs the first image to know
+    // about the second, so nothing needs to.
+    let mut wanted: Vec<(paint::ImageKey, String)> = Vec::new();
     for node in doc.descendants(doc.root()) {
         let Some(element) = doc.element(node) else {
             continue;
@@ -827,19 +831,48 @@ fn load_images(
         if element.local_name() == "img"
             && let Some(src) = element.attr("src")
         {
-            let url = net::resolve(origin, path, src);
-            if let Some(image) = load(&url, loader, &mut cache) {
-                store.insert(paint::ImageKey::content(node), image);
-            }
+            wanted.push((
+                paint::ImageKey::content(node),
+                net::resolve(origin, path, src),
+            ));
         }
         if let Some(source) = styles
             .get(node)
             .and_then(|style| style.background_image.as_deref())
         {
-            let url = net::resolve(origin, path, source);
-            if let Some(image) = load(&url, loader, &mut cache) {
-                store.insert(paint::ImageKey::background(node), image);
-            }
+            wanted.push((
+                paint::ImageKey::background(node),
+                net::resolve(origin, path, source),
+            ));
+        }
+    }
+
+    // The same image often appears many times on a page — a tile on every cell
+    // of a table — so each distinct URL is asked for once. Order is kept so
+    // that what arrives can be matched back positionally.
+    let mut distinct: Vec<String> = Vec::new();
+    for (_, url) in &wanted {
+        if !distinct.contains(url) {
+            distinct.push(url.clone());
+        }
+    }
+
+    // Subresources, so ADR-0006's third-party rule applies — wherever the
+    // loader chooses to apply it.
+    let fetched = loader.load_many(&distinct, Some(origin), RequestKind::Subresource);
+    let decoded: std::collections::HashMap<&str, Option<paint::DecodedImage>> = distinct
+        .iter()
+        .map(String::as_str)
+        .zip(fetched)
+        // Decoded here rather than by the parent: an image format is a parser
+        // like any other, and parsers live on this side of the boundary.
+        .map(|(url, resource)| (url, resource.and_then(|got| paint::decode(&got.bytes))))
+        .collect();
+
+    let mut store = ImageStore::new();
+    for (key, url) in &wanted {
+        if let Some(Some(image)) = decoded.get(url.as_str()) {
+            store.insert(*key, image.clone());
         }
     }
     store

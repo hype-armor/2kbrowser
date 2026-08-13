@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use net::{Fetcher, Origin, RequestKind};
 
 use crate::confine::Confinement;
-use crate::message::{Rendered, ToChild, ToParent};
+use crate::message::{Rendered, Supplied, ToChild, ToParent};
 use crate::{CHILD_ARGUMENT, Error, read_frame, write_frame};
 
 /// A renderer process, however it was started.
@@ -121,6 +121,55 @@ pub const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
 /// renderer could keep the parent fetching forever — a request loop is a denial
 /// of service against whatever the parent is pointed at, not just against us.
 pub const MAX_RESOURCES: usize = 512;
+
+/// How many subresources the parent will fetch at the same time.
+///
+/// A bound on the host at the other end as much as on this process. Browsers
+/// settled on roughly this many per host decades ago, and a renderer that
+/// opened five hundred sockets because a page named five hundred images would
+/// be a denial of service wearing a page's clothes.
+pub const MAX_CONCURRENT_FETCHES: usize = 6;
+
+/// Which of `urls` still have to be fetched: allowed, not already held, and
+/// each one only once however many times it appears.
+///
+/// The collapsing matters more than it looks. A batch's answers are only put in
+/// the cache once the whole batch is done, so duplicates within one would all
+/// miss together and all go to the network together — a page turning one
+/// request into a hundred against somebody else's server. The renderer we ship
+/// collapses repeats before they leave, since it knows which images a page
+/// names; this is about the renderer we might be sent, which is the one the
+/// boundary exists for.
+fn still_wanted<'a>(urls: &'a [String], allowed: &[bool], held: &Fetched) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for (url, allowed) in urls.iter().zip(allowed) {
+        if *allowed && held.get(url).is_none() && !out.contains(&url.as_str()) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// Fetches one URL, as one of a batch.
+///
+/// A free function rather than a method because it runs on a borrowed thread
+/// and must touch nothing the conversation owns mutably: the cache is read
+/// before the threads start and written after they have all finished.
+fn supplied(
+    fetcher: &Fetcher,
+    url: &str,
+    document: Option<&Origin>,
+    kind: RequestKind,
+) -> Supplied {
+    match fetcher.fetch_raw(url, document, kind) {
+        Ok(fetched) => Supplied {
+            body: fetched.body,
+            content_type: fetched.content_type,
+            ok: true,
+        },
+        Err(_) => Supplied::default(),
+    }
+}
 
 /// A renderer process and the conversation with it.
 pub struct Renderer {
@@ -645,13 +694,13 @@ const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Default)]
 struct Fetched {
     /// Answers ready to send, by URL.
-    answers: std::collections::HashMap<String, ToChild>,
+    answers: std::collections::HashMap<String, Supplied>,
     /// How many bytes of body they hold between them.
     bytes: usize,
 }
 
 impl Fetched {
-    fn get(&self, url: &str) -> Option<ToChild> {
+    fn get(&self, url: &str) -> Option<Supplied> {
         self.answers.get(url).cloned()
     }
 
@@ -661,11 +710,8 @@ impl Fetched {
     /// no access pattern worth modelling and an eviction policy would be
     /// machinery in service of a guess; stopping is predictable, and what it
     /// costs is the speed this exists for rather than correctness.
-    fn put(&mut self, url: &str, answer: &ToChild) {
-        let size = match answer {
-            ToChild::Resource { body, .. } => body.len(),
-            _ => return,
-        };
+    fn put(&mut self, url: &str, answer: &Supplied) {
+        let size = answer.body.len();
         if self.bytes.saturating_add(size) > MAX_CACHE_BYTES {
             return;
         }
@@ -770,72 +816,116 @@ impl Conversation {
                     // it is not ours.
                     return Err(Error::Wire(crate::WireError::Unknown));
                 }
-                ToParent::Fetch { url, kind } => {
-                    resources += 1;
+                ToParent::Fetch { urls, kind } => {
+                    // Counted per URL rather than per message, so asking in
+                    // batches cannot be a way around the ceiling.
+                    resources += urls.len();
                     if resources > MAX_RESOURCES {
                         return Err(Error::Render(format!(
                             "the page asked for more than {MAX_RESOURCES} resources"
                         )));
                     }
-                    let answer = self.fetch(&url, kind);
+                    let answer = self.fetch_all(&urls, kind);
                     self.send(&answer)?;
                 }
             }
         }
     }
 
-    /// Fetches what the child asked for, subject to the policy.
+    /// Fetches everything the child asked for, subject to the policy.
     ///
     /// A refusal and a failure are reported identically. The child has no
     /// business knowing whether a resource was blocked or merely missing, and
     /// telling it would leak the parent's configuration to the untrusted side —
     /// which is exactly the sort of thing a compromised renderer would probe
     /// for.
+    ///
     /// `fetch_raw` rather than anything that decodes: the parent hands over the
     /// bytes and the header saying how to read them, and the reading happens on
     /// the far side with every other parser (ADR-0012).
-    fn fetch(&mut self, url: &str, kind: RequestKind) -> ToChild {
-        let refused = ToChild::Resource {
-            body: Vec::new(),
-            content_type: None,
-            ok: false,
-        };
+    ///
+    /// Answers positionally, one per URL, including for URLs that appear twice
+    /// in one batch — a page that uses the same spacer forty times gets forty
+    /// answers and one fetch.
+    fn fetch_all(&mut self, urls: &[String], kind: RequestKind) -> ToChild {
+        // The policy is applied to every URL before anything is fetched or
+        // remembered, and before the cache is consulted — never after. A cached
+        // answer served without it would let a page ask once from a context
+        // where it was allowed and be answered for ever after; ADR-0006's rule
+        // is about who is asking as much as about what for, and the origin
+        // asking can change within one live child. `fetch_raw` checks again on
+        // a miss, which costs a URL parse and keeps the rule in one place
+        // rather than depending on this having got there first.
+        let allowed: Vec<bool> = urls
+            .iter()
+            .map(|url| {
+                net::parse_url(url).is_ok_and(|(origin, _)| {
+                    self.fetcher
+                        .policy
+                        .check(self.document.as_ref(), &origin, kind)
+                        .is_ok()
+                })
+            })
+            .collect();
 
-        // The policy is applied before the cache is consulted, never after. A
-        // cached answer served without it would let a page ask once from a
-        // context where it was allowed and be answered for ever after —
-        // ADR-0006's rule is about who is asking as much as about what for, and
-        // the origin asking can change within one live child. `fetch_raw`
-        // checks again on a miss, which costs a URL parse and keeps the rule in
-        // one place rather than depending on this having got there first.
-        let allowed = net::parse_url(url).is_ok_and(|(origin, _)| {
-            self.fetcher
-                .policy
-                .check(self.document.as_ref(), &origin, kind)
-                .is_ok()
-        });
-        if !allowed {
-            return refused;
+        let wanted = still_wanted(urls, &allowed, &self.fetched);
+
+        // The concurrency this whole change exists for. A page waited for the
+        // sum of its subresources' latencies rather than the longest of them,
+        // which on twenty images is twenty round trips one after another.
+        //
+        // Bounded, and to a small number: the cap is about the host at the
+        // other end as much as about this process. Browsers settled on roughly
+        // this many per host decades ago, and a renderer that opened five
+        // hundred sockets at once because a page named five hundred images
+        // would be a denial of service wearing a page's clothes.
+        let fetcher = &self.fetcher;
+        let document = self.document.as_ref();
+        let mut fresh: Vec<(String, Supplied)> = Vec::new();
+        for chunk in wanted.chunks(MAX_CONCURRENT_FETCHES) {
+            let done: Vec<Supplied> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|url| scope.spawn(move || supplied(fetcher, url, document, kind)))
+                    .collect();
+                handles
+                    .into_iter()
+                    // A panicking fetch is a failed resource rather than a
+                    // failed page: the thread is ours, but what it was parsing
+                    // came from somewhere else.
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+            fresh.extend(chunk.iter().map(|url| (*url).to_owned()).zip(done));
         }
 
-        if let Some(answer) = self.fetched.get(url) {
-            return answer;
-        }
-
-        let answer = match self.fetcher.fetch_raw(url, self.document.as_ref(), kind) {
-            Ok(fetched) => ToChild::Resource {
-                body: fetched.body,
-                content_type: fetched.content_type,
-                ok: true,
-            },
-            Err(_) => refused,
-        };
         // Failures are remembered too. A page with a broken image would
-        // otherwise retry it on every re-render, which is the case this exists
-        // to make cheap, and a resize that quietly started succeeding would
-        // change what the page looks like halfway through reading it.
-        self.fetched.put(url, &answer);
-        answer
+        // otherwise retry it on every re-render — the case the cache exists to
+        // make cheap — and a resize that quietly started succeeding would
+        // change what a page looks like halfway through reading it.
+        for (url, answer) in &fresh {
+            self.fetched.put(url, answer);
+        }
+
+        let resources = urls
+            .iter()
+            .zip(&allowed)
+            .map(|(url, allowed)| {
+                if !allowed {
+                    return Supplied::default();
+                }
+                self.fetched
+                    .get(url)
+                    .or_else(|| {
+                        fresh
+                            .iter()
+                            .find(|(fetched, _)| fetched == url)
+                            .map(|(_, answer)| answer.clone())
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        ToChild::Resources { resources }
     }
 }
 
@@ -866,12 +956,50 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    fn resource(bytes: usize) -> ToChild {
-        ToChild::Resource {
+    fn resource(bytes: usize) -> Supplied {
+        Supplied {
             body: vec![0; bytes],
             content_type: None,
             ok: true,
         }
+    }
+
+    #[test]
+    fn a_batch_asking_for_the_same_thing_many_times_fetches_it_once() {
+        // Not something the renderer we ship does — it collapses repeats before
+        // they leave, because it knows which images a page names. This is about
+        // the renderer we might be sent. A batch's answers only reach the cache
+        // once the whole batch is done, so duplicates inside one would all miss
+        // together and all go out together: a page turning one request into a
+        // hundred against somebody else's server.
+        let held = Fetched::default();
+        let urls: Vec<String> = ["a", "b", "a", "a", "b"]
+            .iter()
+            .map(|name| format!("https://example.com/{name}"))
+            .collect();
+        assert_eq!(
+            still_wanted(&urls, &[true; 5], &held),
+            vec!["https://example.com/a", "https://example.com/b"]
+        );
+    }
+
+    #[test]
+    fn nothing_refused_or_already_held_is_fetched_again() {
+        let mut held = Fetched::default();
+        held.put("https://example.com/held", &resource(4));
+        let urls: Vec<String> = [
+            "https://example.com/held",
+            "https://example.com/refused",
+            "https://example.com/wanted",
+        ]
+        .iter()
+        .map(|url| (*url).to_owned())
+        .collect();
+        assert_eq!(
+            still_wanted(&urls, &[true, false, true], &held),
+            vec!["https://example.com/wanted"],
+            "something already held, or refused by the policy, was fetched anyway"
+        );
     }
 
     #[test]
