@@ -243,6 +243,7 @@ mod tests {
                 links: Vec::new(),
                 can_toggle_layout: false,
                 images_loaded: 0,
+                background: 0x00ff_ffff,
                 top: 0,
             })
         }

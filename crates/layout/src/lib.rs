@@ -141,7 +141,7 @@ pub fn replaced_size(
         length => Some(length.to_px(font_size, available_width)),
     };
 
-    match (width, height, intrinsic) {
+    let (used_width, used_height) = match (width, height, intrinsic) {
         (Some(w), Some(h), _) => (w, h),
         (Some(w), None, Some((iw, ih))) if iw > 0.0 => (w, w * ih / iw),
         (None, Some(h), Some((iw, ih))) if ih > 0.0 => (h * iw / ih, h),
@@ -151,6 +151,27 @@ pub fn replaced_size(
         (None, None, None) => BROKEN_IMAGE_SIZE,
         (Some(w), None, Some(_)) => (w, w),
         (None, Some(h), Some(_)) => (h, h),
+    };
+
+    // §10.4 again, and for a replaced box the height has to come with it: an
+    // image narrowed to fit and left at its original height is a stretched
+    // image, which is worse than one that overflows. The ratio used is the
+    // one that was actually resolved above, so an explicit width and height
+    // are honoured in proportion to each other rather than to the file's.
+    //
+    // This is what keeps a document rendering readable now that it shows
+    // pictures: an article's photograph is routinely wider than the 42em the
+    // reader sheet asks for, and nothing clips it.
+    match style.max_width {
+        Length::Auto => (used_width, used_height),
+        bound => {
+            let bound = bound.to_px(font_size, available_width);
+            if used_width <= bound || used_width <= 0.0 {
+                (used_width, used_height)
+            } else {
+                (bound, used_height * bound / used_width)
+            }
+        }
     }
 }
 
@@ -1086,6 +1107,18 @@ fn layout_block(
     let outer_width = match style.width {
         Length::Auto => (available_width - margin_left - margin_right).max(0.0),
         length => length.to_px(font_size, available_width) + surround,
+    };
+    // §10.4: the used width is clamped to `max-width`, whether it came from a
+    // declared width or from filling the space available. Like `width` it is a
+    // bound on the *content* box, so the surround is added back on.
+    //
+    // The reader sheet has asked for `max-width: 42em` since it was written and
+    // has been getting the whole window: an unimplemented property is not an
+    // ignored declaration, it is a measure nobody chose. A 42em column is most
+    // of what makes a document rendering readable rather than merely plain.
+    let outer_width = match style.max_width {
+        Length::Auto => outer_width,
+        bound => outer_width.min(bound.to_px(font_size, available_width) + surround),
     };
     let content_width = (outer_width - surround).max(0.0);
 
@@ -3533,6 +3566,86 @@ mod tests {
             40.0,
             "the gap is one 40px margin, not two",
         );
+    }
+
+    #[test]
+    fn max_width_narrows_an_image_without_stretching_it() {
+        // A replaced box has to bring its height down with its width. Narrowed
+        // and left at its original height, an image is not bounded, it is
+        // squashed — which is worse than one that overflows, because it looks
+        // like the picture rather than like the browser.
+        let style = ComputedStyle {
+            max_width: Length::Px(300.0),
+            ..ComputedStyle::default()
+        };
+        let (width, height) = replaced_size(&style, Some((1200.0, 400.0)), None, None, 1000.0);
+        assert_eq!(width, 300.0);
+        assert_eq!(height, 100.0, "the 3:1 ratio should have been kept");
+
+        // One already inside the bound is left exactly alone.
+        let (width, height) = replaced_size(&style, Some((120.0, 40.0)), None, None, 1000.0);
+        assert_eq!((width, height), (120.0, 40.0));
+    }
+
+    #[test]
+    fn max_width_bounds_a_box_that_would_otherwise_fill_its_container() {
+        // §10.4. Unimplemented until now, which mattered more than an unused
+        // property usually does: the reader sheet has asked for `max-width:
+        // 42em` since it was written and had been getting the whole window.
+        let rendered = run(
+            "<body><div class=\"bound\"></div></body>",
+            "body { margin: 0 } .bound { height: 10px; max-width: 300px }",
+            1000.0,
+        );
+        let boxes: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.rect.height == 10.0)
+            .collect();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].rect.width, 300.0, "the bound was not applied");
+    }
+
+    #[test]
+    fn max_width_clamps_a_declared_width_rather_than_replacing_it() {
+        // A width below the bound is left exactly alone; one above it is cut
+        // down to the bound. Getting this backwards would make every bounded
+        // box the same size.
+        let width_of = |css: &str, available: f32| {
+            let rendered = run(
+                "<body><div class=\"b\"></div></body>",
+                &format!("body {{ margin: 0 }} .b {{ height: 10px; {css} }}"),
+                available,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.rect.height == 10.0)
+                .expect("the box")
+                .rect
+                .width
+        };
+        assert_eq!(width_of("width: 100px; max-width: 300px", 1000.0), 100.0);
+        assert_eq!(width_of("width: 800px; max-width: 300px", 1000.0), 300.0);
+        // And a bound wider than the space available does not widen anything.
+        assert_eq!(width_of("max-width: 900px", 400.0), 400.0);
+    }
+
+    #[test]
+    fn max_width_measures_the_content_box_like_width_does() {
+        // CSS 2.1 sizes the *content* box, so padding and border grow the box
+        // outwards past the bound rather than eating into it. A bound that
+        // included them would make a padded box narrower than an unpadded one
+        // asking for the same measure.
+        let rendered = run(
+            "<body><div class=\"b\"></div></body>",
+            "body { margin: 0 } \
+             .b { height: 10px; max-width: 300px; padding: 0 20px; border: 0 }",
+            1000.0,
+        );
+        let box_ = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.rect.height == 10.0)
+            .expect("the box");
+        assert_eq!(box_.rect.width, 340.0, "300 of content plus 20 either side");
     }
 
     #[test]

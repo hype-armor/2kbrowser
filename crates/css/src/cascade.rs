@@ -58,6 +58,38 @@ impl StyleMap {
             style.display = crate::style::Display::None;
         }
     }
+
+    /// Raises a node's left and right margins to at least `least` pixels,
+    /// leaving a wider margin alone.
+    ///
+    /// For the page gutter. The UA sheet's `body { margin: 8px }` is a default
+    /// and an author's `margin: 0` beats it, which leaves text against the
+    /// glass. What is wanted is a floor, and CSS has no way to write one: a UA
+    /// rule loses to the author, and an `!important` UA rule would win so hard
+    /// that a page could never ask for a *wider* margin either. So the floor is
+    /// applied after the cascade, like [`Self::hide`], instead of pretending to
+    /// be a stylesheet.
+    ///
+    /// `available_width` resolves a percentage margin, which has to be measured
+    /// against something before it can be compared with a length in pixels.
+    pub fn keep_off_the_edges(&mut self, node: NodeId, least: f32, available_width: f32) {
+        let Some(style) = self.styles.get_mut(&node) else {
+            return;
+        };
+        let font_size = style.font_size;
+        for margin in [&mut style.margin.left, &mut style.margin.right] {
+            // An `auto` horizontal margin on a block of automatic width
+            // resolves to zero, so it has asked for nothing and the floor
+            // applies.
+            let asked = match *margin {
+                Length::Auto => 0.0,
+                length => length.to_px(font_size, available_width),
+            };
+            if asked < least {
+                *margin = Length::Px(least);
+            }
+        }
+    }
 }
 
 /// Sort key for a matched declaration, in increasing precedence order.
@@ -478,6 +510,15 @@ fn apply(
         "width" => {
             if let Some(length) = parse_length(first) {
                 style.width = length;
+            }
+        }
+        // `none` is the initial value and means no bound, which is what `Auto`
+        // stands for here — there is no separate "auto" for a maximum.
+        "max-width" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("none")) {
+                style.max_width = Length::Auto;
+            } else if let Some(length) = parse_length(first) {
+                style.max_width = length;
             }
         }
         "height" => {
@@ -1854,5 +1895,64 @@ mod tests {
 
         let block = style_of("<div>x</div>", "div { display: block }", "div");
         assert!(block.display.is_supported_layout());
+    }
+
+    /// The body's horizontal margins after the floor has been applied.
+    fn margins_after_floor(css: &str, least: f32, available_width: f32) -> (Length, Length) {
+        let doc = dom::parse(&format!("<style>{css}</style><body>x</body>"));
+        let sheets = [Stylesheet::parse(css)];
+        let mut map = cascade(&doc, &sheets);
+        let body = doc.find_element("body").expect("a body");
+        map.keep_off_the_edges(body, least, available_width);
+        let style = map.get(body).expect("a styled body");
+        (style.margin.left, style.margin.right)
+    }
+
+    #[test]
+    fn the_edge_floor_raises_a_margin_that_is_under_it() {
+        let (left, right) = margins_after_floor("body { margin: 0 }", 8.0, 400.0);
+        assert_eq!(left, Length::Px(8.0));
+        assert_eq!(right, Length::Px(8.0));
+    }
+
+    #[test]
+    fn the_edge_floor_leaves_a_wider_margin_alone() {
+        // A floor that overwrote whatever it found would be a fixed margin, and
+        // would flatten every page's own spacing to the same eight pixels.
+        let (left, _) = margins_after_floor("body { margin: 40px }", 8.0, 400.0);
+        assert_eq!(left, Length::Px(40.0));
+    }
+
+    #[test]
+    fn the_edge_floor_measures_a_percentage_margin_before_judging_it() {
+        // 5% of 400px is 20px, which already clears the floor; 1% is 4px, which
+        // does not. Comparing the numbers unresolved would get both wrong.
+        let (wide, _) = margins_after_floor("body { margin: 0 5% }", 8.0, 400.0);
+        assert_eq!(wide, Length::Percent(5.0), "a wide percentage was replaced");
+
+        let (narrow, _) = margins_after_floor("body { margin: 0 1% }", 8.0, 400.0);
+        assert_eq!(narrow, Length::Px(8.0), "a narrow percentage was kept");
+    }
+
+    #[test]
+    fn the_edge_floor_treats_an_auto_margin_as_asking_for_nothing() {
+        // `margin: 0 auto` on a block of automatic width — which the body is —
+        // resolves to zero, so the page has asked for no room at all.
+        let (left, right) = margins_after_floor("body { margin: 0 auto }", 8.0, 400.0);
+        assert_eq!((left, right), (Length::Px(8.0), Length::Px(8.0)));
+    }
+
+    #[test]
+    fn the_edge_floor_ignores_the_vertical_margins() {
+        // The complaint is about text against the side of the window. Topping
+        // up the top margin as well would add a gap above every page.
+        let doc = dom::parse("<style>body { margin: 0 }</style><body>x</body>");
+        let sheets = [Stylesheet::parse("body { margin: 0 }")];
+        let mut map = cascade(&doc, &sheets);
+        let body = doc.find_element("body").expect("a body");
+        map.keep_off_the_edges(body, 8.0, 400.0);
+        let style = map.get(body).expect("a styled body");
+        assert_eq!(style.margin.top, Length::Px(0.0));
+        assert_eq!(style.margin.bottom, Length::Px(0.0));
     }
 }

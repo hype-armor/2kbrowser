@@ -148,6 +148,15 @@ fn links_of(page: &crate::render::Page) -> Vec<Link> {
         .collect()
 }
 
+/// A canvas colour packed for the wire, as `0x00RRGGBB`.
+///
+/// The alpha is dropped rather than carried: the display list's canvas colour
+/// is already composited over white, so it is opaque by construction, and the
+/// window has nothing to blend it against anyway.
+fn packed(colour: css::Color) -> u32 {
+    (u32::from(colour.r) << 16) | (u32::from(colour.g) << 8) | u32::from(colour.b)
+}
+
 impl Render for PageRenderer {
     fn render(
         &mut self,
@@ -227,6 +236,7 @@ impl Render for PageRenderer {
             links: links_of(&page),
             can_toggle_layout: self.can_toggle_layout(&page),
             images_loaded: page.images_loaded as u32,
+            background: packed(page.background),
         };
         // Kept for the questions that come after: find, and re-rendering at a
         // new width without re-fetching anything.
@@ -258,6 +268,7 @@ impl Render for PageRenderer {
             links: links_of(page),
             can_toggle_layout: self.can_toggle_layout(page),
             images_loaded: page.images_loaded as u32,
+            background: packed(page.background),
         })
     }
 
@@ -484,6 +495,28 @@ mod tests {
         assert!(
             band.can_toggle_layout,
             "the band lost the reader's override"
+        );
+    }
+
+    #[test]
+    fn a_band_carries_the_same_canvas_colour_as_the_page_it_is_part_of() {
+        // For the same reason a band re-sends the mode and the title: the
+        // parent replaces what it holds rather than merging. The window fills
+        // the rows a band does not cover with this colour, so a band that
+        // reported white would put a lit strip below every short page the
+        // moment the reader scrolled — and the document fallback is dark.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+        let mut renderer = PageRenderer::new();
+        let whole = renderer
+            .render(
+                &overriding(html.as_bytes(), 300, false, true),
+                &mut no_fetch,
+            )
+            .expect("renders");
+        let band = renderer.band(0, 200).expect("paints a band");
+        assert_eq!(
+            band.background, whole.background,
+            "the band reported a different canvas colour from its own page"
         );
     }
 

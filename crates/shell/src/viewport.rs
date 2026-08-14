@@ -121,6 +121,14 @@ impl Viewport {
         self.page.images_loaded
     }
 
+    /// The page's canvas colour, packed as `0x00RRGGBB`.
+    ///
+    /// What the window paints where it has no pixels of the page: below a page
+    /// shorter than the window, and ahead of a band still being painted.
+    pub fn background(&self) -> u32 {
+        self.page.background
+    }
+
     /// The canvas as a pixmap, for saving.
     ///
     /// Rebuilt from the bytes that crossed the pipe rather than sent as one:

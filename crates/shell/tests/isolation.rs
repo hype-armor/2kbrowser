@@ -1580,3 +1580,40 @@ fn a_charset_that_only_the_header_knows_still_reaches_the_renderer() {
         "the fixture decodes the same either way, so it proves nothing"
     );
 }
+
+#[test]
+fn the_pages_canvas_colour_crosses_the_boundary_with_it() {
+    // The window paints rows the child sent no pixels for — below a page
+    // shorter than the window, and ahead of a band still being painted — and
+    // the only thing it can paint them is what the child told it the canvas
+    // was. Nothing else in the parent knows what colour the page is: the box
+    // tree and the display list are both on the other side.
+    let mut page = viewport("<body><h1>Title</h1><p>An ordinary page.</p></body>", 300);
+    let unpack = |packed: u32| {
+        (
+            (packed >> 16) as u8,
+            ((packed >> 8) & 0xff) as u8,
+            (packed & 0xff) as u8,
+        )
+    };
+    let corner = &page.pixels()[..3];
+    assert_eq!(
+        unpack(page.background()),
+        (corner[0], corner[1], corner[2]),
+        "the child reported a canvas colour it did not paint"
+    );
+
+    // And it follows the page rather than being fixed: the document fallback
+    // is dark, so the same page in the other layout reports another colour.
+    let authored = page.background();
+    page.set_forcing_document(true, 300, 2000)
+        .expect("re-renders");
+    assert_ne!(
+        page.background(),
+        authored,
+        "the fallback reported the same canvas colour as the author's layout"
+    );
+    let (r, g, b) = unpack(page.background());
+    let brightness = (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0;
+    assert!(brightness < 0.2, "the fallback canvas is {r},{g},{b}");
+}
