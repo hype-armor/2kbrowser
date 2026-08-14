@@ -306,6 +306,19 @@ impl Loader for DirectLoader {
     }
 }
 
+/// How close the page's content may come to the edge of the window.
+///
+/// `body { margin: 0 }` is in nearly every modern stylesheet, and those pages
+/// were written for a window with a scrollbar down one side and browser chrome
+/// around the rest — not for a viewport that ends where the glass does. Taken
+/// literally, the declaration puts the first letter of every line hard against
+/// the window frame, which is unpleasant to read and looks like a bug.
+///
+/// So the page keeps a gutter whatever it asks for. Eight pixels, matching the
+/// UA sheet's own body margin: enough to read against, not enough to be a
+/// second opinion about the page's design.
+const PAGE_GUTTER: f32 = 8.0;
+
 /// Renders HTML at a given viewport width.
 ///
 /// `max_height` bounds the canvas so that a pathological page cannot allocate
@@ -563,7 +576,7 @@ fn render_sized(
         layout::classify(&doc, &styles)
     };
 
-    let styles = match mode {
+    let mut styles = match mode {
         RenderMode::Authored => styles,
         // Re-render as a document. The author's sheets are dropped entirely —
         // keeping them would reintroduce exactly the layout that failed — and
@@ -575,6 +588,14 @@ fn render_sized(
             styles
         }
     };
+
+    // Whatever the page asked for, it does not get to put its text against the
+    // glass. The body's own margin counts towards the gutter, so a page that
+    // left the UA default alone is unchanged and only `margin: 0` is topped up.
+    if let Some(body) = doc.find_element("body") {
+        styles.keep_off_the_edges(body, PAGE_GUTTER, width as f32);
+    }
+    let styles = styles;
 
     // Images are loaded whichever way the page is being rendered. They used to
     // be dropped on the document fallback, on the grounds that a rendering
@@ -1187,6 +1208,107 @@ mod tests {
         assert!(
             rows_with_green.abs_diff(expected_rows) <= 2,
             "{widest}x{rows_with_green} is not the 15:2 image scaled down"
+        );
+    }
+
+    /// The leftmost and rightmost columns of the canvas carrying any ink.
+    fn ink_columns(page: &Page) -> (u32, u32) {
+        let width = page.pixmap.width();
+        let mut span: Option<(u32, u32)> = None;
+        for (index, pixel) in page.pixmap.data().chunks_exact(4).enumerate() {
+            // Anything that is not the blank canvas. Every fixture below is
+            // black text on white, so "not white" is exactly "content".
+            if pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 {
+                continue;
+            }
+            let column = index as u32 % width;
+            span = Some(match span {
+                None => (column, column),
+                Some((lo, hi)) => (lo.min(column), hi.max(column)),
+            });
+        }
+        span.expect("the fixture rendered nothing at all")
+    }
+
+    /// Enough words to fill several lines at any sensible width.
+    const PARAGRAPH: &str = "The quick brown fox jumps over the lazy dog, and then does \
+                             it again because the first time nobody was watching.";
+
+    #[test]
+    fn a_page_that_zeroes_its_body_margin_still_keeps_a_gutter() {
+        // `body { margin: 0 }` is in nearly every modern stylesheet, and taken
+        // literally it sets the first letter of every line against the window
+        // frame.
+        let mut fonts = FontStore::new();
+        let page = render(
+            &format!("<style>body {{ margin: 0 }}</style><body><p>{PARAGRAPH}</p></body>"),
+            400,
+            2000,
+            &mut fonts,
+        );
+        let (left, right) = ink_columns(&page);
+        assert!(left >= 8, "text starts at column {left}");
+        assert!(right <= 400 - 8, "text runs to column {right} of 400");
+    }
+
+    #[test]
+    fn the_gutter_is_a_floor_and_not_an_extra_margin() {
+        // The whole point of a floor: a page that already asked for room gets
+        // exactly the room it asked for. Adding the gutter on top would push
+        // every ordinary page inwards for no reason, and would keep pushing a
+        // generous one further in.
+        let mut fonts = FontStore::new();
+        let render_at = |css: &str, fonts: &mut FontStore| {
+            ink_columns(&render(
+                &format!("<style>{css}</style><body><p>{PARAGRAPH}</p></body>"),
+                400,
+                2000,
+                fonts,
+            ))
+        };
+
+        // The UA sheet's own 8px, which is already the floor.
+        let default = render_at("", &mut fonts);
+        let zeroed = render_at("body { margin: 0 }", &mut fonts);
+        assert_eq!(
+            default, zeroed,
+            "the floor moved a page that had not asked for less than it"
+        );
+
+        // And a page asking for more keeps all of it, unchanged.
+        let generous = render_at("body { margin: 40px }", &mut fonts);
+        assert_eq!(generous.0, 40, "a 40px margin became {}", generous.0);
+    }
+
+    #[test]
+    fn the_pages_background_still_reaches_the_window_edge() {
+        // The gutter holds the page's *content* back; it is not a frame drawn
+        // around the page. A body background that stopped 8px short would put a
+        // pale border around every coloured page.
+        //
+        // The root is given a background of its own so that §14.2 propagation
+        // cannot answer this by accident: the canvas is white here, and the
+        // blue at the window edge can only have come from the body's own box
+        // still spanning the window.
+        let mut fonts = FontStore::new();
+        let page = render(
+            "<style>html { background: #ffffff } \
+             body { margin: 0; background: #3366cc }</style><body><p>hi</p></body>",
+            400,
+            2000,
+            &mut fonts,
+        );
+        let row = &page.pixmap.data()[..page.pixmap.width() as usize * 4];
+        let colour = |pixel: &[u8]| (pixel[0], pixel[1], pixel[2]);
+        assert_eq!(
+            colour(&row[..4]),
+            (0x33, 0x66, 0xcc),
+            "the top-left pixel is not the page's background"
+        );
+        assert_eq!(
+            colour(&row[row.len() - 4..]),
+            (0x33, 0x66, 0xcc),
+            "the top-right pixel is not the page's background"
         );
     }
 
