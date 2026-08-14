@@ -920,6 +920,12 @@ pub struct ComputedStyle {
     pub clear: Clear,
     /// `width`.
     pub width: Length,
+    /// An upper bound on the used width, which `width` is clamped to.
+    ///
+    /// `Auto` means no bound. Only the maximum is modelled: `min-width` has no
+    /// use here yet, and a property that is parsed and ignored is worse than
+    /// one that is absent — it reads as supported.
+    pub max_width: Length,
     /// `height`.
     pub height: Length,
 }
@@ -965,6 +971,7 @@ impl Default for ComputedStyle {
             float: Float::None,
             clear: Clear::None,
             width: Length::Auto,
+            max_width: Length::Auto,
             height: Length::Auto,
         }
     }

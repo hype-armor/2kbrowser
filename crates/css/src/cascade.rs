@@ -480,6 +480,15 @@ fn apply(
                 style.width = length;
             }
         }
+        // `none` is the initial value and means no bound, which is what `Auto`
+        // stands for here — there is no separate "auto" for a maximum.
+        "max-width" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("none")) {
+                style.max_width = Length::Auto;
+            } else if let Some(length) = parse_length(first) {
+                style.max_width = length;
+            }
+        }
         "height" => {
             if let Some(length) = parse_length(first) {
                 style.height = length;
