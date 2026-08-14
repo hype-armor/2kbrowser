@@ -375,6 +375,16 @@ which is where nearly all of its coverage comes from. What is *not* tested is
 the event loop itself: CI has no display server, so key and pointer handling are
 exercised by hand and a regression in them would not be caught by `cargo test`.
 
+Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
+Discarding the author's layout without also discarding the author's furniture
+turned out not to be reader mode at all: the navigation, the sidebar and the
+footer stop sitting *beside* the article and start stacking above and below it,
+so the reading view opened on every link the site had. The extractor scores
+containers by how much running prose they hold, takes the best one and names the
+rest — and refuses to act at all when the page does not look enough like an
+article, because a reading view that quietly shows a fragment of a page is worse
+than one that shows the whole of it with the menus still attached.
+
 ### M4 — Hardening
 Process/sandbox model, continuous fuzzing of the HTML, CSS, and image-decode
 paths, TLS configuration review.
