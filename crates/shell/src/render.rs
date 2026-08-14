@@ -576,14 +576,21 @@ fn render_sized(
         }
     };
 
-    // Images are only loaded for the authored path: the document fallback
-    // discards the author's layout, and pulling in its images with it would
-    // spend requests on decoration nobody is going to see.
-    let images = match (&mode, base) {
-        (RenderMode::Authored, Some((origin, path))) => {
-            load_images(&doc, &styles, loader, origin, path)
-        }
-        _ => ImageStore::new(),
+    // Images are loaded whichever way the page is being rendered. They used to
+    // be dropped on the document fallback, on the grounds that a rendering
+    // which has discarded the author's layout should not spend requests on
+    // their decoration. That reasoning does not survive contact with what those
+    // images actually are: a diagram in an article, a photograph a caption
+    // refers to, the panel of a comic. Discarding the layout is a judgement
+    // about how a page is arranged, and it was quietly being used as a
+    // judgement about what the page is *made of*.
+    //
+    // What made them decoration was the author's stylesheet, and that is
+    // already gone: a background image cannot survive the sheet that named it,
+    // so what is left here is the images the markup itself points at.
+    let images = match base {
+        Some((origin, path)) => load_images(&doc, &styles, loader, origin, path),
+        None => ImageStore::new(),
     };
     // Only content images have an intrinsic size layout cares about: a
     // background tile is drawn at its natural size and never sizes its box.
@@ -1067,6 +1074,120 @@ mod tests {
             None,
         );
         (document.content_height, authored.content_height)
+    }
+
+    /// A loader that answers any `.png` with one solid green image.
+    struct GreenImages {
+        png: Vec<u8>,
+    }
+
+    impl Loader for GreenImages {
+        fn load(
+            &mut self,
+            url: &str,
+            _document: Option<&Origin>,
+            _kind: RequestKind,
+        ) -> Option<Loaded> {
+            url.ends_with(".png").then(|| Loaded {
+                bytes: self.png.clone(),
+                content_type: Some("image/png".to_owned()),
+            })
+        }
+    }
+
+    fn green_png(width: u32, height: u32) -> Vec<u8> {
+        let mut pixmap = Pixmap::new(width, height).expect("a pixmap");
+        pixmap.fill(paint::RasterColor::from_rgba8(0, 0xff, 0, 0xff));
+        let file = std::env::temp_dir().join(format!("2kbrowser-green-{width}x{height}.png"));
+        pixmap.save_png(&file).expect("writes a png");
+        std::fs::read(&file).expect("reads it back")
+    }
+
+    fn green_pixels(page: &Page) -> usize {
+        page.pixmap
+            .data()
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
+            .count()
+    }
+
+    #[test]
+    fn the_document_fallback_still_shows_the_pages_images() {
+        // They used to be dropped, on the grounds that a rendering which has
+        // discarded the author's layout should not spend requests on their
+        // decoration. That was using a judgement about how a page is arranged
+        // as a judgement about what it is made of: the diagram in an article
+        // and the photograph a caption refers to are the content.
+        let html = "<body><p>before</p><img src=\"picture.png\"><p>after</p></body>";
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut GreenImages {
+                png: green_png(100, 60),
+            },
+            Some((&origin, &at)),
+        );
+
+        assert_eq!(page.images_loaded, 1, "the image was never fetched");
+        assert_eq!(
+            green_pixels(&page),
+            100 * 60,
+            "the image was fetched and then not painted at its own size"
+        );
+    }
+
+    #[test]
+    fn an_image_too_wide_for_the_reader_column_is_brought_down_to_it() {
+        // An article's photograph is routinely wider than the 42em the reader
+        // sheet asks for, and nothing clips an overflow — so without a bound it
+        // runs off the side of the page it is supposed to be illustrating.
+        let html = "<body><p>before</p><img src=\"wide.png\"><p>after</p></body>";
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut GreenImages {
+                png: green_png(3000, 400),
+            },
+            Some((&origin, &at)),
+        );
+
+        let green = green_pixels(&page);
+        assert!(green > 0, "the image was not painted at all");
+        assert!(
+            green < 3000 * 400,
+            "the image was painted at its full size and overflowed"
+        );
+        let rows_with_green = (0..page.pixmap.height())
+            .filter(|row| {
+                let start = (*row * page.pixmap.width() * 4) as usize;
+                let end = start + (page.pixmap.width() * 4) as usize;
+                page.pixmap.data()[start..end]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
+            })
+            .count();
+        let widest = green / rows_with_green.max(1);
+        assert!(
+            widest <= 900,
+            "the image is {widest}px wide on a 900px canvas"
+        );
+        // 3000x400 is 15:2, so a width of `widest` should come with about
+        // `widest * 2 / 15` rows. Anything else means it was squashed.
+        let expected_rows = (widest * 2).div_ceil(15);
+        assert!(
+            rows_with_green.abs_diff(expected_rows) <= 2,
+            "{widest}x{rows_with_green} is not the 15:2 image scaled down"
+        );
     }
 
     #[test]

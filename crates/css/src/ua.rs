@@ -85,6 +85,7 @@ small, sub, sup { font-size: 0.83em; }
 /// full-window line lengths would trade one unreadable rendering for another.
 pub const READER_STYLESHEET: &str = r#"
 body { margin: 40px; max-width: 42em; line-height: 1.5; }
+img { max-width: 100%; }
 "#;
 
 #[cfg(test)]
