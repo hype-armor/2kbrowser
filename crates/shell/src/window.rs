@@ -359,6 +359,13 @@ struct App {
     pointer: (f32, f32),
     /// Whether the pointer is over a link, so the cursor can say so.
     over_link: bool,
+    /// How far through a navigation the browser is, or `None` when it is not
+    /// in one.
+    ///
+    /// A share rather than a spinner, because the stages a navigation goes
+    /// through are known and unequal, and saying which one it is in is more
+    /// use than saying that something is happening.
+    loading: Option<f32>,
     /// A scrollbar drag in progress, and how far down the thumb it was
     /// started. `None` when the pointer is not holding the thumb.
     ///
@@ -569,13 +576,23 @@ impl App {
     /// Used by back and forward as well as by following a link, so the history
     /// bookkeeping stays in one place rather than being repeated per caller.
     fn show(&mut self, url: &str) {
+        // A navigation is synchronous — the fetch blocks, and so does the round
+        // trip to the child that lays the page out — so the event loop cannot
+        // repaint while one is in flight. The bar is therefore painted from
+        // here, at each stage, rather than left to a redraw that will not
+        // happen until the page is already up. It steps rather than sliding,
+        // and the steps are the real ones.
+        self.stage(Some(FETCHING));
         // Raw, not decoded: the encoding sniffer lives with every other parser
         // on the far side of the boundary, so the parent never turns a
         // stranger's bytes into text (ADR-0012).
-        match self
+        let fetched = self
             .fetcher
-            .fetch_raw(url, None, net::RequestKind::Navigation)
-        {
+            .fetch_raw(url, None, net::RequestKind::Navigation);
+        // Painted before the page is cleared, so what stays on screen behind
+        // the bar is the page being left rather than a white window.
+        self.stage(Some(LAYING_OUT));
+        match fetched {
             Ok(fetched) => {
                 self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
@@ -604,9 +621,20 @@ impl App {
             Err(error) => self.tab_mut().error = Some(error.to_string()),
         }
         self.rerender();
+        self.loading = None;
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Moves the loading bar and puts it on screen at once.
+    ///
+    /// The `draw` is the point: nothing else is going to run until the
+    /// navigation finishes, so a stage that only set the field would be shown
+    /// for no time at all and then replaced by the finished page.
+    fn stage(&mut self, progress: Option<f32>) {
+        self.loading = progress;
+        self.draw();
     }
 
     /// Follows a link.
@@ -732,10 +760,15 @@ impl App {
 
     /// Opens a new tab showing `url`, beside the current one.
     fn open_tab(&mut self, url: &str) {
-        match self
+        // A new tab is a navigation like any other, and a slow one leaves the
+        // window showing the page the reader middle-clicked from with nothing
+        // to say a tab is on its way.
+        self.stage(Some(FETCHING));
+        let fetched = self
             .fetcher
-            .fetch_raw(url, None, net::RequestKind::Navigation)
-        {
+            .fetch_raw(url, None, net::RequestKind::Navigation);
+        self.stage(Some(LAYING_OUT));
+        match fetched {
             Ok(fetched) => {
                 let local_root = fetched.trust == net::Trust::LocalRoot;
                 let loaded = Loaded {
@@ -766,6 +799,7 @@ impl App {
         }
         self.editing = None;
         self.rerender();
+        self.loading = None;
     }
 
     /// Closes a tab. The last one cannot be closed.
@@ -1219,10 +1253,11 @@ impl App {
             chrome,
             strip,
             size,
+            loading,
             ..
         } = self;
         let tab = tabs.active();
-        let (Some(surface), Some(page)) = (surface.as_mut(), tab.page.as_ref()) else {
+        let Some(surface) = surface.as_mut() else {
             return;
         };
         let (Some(width), Some(height)) = (NonZeroU32::new(size.0), NonZeroU32::new(size.1)) else {
@@ -1235,15 +1270,6 @@ impl App {
             return;
         };
 
-        let (page_width, page_height) = (page.width(), page.height());
-        let page_pixels = page.pixels();
-        // What the rows without pixels are filled with. The page's own canvas
-        // colour rather than white: white is invisible under a white page and a
-        // lit strip under any other, and the document rendering is dark.
-        let blank = page.background();
-        // Where the painted band sits in the document, so a scroll offset in
-        // document coordinates can be turned into a row of the band.
-        let band_top = page.band_top();
         let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
         let strip_height = if tabs.len() > 1 {
@@ -1269,28 +1295,51 @@ impl App {
         blit(&mut buffer, strip, 0, strip_height);
         blit(&mut buffer, chrome, strip_height, bar_height - strip_height);
 
-        for row in bar_height..height.get() {
-            let document_row = row - bar_height + offset;
-            let start = row as usize * viewport_width;
-            compose_row(
-                &mut buffer[start..start + viewport_width],
-                page_pixels,
-                document_row
-                    .checked_sub(band_top)
-                    .filter(|it| *it < page_height),
-                page_width,
-                blank,
-            );
+        // A tab with no page yet — a window that has not loaded anything, or
+        // one whose first navigation failed — still gets its chrome drawn, and
+        // the page area gets a blank rather than whatever the buffer happened
+        // to be handed. The compositor gives back an uninitialised buffer, so
+        // there is no "leave it alone" to choose here.
+        match tab.page.as_ref() {
+            Some(page) => {
+                let (page_width, page_height) = (page.width(), page.height());
+                let page_pixels = page.pixels();
+                // What the rows without pixels are filled with. The page's own
+                // canvas colour rather than white: white is invisible under a
+                // white page and a lit strip under any other, and the document
+                // rendering is dark.
+                let blank = page.background();
+                // Where the painted band sits in the document, so a scroll
+                // offset in document coordinates can be turned into a row of
+                // the band.
+                let band_top = page.band_top();
+                for row in bar_height..height.get() {
+                    let document_row = row - bar_height + offset;
+                    let start = row as usize * viewport_width;
+                    compose_row(
+                        &mut buffer[start..start + viewport_width],
+                        page_pixels,
+                        document_row
+                            .checked_sub(band_top)
+                            .filter(|it| *it < page_height),
+                        page_width,
+                        blank,
+                    );
+                }
+                draw_scrollbar(
+                    &mut buffer,
+                    tab.scroll,
+                    page.scrollable_height(),
+                    (width.get(), height.get()),
+                    bar_height,
+                    blank,
+                );
+            }
+            None => {
+                let start = bar_height as usize * viewport_width;
+                buffer[start..].fill(0x00ff_ffff);
+            }
         }
-
-        draw_scrollbar(
-            &mut buffer,
-            tab.scroll,
-            page.scrollable_height(),
-            (width.get(), height.get()),
-            bar_height,
-            blank,
-        );
         highlight_matches(
             &mut buffer,
             &tab.matches,
@@ -1306,7 +1355,59 @@ impl App {
             (width.get(), height.get()),
             bar_height,
         );
+        // Over everything, because it is about the window rather than about
+        // the page under it, and a page can be any colour at all.
+        draw_loading(
+            &mut buffer,
+            *loading,
+            (width.get(), height.get()),
+            bar_height,
+        );
         let _ = buffer.present();
+    }
+}
+
+/// How far along the loading bar sits while the document is being fetched.
+///
+/// Not zero: the bar has to be visible the instant a link is clicked, because
+/// the slowest part of a navigation on a slow connection is the part before
+/// anything has arrived, and that is exactly when a reader wonders whether
+/// their click registered.
+const FETCHING: f32 = 0.2;
+
+/// And once the document is in hand and is being laid out.
+///
+/// Two thirds rather than nine tenths. Laying out is not the tail end of a
+/// navigation: it fetches the page's stylesheets and images and can easily be
+/// the longer half, and a bar that claimed to be nearly done and then sat
+/// there would be worse than one that never moved.
+const LAYING_OUT: f32 = 0.65;
+
+/// How tall the loading bar is.
+const LOADING_HEIGHT: u32 = 3;
+
+/// Colour of the loading bar. The chrome's focus blue, which is already this
+/// browser's one accent.
+const LOADING_COLOUR: u32 = 0x003a_6ea5;
+
+/// Draws the loading bar across the top of the page area.
+///
+/// A line under the chrome rather than a widget in it: it appears and vanishes
+/// with every navigation, and anything that took up room in the bar would move
+/// every control beside it twice per page.
+///
+/// `progress` is `None` when nothing is loading, which is nearly always, and a
+/// share between 0 and 1 while a navigation is in flight.
+fn draw_loading(buffer: &mut [u32], progress: Option<f32>, size: (u32, u32), bar_height: u32) {
+    let Some(progress) = progress else { return };
+    let (width, height) = size;
+    let filled = ((width as f32 * progress.clamp(0.0, 1.0)) as usize).min(width as usize);
+    if filled == 0 {
+        return;
+    }
+    for row in bar_height..(bar_height + LOADING_HEIGHT).min(height) {
+        let start = row as usize * width as usize;
+        buffer[start..start + filled].fill(LOADING_COLOUR);
     }
 }
 
@@ -1936,6 +2037,7 @@ pub fn open(
         rendered_size: (0, 0),
         pointer: (0.0, 0.0),
         over_link: false,
+        loading: None,
         dragging: None,
         theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),
@@ -2616,5 +2718,97 @@ mod scrollbar_tests {
         let mut buffer = vec![WHITE; (4 * HEIGHT) as usize];
         draw_scrollbar(&mut buffer, 0.0, 200.0, (4, HEIGHT), BAR, WHITE);
         assert!(buffer.iter().any(|pixel| *pixel != WHITE), "nothing drawn");
+    }
+}
+
+#[cfg(test)]
+mod loading_tests {
+    use super::{LOADING_COLOUR, LOADING_HEIGHT, draw_loading};
+
+    const WHITE: u32 = 0x00ff_ffff;
+    const WIDTH: u32 = 40;
+    const HEIGHT: u32 = 30;
+    const BAR: u32 = 10;
+
+    fn window() -> Vec<u32> {
+        vec![WHITE; (WIDTH * HEIGHT) as usize]
+    }
+
+    fn at(buffer: &[u32], x: u32, y: u32) -> u32 {
+        buffer[(y * WIDTH + x) as usize]
+    }
+
+    #[test]
+    fn nothing_loading_draws_nothing() {
+        // Which is nearly always. A bar that sat there empty would be a piece
+        // of furniture saying a browser has a progress bar.
+        let mut buffer = window();
+        draw_loading(&mut buffer, None, (WIDTH, HEIGHT), BAR);
+        assert!(buffer.iter().all(|pixel| *pixel == WHITE));
+    }
+
+    #[test]
+    fn the_bar_is_as_wide_a_share_of_the_window_as_the_navigation_is_done() {
+        let mut buffer = window();
+        draw_loading(&mut buffer, Some(0.5), (WIDTH, HEIGHT), BAR);
+        assert_eq!(at(&buffer, WIDTH / 2 - 1, BAR), LOADING_COLOUR);
+        assert_eq!(
+            at(&buffer, WIDTH / 2 + 1, BAR),
+            WHITE,
+            "the bar ran past the share it was given"
+        );
+    }
+
+    #[test]
+    fn the_bar_sits_directly_under_the_chrome() {
+        // Under rather than in: it appears and vanishes with every navigation,
+        // and anything taking room in the bar would move every control beside
+        // it twice per page.
+        let mut buffer = window();
+        draw_loading(&mut buffer, Some(1.0), (WIDTH, HEIGHT), BAR);
+        assert_eq!(at(&buffer, 0, BAR - 1), WHITE, "the bar is over the chrome");
+        assert_eq!(at(&buffer, 0, BAR), LOADING_COLOUR);
+        assert_eq!(at(&buffer, 0, BAR + LOADING_HEIGHT - 1), LOADING_COLOUR);
+        assert_eq!(
+            at(&buffer, 0, BAR + LOADING_HEIGHT),
+            WHITE,
+            "the bar is thicker than it says it is"
+        );
+    }
+
+    #[test]
+    fn a_share_of_nothing_draws_nothing() {
+        // The bar is set to a definite share the moment a navigation starts, so
+        // zero should never arrive — but a bar of no width is nothing to draw
+        // either way, and a zero-length fill is not worth a special case
+        // downstream.
+        let mut buffer = window();
+        draw_loading(&mut buffer, Some(0.0), (WIDTH, HEIGHT), BAR);
+        assert!(buffer.iter().all(|pixel| *pixel == WHITE));
+    }
+
+    #[test]
+    fn a_share_past_the_end_stops_at_the_window_edge() {
+        // Not a share anything passes today. It is one line of clamping
+        // between a rounding error and a bar that wraps: a row is a slice of
+        // one long buffer, so a fill wider than the window runs on into the
+        // rows below it rather than stopping at the glass.
+        let mut buffer = window();
+        draw_loading(&mut buffer, Some(4.0), (WIDTH, HEIGHT), BAR);
+        assert_eq!(at(&buffer, WIDTH - 1, BAR), LOADING_COLOUR);
+        assert_eq!(
+            at(&buffer, 0, BAR + LOADING_HEIGHT),
+            WHITE,
+            "the bar wrapped past the end of its own row"
+        );
+    }
+
+    #[test]
+    fn a_window_shorter_than_its_own_chrome_draws_no_bar() {
+        // A window dragged down to nothing. The page area is empty, so there is
+        // nowhere under the chrome to put a bar.
+        let mut buffer = vec![WHITE; (WIDTH * BAR) as usize];
+        draw_loading(&mut buffer, Some(0.5), (WIDTH, BAR), BAR);
+        assert!(buffer.iter().all(|pixel| *pixel == WHITE));
     }
 }

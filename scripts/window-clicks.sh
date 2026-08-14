@@ -408,4 +408,77 @@ either, so the check above proved nothing: $after" ;;
 esac
 stop
 
+# 8. The loading bar appears while a navigation is in flight and goes away
+#    when it lands.
+#
+#    A navigation is synchronous — the fetch blocks, and so does the round trip
+#    to the child that lays the page out — so the bar is painted from inside
+#    `show` rather than by a redraw that will not happen until the page is
+#    already up. Whether that painting reaches the screen is not something
+#    `cargo test` can see, and a progress bar that never appears is the one
+#    failure that matters.
+#
+#    The fixture is generated rather than committed: it has to take long enough
+#    to lay out that the bar is on screen for more than a frame, which means it
+#    has to be megabytes, and a megabyte of filler is not worth keeping.
+heavy=$(mktemp -d)
+trap 'rm -f "$dump"; rm -rf "$heavy"; cleanup' EXIT
+python3 - "$heavy" <<'FIXTURE'
+import pathlib, sys
+into = pathlib.Path(sys.argv[1])
+(into / "heavy.html").write_text(
+    "<!doctype html>\n<title>Heavy</title>\n<body>\n"
+    + "".join(
+        f"<p>Paragraph number {i} with a good few words in it so that shaping "
+        "and layout have real work to do on this line.</p>\n"
+        for i in range(20000)
+    )
+    + "</body>\n"
+)
+(into / "heavy-from.html").write_text(
+    "<!doctype html>\n<title>Heavy departure</title>\n<body>\n"
+    '<p><a href="heavy.html">go to the heavy page</a></p>\n</body>\n'
+)
+FIXTURE
+
+heavy_link=$("$browser" links "$heavy/heavy-from.html" --width "$width" | sed -n '2p')
+[ -n "$heavy_link" ] || fail "the generated fixture has no link to follow"
+h_x=$(echo "$heavy_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\1/')
+h_y=$(echo "$heavy_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\2/')
+h_w=$(echo "$heavy_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\3/')
+h_h=$(echo "$heavy_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\4/')
+
+# The bar's accent, from `window.rs`, as the pixel reader prints it.
+accent="58 110 165"
+
+start_on "$heavy/heavy-from.html" "Heavy departure"
+DISPLAY=$display xdotool mousemove $((h_x + h_w / 2)) $((h_y + h_h / 2 + chrome))
+sleep 0.3
+DISPLAY=$display xdotool click 1
+
+# Sampled a fifth of the way across, which the bar covers at its first stage.
+seen=""
+for _ in $(seq 1 60); do
+    if [ "$(pixel 100 $((chrome + 1)))" = "$accent" ]; then
+        seen=yes
+        break
+    fi
+done
+[ -n "$seen" ] || fail "no loading bar during a navigation that takes a second"
+
+waited=0
+while [ "$waited" -lt 60 ]; do
+    case "$(DISPLAY=$display xdotool getwindowname "$window")" in
+        Heavy\ —*) break ;;
+    esac
+    sleep 0.5
+    waited=$((waited + 1))
+done
+[ "$waited" -lt 60 ] || fail "the heavy page never finished loading"
+after=$(pixel 100 $((chrome + 1)))
+[ "$after" != "$accent" ] || fail "the loading bar is still on screen after the \
+page arrived, so it says nothing about whether anything is loading"
+echo "ok: the loading bar showed during a navigation and went away after it"
+stop
+
 echo "all window click checks passed"
