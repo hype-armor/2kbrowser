@@ -7,6 +7,11 @@ header of big-endian `u32`s followed by the pixel rows, which is little enough
 to read here rather than pulling in an image library for three numbers.
 
     xwd -silent -id "$window" | xwd-pixel.py X Y
+
+`xwd-to-png.py` reads the same header, for `screenshots.sh`. Kept separate
+rather than shared: between them the common part is the eight lines below that
+unpack a format frozen since the 1980s, and a module existing only to hold
+those would be more to find than to repeat.
 """
 
 import struct
