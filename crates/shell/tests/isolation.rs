@@ -1191,6 +1191,102 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
 }
 
 #[test]
+fn the_renderer_that_rendered_a_page_says_it_was_confined() {
+    // What every other test here leaves out. `Renderer::spawn` falls back to an
+    // ordinary child when the container will not launch — deliberately, because
+    // a browser that renders nothing on a machine whose `CreateProcess` refuses
+    // the container is a browser nobody can use to find out why — and the page
+    // that comes back is identical either way. So every test that spawns a
+    // `Renderer` passes whether or not the renderer was confined, the one above
+    // this included: it compares pixels, and an unconfined child produces the
+    // same ones.
+    //
+    // A user on Windows found that out the way it was always going to be found,
+    // by reading the line the browser prints at startup. The container failed
+    // inside `CreateProcessW`, the fallback worked, the page rendered, and every
+    // check in this repository stayed green.
+    //
+    // The self-test above is the stronger check of the two and does not cover
+    // this: it confines and probes from *inside*, which is the only honest way
+    // to test a sandbox, but it builds its own container in `confine::selftest`.
+    // That says nothing about the one `Renderer` builds and nothing about the
+    // fallback. This is the other half — the renderer that actually rendered
+    // something, asked afterwards what had confined it.
+    //
+    // Worth what it is worth per platform, and they differ. On Windows the
+    // parent builds the container, so this is the outcome rather than the
+    // intention, and it is the only place a launch that failed becomes visible.
+    // On Linux and macOS the child confines itself after `exec` and the parent
+    // cannot see whether that worked, so this is what the build *will* apply —
+    // weaker, and still not nothing: it fails a build that stopped claiming a
+    // mechanism at all, and the self-test covers the rest.
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+
+    // Asked *after* a page has been through it, which is the whole reason this
+    // is a test out here and not a unit test on `Renderer`. Building a
+    // container can succeed and launching into it still fail, so the failure
+    // does not exist until the first spawn: a renderer nothing has run yet
+    // reports the confinement it intends rather than the one it got.
+    //
+    // The page has no subresources, so nothing is fetched and the origin below
+    // is never contacted.
+    let (origin, at) = net::parse_url("http://127.0.0.1:1/p.html").expect("parses");
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: PAGE.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        800,
+        2000,
+        false,
+        false,
+    )
+    .expect("the renderer opens the page");
+    assert!(page.height() > 0, "nothing was rendered");
+
+    let confinement = renderer.confinement();
+    if !confinement.is_confined() {
+        // The same rule the self-test states at length: a skip is legitimate on
+        // a developer's machine and never in CI, because CI is where the claim
+        // gets made. The reason is printed with it — `os error 203` on its own
+        // is not something anyone can act on, and this is the report the person
+        // who hits it will be asked for.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "a page was rendered by a renderer nothing confined, and this is \
+             CI — where a skip is the finding: {}{}",
+            confinement.describe(),
+            renderer
+                .confinement_failure()
+                .map(|reason| format!("\n{reason}"))
+                .unwrap_or_default()
+        );
+        eprintln!(
+            "SKIP: nothing confined the renderer here: {}",
+            confinement.describe()
+        );
+        return;
+    }
+
+    // Which mechanism, not merely that there was one. A platform reporting a
+    // neighbour's — the Windows parent claiming `Seccomp` because a `cfg` arm
+    // was edited in one place and not the other — is a green test asserting
+    // confinement that does not exist, which this file has already had once.
+    let expected = if cfg!(target_os = "windows") {
+        sandbox::Confinement::AppContainer
+    } else if cfg!(target_os = "macos") {
+        sandbox::Confinement::AppSandbox
+    } else {
+        sandbox::Confinement::Seccomp
+    };
+    assert_eq!(confinement, expected);
+}
+
+#[test]
 fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
     // What banded rendering is for. A page used to stop at the canvas it was
     // given: the rows past it had no pixels, the scroll stopped there, and the

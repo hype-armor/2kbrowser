@@ -1085,6 +1085,49 @@ mod tests {
     }
 
     #[test]
+    fn a_container_that_would_not_launch_leaves_the_renderer_reporting_unconfined() {
+        // The step between "the sandbox failed" and anyone finding out. On
+        // Windows the container is built once and launched into per page, so a
+        // launch that fails happens long after `Renderer` was constructed and
+        // decided it was confined — `spawn` records the reason, and this is what
+        // has to notice. If it did not, the browser would print `confined: an
+        // AppContainer with no capabilities` over a page an ordinary process had
+        // rendered, which is the failure this whole file is written against.
+        //
+        // Runs everywhere rather than on Windows alone, because it is the
+        // accessor being pinned and the accessor is not platform-specific. The
+        // isolation tests check the same thing through a real render; this one
+        // can state the transition directly, which there is no way to provoke
+        // from outside on a machine where the container launches fine.
+        let renderer = Renderer::with_program(PathBuf::from("/nonexistent"));
+        let before = renderer.confinement();
+        renderer
+            .launch_failure
+            .set("the machine refused it".to_owned())
+            .expect("nothing has failed yet");
+
+        assert_eq!(renderer.confinement(), Confinement::Failed);
+        assert!(!renderer.confinement().is_confined());
+        assert_eq!(
+            renderer.confinement_failure(),
+            Some("the machine refused it")
+        );
+
+        // And it really was a change of answer rather than one that was already
+        // `Failed`. Only where the parent does not build the confinement
+        // itself: on Windows the container above was built for a program that
+        // does not exist, so it had failed before this test touched anything.
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            before.is_confined(),
+            "this platform reported {before:?} before any launch failed, so the \
+             assertions above prove nothing about the transition"
+        );
+        // Read on Windows too, where the assertion above is compiled out.
+        let _ = before;
+    }
+
+    #[test]
     fn the_timeout_is_configurable_and_defaults_to_something_generous() {
         // Killing a page someone is waiting for is worse than waiting, so the
         // default is well past any legitimate render.
