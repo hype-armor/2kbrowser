@@ -43,6 +43,10 @@ chrome=46
 padding=8
 bookmark=56
 toggle=96
+# The scrollbar's width, from `scrollbar.rs`. Same caveat as the numbers above:
+# pinned there by its own tests, and repeated here because a pointer has to be
+# told a number.
+scrollbar=8
 toggle_x=$((width - padding - bookmark - toggle / 2))
 toggle_y=$((chrome / 2))
 
@@ -83,7 +87,15 @@ click_y=$((link_y + link_h / 2 + chrome))
 # Starts the browser on the fixture and blocks until it has rendered something,
 # which is the title changing from the URL it was launched with.
 start() {
-    DISPLAY=$display "$browser" open "$page" --width "$width" --height "$height" \
+    start_on "$page" "Departure"
+}
+
+# The same, on a named page whose rendered title is `$2`. Readiness is the
+# title changing from the URL it was launched with, so the caller has to say
+# what the page's title actually is.
+start_on() {
+    local on=$1 ready=$2
+    DISPLAY=$display "$browser" open "$on" --width "$width" --height "$height" \
         >/dev/null 2>&1 &
     app=$!
     local waited=0
@@ -93,7 +105,7 @@ start() {
             title=$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)
             # The launch title is the URL; anything else means a page rendered.
             case "$title" in
-                *Departure*) return 0 ;;
+                *"$ready"*) return 0 ;;
             esac
         fi
         sleep 0.5
@@ -285,13 +297,115 @@ case "$after" in
     *"rendered as document"*) ;;
     *) fail "the layout toggle did not reach the renderer: $after" ;;
 esac
-for point in "$((width / 2)) 200" "$((width / 2)) $below" "$((width - 4)) 400"; do
+# Near the right-hand edge but clear of the scrollbar column, which is drawn
+# over the page and has a colour of its own.
+edge=$((width - scrollbar - 4))
+for point in "$((width / 2)) 200" "$((width / 2)) $below" "$edge 400"; do
     # shellcheck disable=SC2086
     got=$(pixel $point)
     dark "$got" || fail "the document fallback left ($point) at $got, which is \
 not a dark page"
 done
 echo "ok: the document fallback reached the screen dark, edge to edge"
+stop
+
+# 7. The scrollbar is drawn on a page taller than the window, and dragging its
+#    thumb scrolls the page.
+#
+#    The geometry is pinned by unit tests in `scrollbar.rs`. What those cannot
+#    see is any of the parts that live in the event loop: that the bar is drawn
+#    at all, that a press on it is recognised as a grab rather than as a click
+#    on the page, and that the pointer moving while held reaches the page. A
+#    scrollbar that draws and does not drag looks exactly like a working one
+#    until you try to use it.
+long="$here/tests/window/long.html"
+bar_x=$((width - scrollbar / 2))
+
+# The first and last rows of the page area whose right-hand column is not the
+# page's own background, which is where the thumb is.
+thumb_span() {
+    local first="" last="" row rgb
+    DISPLAY=$display xwd -silent -id "$window" > "$dump"
+    for row in $(seq $((chrome + 2)) 8 $((height - 4))); do
+        rgb=$(python3 "$here/scripts/xwd-pixel.py" "$bar_x" "$row" < "$dump")
+        if [ "$rgb" != "255 255 255" ]; then
+            [ -z "$first" ] && first=$row
+            last=$row
+        fi
+    done
+    echo "$first $last"
+}
+
+dump=$(mktemp)
+trap 'rm -f "$dump"; cleanup' EXIT
+
+start_on "$long" "Long"
+before=$(thumb_span)
+[ "$before" != " " ] || fail "no scrollbar on a page far taller than the window"
+before_top=${before% *}
+
+# Grab the thumb and pull it down the track.
+DISPLAY=$display xdotool mousemove "$bar_x" "$((before_top + 4))"
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+for step in 100 200 300 400; do
+    DISPLAY=$display xdotool mousemove "$bar_x" $((chrome + step))
+    sleep 0.2
+done
+DISPLAY=$display xdotool mouseup 1
+sleep 1
+
+after=$(thumb_span)
+after_top=${after% *}
+[ -n "$after_top" ] || fail "the thumb vanished during the drag"
+[ "$after_top" -gt "$before_top" ] || fail "dragging the thumb from $before_top \
+left it at $after_top — the drag never reached the page"
+echo "ok: the scrollbar drew and its thumb followed a drag"
+
+# And letting go of the thumb is not a click on whatever the pointer has
+# wandered over by then. A hand dragging a scrollbar leaves the bar constantly,
+# and this fixture has a link near the top for it to land on.
+long_link=$("$browser" links "$long" --width "$width" | sed -n '2p')
+[ -n "$long_link" ] || fail "the long fixture has no link, so releasing the \
+thumb has nothing to land on and this check proves nothing"
+l_x=$(echo "$long_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\1/')
+l_y=$(echo "$long_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\2/')
+l_w=$(echo "$long_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\3/')
+l_h=$(echo "$long_link" | sed -E 's/^ *([0-9]+),([0-9]+) +([0-9]+)x([0-9]+).*/\4/')
+
+# Grab the thumb near its *bottom* and drag back to the top. Near the bottom
+# because the drag keeps the pointer's offset within the thumb: with a big
+# offset the pointer can wander a long way down the window and the page stays
+# at the top, which is what puts the link back where the layout says it is.
+# Grabbing near the top instead pulls the page down again the moment the
+# pointer leaves the bar, and the release lands on nothing.
+after_bottom=${after#* }
+DISPLAY=$display xdotool mousemove "$bar_x" "$((after_bottom - 8))"
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+DISPLAY=$display xdotool mousemove "$bar_x" "$chrome"
+sleep 0.5
+DISPLAY=$display xdotool mousemove $((l_x + l_w / 2)) $((l_y + l_h / 2 + chrome))
+sleep 0.5
+DISPLAY=$display xdotool mouseup 1
+sleep 1
+after=$(DISPLAY=$display xdotool getwindowname "$window")
+case "$after" in
+    *Long*) ;;
+    *) fail "releasing the scrollbar navigated to: $after" ;;
+esac
+
+# And the point it was released on really is a link, so the assertion above is
+# about the release and not about the pointer having landed on blank page. An
+# earlier version of this check omitted this and passed against a browser that
+# followed the link on release, because the drag had left the pointer nowhere
+# in particular.
+after=$(click_and_read $((l_x + l_w / 2)) $((l_y + l_h / 2 + chrome)))
+case "$after" in
+    *Arrival*) echo "ok: letting go of the thumb was not a click on the page" ;;
+    *) fail "a plain click where the thumb was released did not follow a link \
+either, so the check above proved nothing: $after" ;;
+esac
 stop
 
 echo "all window click checks passed"

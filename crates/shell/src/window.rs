@@ -359,6 +359,13 @@ struct App {
     pointer: (f32, f32),
     /// Whether the pointer is over a link, so the cursor can say so.
     over_link: bool,
+    /// A scrollbar drag in progress, and how far down the thumb it was
+    /// started. `None` when the pointer is not holding the thumb.
+    ///
+    /// The offset is what stops the thumb jumping so its top is under the
+    /// pointer the moment it is pressed, which would move the page before the
+    /// drag had begun.
+    dragging: Option<f32>,
     /// Which colour scheme the chrome draws in.
     theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
@@ -1134,9 +1141,43 @@ impl App {
     /// The pointer is in window coordinates; the page starts below the bar and
     /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
+        // The scrollbar is on top of the page, so a link beneath it is not
+        // under the pointer — it is under the bar. Answered here rather than at
+        // each caller so that the cursor, a click and a middle-click cannot
+        // disagree about what the pointer is on.
+        if self.scrollbar_grab().is_some() {
+            return None;
+        }
         let page = self.tab().page.as_ref()?;
         let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
         page.link_at(x, y).map(str::to_owned)
+    }
+
+    /// Where the pointer falls on the scrollbar, if it falls on one at all.
+    ///
+    /// `None` when the page fits, since then no bar is drawn and the column it
+    /// would have occupied is ordinary page.
+    fn scrollbar_grab(&self) -> Option<crate::scrollbar::Grab> {
+        let page = self.tab().page.as_ref()?;
+        let bar = self.chrome_height() as f32;
+        let left = self.size.0.saturating_sub(crate::scrollbar::WIDTH) as f32;
+        if self.pointer.1 < bar || self.pointer.0 < left {
+            return None;
+        }
+        crate::scrollbar::grab(
+            self.pointer.1 - bar,
+            self.tab().scroll,
+            page.scrollable_height(),
+            self.viewport_height(),
+        )
+    }
+
+    /// Scrolls so the top of the thumb sits at `top` in the track.
+    fn drag_thumb_to(&mut self, top: f32) {
+        let Some(page) = &self.tab().page else { return };
+        let content = page.scrollable_height();
+        let to = crate::scrollbar::scroll_at(top, content, self.viewport_height());
+        self.scroll_by(to - self.tab().scroll);
     }
 
     /// Total chrome height: the URL bar, plus the tab strip when there is one.
@@ -1242,6 +1283,14 @@ impl App {
             );
         }
 
+        draw_scrollbar(
+            &mut buffer,
+            tab.scroll,
+            page.scrollable_height(),
+            (width.get(), height.get()),
+            bar_height,
+            blank,
+        );
         highlight_matches(
             &mut buffer,
             &tab.matches,
@@ -1292,6 +1341,56 @@ fn compose_row(
             None => blank,
         };
     }
+}
+
+/// Draws the page's scrollbar down the right-hand edge of the page area.
+///
+/// Drawn into the window buffer rather than into the page, for the same reason
+/// the find highlights are: the bar moves on every scroll and the page under it
+/// has not changed. It also could not be drawn into the page — the child that
+/// paints one knows nothing about how tall the window showing it is.
+///
+/// Nothing is drawn when the page fits. A bar that is always full length says
+/// only that a scrollbar exists.
+fn draw_scrollbar(
+    buffer: &mut [u32],
+    scroll: f32,
+    content: f32,
+    size: (u32, u32),
+    bar_height: u32,
+    page_background: u32,
+) {
+    let (width, height) = size;
+    let track = height.saturating_sub(bar_height) as f32;
+    let Some((top, thumb_height)) = crate::scrollbar::thumb(scroll, content, track) else {
+        return;
+    };
+    let thickness = crate::scrollbar::WIDTH.min(width) as usize;
+    let left = width as usize - thickness;
+    let first = bar_height + top as u32;
+    let last = (first + thumb_height.round() as u32).min(height);
+
+    // Taken from the page rather than fixed, so the bar reads as a mark on the
+    // page instead of a light strip laid over a dark one.
+    let thumb_colour = contrasting(page_background);
+    for row in first..last {
+        let start = row as usize * width as usize + left;
+        buffer[start..start + thickness].fill(thumb_colour);
+    }
+}
+
+/// A colour that shows against `background` without shouting at it.
+///
+/// Each channel moved 45% of the way towards whichever end of the scale is
+/// further off. Blending towards a fixed grey instead would vanish against a
+/// mid-grey page, which is exactly the page a scrollbar is least useful to lose.
+fn contrasting(background: u32) -> u32 {
+    let channel = |shift: u32| {
+        let value = ((background >> shift) & 0xff) as f32;
+        let target = if value > 127.0 { 0.0 } else { 255.0 };
+        (value + (target - value) * 0.45) as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 /// Colour of the keyboard focus outline. The chrome's focus blue, because it
@@ -1497,6 +1596,15 @@ impl ApplicationHandler<BandReady> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
+                // A drag in progress owns the pointer. It deliberately does not
+                // check that the pointer is still over the bar: a hand dragging
+                // a thumb wanders off it constantly, and a bar that let go
+                // every time would be unusable.
+                if let Some(held) = self.dragging {
+                    let top = self.pointer.1 - self.chrome_height() as f32 - held;
+                    self.drag_thumb_to(top);
+                    return;
+                }
                 // The cursor says whether there is a link here, which is how a
                 // pointer-driven browser has always answered that question.
                 let over = self.link_under_pointer().is_some();
@@ -1512,11 +1620,45 @@ impl ApplicationHandler<BandReady> for App {
                 }
             }
             WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => match self.scrollbar_grab() {
+                Some(crate::scrollbar::Grab::Thumb(held)) => self.dragging = Some(held),
+                // A press on the track puts the middle of the thumb where the
+                // pointer is — one movement to anywhere in the document — and
+                // then goes on holding it, so a press that turns into a drag
+                // carries on from there rather than needing a second grab.
+                Some(crate::scrollbar::Grab::Track) => {
+                    let page = self
+                        .tab()
+                        .page
+                        .as_ref()
+                        .map(|page| page.scrollable_height());
+                    let Some(content) = page else { return };
+                    let track = self.viewport_height();
+                    let Some((_, height)) =
+                        crate::scrollbar::thumb(self.tab().scroll, content, track)
+                    else {
+                        return;
+                    };
+                    let y = self.pointer.1 - self.chrome_height() as f32;
+                    self.dragging = Some(height / 2.0);
+                    self.drag_thumb_to(y - height / 2.0);
+                }
+                None => {}
+            },
+            WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button,
                 ..
             } => match button {
                 MouseButton::Left => {
+                    // Letting go of the thumb is not a click on whatever the
+                    // pointer happens to be over by then.
+                    if self.dragging.take().is_some() {
+                        return;
+                    }
                     // The bar owns the top of the window, so it gets first
                     // refusal on a click there.
                     let strip_height = if self.tabs.len() > 1 {
@@ -1794,6 +1936,7 @@ pub fn open(
         rendered_size: (0, 0),
         pointer: (0.0, 0.0),
         over_link: false,
+        dragging: None,
         theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
@@ -2342,5 +2485,136 @@ mod focus_outline_tests {
         let mut out = [0u32; 4];
         compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::{contrasting, draw_scrollbar};
+
+    const WHITE: u32 = 0x00ff_ffff;
+    const DARK_PAGE: u32 = 0x001c_1b22;
+    /// A window 40 wide and 30 tall, with a 10px bar across the top.
+    const WIDTH: u32 = 40;
+    const HEIGHT: u32 = 30;
+    const BAR: u32 = 10;
+
+    fn window() -> Vec<u32> {
+        vec![WHITE; (WIDTH * HEIGHT) as usize]
+    }
+
+    fn at(buffer: &[u32], x: u32, y: u32) -> u32 {
+        buffer[(y * WIDTH + x) as usize]
+    }
+
+    /// Rows of the page area whose right-hand column has been drawn on.
+    fn thumb_rows(buffer: &[u32]) -> Vec<u32> {
+        (BAR..HEIGHT)
+            .filter(|row| at(buffer, WIDTH - 1, *row) != WHITE)
+            .collect()
+    }
+
+    #[test]
+    fn a_page_that_fits_gets_no_bar() {
+        // Nothing to scroll, nothing to say. A bar that is always there and
+        // always full length is furniture.
+        let mut buffer = window();
+        draw_scrollbar(&mut buffer, 0.0, 15.0, (WIDTH, HEIGHT), BAR, WHITE);
+        assert!(buffer.iter().all(|pixel| *pixel == WHITE));
+    }
+
+    #[test]
+    fn the_bar_sits_in_the_right_hand_gutter_and_nowhere_else() {
+        let mut buffer = window();
+        draw_scrollbar(&mut buffer, 0.0, 200.0, (WIDTH, HEIGHT), BAR, WHITE);
+
+        let bar_starts = WIDTH - crate::scrollbar::WIDTH;
+        assert_ne!(at(&buffer, bar_starts, BAR), WHITE, "the bar is missing");
+        assert_ne!(at(&buffer, WIDTH - 1, BAR), WHITE, "the bar is too narrow");
+        assert_eq!(
+            at(&buffer, bar_starts - 1, BAR),
+            WHITE,
+            "the bar is wider than the gutter it is supposed to sit in"
+        );
+    }
+
+    #[test]
+    fn the_bar_stays_out_of_the_chrome() {
+        // The rows above the page area belong to the URL bar, which is drawn
+        // from a pixmap and would simply be overwritten.
+        let mut buffer = window();
+        draw_scrollbar(&mut buffer, 0.0, 200.0, (WIDTH, HEIGHT), BAR, WHITE);
+        for row in 0..BAR {
+            assert_eq!(at(&buffer, WIDTH - 1, row), WHITE, "row {row} is chrome");
+        }
+    }
+
+    #[test]
+    fn the_thumb_moves_down_the_track_as_the_page_scrolls() {
+        let track = (HEIGHT - BAR) as f32;
+        let content = 200.0;
+        let top = thumb_rows(&{
+            let mut buffer = window();
+            draw_scrollbar(&mut buffer, 0.0, content, (WIDTH, HEIGHT), BAR, WHITE);
+            buffer
+        });
+        let bottom = thumb_rows(&{
+            let mut buffer = window();
+            draw_scrollbar(
+                &mut buffer,
+                content - track,
+                content,
+                (WIDTH, HEIGHT),
+                BAR,
+                WHITE,
+            );
+            buffer
+        });
+
+        assert_eq!(
+            top.first(),
+            Some(&BAR),
+            "the thumb does not start at the top"
+        );
+        assert_eq!(
+            bottom.last(),
+            Some(&(HEIGHT - 1)),
+            "the thumb does not reach the bottom at the end of the page"
+        );
+        assert_eq!(
+            top.len(),
+            bottom.len(),
+            "the thumb changed length as it travelled"
+        );
+    }
+
+    #[test]
+    fn the_thumb_shows_against_a_dark_page_as_well_as_a_light_one() {
+        // A fixed grey would disappear into whichever page happened to match
+        // it, and the document fallback is very dark indeed.
+        let brightness = |colour: u32| {
+            let (r, g, b) = (
+                ((colour >> 16) & 0xff) as f32,
+                ((colour >> 8) & 0xff) as f32,
+                (colour & 0xff) as f32,
+            );
+            (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        };
+        for page in [WHITE, DARK_PAGE, 0x0080_8080] {
+            let thumb = contrasting(page);
+            assert!(
+                (brightness(thumb) - brightness(page)).abs() > 0.15,
+                "a {thumb:06x} thumb on a {page:06x} page is not a visible mark"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_narrower_than_the_bar_still_draws_one_that_fits() {
+        // Not a size anyone chooses, but a window can be dragged to it, and a
+        // slice out of bounds is a panic rather than a bad rendering.
+        let mut buffer = vec![WHITE; (4 * HEIGHT) as usize];
+        draw_scrollbar(&mut buffer, 0.0, 200.0, (4, HEIGHT), BAR, WHITE);
+        assert!(buffer.iter().any(|pixel| *pixel != WHITE), "nothing drawn");
     }
 }
