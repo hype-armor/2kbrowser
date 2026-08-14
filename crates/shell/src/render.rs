@@ -49,6 +49,13 @@ pub struct Page {
     pub title: Option<String>,
     /// The document row `pixmap` starts at.
     pub band_top: u32,
+    /// The colour the canvas was cleared to, opaque (CSS 2.1 §14.2).
+    ///
+    /// The window needs it for the rows it has no pixels for — below a page
+    /// shorter than the window, and ahead of a band still being painted. White
+    /// there is fine under a white page and a bright hole under any other,
+    /// which the dark document rendering makes impossible to miss.
+    pub background: css::Color,
     /// What another band would be painted from, when this page can paint one.
     ///
     /// Kept so that scrolling costs a paint rather than a re-layout: the
@@ -671,6 +678,7 @@ fn render_sized(
         title,
         frames,
         band_top,
+        background: list.canvas,
         source: Some(Box::new(BandSource { list, images })),
     }
 }
@@ -827,6 +835,10 @@ fn render_frameset(
         // has rows below the ones it holds.
         source: None,
         mode: RenderMode::Authored,
+        // A frameset fills its own viewport exactly, so the window never has a
+        // row of it to fill in. White is the colour of the gaps between the
+        // frames, which is what `render_frameset` clears its canvas to.
+        background: css::Color::rgb(0xff, 0xff, 0xff),
         content_height: height as f32,
         images_loaded: loaded,
         // The frameset document's own title, not any frame's: a frame is a
@@ -1208,6 +1220,53 @@ mod tests {
         assert!(
             rows_with_green.abs_diff(expected_rows) <= 2,
             "{widest}x{rows_with_green} is not the 15:2 image scaled down"
+        );
+    }
+
+    #[test]
+    fn the_document_fallback_paints_a_dark_page_and_says_so() {
+        // Two halves of the same thing. The canvas has to *be* dark, and the
+        // page has to *report* what colour it is: the window fills the rows it
+        // has no pixels for — below a short page, ahead of a band still being
+        // painted — and white there would be a lit strip beside the text.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            800,
+            0,
+            2000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+
+        let corner = &page.pixmap.data()[..4];
+        let brightness = |r: u8, g: u8, b: u8| {
+            (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0
+        };
+        assert!(
+            brightness(corner[0], corner[1], corner[2]) < 0.2,
+            "the fallback canvas came out {corner:?}"
+        );
+        assert_eq!(
+            (
+                page.background.r,
+                page.background.g,
+                page.background.b,
+                page.background.a
+            ),
+            (corner[0], corner[1], corner[2], corner[3]),
+            "the page reported a background it did not paint"
+        );
+
+        // And the author's own layout is left in the light, since the reader
+        // sheet is not applied to it.
+        let authored = render(html, 800, 2000, &mut fonts);
+        let lit = &authored.pixmap.data()[..4];
+        assert!(
+            brightness(lit[0], lit[1], lit[2]) > 0.8,
+            "the authored rendering went dark too: {lit:?}"
         );
     }
 

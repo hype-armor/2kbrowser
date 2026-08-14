@@ -83,9 +83,29 @@ small, sub, sup { font-size: 0.83em; }
 /// Deliberately opinionated and narrow-measure: once the author's layout has
 /// been discarded, something has to make the result pleasant, and defaulting to
 /// full-window line lengths would trade one unreadable rendering for another.
+///
+/// Dark, for the same reason it is narrow. This rendering is what a reader
+/// falls back to for the pages they mean to sit and read, and a full window of
+/// white is the wrong thing to hand them — which is why every reading mode
+/// worth using, Firefox's included, offers one. The palette is Firefox's: a
+/// near-black that is not quite black, off-white text so the contrast is not
+/// the maximum the display can produce, and a pale blue for links, since the
+/// UA sheet's `#0000ee` is unreadable against it.
+///
+/// The colours have to be stated rather than inherited from anywhere: the
+/// author's sheets are gone by the time this is applied, so what is left
+/// underneath is the UA sheet's black-on-white.
 pub const READER_STYLESHEET: &str = r#"
-body { margin: 40px; max-width: 42em; line-height: 1.5; }
+body {
+  margin: 40px;
+  max-width: 42em;
+  line-height: 1.5;
+  background-color: #1c1b22;
+  color: #fbfbfe;
+}
+a[href] { color: #8cb4ff; }
 img { max-width: 100%; }
+hr { border-top: 1px solid #5b5b66; }
 "#;
 
 #[cfg(test)]
@@ -109,5 +129,55 @@ mod tests {
     #[test]
     fn reader_stylesheet_parses() {
         assert!(!Stylesheet::parse(super::READER_STYLESHEET).rules.is_empty());
+    }
+
+    /// Perceived brightness, 0 for black and 1 for white.
+    ///
+    /// The coefficients are Rec. 601's, which is what "is this dark?" wants:
+    /// green reads as far brighter than blue at the same number, and comparing
+    /// the channels evenly would call a saturated blue light.
+    fn brightness(colour: crate::Color) -> f32 {
+        (0.299 * f32::from(colour.r) + 0.587 * f32::from(colour.g) + 0.114 * f32::from(colour.b))
+            / 255.0
+    }
+
+    #[test]
+    fn the_reader_sheet_is_dark() {
+        let doc = dom::parse("<body><p>text</p></body>");
+        let sheets = [Stylesheet::parse(super::READER_STYLESHEET)];
+        let map = crate::cascade::cascade(&doc, &sheets);
+        let body = map
+            .get(doc.find_element("body").expect("a body"))
+            .expect("a styled body");
+
+        assert!(
+            brightness(body.background_color) < 0.2,
+            "the reader background is {:?}, which is not dark",
+            body.background_color
+        );
+        assert!(
+            brightness(body.color) > 0.8,
+            "the reader text is {:?}, which will not read on a dark page",
+            body.color
+        );
+    }
+
+    #[test]
+    fn the_reader_sheet_recolours_links_for_a_dark_page() {
+        // The UA sheet's `#0000ee` is very nearly invisible against a near
+        // black background, and the reader sheet replaces the author's — so
+        // nothing else is going to fix this.
+        let doc = dom::parse(r#"<body><p><a href="/next">onwards</a></p></body>"#);
+        let plain = crate::cascade::cascade(&doc, &[]);
+        let reader = crate::cascade::cascade(&doc, &[Stylesheet::parse(super::READER_STYLESHEET)]);
+        let link = doc.find_element("a").expect("a link");
+
+        let default = plain.get(link).expect("a styled link").color;
+        let recoloured = reader.get(link).expect("a styled link").color;
+        assert_ne!(recoloured, default, "links kept the UA sheet's blue");
+        assert!(
+            brightness(recoloured) > 0.5,
+            "the link colour is {recoloured:?}, which will not read on a dark page"
+        );
     }
 }

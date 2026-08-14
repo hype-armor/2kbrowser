@@ -52,7 +52,7 @@ fail() {
 }
 
 [ -x "$browser" ] || fail "build it first: cargo build --release"
-for tool in Xvfb xdotool; do
+for tool in Xvfb xdotool xwd python3; do
     command -v "$tool" >/dev/null || fail "$tool is not installed"
 done
 
@@ -250,6 +250,48 @@ case "$after" in
     *) fail "after resizing to ${narrow}px the link was not where that width \
 puts it — the window is on: $after" ;;
 esac
+stop
+
+# 6. The document fallback reaches the screen dark, including the rows the
+#    child sent no pixels for.
+#
+#    Three things have to line up for this and none of them is reachable from
+#    `cargo test`: the reader sheet has to be applied, its canvas colour has to
+#    cross the pipe with the page, and `draw` has to fill the rows below a short
+#    page with *that* rather than with white. The last of those is one line
+#    inside the event loop, and the failure it guards against — a lit strip
+#    under every article — is exactly the kind that unit tests cannot see.
+pixel() {
+    DISPLAY=$display xwd -silent -id "$window" | python3 "$here/scripts/xwd-pixel.py" "$1" "$2"
+}
+
+# Dark enough to be the fallback's near-black rather than a white page, by
+# Rec. 601 brightness scaled to 0-255. A threshold rather than the exact colour:
+# this is checking that the page went dark, not what shade the sheet picked.
+dark() {
+    echo "$1" | awk '{ exit !((0.299 * $1 + 0.587 * $2 + 0.114 * $3) < 60) }'
+}
+
+start
+# Well below the content of this fixture, so it is a row the band does not
+# cover — the very rows `draw` has to colour itself.
+below=$((height - 60))
+before=$(pixel $((width / 2)) "$below")
+dark "$before" && fail "the page is already dark before the toggle, so this \
+check would pass without the fallback ever being asked for"
+
+after=$(click_and_read "$toggle_x" "$toggle_y")
+case "$after" in
+    *"rendered as document"*) ;;
+    *) fail "the layout toggle did not reach the renderer: $after" ;;
+esac
+for point in "$((width / 2)) 200" "$((width / 2)) $below" "$((width - 4)) 400"; do
+    # shellcheck disable=SC2086
+    got=$(pixel $point)
+    dark "$got" || fail "the document fallback left ($point) at $got, which is \
+not a dark page"
+done
+echo "ok: the document fallback reached the screen dark, edge to edge"
 stop
 
 echo "all window click checks passed"

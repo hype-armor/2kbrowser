@@ -808,6 +808,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             }],
             can_toggle_layout: true,
             images_loaded: 2,
+            background: 0x0011_2233,
             top: 0,
         }))
         .encode(),

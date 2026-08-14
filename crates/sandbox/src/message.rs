@@ -397,6 +397,13 @@ pub struct Rendered {
     /// reports it, and a page that suddenly loads no images is how a broken
     /// subresource path first shows itself.
     pub images_loaded: u32,
+    /// The colour the canvas was cleared to, packed as `0x00RRGGBB`.
+    ///
+    /// What the window fills the rows it has no pixels for with: below a page
+    /// shorter than the window, and ahead of a band still being painted. It is
+    /// always opaque — the child composites the page's background over white
+    /// before sending it — so no alpha channel crosses the pipe.
+    pub background: u32,
 }
 
 impl ToParent {
@@ -435,6 +442,7 @@ impl ToParent {
                 }
                 writer.some(page.can_toggle_layout);
                 writer.u32(page.images_loaded);
+                writer.u32(page.background);
             }
             ToParent::Failed { message } => {
                 writer.tag(2);
@@ -498,6 +506,10 @@ impl ToParent {
                 }
                 let can_toggle_layout = reader.some()?;
                 let images_loaded = reader.u32()?;
+                // Masked rather than rejected: the child is the untrusted side,
+                // and a stray high byte here is a colour question, not a
+                // structural one — there is nothing to refuse a frame over.
+                let background = reader.u32()? & 0x00ff_ffff;
                 // The pixel buffer has to match the dimensions it is labelled
                 // with, or every reader of it indexes out of bounds. Checked
                 // here rather than trusted, because the sender is the
@@ -520,6 +532,7 @@ impl ToParent {
                     links,
                     can_toggle_layout,
                     images_loaded,
+                    background,
                 }))
             }
             2 => ToParent::Failed {
@@ -569,6 +582,7 @@ mod tests {
             }],
             can_toggle_layout: true,
             images_loaded: 3,
+            background: 0x001c_1b22,
         }
     }
 

@@ -1196,6 +1196,10 @@ impl App {
 
         let (page_width, page_height) = (page.width(), page.height());
         let page_pixels = page.pixels();
+        // What the rows without pixels are filled with. The page's own canvas
+        // colour rather than white: white is invisible under a white page and a
+        // lit strip under any other, and the document rendering is dark.
+        let blank = page.background();
         // Where the painted band sits in the document, so a scroll offset in
         // document coordinates can be turned into a row of the band.
         let band_top = page.band_top();
@@ -1227,33 +1231,15 @@ impl App {
         for row in bar_height..height.get() {
             let document_row = row - bar_height + offset;
             let start = row as usize * viewport_width;
-            // Rows the painted band does not cover: past the end of the
-            // document, or ahead of a band still being painted. White rather
-            // than stale pixels either way — showing the previous band's rows
-            // under the wrong offset would be showing the wrong part of the
-            // page, which is worse than showing none of it.
-            let Some(source_row) = document_row.checked_sub(band_top) else {
-                buffer[start..start + viewport_width].fill(0x00ff_ffff);
-                continue;
-            };
-            if source_row >= page_height {
-                buffer[start..start + viewport_width].fill(0x00ff_ffff);
-                continue;
-            }
-            let source_start = source_row as usize * page_width as usize * 4;
-            for column in 0..viewport_width {
-                // Premultiplied RGBA as it crossed the pipe, packed to the 0RGB
-                // softbuffer wants. Bounds-checked per pixel because the row
-                // may be narrower than the window after a resize the child has
-                // not caught up with.
-                let at = source_start + column * 4;
-                buffer[start + column] = match page_pixels.get(at..at + 3) {
-                    Some(rgb) => {
-                        (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2])
-                    }
-                    None => 0x00ff_ffff,
-                };
-            }
+            compose_row(
+                &mut buffer[start..start + viewport_width],
+                page_pixels,
+                document_row
+                    .checked_sub(band_top)
+                    .filter(|it| *it < page_height),
+                page_width,
+                blank,
+            );
         }
 
         highlight_matches(
@@ -1272,6 +1258,39 @@ impl App {
             bar_height,
         );
         let _ = buffer.present();
+    }
+}
+
+/// Fills one row of the page area from the painted band.
+///
+/// `source_row` is `None` for a row the band does not cover: past the end of
+/// the document, or ahead of a band still being painted. Those are filled with
+/// `blank` — the page's own canvas colour — rather than left holding the
+/// previous band's pixels, which would be showing the wrong part of the page
+/// under the right offset, and worse than showing none of it. The colour comes
+/// from the page because a white strip beside a dark rendering is a hole in it.
+fn compose_row(
+    out: &mut [u32],
+    pixels: &[u8],
+    source_row: Option<u32>,
+    page_width: u32,
+    blank: u32,
+) {
+    let Some(source_row) = source_row else {
+        out.fill(blank);
+        return;
+    };
+    let source_start = source_row as usize * page_width as usize * 4;
+    for (column, slot) in out.iter_mut().enumerate() {
+        // Premultiplied RGBA as it crossed the pipe, packed to the 0RGB
+        // softbuffer wants. Bounds-checked per pixel because the row may be
+        // narrower than the window after a resize the child has not caught up
+        // with.
+        let at = source_start + column * 4;
+        *slot = match pixels.get(at..at + 3) {
+            Some(rgb) => (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]),
+            None => blank,
+        };
     }
 }
 
@@ -2287,5 +2306,41 @@ mod focus_outline_tests {
         let mut buffer = buffer();
         outline_focus(&mut buffer, &[], 0.0, (12, 12), 0);
         assert!(buffer.iter().all(|p| *p == 0x00ff_ffff));
+    }
+
+    use super::compose_row;
+
+    /// Two pixels of premultiplied RGBA, one row of a two-pixel-wide page.
+    fn page_row(rgb: (u8, u8, u8)) -> Vec<u8> {
+        let (r, g, b) = rgb;
+        vec![r, g, b, 0xff, r, g, b, 0xff]
+    }
+
+    const DARK: u32 = 0x001c_1b22;
+
+    #[test]
+    fn a_row_the_band_does_not_cover_is_the_pages_own_colour() {
+        // Below a page shorter than the window, and ahead of a band still being
+        // painted. White here was invisible while every page was white and is a
+        // lit strip beside the document rendering, which is dark.
+        let mut out = [0u32; 2];
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), None, 2, DARK);
+        assert_eq!(out, [DARK, DARK]);
+    }
+
+    #[test]
+    fn a_row_the_band_covers_comes_from_the_band() {
+        let mut out = [0u32; 2];
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        assert_eq!(out, [0x0011_2233, 0x0011_2233]);
+    }
+
+    #[test]
+    fn a_row_narrower_than_the_window_is_made_up_with_the_pages_colour() {
+        // What a resize the child has not caught up with looks like: the band
+        // is still the old width, and the columns past it have no pixel.
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
     }
 }
