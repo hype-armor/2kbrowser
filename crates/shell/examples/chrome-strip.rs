@@ -242,6 +242,46 @@ fn main() {
             saved: false,
             local_root: false,
         },
+        // The dark scheme, which until now this sheet did not draw at all — so
+        // "every state the bar can be in" was every state of one of the two
+        // themes. That was survivable while the schemes differed only in the
+        // colours behind text, and stopped being when the controls gained a
+        // surface of their own: a `Theme` colour given a real value for one
+        // scheme and a guess for the other passes every test and is wrong on
+        // screen, which is the failure this sheet exists to catch.
+        //
+        // Two rows, because the thing worth looking at is the difference
+        // between them — a control with a surface and one without.
+        chrome::State {
+            theme: chrome::Theme::DARK,
+            url: "https://example.com/a-perfectly-ordinary-page.html",
+            mode: &authored,
+            error: None,
+            can_go_back: false,
+            can_go_forward: false,
+            forcing_authored: false,
+            forcing_document: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: None,
+            saved: false,
+            local_root: false,
+        },
+        chrome::State {
+            theme: chrome::Theme::DARK,
+            url: "http://example.org/an-old-page.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: true,
+            forcing_authored: false,
+            forcing_document: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: None,
+            saved: true,
+            local_root: false,
+        },
     ];
 
     // Tab strips, drawn below the bars.

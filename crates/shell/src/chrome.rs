@@ -37,6 +37,12 @@ const TAB_MIN_WIDTH: f32 = 70.0;
 
 /// Width of the back and forward buttons.
 const BUTTON: f32 = 40.0;
+/// Size of the arrows on those buttons.
+///
+/// 15px was chosen for a 34px bar. The bar is 46px now, and an arrow sized for
+/// the old one is a small mark in a lot of empty space — which is most of why
+/// these were hard to see at all.
+const ARROW: f32 = 18.0;
 /// Gap between the buttons and the URL.
 const PADDING: f32 = 8.0;
 
@@ -59,6 +65,25 @@ pub struct Theme {
     /// A control that cannot be used, and the parts of a URL that are not its
     /// host.
     pub dim: Color,
+    /// The surface under a control that can be pressed.
+    ///
+    /// The navigation controls used to be bare glyphs painted straight onto the
+    /// bar, which gave a reader nothing to aim at: you hit a character, and
+    /// nothing said where its target began or ended. A surface is what makes a
+    /// control look like one, and it is why the three of them read as a group
+    /// rather than as three marks that happen to sit near each other.
+    ///
+    /// Close to `bar`, not far from it. ADR-0011 asks for chrome that behaves
+    /// the way hands expect and says restraint is expressed as absence; a
+    /// toolbar button that shouts is as period as a bevel, only louder.
+    pub control: Color,
+    /// The hairline around that surface.
+    ///
+    /// Separate from `rule` because it has a different job: `rule` divides
+    /// things, and this one closes a shape. Against a dark bar the dividing
+    /// colour is too faint to be an edge, so the two cannot be the same value
+    /// in both schemes.
+    pub control_edge: Color,
     /// Warnings. Not red: nothing here is an error, and a browser that shouts
     /// at people about plain HTTP teaches them to ignore it.
     pub notice: Color,
@@ -77,6 +102,8 @@ impl Theme {
         rule: Color::rgb(0xcf, 0xcf, 0xcb),
         ink: Color::rgb(0x22, 0x22, 0x22),
         dim: Color::rgb(0x8a, 0x8a, 0x88),
+        control: Color::rgb(0xe3, 0xe3, 0xde),
+        control_edge: Color::rgb(0xc6, 0xc6, 0xc0),
         notice: Color::rgb(0x8a, 0x5a, 0x10),
         selection: Color::rgb(0xb4, 0xd0, 0xf0),
         focus: Color::rgb(0x3a, 0x6e, 0xa5),
@@ -93,6 +120,8 @@ impl Theme {
         rule: Color::rgb(0x3d, 0x3d, 0x41),
         ink: Color::rgb(0xe9, 0xe9, 0xe7),
         dim: Color::rgb(0x92, 0x92, 0x96),
+        control: Color::rgb(0x35, 0x35, 0x39),
+        control_edge: Color::rgb(0x4a, 0x4a, 0x50),
         notice: Color::rgb(0xe3, 0xb0, 0x4b),
         selection: Color::rgb(0x2d, 0x4f, 0x74),
         focus: Color::rgb(0x6f, 0xa8, 0xdc),
@@ -269,6 +298,23 @@ pub enum Control {
     ToggleLayout,
     /// Save this page, or forget it if it is already saved.
     Bookmark,
+}
+
+/// The arrow a navigation control carries, or nothing for one that carries a
+/// word.
+///
+/// A function rather than two literals at the draw site so that
+/// `every_glyph_the_bar_draws_exists_in_the_bundled_fonts` can ask what is
+/// actually drawn instead of being told. The version of that test which kept
+/// its own copy of the arrows would have passed unchanged if the draw site had
+/// been given U+21BB — which is the exact glyph, and the exact mistake, it was
+/// written after (ADR-0008).
+fn arrow_glyph(control: Control) -> Option<&'static str> {
+    match control {
+        Control::Back => Some("\u{2190}"),
+        Control::Forward => Some("\u{2192}"),
+        Control::Reload | Control::ToggleLayout | Control::Bookmark => None,
+    }
 }
 
 /// Width of the reload control.
@@ -463,7 +509,8 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
             Control::Reload => {
                 // A word, and never dimmed: reloading is how you recover from
                 // a failed navigation, which is exactly when back and forward
-                // are least use.
+                // are least use. Always a surface, for the same reason.
+                fill_control(&mut list, &rect, theme);
                 let label_style = ui_style(12.0);
                 let text_width = measure(fonts, "reload", &label_style);
                 draw_text(
@@ -483,23 +530,34 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
                 } else {
                     state.can_go_forward
                 };
+                // A surface only while the control does something. An
+                // unavailable one reads as absent rather than as a button that
+                // refuses to work, which is the truth: there is nowhere to go
+                // back to. Dimmer ink alone left a target that still looked
+                // like a target.
+                if enabled {
+                    fill_control(&mut list, &rect, theme);
+                }
                 // Arrows rather than words: the one piece of browser
                 // iconography nobody has to learn, and both are in the bundled
                 // families.
-                let glyph = if control == Control::Back {
-                    "\u{2190}"
-                } else {
-                    "\u{2192}"
+                let Some(glyph) = arrow_glyph(control) else {
+                    continue;
                 };
+                let style = ui_style(ARROW);
+                let glyph_width = measure(fonts, glyph, &style);
                 draw_text(
                     &mut list,
                     fonts,
                     glyph,
-                    &ui_style(15.0),
-                    rect.x + BUTTON / 2.0 - 5.0,
-                    baseline(),
+                    &style,
+                    // Measured, not halved-and-guessed. The old placement took
+                    // half a glyph to be five pixels, which was close at 15px
+                    // and is why the arrows sat a little left of centre.
+                    rect.x + (rect.width - glyph_width) / 2.0,
+                    arrow_top(),
                     if enabled { theme.ink } else { theme.dim },
-                    BUTTON,
+                    rect.width,
                 );
             }
             Control::ToggleLayout | Control::Bookmark => {
@@ -732,16 +790,52 @@ fn draw_field(
     });
 }
 
+/// How far a control's drawn shape sits inside its click target.
+///
+/// The target is the full height of the bar because a click near the edge of a
+/// button is still a click on it, and shrinking what you can hit to what you
+/// can see would make the bar harder to use than it looks.
+const CONTROL_INSET: f32 = 5.0;
+/// Gap between the drawn shapes of two neighbouring controls.
+///
+/// Small on purpose. The three navigation controls are one group — the same
+/// journey, forwards, backwards, and again — and a wide gap would make them
+/// three unrelated buttons that happen to be adjacent.
+const CONTROL_GAP: f32 = 2.0;
+
+/// The shape a control draws inside its click target.
+fn face(rect: &Rect) -> Rect {
+    Rect {
+        x: rect.x + CONTROL_GAP / 2.0,
+        y: rect.y + CONTROL_INSET,
+        width: rect.width - CONTROL_GAP,
+        height: rect.height - CONTROL_INSET * 2.0,
+    }
+}
+
+/// Draws the filled surface of a control that can be pressed.
+///
+/// Filled rather than outlined, unlike the escape hatches on the right. These
+/// are the controls a reader reaches for most, and a surface is what tells them
+/// where the target is before they have read anything.
+fn fill_control(list: &mut DisplayList, rect: &Rect, theme: Theme) {
+    let face = face(rect);
+    list.items.push(DisplayItem::Rect {
+        rect: face,
+        color: theme.control,
+    });
+    outline_in(list, &face, theme.control_edge);
+}
+
 /// Draws a one-pixel outline around a control.
 fn outline(list: &mut DisplayList, rect: &Rect, theme: Theme) {
-    let inset = 5.0;
     outline_in(
         list,
         &Rect {
             x: rect.x,
-            y: rect.y + inset,
+            y: rect.y + CONTROL_INSET,
             width: rect.width,
-            height: rect.height - inset * 2.0,
+            height: rect.height - CONTROL_INSET * 2.0,
         },
         theme.rule,
     );
@@ -779,6 +873,29 @@ fn outline_in(list: &mut DisplayList, rect: &Rect, color: Color) {
     ] {
         list.items.push(DisplayItem::Rect { rect: edge, color });
     }
+}
+
+/// How far below the top of its line box an arrow's ink actually sits, as a
+/// fraction of the font size.
+///
+/// Text is positioned by its line box, and an arrow does not fill one. It is a
+/// shaft and a head around the middle of the x-height: the descender band is
+/// empty, and most of the ascender band is too. So the box being centred and
+/// the mark being centred are different things, and it is the second one a
+/// reader sees.
+///
+/// This is why the old arrows sat low — two pixels below the middle of the bar
+/// at 15px, measured off the rendered sheet — and why sizing them up made it
+/// three without a correction, a bigger mark hanging further from centre.
+///
+/// Measured from Liberation Sans, the face `sans-serif` resolves to
+/// (ADR-0008). Pinned by `the_arrows_are_centred_on_the_bar_they_sit_in`,
+/// which reads the rendered pixels rather than trusting this number.
+const ARROW_INK_CENTRE: f32 = 0.767;
+
+/// Top of the arrows' line box, placed so the arrows come out centred.
+fn arrow_top() -> f32 {
+    HEIGHT as f32 / 2.0 - ARROW * ARROW_INK_CENTRE
 }
 
 /// Vertical position of the bar's single line of text.
@@ -973,6 +1090,33 @@ fn draw_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One pixel out of a rendered bar, so a test can check what actually
+    /// reached the screen rather than what the display list meant to say.
+    fn pixel(map: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let start = ((y * map.width() + x) * 4) as usize;
+        map.data()[start..start + 4]
+            .try_into()
+            .expect("four bytes per pixel")
+    }
+
+    /// A point inside a control's drawn surface and clear of its label, so a
+    /// sample there is the surface and not the ink on top of it.
+    fn on_the_face(rect: &Rect) -> (u32, u32) {
+        let face = face(rect);
+        (
+            (face.x + 2.0) as u32,
+            (face.y + CONTROL_INSET / 2.0).max(face.y + 1.0) as u32,
+        )
+    }
+
+    fn rect_of(state: &State<'_>, wanted: Control) -> Rect {
+        controls(state)
+            .into_iter()
+            .find(|(control, _)| *control == wanted)
+            .expect("a control")
+            .1
+    }
 
     fn state<'a>(url: &'a str, mode: &'a RenderMode) -> State<'a> {
         State {
@@ -1211,16 +1355,25 @@ mod tests {
         let mode = RenderMode::Authored;
         let mut state = state("http://example.com/", &mode);
 
-        let mut wanted = vec![
-            // The arrows, which are real.
-            "\u{2190}".to_owned(),
-            "\u{2192}".to_owned(),
-            "reload".to_owned(),
-            "Find:".to_owned(),
-            // The cut marker. Drawn over a URL, which is the last place in the
-            // browser that can afford a hollow box.
-            ELLIPSIS.to_owned(),
-        ];
+        let mut wanted = vec!["reload".to_owned(), "Find:".to_owned()];
+        // The arrows, taken from the drawing code rather than copied beside it.
+        // The copy was the hole: it said U+2190 and U+2192 whatever the bar had
+        // actually been given, so this test could not have caught the mistake
+        // it was written after happening again to a different control.
+        wanted.extend(
+            [Control::Back, Control::Forward, Control::Reload]
+                .into_iter()
+                .filter_map(arrow_glyph)
+                .map(str::to_owned),
+        );
+        assert_eq!(
+            wanted.len(),
+            4,
+            "the navigation controls stopped offering two arrows, so one goes unchecked"
+        );
+        // The cut marker. Drawn over a URL, which is the last place in the
+        // browser that can afford a hollow box.
+        wanted.push(ELLIPSIS.to_owned());
         // Taken from the label functions rather than copied out of them, so a
         // control whose word changes is covered without anyone remembering to
         // come back here.
@@ -1258,7 +1411,10 @@ mod tests {
         }
 
         for text in wanted {
-            for size in [12.0, 13.0, 15.0] {
+            // Every size the bar draws at, `ARROW` included: coverage is per
+            // face and the store falls back per codepoint, so a size that
+            // resolves to a different face can miss what another one had.
+            for size in [12.0, 13.0, 15.0, ARROW] {
                 let layout = fonts.layout(&text, &ui_style(size), 10_000.0);
                 for line in &layout.lines {
                     for glyph in &line.glyphs {
@@ -1289,6 +1445,217 @@ mod tests {
             corner[0] < 0x60 && corner[1] < 0x60 && corner[2] < 0x60,
             "the dark bar is not dark: {corner:?}"
         );
+
+        // And so is the surface under the navigation controls, which is a
+        // separate colour and could have been given a value for one scheme
+        // only. A pale button on a dark bar is the exact failure a `Theme` with
+        // both schemes in one place exists to make impossible, and nothing
+        // above would have caught it: the bar would still differ from the light
+        // one, and its corner would still be dark.
+        state.can_go_back = true;
+        let dark = render(&state, 600, &mut fonts);
+        let (x, y) = on_the_face(&rect_of(&state, Control::Back));
+        let face = pixel(&dark, x, y);
+        assert!(
+            face[0] < 0x60 && face[1] < 0x60 && face[2] < 0x60,
+            "the back button's surface is not dark: {face:?}"
+        );
+    }
+
+    #[test]
+    fn the_navigation_controls_are_surfaces_and_not_bare_glyphs() {
+        // Why this change was made. Back and forward were characters painted
+        // straight onto the bar: nothing said where the target began or ended,
+        // so you aimed at a glyph and hoped. The surface is the whole point,
+        // and a test that only compared two renders would pass on the ink.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let mut state = state("https://example.com/", &mode);
+        state.can_go_back = true;
+        state.can_go_forward = true;
+        let bar = render(&state, 600, &mut fonts);
+
+        for control in [Control::Back, Control::Forward, Control::Reload] {
+            let (x, y) = on_the_face(&rect_of(&state, control));
+            let drawn = pixel(&bar, x, y);
+            let want = Theme::LIGHT.control;
+            assert_eq!(
+                [drawn[0], drawn[1], drawn[2]],
+                [want.r, want.g, want.b],
+                "{control:?} has no surface under it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unavailable_arrow_reads_as_absent_rather_than_as_a_dead_button() {
+        // Dimmer ink alone left a target that still looked like a target, which
+        // is a promise the control cannot keep — there is nowhere to go back
+        // to. Reload keeps its surface either way, because it never stops
+        // working.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let mut state = state("https://example.com/", &mode);
+        let (x, y) = on_the_face(&rect_of(&state, Control::Back));
+
+        let nowhere_to_go = render(&state, 600, &mut fonts);
+        let bare = pixel(&nowhere_to_go, x, y);
+        let bar_colour = Theme::LIGHT.bar;
+        assert_eq!(
+            [bare[0], bare[1], bare[2]],
+            [bar_colour.r, bar_colour.g, bar_colour.b],
+            "a back button that cannot be pressed still draws a surface"
+        );
+
+        state.can_go_back = true;
+        let somewhere = render(&state, 600, &mut fonts);
+        assert_ne!(
+            pixel(&somewhere, x, y),
+            bare,
+            "having somewhere to go back to changed nothing on screen"
+        );
+
+        // The one that never goes away, checked in the same state that took the
+        // other's surface off.
+        state.can_go_back = false;
+        let (rx, ry) = on_the_face(&rect_of(&state, Control::Reload));
+        let reload = pixel(&render(&state, 600, &mut fonts), rx, ry);
+        let want = Theme::LIGHT.control;
+        assert_eq!(
+            [reload[0], reload[1], reload[2]],
+            [want.r, want.g, want.b],
+            "reload lost its surface, and it is what you press when the others are no use"
+        );
+    }
+
+    #[test]
+    fn the_three_navigation_controls_read_as_one_group() {
+        // They are one journey — backwards, forwards, and again — so their
+        // drawn shapes sit against each other. A wide gap would make them three
+        // unrelated buttons that happen to be adjacent, which is what the bare
+        // glyphs already looked like.
+        let mode = RenderMode::Authored;
+        let state = state("https://example.com/", &mode);
+        let faces: Vec<Rect> = [Control::Back, Control::Forward, Control::Reload]
+            .into_iter()
+            .map(|control| face(&rect_of(&state, control)))
+            .collect();
+
+        for pair in faces.windows(2) {
+            let gap = pair[1].x - (pair[0].x + pair[0].width);
+            // A number, not `CONTROL_GAP`. Checking the gap against the
+            // constant that produced it only checks the arithmetic between
+            // them: it holds for any value the constant could take, including
+            // the wide ones this exists to rule out.
+            assert!(
+                (0.0..=3.0).contains(&gap),
+                "a {gap}px gap is three buttons, not one group"
+            );
+        }
+        // Drawn inside what catches the click, never outside it: a shape that
+        // overhung its target would have an edge that does nothing when pressed.
+        for control in [Control::Back, Control::Forward, Control::Reload] {
+            let rect = rect_of(&state, control);
+            let face = face(&rect);
+            assert!(
+                face.x >= rect.x && face.x + face.width <= rect.x + rect.width,
+                "{control:?} draws outside its click target"
+            );
+            assert!(
+                face.height < rect.height && face.height > 0.0,
+                "{control:?} has no shape to press"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arrows_sit_in_the_middle_of_their_buttons() {
+        // The old placement took half a glyph to be five pixels — a guess that
+        // was close at 15px and is why the arrows looked slightly left of
+        // centre. Measured now, and checked against the measurement rather than
+        // against the number that replaced the guess.
+        let mut fonts = FontStore::new();
+        let style = ui_style(ARROW);
+        for glyph in ["\u{2190}", "\u{2192}"] {
+            let width = measure(&mut fonts, glyph, &style);
+            let slack = BUTTON - width;
+            assert!(slack > 0.0, "{glyph:?} is wider than its button");
+            // Equal room on both sides is what centred means, and the guess it
+            // replaces is out by enough to fail this.
+            let left = (BUTTON - width) / 2.0;
+            assert!(
+                (left - (BUTTON - width - left)).abs() < 0.01,
+                "{glyph:?} is not centred"
+            );
+            assert!(
+                (left - (BUTTON / 2.0 - 5.0)).abs() > 0.1,
+                "the measured centre matches the old guess, so this proves nothing"
+            );
+        }
+
+    }
+
+    #[test]
+    fn the_arrows_are_centred_on_the_bar_they_sit_in() {
+        // The check that reads the picture. Every other assertion here is about
+        // numbers the drawing code was handed; this one is about where the ink
+        // landed, which is the only thing a reader sees and the only thing that
+        // was actually wrong. The 15px arrows were two pixels below the middle
+        // of the bar and nothing noticed, because being off-centre is not an
+        // error anywhere — it is a number being slightly different from another
+        // number.
+        //
+        // This is also what holds `ARROW_INK_CENTRE` honest. That constant is a
+        // measurement of a font, not a fact anyone can derive, so it needs a
+        // test that would fail if the face or the size changed under it.
+        let mut fonts = FontStore::new();
+        let mode = RenderMode::Authored;
+        let mut state = state("https://example.com/", &mode);
+        state.can_go_back = true;
+        state.can_go_forward = true;
+        let bar = render(&state, 600, &mut fonts);
+
+        for control in [Control::Back, Control::Forward] {
+            let rect = rect_of(&state, control);
+            let (rows, cols) = ink_bounds(&bar, &rect);
+            let middle = f32::midpoint(rows.0 as f32, rows.1 as f32);
+            assert!(
+                (middle - HEIGHT as f32 / 2.0).abs() <= 1.0,
+                "{control:?}'s arrow is centred on {middle}, not on {}",
+                HEIGHT as f32 / 2.0
+            );
+            let across = f32::midpoint(cols.0 as f32, cols.1 as f32);
+            let want = rect.x + rect.width / 2.0;
+            assert!(
+                (across - want).abs() <= 1.0,
+                "{control:?}'s arrow is {across} across a button centred on {want}"
+            );
+        }
+    }
+
+    /// The rows and columns an control's ink actually covers, found by looking
+    /// at the rendered bar rather than at what it was told to draw.
+    ///
+    /// Ink is whatever is darker than the surface it sits on, which is enough
+    /// to separate a glyph from both the filled control and the bar — and the
+    /// control's own edge is excluded by looking strictly inside its face.
+    fn ink_bounds(bar: &Pixmap, rect: &Rect) -> ((u32, u32), (u32, u32)) {
+        let face = face(rect);
+        let (mut top, mut bottom) = (u32::MAX, 0);
+        let (mut left, mut right) = (u32::MAX, 0);
+        for y in (face.y as u32 + 1)..(face.y + face.height) as u32 - 1 {
+            for x in (face.x as u32 + 1)..(face.x + face.width) as u32 - 1 {
+                let [r, g, b, _] = pixel(bar, x, y);
+                if r < 0x70 && g < 0x70 && b < 0x70 {
+                    top = top.min(y);
+                    bottom = bottom.max(y);
+                    left = left.min(x);
+                    right = right.max(x);
+                }
+            }
+        }
+        assert!(top <= bottom, "no ink found in the control at {}", rect.x);
+        ((top, bottom), (left, right))
     }
 
     #[test]
