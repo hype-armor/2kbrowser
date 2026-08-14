@@ -325,7 +325,11 @@ parses a byte from the network is in it.
 
 All three are checked from inside, in CI, on every push. A machine where the
 sandbox cannot be installed is a skip on a laptop and a failure on a runner,
-because a runner is where these claims get made.
+because a runner is where these claims get made. A runner is also only one
+machine: a user has since reported the Windows container failing to launch on
+theirs, which four green runners a push cannot rule out and which is not
+explained — so the claim above is about the sandbox being installable, not about
+it being installed everywhere.
 
 A syscall the allowlist forgot returns `EPERM` rather than killing the process.
 That is a deliberate softening: a call nobody measured costs a page, which the
@@ -350,6 +354,11 @@ the outside.
 > container falls back to an unconfined renderer, saying so on stderr and in
 > `--confine-selftest` — a fallback that stayed silently broken in CI for weeks,
 > because the test that should have caught it was skipping rather than failing.
+> **It is not a closed problem.** A user has reported the same launch failure
+> from a release build on their own machine since, with CI green on every push
+> either side of it, and it is unexplained: everything about that launch which
+> does not vary by machine is ruled out by CI succeeding, and what is left needs
+> a report from the machine that fails. The failure now prints those inputs.
 > Only loopback is probed there; what rules out outbound is the capability set
 > being empty, asserted directly. Until an outside reader has been through this,
 > it is a tool for its authors.

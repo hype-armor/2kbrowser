@@ -116,6 +116,53 @@ static PREPARED: std::sync::OnceLock<Result<SecurityCapabilities, String>> =
 /// Executables already granted access, so the DACL is rewritten once each.
 static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+/// The variables the renderer is given, where the parent has them.
+///
+/// `SystemRoot` and `windir` are how the loader finds the system DLLs every
+/// Windows process links; the processor variables are read by the C runtime
+/// during startup.
+///
+/// Named at module scope rather than inside [`environment`] because a launch
+/// that fails needs to say which of them the machine did not have — see
+/// [`launch_inputs`]. Absence is silent otherwise: the block is built with
+/// `filter_map`, so a variable the parent lacks is simply not passed on, and
+/// that is exactly the shape of the bug this list has already had twice.
+#[cfg(target_os = "windows")]
+const WANTED: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    // Not needed by the renderer, which opens no files, but an AppContainer
+    // redirects these into its own profile anyway, so they leak nothing and
+    // their absence surprises anything that assumes them.
+    "TEMP",
+    "TMP",
+    // The same argument one step back, and the actual cause of the launch
+    // failure this list spent three attempts on. Redirecting `TEMP` into the
+    // package profile means *computing* where that profile is, and Windows does
+    // that from these. An explicit block that omits them is precisely what "the
+    // system could not find the environment option that was entered" is
+    // complaining about — the error names the problem, in its way, and reads as
+    // nonsense until you know which option it means.
+    //
+    // They name the user's own directories, which the first version of this
+    // list avoided on purpose. Kept because the alternative is no AppContainer
+    // at all, and safe because the container cannot open any of them: a path it
+    // may not follow is a string.
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    // Only when the operator asked for it.
+    "RUST_BACKTRACE",
+];
+
 /// The environment the renderer is given.
 ///
 /// Named, rather than inherited. Two reasons, and both are the point.
@@ -164,45 +211,30 @@ static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new(
 /// adds, in the order Win32 asks for. `RUST_BACKTRACE` is passed through when
 /// it is set, because a renderer that panics is the case where its output
 /// matters most.
+///
+/// # It is still an allowlist, and that is the risk that is left
+///
+/// The same error has since been reported again, from a machine none of the
+/// above reached: a release build, on Windows, falling back to an unconfined
+/// renderer at `CreateProcessW`. Nothing was changed here in response, because
+/// nothing about it could be established without the machine — CI has launched
+/// the identical container on every push since, and every input to that launch
+/// that does *not* vary by machine is therefore already ruled out. What is
+/// left is this list and the package directory, and the way to tell them apart
+/// is to look, which is what [`launch_inputs`] now makes the failure say.
+///
+/// The shape of the risk is worth naming rather than discovering a fourth
+/// time. [`WANTED`] is a hand-picked allowlist, so every machine that needs a
+/// variable nobody thought of gets a renderer with no sandbox, and the only
+/// signal is a line on stderr. `rappct`'s own remedy for error 203 is the
+/// opposite trade — `RAPPCT_TEST_FORCE_ENV` passes the *whole* parent
+/// environment — which would end this class of failure and hand the process
+/// that parses hostile documents the tokens and credentials a browser's
+/// environment holds. That is not obviously the wrong trade and it is not one
+/// to make from a guess about which variable was missing; it needs the report
+/// from a machine that fails, which is now a report worth having.
 #[cfg(target_os = "windows")]
 fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    // `SystemRoot` and `windir` are how the loader finds the system DLLs every
-    // Windows process links; the processor variables are read by the C runtime
-    // during startup.
-    const WANTED: &[&str] = &[
-        "SystemRoot",
-        "windir",
-        "SystemDrive",
-        "ComSpec",
-        "PATHEXT",
-        "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",
-        "PROCESSOR_IDENTIFIER",
-        "PROCESSOR_LEVEL",
-        "PROCESSOR_REVISION",
-        // Not needed by the renderer, which opens no files, but an
-        // AppContainer redirects these into its own profile anyway, so they
-        // leak nothing and their absence surprises anything that assumes them.
-        "TEMP",
-        "TMP",
-        // The same argument one step back, and the actual cause of the launch
-        // failure this function spent three attempts on. Redirecting `TEMP`
-        // into the package profile means *computing* where that profile is, and
-        // Windows does that from these. An explicit block that omits them is
-        // precisely what "the system could not find the environment option that
-        // was entered" is complaining about — the error names the problem, in
-        // its way, and reads as nonsense until you know which option it means.
-        //
-        // They name the user's own directories, which the first version of this
-        // list avoided on purpose. Kept because the alternative is no
-        // AppContainer at all, and safe because the container cannot open any
-        // of them: a path it may not follow is a string.
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "APPDATA",
-        // Only when the operator asked for it.
-        "RUST_BACKTRACE",
-    ];
     let wanted = WANTED
         .iter()
         .filter_map(|name| {
@@ -218,6 +250,85 @@ fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut environment = rappct::launch::merge_parent_env(wanted);
     environment.sort_by_key(|(name, _)| name.to_string_lossy().to_lowercase());
     environment
+}
+
+/// What this machine handed the launch, for a failure only it can see.
+///
+/// `CreateProcessW` reports a container it would not build as a three-digit
+/// code, and the code is not about the thing that is wrong: this file's history
+/// is two rounds of guessing at `ERROR_ENVVAR_NOT_FOUND (203)` and one round of
+/// printing what the launch had been handed, which is the one that ended it.
+/// The same error has now been reported from a machine none of the fixes
+/// reached, and the number on its own says no more this time than it did then.
+///
+/// So this says what went in, split into the two kinds, because the split is
+/// the whole diagnostic value:
+///
+/// * **The same on every machine.** The capability count and the LPAC flag,
+///   which together fix the shape of the attribute list — one entry for the
+///   security capabilities, one for the inherited pipes, and, since LPAC is
+///   never asked for here, no third. CI launches that identical structure on
+///   every push and it succeeds, so a failure reporting `capabilities=0
+///   lpac=false` is a failure that cannot be about the attribute list, however
+///   much "extended startup with AC/LPAC" in the error sounds like it is. That
+///   phrase is a fixed hint in `rappct`, printed whether or not LPAC was used.
+///   Named here to be ruled out, not because they are suspects.
+/// * **Only this machine's.** The package SID, whether the package directory
+///   exists, and which of [`WANTED`] the parent did not have. These are the
+///   only inputs that differ between a green CI run and a user's desktop, so a
+///   launch that fails on one and not on the other is about one of them — and
+///   the first two tell a profile that was never really created from an
+///   environment block that is missing something, which is otherwise the same
+///   error twice.
+///
+/// Names, never values. Not inheriting the environment is the whole point of
+/// [`environment`] — a browser's holds tokens and someone's directory layout —
+/// and a diagnostic that printed them into a bug report would hand them to a
+/// wider audience than the renderer was refused.
+#[cfg(target_os = "windows")]
+fn launch_inputs(capabilities: &SecurityCapabilities) -> String {
+    let absent: Vec<&str> = WANTED
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_none())
+        .collect();
+    let absent = if absent.is_empty() {
+        "none".to_owned()
+    } else {
+        absent.join(",")
+    };
+
+    // `CreateAppContainerProfile` makes this directory, named for the profile,
+    // and `rappct` falls back to *deriving* the SID when the call fails with
+    // `ERROR_INVALID_PARAMETER` — so a container can be built, and this
+    // directory still not exist, and nothing before the launch would say so.
+    // Windows redirects the child's `TEMP` into it as the process starts.
+    let package_directory = match std::env::var_os("LOCALAPPDATA") {
+        Some(local) => {
+            if Path::new(&local)
+                .join("Packages")
+                .join(PROFILE_NAME)
+                .is_dir()
+            {
+                "present"
+            } else {
+                "absent"
+            }
+        }
+        // Which is itself the finding, and one this cannot be reached with:
+        // `LOCALAPPDATA` is in `WANTED`, so it would be named above too.
+        None => "unknown, LOCALAPPDATA is not set",
+    };
+
+    format!(
+        "launch inputs: capabilities={} lpac={} package-sid={} \
+         package-directory={package_directory} \
+         environment-variables={} wanted-but-absent={absent}",
+        capabilities.caps.len(),
+        capabilities.lpac,
+        capabilities.package.as_string(),
+        environment().len(),
+    )
 }
 
 /// A built AppContainer, ready to spawn renderers into.
@@ -325,8 +436,20 @@ impl Container {
             ..Default::default()
         };
 
-        let mut io = launch_in_container_with_io(&self.capabilities, &options)
-            .map_err(|error| format!("could not start a contained renderer: {}", chain(&error)))?;
+        // The inputs go out with the failure rather than behind a flag. A
+        // launch that fails here is a security control degrading on a machine
+        // nobody here can see, and the report of it is the whole evidence there
+        // will ever be — asking the person who hit it to rebuild with a
+        // diagnostic turned on costs a round trip that this file has already
+        // spent three times.
+        let mut io =
+            launch_in_container_with_io(&self.capabilities, &options).map_err(|error| {
+                format!(
+                    "could not start a contained renderer: {}; {}",
+                    chain(&error),
+                    launch_inputs(&self.capabilities)
+                )
+            })?;
 
         // The child's stderr is a pipe rather than the parent's console, because
         // an AppContainer cannot be handed an arbitrary inherited console
@@ -452,6 +575,62 @@ mod tests {
         assert!(
             !capabilities.lpac,
             "LPAC changes which capabilities are needed, so it is not a free upgrade"
+        );
+    }
+
+    #[test]
+    fn the_three_variables_that_locate_the_package_profile_are_still_asked_for() {
+        // These three cost a user's bug report, two guesses, and a CI run that
+        // had been failing invisibly for days. Windows redirects an
+        // AppContainer's `TEMP` into its package profile as the process starts
+        // and works out where that profile is from them, so an explicit
+        // environment block without them is a launch that fails with a message
+        // about an environment option nobody entered.
+        //
+        // Named individually here because the reason they are in `WANTED` is
+        // not visible from the renderer's own needs — it opens no files and
+        // wants none of them — so they read like the sort of thing a later
+        // tidy-up removes for privacy, which is exactly the argument that put
+        // the bug there the first time.
+        for locates_the_profile in ["USERPROFILE", "LOCALAPPDATA", "APPDATA"] {
+            assert!(
+                WANTED.contains(&locates_the_profile),
+                "{locates_the_profile} is how Windows finds the package profile",
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_launch_reports_what_only_this_machine_could_have_contributed() {
+        // A diagnostic that prints nothing useful is the same shape of mistake
+        // as a check that cannot fail, and this file has produced three of
+        // those. So: the report must name the inputs that vary by machine —
+        // they are the only ones a green CI run does not already rule out — and
+        // must not print any variable's value.
+        let sid = rappct::derive_sid_from_name(PROFILE_NAME).expect("derives the package SID");
+        let capabilities = SecurityCapabilitiesBuilder::new(&sid)
+            .build()
+            .expect("builds the capability set");
+        let report = launch_inputs(&capabilities);
+
+        for named in [
+            "capabilities=0",
+            "lpac=false",
+            "package-sid=",
+            "package-directory=",
+            "wanted-but-absent=",
+        ] {
+            assert!(report.contains(named), "no `{named}` in:\n{report}");
+        }
+
+        // Names, never values. `SystemRoot` is set on every Windows machine
+        // there is, so its value is the one that can be checked for without
+        // arranging anything — and if it leaked, so would `USERPROFILE`, which
+        // is somebody's name.
+        let system_root = std::env::var("SystemRoot").expect("Windows sets this");
+        assert!(
+            !report.contains(&system_root),
+            "the report printed a variable's value:\n{report}"
         );
     }
 }
