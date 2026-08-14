@@ -18,10 +18,13 @@
 //! whole point — the renderer's needs are memory and CPU, and every resource it
 //! wants is a request the parent answers over the pipe.
 //!
-//! That makes the Windows confinement stronger than the Linux one rather than
-//! equivalent to it. Linux gets a denylist, so a syscall nobody named is
-//! allowed; an AppContainer with no capabilities refuses by default and grants
-//! only what is named, and nothing is named.
+//! Both platforms refuse by default now — the Linux filter became an allowlist
+//! in [ADR-0016](../../../docs/adr/0016-syscall-allowlist-measured.md), and
+//! before that this paragraph said the Windows side was categorically stronger
+//! for exactly that reason. What is left is a difference in kind rather than in
+//! strength. seccomp filters *calls* and is installed by the process being
+//! confined; an AppContainer restricts access to *resources* and is built by the
+//! parent, so nothing the child does can undo it. Neither subsumes the other.
 //!
 //! # What it still needs
 //!
@@ -113,6 +116,110 @@ static PREPARED: std::sync::OnceLock<Result<SecurityCapabilities, String>> =
 /// Executables already granted access, so the DACL is rewritten once each.
 static GRANTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+/// The environment the renderer is given.
+///
+/// Named, rather than inherited. Two reasons, and both are the point.
+///
+/// **It is what the parent knows.** A browser's environment routinely holds
+/// API tokens, proxy credentials, and the shape of someone's home directory,
+/// and handing all of it to the process that parses hostile documents is
+/// exactly backwards. The renderer reads a pipe, allocates, and computes; it
+/// has no use for any of it.
+///
+/// **Inheriting does not work everywhere.** Passing no environment block means
+/// `CreateProcessW` uses the caller's, and on some machines that fails when the
+/// child is going into an AppContainer — reported as
+/// `ERROR_ENVVAR_NOT_FOUND (203)`, "the system could not find the environment
+/// option that was entered", which is an unusually unhelpful way to say it.
+/// `rappct` documents an explicit block as the remedy.
+///
+/// The first version of this said the bug "was not reproducible on CI and was
+/// on a real machine, which is the ordinary shape of an environment-dependent
+/// bug". That was wrong, and wrong in the way that costs the most: it *was*
+/// happening on CI, on every push, and the test that should have said so was
+/// skipping silently because no sandbox had been installed. The explicit block
+/// did not fix the error — it was the error, and nothing was watching.
+///
+/// What was missing was the three variables Windows needs to work out where an
+/// AppContainer's package profile lives — `USERPROFILE`, `LOCALAPPDATA`, and
+/// `APPDATA`. It redirects `TEMP` into that profile as the process starts, and
+/// cannot when the block it was handed does not say where the user's is. The
+/// error is not as unhelpful as it looks once you know which option it means.
+///
+/// Two other things were wrong with the block, found first because `rappct`
+/// names them both, and fixed here despite being innocent of this bug:
+///
+/// **`PATH`.** Its `merge_parent_env` exists for exactly this, and its comment
+/// says so — these are the keys "whose absence causes common failures (e.g.,
+/// error 203)". Called here rather than copied, so that anything upstream
+/// learns about this arrives with a version bump.
+///
+/// **Sorted order.** Win32 wants a Unicode environment block sorted
+/// case-insensitively by name. `rappct`'s block builder does not sort what a
+/// caller hands it, and its own test path sorts before calling — which is the
+/// tell. An unsorted block is the kind of input that works until something
+/// downstream does a binary search over it.
+///
+/// So: the handful Windows itself wants to start a process, plus what upstream
+/// adds, in the order Win32 asks for. `RUST_BACKTRACE` is passed through when
+/// it is set, because a renderer that panics is the case where its output
+/// matters most.
+#[cfg(target_os = "windows")]
+fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    // `SystemRoot` and `windir` are how the loader finds the system DLLs every
+    // Windows process links; the processor variables are read by the C runtime
+    // during startup.
+    const WANTED: &[&str] = &[
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
+        "ComSpec",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        // Not needed by the renderer, which opens no files, but an
+        // AppContainer redirects these into its own profile anyway, so they
+        // leak nothing and their absence surprises anything that assumes them.
+        "TEMP",
+        "TMP",
+        // The same argument one step back, and the actual cause of the launch
+        // failure this function spent three attempts on. Redirecting `TEMP`
+        // into the package profile means *computing* where that profile is, and
+        // Windows does that from these. An explicit block that omits them is
+        // precisely what "the system could not find the environment option that
+        // was entered" is complaining about — the error names the problem, in
+        // its way, and reads as nonsense until you know which option it means.
+        //
+        // They name the user's own directories, which the first version of this
+        // list avoided on purpose. Kept because the alternative is no
+        // AppContainer at all, and safe because the container cannot open any
+        // of them: a path it may not follow is a string.
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        // Only when the operator asked for it.
+        "RUST_BACKTRACE",
+    ];
+    let wanted = WANTED
+        .iter()
+        .filter_map(|name| {
+            std::env::var_os(name).map(|value| (std::ffi::OsString::from(*name), value))
+        })
+        .collect();
+
+    // Adds `PATH` and anything else upstream considers essential, without
+    // duplicating what is already here. It does bring in a variable naming
+    // directories belonging to the user, which the earlier version of this
+    // avoided on purpose — a fair trade only because the container cannot open
+    // any of them, and not one to make silently.
+    let mut environment = rappct::launch::merge_parent_env(wanted);
+    environment.sort_by_key(|(name, _)| name.to_string_lossy().to_lowercase());
+    environment
+}
+
 /// A built AppContainer, ready to spawn renderers into.
 ///
 /// Built once per browser process rather than once per page: creating the
@@ -200,6 +307,7 @@ impl Container {
             exe: self.program.clone(),
             cmdline: Some(command),
             stdio: StdioConfig::Pipe,
+            env: Some(environment()),
             join_job: Some(JobLimits {
                 // The renderer dies when this handle closes, which happens when
                 // the session is dropped *and* if the browser is killed outright.
@@ -279,13 +387,19 @@ impl Contained {
 /// up leaves the thread parked on a read it will never finish, which is fine:
 /// dropping `child` closes the job handle, the kernel kills the process, the
 /// pipe closes, and the thread ends.
-pub fn capture(container: &Container, arguments: &str, timeout: std::time::Duration) -> String {
-    let mut child = match container.spawn(arguments) {
-        Ok(child) => child,
-        Err(error) => return format!("spawn-failed={error}"),
-    };
+pub fn capture(
+    container: &Container,
+    arguments: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    // A failure here is *not* a report about a confined process, and returning
+    // one as if it were is how the self-test came to print
+    // `confinement=AppContainer` above a line saying the container never
+    // launched anything. The whole point of this file is that a sandbox which
+    // claims to work and does not is worse than one that says it is missing.
+    let mut child = container.spawn(arguments)?;
     let Some(stdout) = child.io.stdout.take() else {
-        return "no-stdout".to_owned();
+        return Err("the contained process had no stdout".to_owned());
     };
 
     let (finished, output) = std::sync::mpsc::channel();
@@ -302,16 +416,15 @@ pub fn capture(container: &Container, arguments: &str, timeout: std::time::Durat
         })
         .is_err()
     {
-        return "no-thread".to_owned();
+        return Err("could not start a thread to read the contained process".to_owned());
     }
 
-    match output.recv_timeout(timeout) {
-        Ok(text) => text,
-        Err(_) => format!(
-            "timed-out after {}s waiting for the contained process to answer",
+    output.recv_timeout(timeout).map_err(|_| {
+        format!(
+            "the contained process said nothing for {}s",
             timeout.as_secs()
-        ),
-    }
+        )
+    })
 }
 
 #[cfg(test)]

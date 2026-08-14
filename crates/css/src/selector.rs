@@ -204,9 +204,30 @@ impl Selector {
 
 /// Parses a comma-separated selector list.
 ///
-/// Returns only the selectors that parsed. A selector list containing anything
-/// unsupported drops just that selector, matching how browsers treat unknown
-/// syntax: ignore what you cannot understand, keep what you can.
+/// Returns only the selectors that parsed, and **that is wrong for one of the
+/// two reasons a selector can fail to parse.** This comment used to justify it
+/// as "matching how browsers treat unknown syntax"; browsers do not do this.
+/// CSS 2.1 §4.1.7 says a statement with an error anywhere in its selector is
+/// ignored *entirely*, so `[1digit], div { color: red }` styles nothing at all
+/// — the malformed attribute name takes the valid `div` down with it. Keeping
+/// the `div` applies a colour the author never asked for, which is how the CSS
+/// 2.1 suite catches this: a page of tests whose whole assertion is "no red".
+///
+/// The fix is not simply to be strict, which is why this is a comment rather
+/// than a patch. Two different failures arrive here as the same `None`:
+///
+/// * **Invalid** — `[1digit]`, `[title~=]`. No browser accepts it, the rule
+///   must be dropped, and dropping it is what the suite expects.
+/// * **Unsupported** — `p:first-child`, `a::before`. Valid CSS 2.1 that this
+///   engine does not implement. Browsers apply these, so dropping the whole
+///   rule would *lose* styling they show, making real pages worse in exchange
+///   for passing tests.
+///
+/// So the honest fix distinguishes them: drop the rule for the first, skip the
+/// selector for the second. That needs a three-way result threaded through
+/// `parse_compound` and `parse_attribute_test`, and it wants measuring against
+/// both the suite and the reference baselines, because it can move rendering
+/// on real pages in either direction.
 pub fn parse_selector_list(input: &str) -> Vec<Selector> {
     input
         .split(',')

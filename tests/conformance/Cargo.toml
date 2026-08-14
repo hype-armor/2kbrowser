@@ -1,0 +1,20 @@
+[package]
+name = "conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+
+[dependencies]
+dom = { path = "../../crates/dom" }
+net = { path = "../../crates/net" }
+paint = { path = "../../crates/paint" }
+shell = { path = "../../crates/shell" }
+text = { path = "../../crates/text" }
+
+[lints]
+workspace = true

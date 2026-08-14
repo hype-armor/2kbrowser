@@ -28,6 +28,23 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+/// What a renderer thread sends to wake the window.
+///
+/// winit waits for events rather than polling (a document browser has nothing
+/// to animate), so a band arriving on another thread has to *become* an event
+/// or nothing would redraw until the reader moved the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandReady;
+
+/// How much taller than the window a painted band is.
+///
+/// The reader sees one window's worth; painting three means scrolling roughly a
+/// screen in either direction before anything has to be asked for, and asking
+/// starts a screen before the edge. Bigger costs memory and a longer first
+/// paint; smaller asks more often. Three is the smallest that leaves a margin
+/// on both sides of the window.
+const BAND_SCREENS: u32 = 3;
+
 /// Pixels scrolled per arrow-key press.
 const SCROLL_STEP: f32 = 60.0;
 /// Multiplier applied to line-based mouse wheel deltas.
@@ -88,11 +105,52 @@ fn pack(pixel: &paint::PremultipliedColor) -> u32 {
 /// Pure, and therefore testable without a display — which is most of what this
 /// module gets wrong when it gets anything wrong.
 ///
-/// The range is the *canvas*, not the content, and for every page short enough
-/// those are the same number. Past the canvas there are no pixels — the blit
-/// fills white — so a taller document used to be scrollable into a void that
-/// looked exactly like the document ending. Stopping where the pixels stop is
-/// half the answer; the bar saying the page is not all there is the other half.
+/// The range is the whole document. It was briefly the painted canvas, back
+/// when a page stopped at one and scrolling past it showed white that looked
+/// exactly like the document ending — banded rendering removed that, and this
+/// comment with it.
+/// Where a pointer in window coordinates falls in the document, or `None` if
+/// it is over the chrome rather than the page.
+///
+/// Pulled out of `link_under_pointer` so it can be tested without a window.
+/// Hit-testing has to agree with `draw`, which turns a screen row into a
+/// document row by exactly this arithmetic in the other direction — and until
+/// now nothing checked that they agreed. They quietly did not have to: the
+/// chrome's height is a constant, and when it changed from 34 to 46 the two
+/// sites were updated by hand and nothing would have said so if only one had
+/// been.
+fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Option<(f32, f32)> {
+    let y = pointer.1 - chrome_height as f32;
+    // Above the page is the bar, which owns its own clicks.
+    (y >= 0.0).then_some((pointer.0, y + scroll))
+}
+
+/// Shrinks a requested window to something the screen can actually show.
+///
+/// A window taller than the display is not merely awkward: the browser sizes
+/// its viewport from `inner_size`, so it believes every row it was given is
+/// visible. A page that fits in that imaginary viewport is a page it will not
+/// scroll — leaving the rows below the bottom of the monitor unreachable
+/// rather than just off-screen.
+///
+/// The margin is for whatever the desktop keeps at the edges: a title bar it
+/// adds itself, a taskbar, a dock. Winit has no work-area query, so this is an
+/// allowance rather than a measurement, and it is only ever a shrink — a
+/// monitor smaller than the floor leaves the request alone rather than
+/// producing a window too small to use.
+fn clamp_to_monitor(requested: (u32, u32), monitor: (u32, u32)) -> (u32, u32) {
+    const EDGES: u32 = 96;
+    const FLOOR: (u32, u32) = (360, 320);
+    let fit = |want: u32, screen: u32, floor: u32| {
+        let room = screen.saturating_sub(EDGES);
+        if room < floor { want } else { want.min(room) }
+    };
+    (
+        fit(requested.0, monitor.0, FLOOR.0),
+        fit(requested.1, monitor.1, FLOOR.1),
+    )
+}
+
 fn clamp_scroll(offset: f32, scrollable_height: f32, viewport_height: f32) -> f32 {
     let max = (scrollable_height - viewport_height).max(0.0);
     offset.clamp(0.0, max)
@@ -139,8 +197,18 @@ struct Tab {
     /// Whether the reader has overruled the document fallback here (ADR-0009).
     /// Reset on navigation: it is a decision about a page, not a setting.
     forcing_authored: bool,
-    /// Whether this page had a fallback decision to overrule.
+    /// Whether the reader has asked for the document fallback on a page that
+    /// classification did not give one to (ADR-0009). Reset on navigation for
+    /// the same reason, and never true at the same time as `forcing_authored`.
+    forcing_document: bool,
+    /// Whether this page is in a layout decision the reader can change.
     can_toggle_layout: bool,
+    /// Whether this page's certificate verified only against a local root.
+    ///
+    /// A property of the connection that fetched it, so it is remembered per
+    /// tab rather than recomputed: the page is on screen long after the
+    /// handshake is over.
+    local_root: bool,
     /// The find field when find-in-page is open in this tab.
     finding: Option<crate::field::Field>,
     /// Where the current query matches, in canvas coordinates.
@@ -169,12 +237,41 @@ impl Tab {
             scroll: 0.0,
             error: None,
             forcing_authored: false,
+            forcing_document: false,
             can_toggle_layout: false,
+            local_root: false,
             finding: None,
             matches: Vec::new(),
             current_match: 0,
             focused_link: None,
             focused_rects: Vec::new(),
+        }
+    }
+
+    /// What pressing the layout toggle does here (ADR-0009).
+    ///
+    /// The same three cases the bar's wording distinguishes, in the same order,
+    /// because they have to agree: the button says where it leads, and this is
+    /// where it leads. Kept beside the state it changes rather than inline in
+    /// the click handler so that the two flags cannot both end up set — the
+    /// child resolves that in favour of the author's layout, which would look
+    /// like a press that did nothing.
+    fn toggle_layout(&mut self) {
+        if self.forcing_authored {
+            // Overruling a fallback. Back to the fallback.
+            self.forcing_authored = false;
+        } else if self.forcing_document {
+            // Showing a fallback nobody classified. Back to the page as it is.
+            self.forcing_document = false;
+        } else if self.can_toggle_layout {
+            // Classification chose the fallback and the reader wants to see
+            // what the author actually wrote.
+            self.forcing_authored = true;
+        } else {
+            // An ordinary page, asked for the plain view it did not need. Not
+            // the absence of the case above: there is no fallback here to
+            // return to, so this is its own request.
+            self.forcing_document = true;
         }
     }
 
@@ -191,6 +288,50 @@ impl Tab {
     }
 }
 
+/// A window size that has arrived and not yet been rendered at.
+///
+/// Dragging a window edge produces a resize event per frame, and rendering a
+/// page costs far more than a frame — 64ms for an ordinary page against a 16ms
+/// budget, measured. Servicing them one for one meant the work arrived about
+/// four times faster than it could be done, so the backlog grew for as long as
+/// the drag lasted and every render in it was for a window that had already
+/// stopped being that size. The event loop was blocked throughout.
+///
+/// So the size is recorded here and rendered once, when the queue drains. Every
+/// resize but the last describes a window that no longer exists, and the last
+/// one is the only one anybody can see.
+///
+/// Deliberately not a timer. A delay would need a number nobody can justify and
+/// would add latency to a single resize, which is the common case — a maximise,
+/// a tiling keystroke, one drag that stops. Draining is self-limiting instead:
+/// it renders as fast as rendering can go and no faster, and always at the size
+/// that arrived most recently.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PendingResize {
+    /// The newest size seen, if it has not been rendered at yet.
+    wanted: Option<(u32, u32)>,
+}
+
+impl PendingResize {
+    /// Records a size the window has become.
+    fn note(&mut self, size: (u32, u32)) {
+        self.wanted = Some(size);
+    }
+
+    /// The size to render at, if there is one worth rendering at.
+    ///
+    /// `rendered` is the size the page on screen was laid out for. A resize
+    /// back to that — a drag that returns where it started, or the event a
+    /// window manager sends confirming a size we asked for — has nothing to do,
+    /// and doing it anyway would be a 64ms stall for an identical picture.
+    fn take(&mut self, rendered: (u32, u32)) -> Option<(u32, u32)> {
+        match self.wanted.take() {
+            Some(size) if size != rendered => Some(size),
+            _ => None,
+        }
+    }
+}
+
 /// Everything the event loop needs between frames.
 struct App {
     tabs: crate::tabs::Tabs<Tab>,
@@ -202,10 +343,24 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     size: (u32, u32),
+    /// A size the window has become that the page has not been laid out for.
+    ///
+    /// Updated on every resize event and acted on once the queue drains, so a
+    /// drag costs one render rather than one per frame.
+    pending_resize: PendingResize,
+    /// The size the page on screen was laid out for.
+    ///
+    /// Not the same as `size`, and the difference is the point: during a drag
+    /// `size` is where the window is now and this is what it last showed. What
+    /// is between them is a page drawn at the wrong width for a moment, which
+    /// is what makes the window keep answering instead of freezing.
+    rendered_size: (u32, u32),
     /// Last known pointer position, in window coordinates.
     pointer: (f32, f32),
     /// Whether the pointer is over a link, so the cursor can say so.
     over_link: bool,
+    /// Which colour scheme the chrome draws in.
+    theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
     modifiers: winit::event::Modifiers,
     /// The chrome bar, redrawn whenever what it says changes.
@@ -218,6 +373,11 @@ struct App {
     /// The saved list, shared by every tab: a bookmark is a property of the
     /// browser, not of the window you happened to press Ctrl+D in.
     bookmarks: crate::bookmarks::Bookmarks,
+    /// How a renderer thread wakes this loop when a band is ready.
+    ///
+    /// `None` only in tests and before the loop starts, where nothing is
+    /// waiting to be woken.
+    waker: Option<winit::event_loop::EventLoopProxy<BandReady>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
 }
@@ -233,6 +393,58 @@ impl App {
         self.tabs.active_mut()
     }
 
+    /// How tall a painted band is.
+    fn band_span(&self) -> u32 {
+        let screens = (self.viewport_height() as u32).max(1) * BAND_SCREENS;
+        screens.min(sandbox::max_canvas_height(self.size.0.max(1)))
+    }
+
+    /// Asks for the rows around the reader, if the painted band is running out.
+    ///
+    /// Speculative on purpose: the request goes out while the window is still
+    /// drawing rows it already has, so in ordinary reading the next band has
+    /// arrived before the reader reaches the edge of this one. A margin of one
+    /// window on each side is what "before" means here.
+    fn refresh_band(&mut self) {
+        let viewport = self.viewport_height();
+        let span = self.band_span();
+        let scroll = self.tab().scroll;
+        let Some(page) = self.tab().page.as_ref() else {
+            return;
+        };
+        // One band in flight at a time. A second would be answered after the
+        // first and immediately replace it, which is work for a picture nobody
+        // sees.
+        if page.band_outstanding() {
+            return;
+        }
+        let (band_top, band_height) = (page.band_top() as f32, page.height() as f32);
+        let content = page.content_height().max(band_height);
+        // Comfortable means a window's worth of margin above and below, or the
+        // document's own edge where there is no more page to have.
+        let wanted_top = (scroll - viewport).max(0.0);
+        let wanted_bottom = (scroll + viewport * 2.0).min(content);
+        if wanted_top >= band_top && wanted_bottom <= band_top + band_height {
+            return;
+        }
+        let furthest = (content - span as f32).max(0.0);
+        let desired = (scroll - viewport).clamp(0.0, furthest) as u32;
+        if desired == page.band_top() {
+            return;
+        }
+        if let Some(page) = self.tab_mut().page.as_mut() {
+            let _ = page.request_band(desired, span);
+        }
+    }
+
+    /// Shows a band that has arrived. Returns whether anything changed.
+    fn accept_band(&mut self) -> bool {
+        self.tab_mut()
+            .page
+            .as_mut()
+            .is_some_and(crate::viewport::Viewport::accept_band)
+    }
+
     /// Re-renders at the current width. Called on open and on resize, because
     /// layout depends on viewport width and nothing else here does.
     fn rerender(&mut self) {
@@ -240,31 +452,64 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
+        // Recorded before the work rather than after it, and recorded even if
+        // the render below fails: this says what the page on screen was laid
+        // out for, and a failed render leaves the previous page there. Setting
+        // it only on success would have every later resize event to the same
+        // size retry a render that is not going to work.
+        //
+        // Nothing is done to `pending_resize` here, deliberately. It is emptied
+        // by the `take` that asked for this render, and emptying it a second
+        // time would mean nothing could tell whether that `take` still did.
+        // A resize arriving while this one renders stays queued in the
+        // operating system and is coalesced into the next drain.
+        self.rendered_size = self.size;
         let viewport = self.viewport_height();
-        // The canvas is the full document height, not the viewport height:
-        // scrolling then costs a blit offset rather than a re-layout. Bounded
-        // by what fits in one frame across the boundary — a page taller than
-        // that is clipped, which `sandbox::max_canvas_height` states plainly.
-        let max_height = sandbox::max_canvas_height(width);
+        // A band several windows tall rather than the whole document: scrolling
+        // within it costs a blit offset, and leaving it costs a paint of the
+        // rows ahead — which is asked for before the reader gets there. Still
+        // bounded by what fits in one frame across the boundary, because that
+        // bound is about what a compromised renderer can make the parent
+        // allocate and has nothing to do with how long the page is.
+        let band = self.band_span();
 
         // Destructured so the borrows are disjoint: opening a page needs the
         // renderer while the tab is held mutably.
-        let App { tabs, renderer, .. } = self;
+        let App {
+            tabs,
+            renderer,
+            waker,
+            ..
+        } = self;
         let tab = tabs.active_mut();
 
         // Re-render in the child that already holds this document when there is
         // one — a resize is not a fresh page, and re-opening would re-fetch
         // every image on it.
         let outcome = match tab.page.as_mut() {
-            Some(page) => page.resize(width, max_height),
+            // The tab holds the reader's choice of layout; the child holds the
+            // page. Pushing the choice across on every re-render, rather than
+            // only where it changes, is what makes pressing the toggle do
+            // anything at all: `resize` renders with whatever the viewport was
+            // last told, so a press that updated only the tab moved the word on
+            // the button and nothing else.
+            Some(page) => page.set_forcing(tab.forcing_authored, tab.forcing_document, width, band),
             None => match crate::viewport::Viewport::open(
                 renderer,
                 tab.loaded.clone(),
                 width,
-                max_height,
+                band,
                 tab.forcing_authored,
+                tab.forcing_document,
             ) {
                 Ok(page) => {
+                    // How a band painted on another thread reaches a window
+                    // that is otherwise asleep.
+                    if let Some(waker) = waker.clone() {
+                        page.set_wake(Box::new(move || {
+                            let _ = waker.send_event(BandReady);
+                        }));
+                    }
                     tab.page = Some(page);
                     Ok(())
                 }
@@ -306,6 +551,9 @@ impl App {
                 tab.error.as_deref(),
             ));
         }
+        // A fresh render paints from the top of the document; if the reader was
+        // not there, the rows they are looking at have to be asked for.
+        self.refresh_band();
         self.refresh_chrome();
     }
 
@@ -321,20 +569,24 @@ impl App {
             .fetcher
             .fetch_raw(url, None, net::RequestKind::Navigation)
         {
-            Ok((body, content_type, origin, path)) => {
+            Ok(fetched) => {
+                self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
-                    body,
-                    content_type,
-                    origin,
-                    path,
+                    body: fetched.body,
+                    content_type: fetched.content_type,
+                    origin: fetched.origin,
+                    path: fetched.path,
                 };
                 // A fresh document means a fresh renderer: the old child holds
                 // the page that just left, and dropping it kills that process.
                 self.tab_mut().page = None;
                 self.tab_mut().error = None;
                 self.tab_mut().scroll = 0.0;
-                // A decision about the previous page, not a setting.
+                // A decision about the previous page, not a setting. Both of
+                // them: a reader who asked one page for a plain view has not
+                // asked for one of every page they go on to visit.
                 self.tab_mut().forcing_authored = false;
+                self.tab_mut().forcing_document = false;
                 // Focus belonged to a link on the page that just left.
                 self.tab_mut().focused_link = None;
                 self.tab_mut().focused_rects.clear();
@@ -355,6 +607,29 @@ impl App {
         self.tab_mut().history.visit(url);
         let target = self.tab().history.current().to_owned();
         self.show(&target);
+    }
+
+    /// Fetches the current page again.
+    ///
+    /// Deliberately not routed through `navigate`: reloading is not a
+    /// navigation, and pushing the same URL again would leave Back appearing
+    /// to do nothing.
+    fn reload(&mut self) {
+        let url = self.tab().history.current().to_owned();
+        self.show(&url);
+    }
+
+    /// Switches between the light and dark chrome.
+    fn toggle_theme(&mut self) {
+        self.theme = if self.theme == crate::chrome::Theme::DARK {
+            crate::chrome::Theme::LIGHT
+        } else {
+            crate::chrome::Theme::DARK
+        };
+        self.refresh_chrome();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     fn go_back(&mut self) {
@@ -384,6 +659,7 @@ impl App {
             editing,
             size,
             bookmarks,
+            theme,
             ..
         } = self;
         let tab = tabs.active();
@@ -394,12 +670,14 @@ impl App {
             .unwrap_or(layout::RenderMode::Authored);
         *chrome = crate::chrome::render(
             &crate::chrome::State {
+                theme: *theme,
                 url: tab.history.current(),
                 mode: &mode,
                 error: tab.error.as_deref(),
                 can_go_back: tab.history.can_go_back(),
                 can_go_forward: tab.history.can_go_forward(),
                 forcing_authored: tab.forcing_authored,
+                forcing_document: tab.forcing_document,
                 can_toggle_layout: tab.can_toggle_layout,
                 editing: editing.as_ref(),
                 finding: tab
@@ -407,10 +685,7 @@ impl App {
                     .as_ref()
                     .map(|field| (field, tab.current_match, tab.matches.len())),
                 saved: bookmarks.contains(tab.history.current()),
-                truncated: tab
-                    .page
-                    .as_ref()
-                    .is_some_and(crate::viewport::Viewport::is_truncated),
+                local_root: tab.local_root,
             },
             size.0,
             fonts,
@@ -422,10 +697,11 @@ impl App {
             fonts,
             strip,
             size,
+            theme,
             ..
         } = self;
         let labels: Vec<&str> = tabs.iter().map(Tab::label).collect();
-        *strip = crate::chrome::render_tabs(&labels, tabs.active_index(), size.0, fonts);
+        *strip = crate::chrome::render_tabs(&labels, tabs.active_index(), size.0, fonts, *theme);
 
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -453,14 +729,17 @@ impl App {
             .fetcher
             .fetch_raw(url, None, net::RequestKind::Navigation)
         {
-            Ok((body, content_type, origin, path)) => {
+            Ok(fetched) => {
+                let local_root = fetched.trust == net::Trust::LocalRoot;
                 let loaded = Loaded {
-                    body,
-                    content_type,
-                    origin,
-                    path,
+                    body: fetched.body,
+                    content_type: fetched.content_type,
+                    origin: fetched.origin,
+                    path: fetched.path,
                 };
-                self.tabs.open(Tab::new(loaded, url.to_owned()));
+                let mut tab = Tab::new(loaded, url.to_owned());
+                tab.local_root = local_root;
+                self.tabs.open(tab);
             }
             Err(error) => {
                 // A tab that failed still opens, showing nothing and saying
@@ -609,6 +888,9 @@ impl App {
         // jammed against the top edge.
         let target = bounds.y - viewport / 3.0;
         self.tab_mut().scroll = clamp_scroll(target, height, viewport);
+        // A match or a link can be anywhere in the document, so scrolling to
+        // one is the case most likely to leave the painted band entirely.
+        self.refresh_band();
     }
 
     /// Saves the current page, or forgets it if it is already saved.
@@ -820,12 +1102,14 @@ impl App {
         let mode = mode.unwrap_or(layout::RenderMode::Authored);
         crate::chrome::control_at(
             &crate::chrome::State {
+                theme: self.theme,
                 url: self.tab().history.current(),
                 mode: &mode,
                 error: self.tab().error.as_deref(),
                 can_go_back: self.tab().history.can_go_back(),
                 can_go_forward: self.tab().history.can_go_forward(),
                 forcing_authored: self.tab().forcing_authored,
+                forcing_document: self.tab().forcing_document,
                 can_toggle_layout: self.tab().can_toggle_layout,
                 editing: self.editing.as_ref(),
                 finding: self
@@ -834,11 +1118,7 @@ impl App {
                     .as_ref()
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
                 saved: self.bookmarks.contains(self.tab().history.current()),
-                truncated: self
-                    .tab()
-                    .page
-                    .as_ref()
-                    .is_some_and(crate::viewport::Viewport::is_truncated),
+                local_root: self.tab().local_root,
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -855,12 +1135,8 @@ impl App {
     /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
         let page = self.tab().page.as_ref()?;
-        let y = self.pointer.1 - self.chrome_height() as f32;
-        if y < 0.0 {
-            return None;
-        }
-        page.link_at(self.pointer.0, y + self.tab().scroll)
-            .map(str::to_owned)
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
+        page.link_at(x, y).map(str::to_owned)
     }
 
     /// Total chrome height: the URL bar, plus the tab strip when there is one.
@@ -881,10 +1157,14 @@ impl App {
             page.scrollable_height(),
             self.viewport_height(),
         );
-        if self.tab().scroll != before
-            && let Some(window) = &self.window
-        {
-            window.request_redraw();
+        if self.tab().scroll != before {
+            // Before the reader gets there, which is the whole point of asking
+            // speculatively: the rows ahead are usually painted by the time
+            // they are scrolled to.
+            self.refresh_band();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -916,6 +1196,9 @@ impl App {
 
         let (page_width, page_height) = (page.width(), page.height());
         let page_pixels = page.pixels();
+        // Where the painted band sits in the document, so a scroll offset in
+        // document coordinates can be turned into a row of the band.
+        let band_top = page.band_top();
         let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
         let strip_height = if tabs.len() > 1 {
@@ -942,10 +1225,18 @@ impl App {
         blit(&mut buffer, chrome, strip_height, bar_height - strip_height);
 
         for row in bar_height..height.get() {
-            let source_row = row - bar_height + offset;
+            let document_row = row - bar_height + offset;
             let start = row as usize * viewport_width;
+            // Rows the painted band does not cover: past the end of the
+            // document, or ahead of a band still being painted. White rather
+            // than stale pixels either way — showing the previous band's rows
+            // under the wrong offset would be showing the wrong part of the
+            // page, which is worse than showing none of it.
+            let Some(source_row) = document_row.checked_sub(band_top) else {
+                buffer[start..start + viewport_width].fill(0x00ff_ffff);
+                continue;
+            };
             if source_row >= page_height {
-                // Past the end of the document: white, not stale pixels.
                 buffer[start..start + viewport_width].fill(0x00ff_ffff);
                 continue;
             }
@@ -1089,11 +1380,53 @@ fn highlight_matches(
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<BandReady> for App {
+    /// Every event that had arrived has been handled, so the loop is about to
+    /// sleep. The last thing to do before that is lay the page out for whatever
+    /// size the window ended up.
+    ///
+    /// This is where a resize is paid for, and it is why a drag no longer
+    /// blocks: while events keep arriving they are only recorded, and the
+    /// render happens once the burst is over. If the drag is still going by
+    /// then, the events that arrived during the render coalesce into the next
+    /// one — so rendering runs as often as it can finish rather than as often
+    /// as the compositor asks, and the backlog cannot grow.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.pending_resize.take(self.rendered_size).is_none() {
+            return;
+        }
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// A band painted on a renderer thread has arrived.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: BandReady) {
+        if self.accept_band()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // In logical pixels, because that is what the requested size is in.
+        let monitor = event_loop.primary_monitor().map(|monitor| {
+            let scale = monitor.scale_factor();
+            let size = monitor.size();
+            (
+                (f64::from(size.width) / scale) as u32,
+                (f64::from(size.height) / scale) as u32,
+            )
+        });
+        let wanted = match monitor {
+            Some(monitor) => clamp_to_monitor(self.size, monitor),
+            None => self.size,
+        };
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
-            .with_inner_size(winit::dpi::LogicalSize::new(self.size.0, self.size.1));
+            .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
             return;
@@ -1126,10 +1459,13 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.size = (size.width.max(1), size.height.max(1));
-                self.rerender();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.pending_resize.note(self.size);
+                // The bar is redrawn now and the page is not. It costs 0.44ms
+                // against the page's 64ms, and it is the part that would look
+                // broken if it were left alone: a bar that does not reach the
+                // edge of its own window reads as a hung program, where a page
+                // still laid out for the old width reads as one mid-resize.
+                self.refresh_chrome();
             }
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
@@ -1186,9 +1522,10 @@ impl ApplicationHandler for App {
                         match self.control_under_pointer() {
                             Some(crate::chrome::Control::Back) => self.go_back(),
                             Some(crate::chrome::Control::Forward) => self.go_forward(),
+                            Some(crate::chrome::Control::Reload) => self.reload(),
                             Some(crate::chrome::Control::Bookmark) => self.toggle_bookmark(),
                             Some(crate::chrome::Control::ToggleLayout) => {
-                                self.tab_mut().forcing_authored = !self.tab().forcing_authored;
+                                self.tab_mut().toggle_layout();
                                 self.rerender();
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
@@ -1258,12 +1595,24 @@ impl ApplicationHandler for App {
                         }
                         // Ctrl+D saves and Ctrl+B shows the list, which is
                         // where every browser has put them for twenty years.
-                        Key::Character(c) if c == "d" => {
+                        Key::Character(c) if c == "d" && !shift => {
                             self.toggle_bookmark();
                             return;
                         }
                         Key::Character(c) if c == "b" => {
                             self.open_bookmarks();
+                            return;
+                        }
+                        // Ctrl+R reloads, as it has everywhere since Netscape.
+                        Key::Character(c) if c == "r" => {
+                            self.reload();
+                            return;
+                        }
+                        // Ctrl+Shift+D rather than Ctrl+D, which is taken by
+                        // saving — and taken by saving in every other browser
+                        // too, so it is not a key this one gets to reassign.
+                        Key::Character(c) if c.eq_ignore_ascii_case("d") && shift => {
+                            self.toggle_theme();
                             return;
                         }
                         Key::Named(NamedKey::Tab) => {
@@ -1393,9 +1742,13 @@ pub fn open(
         }
     }
 
-    let event_loop = EventLoop::new().map_err(|error| {
-        format!("could not start the event loop ({error}); is a display available?")
-    })?;
+    // With a user event, so a band painted on a renderer thread can wake a
+    // window that is otherwise asleep waiting for input.
+    let event_loop = EventLoop::<BandReady>::with_user_event()
+        .build()
+        .map_err(|error| {
+            format!("could not start the event loop ({error}); is a display available?")
+        })?;
     // Wait rather than poll: a document browser has nothing to animate, and
     // polling would burn CPU against the resource-weight goal for no benefit.
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1416,14 +1769,20 @@ pub fn open(
         window: None,
         surface: None,
         size: (width.max(1), height.max(1)),
+        pending_resize: PendingResize::default(),
+        // Nothing has been rendered yet, and no window is this size, so the
+        // first resize to arrive is never mistaken for one already shown.
+        rendered_size: (0, 0),
         pointer: (0.0, 0.0),
         over_link: false,
+        theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         strip: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        waker: Some(event_loop.create_proxy()),
     };
     event_loop
         .run_app(&mut app)
@@ -1432,6 +1791,156 @@ pub fn open(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_drag_full_of_resizes_costs_one_render_at_the_last_size() {
+        // The whole point. A drag delivers a resize per frame and a render
+        // costs several frames, so servicing them one for one meant the backlog
+        // grew for as long as the drag lasted — and every render in it was for
+        // a window that had already stopped being that size.
+        let mut pending = PendingResize::default();
+        for width in 800..900 {
+            pending.note((width, 600));
+        }
+        assert_eq!(
+            pending.take((800, 600)),
+            Some((899, 600)),
+            "the render has to be for where the window ended up, not where it started"
+        );
+        assert_eq!(
+            pending.take((899, 600)),
+            None,
+            "one drag, one render — a second would be for a size already on screen"
+        );
+    }
+
+    #[test]
+    fn a_resize_to_the_size_already_on_screen_renders_nothing() {
+        // A drag that returns where it started, and the event a window manager
+        // sends back to confirm a size that was asked for. Rendering either
+        // would be a stall of tens of milliseconds for an identical picture.
+        let mut pending = PendingResize::default();
+        pending.note((1024, 768));
+        assert_eq!(pending.take((1024, 768)), None);
+
+        // But a real change still gets through, including one that only moves
+        // in one axis — a page laid out for a narrower window is wrong, and so
+        // is a band sized for a shorter one.
+        pending.note((1024, 900));
+        assert_eq!(pending.take((1024, 768)), Some((1024, 900)));
+        pending.note((900, 768));
+        assert_eq!(pending.take((1024, 768)), Some((900, 768)));
+    }
+
+    #[test]
+    fn a_size_is_handed_out_once_and_then_it_is_gone() {
+        // Taking is what consumes it, and nothing else does — the render it
+        // asks for deliberately leaves it alone, so that this stays checkable.
+        // Left in place, it would ask for a render on every drain of the event
+        // queue from then on, which is a resize storm with no resizing in it.
+        let mut pending = PendingResize::default();
+        pending.note((1024, 768));
+        assert_eq!(pending.take((800, 600)), Some((1024, 768)));
+        assert_eq!(
+            pending.take((800, 600)),
+            None,
+            "the size survived being taken, so every later drain re-renders"
+        );
+    }
+
+    #[test]
+    fn nothing_pending_asks_for_nothing() {
+        // `about_to_wait` runs after every batch of events there is, most of
+        // which are pointer moves. It has to be free when nothing resized.
+        let mut pending = PendingResize::default();
+        assert_eq!(pending.take((800, 600)), None);
+        assert_eq!(pending, PendingResize::default());
+    }
+
+    #[test]
+    fn a_window_is_never_asked_to_be_taller_than_the_screen() {
+        // The case that shipped: `open` asked for 2000px on a 1080p display.
+        let (_, height) = clamp_to_monitor((800, 2000), (1920, 1080));
+        assert!(
+            height < 1080,
+            "{height} still does not fit on a 1080p screen"
+        );
+        // and it leaves room for whatever the desktop keeps at the edges
+        assert!(height <= 1080 - 96);
+    }
+
+    #[test]
+    fn a_window_that_already_fits_is_left_alone() {
+        assert_eq!(clamp_to_monitor((800, 800), (1920, 1080)), (800, 800));
+        assert_eq!(clamp_to_monitor((1200, 900), (2560, 1440)), (1200, 900));
+    }
+
+    #[test]
+    fn a_tiny_monitor_does_not_produce_an_unusable_window() {
+        // Shrinking to fit is only worth doing while what is left is usable; a
+        // 200px-tall screen is not a reason to hand back a 104px window.
+        assert_eq!(clamp_to_monitor((800, 800), (300, 200)), (800, 800));
+    }
+
+    #[test]
+    fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
+        let chrome = crate::chrome::total_height(1);
+        assert_eq!(document_point((10.0, 0.0), chrome, 0.0), None);
+        assert_eq!(
+            document_point((10.0, chrome as f32 - 1.0), chrome, 0.0),
+            None
+        );
+        // The first row of the page is the first row of the document.
+        assert_eq!(
+            document_point((10.0, chrome as f32), chrome, 0.0),
+            Some((10.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn scrolling_moves_the_document_under_the_pointer() {
+        let chrome = crate::chrome::total_height(1);
+        let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, scroll);
+        assert_eq!(at(0.0), Some((0.0, 100.0)));
+        assert_eq!(at(973.0), Some((0.0, 1073.0)));
+        // x is never touched: nothing is scrolled sideways.
+        assert_eq!(
+            document_point((42.0, chrome as f32), chrome, 500.0)
+                .unwrap()
+                .0,
+            42.0
+        );
+    }
+
+    #[test]
+    fn hit_testing_agrees_with_what_was_drawn() {
+        // `draw` turns a screen row into a document row; `document_point` turns
+        // a screen y into a document y. They are the same conversion, and a
+        // browser where they disagree paints a link in one place and follows it
+        // from another. This is the check that was missing when the bar grew
+        // from 34 pixels to 46.
+        for tabs in [1_usize, 2, 5] {
+            let chrome = crate::chrome::total_height(tabs);
+            // Exactly how `draw` computes it, from the same constants.
+            let strip = if tabs > 1 {
+                crate::chrome::TAB_HEIGHT
+            } else {
+                0
+            };
+            let bar = strip + crate::chrome::HEIGHT;
+            for row in [bar, bar + 1, bar + 250, bar + 4000] {
+                for scroll in [0_u32, 1, 973, 10_000] {
+                    let drawn = row - bar + scroll;
+                    let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
+                        .expect("a row at or below the bar is on the page");
+                    assert_eq!(
+                        hit as u32, drawn,
+                        "tabs={tabs} row={row} scroll={scroll}: drawn {drawn}, hit {hit}"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     #[test]

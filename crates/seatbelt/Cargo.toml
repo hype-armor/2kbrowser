@@ -1,0 +1,26 @@
+[package]
+name = "seatbelt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The one crate in this workspace that does not inherit `[lints] workspace =
+# true`, and the only reason it exists.
+#
+# ADR-0002 forbids `unsafe` workspace-wide, with `forbid` rather than `deny` so
+# that no `#[allow]` in source can undo it — relaxing it has to be an edit to a
+# manifest, which is a reviewable diff. This is that edit, and ADR-0017 is the
+# argument for it: macOS confines a process by calling `sandbox_init`, there is
+# no safe wrapper for it on crates.io, and a renderer nobody confines is worse
+# than one unsafe call in a crate that does nothing else.
+#
+# Nothing else may be added to this crate. `tests/quarantine.rs` asserts that
+# every other workspace member still inherits the workspace lints, so the
+# exception cannot spread by being copied.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

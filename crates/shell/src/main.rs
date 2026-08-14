@@ -102,21 +102,30 @@ fn report(outcome: Result<String, String>) -> ExitCode {
 fn run_open(args: &[String]) -> Result<String, String> {
     let options = Options::parse(args)?;
     let input = options.input.ok_or("no input given")?;
-    let (resource, url) = load_from(&input)?;
+    let (document, url) = load_from(&input)?;
     window::open(
-        // The raw bytes, not the decoded text: the window renders in a child
-        // process, and the encoding sniffer lives there with every other parser
-        // (ADR-0012).
-        resource.bytes,
-        None,
+        document.body,
+        document.content_type,
         url,
-        resource.origin,
-        resource.path,
+        document.origin,
+        document.path,
         options.width,
-        options.height.min(2000),
+        if options.height_given {
+            options.height
+        } else {
+            // `render` writes a PNG, so its 4000px default is a canvas that
+            // shrinks to the content. A window is not a canvas: asking for one
+            // 2000px tall — as this did — puts most of it below the bottom of
+            // an ordinary screen, and the browser then believes the whole page
+            // is visible and refuses to scroll to the part that is not.
+            WINDOW_HEIGHT
+        },
     )?;
     Ok(String::new())
 }
+
+/// Height of a window that nobody asked to be a particular size.
+const WINDOW_HEIGHT: u32 = 800;
 
 /// Options shared by both commands.
 struct Options {
@@ -124,6 +133,9 @@ struct Options {
     output: String,
     width: u32,
     height: u32,
+    /// Whether `--height` was given, so `open` can tell a deliberate window
+    /// height from `render`'s canvas default.
+    height_given: bool,
 }
 
 impl Options {
@@ -133,6 +145,7 @@ impl Options {
             output: "page.png".to_owned(),
             width: 800,
             height: 4000,
+            height_given: false,
         };
         let mut index = 0;
         while index < args.len() {
@@ -144,6 +157,7 @@ impl Options {
                         .map_err(|_| "--width must be a number".to_owned())?;
                 }
                 "--height" => {
+                    options.height_given = true;
                     options.height = take(args, &mut index, "--height")?
                         .parse()
                         .map_err(|_| "--height must be a number".to_owned())?;
@@ -233,7 +247,10 @@ fn run_render(args: &[String]) -> Result<String, String> {
     if page.images_loaded() > 0 {
         message.push_str(&format!(", {} image(s)", page.images_loaded()));
     }
-    if page.is_truncated() {
+    // Still a real clip here, and still worth saying: a PNG is one image, so
+    // `--height` is a ceiling rather than a band. The window has no such limit
+    // any more — it paints whatever rows the reader scrolls to.
+    if page.content_height().ceil() > page.height() as f32 {
         message.push_str(&format!(
             "\nnote: page is {}px tall; output was clipped to {}px",
             page.content_height().ceil() as u32,
@@ -266,7 +283,7 @@ fn run_render(args: &[String]) -> Result<String, String> {
 /// The canvas is capped at what one frame can carry, so a `--height` past that
 /// is a clipped page with a note rather than a renderer that cannot answer.
 fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, String> {
-    let (resource, _) = load_from(input)?;
+    let (document, _) = load_from(input)?;
     let renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
     if !renderer.confinement().is_confined() {
         eprintln!("2kbrowser: {}", renderer.confinement().describe());
@@ -276,16 +293,12 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
     }
     Viewport::open(
         &renderer,
-        shell::viewport::Document {
-            // Raw bytes, not decoded text: the encoding sniffer lives on the
-            // far side with every other parser.
-            body: resource.bytes,
-            content_type: None,
-            origin: resource.origin,
-            path: resource.path,
-        },
+        document,
         width,
         height.min(sandbox::max_canvas_height(width)),
+        // Neither layout override: the command line has no chrome to press,
+        // so it gets whatever classification decided (ADR-0009).
+        false,
         false,
     )
     .map_err(|error| error.to_string())
@@ -299,13 +312,38 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
 /// to judge subresources against. The window needs the URL as well: it is the
 /// first history entry, and every relative link on the page resolves against
 /// it.
-fn load_from(input: &str) -> Result<(net::Resource, String), String> {
+///
+/// Raw, and *with* the `Content-Type`. The bytes stay undecoded because the
+/// encoding sniffer lives on the far side of the renderer boundary with every
+/// other parser (ADR-0012) — but the header has to travel with them, because on
+/// a page that declares its encoding nowhere else the header is the only thing
+/// that knows. Dropping it decoded Hacker News, which says `charset=utf-8` in
+/// the header and nothing in the markup, as windows-1252: every em dash and
+/// curly quote came out as mojibake.
+fn load_from(input: &str) -> Result<(shell::viewport::Document, String), String> {
     let fetcher = net::Fetcher::default();
     let url = absolute_url(input)?;
-    let resource = fetcher
-        .fetch(&url, None, net::RequestKind::Navigation)
+    let fetched = fetcher
+        .fetch_raw(&url, None, net::RequestKind::Navigation)
         .map_err(|error| format!("{url}: {error}"))?;
-    Ok((resource, url))
+    if fetched.trust == net::Trust::LocalRoot {
+        // ADR-0015: usable behind an intercepting proxy, and never quiet about
+        // it. The window marks this in the bar; the command line has only
+        // stderr to say it in.
+        eprintln!(
+            "2kbrowser: {url}: verified only by a certificate this computer trusts — \
+             something on this network can read it"
+        );
+    }
+    Ok((
+        shell::viewport::Document {
+            body: fetched.body,
+            content_type: fetched.content_type,
+            origin: fetched.origin,
+            path: fetched.path,
+        },
+        url,
+    ))
 }
 
 /// Turns a command-line argument into a URL.

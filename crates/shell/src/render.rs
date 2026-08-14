@@ -7,7 +7,7 @@
 use css::Stylesheet;
 use layout::{IntrinsicSizes, RenderMode};
 use net::{Fetcher, Origin, RequestKind};
-use paint::{ImageStore, Pixmap, build_display_list, rasterise};
+use paint::{ImageStore, Pixmap, build_display_list};
 use text::FontStore;
 
 /// One document occupying a rectangle of the canvas.
@@ -47,9 +47,57 @@ pub struct Page {
     /// and on anything hand-written — the caller falls back to the URL rather
     /// than showing an empty tab.
     pub title: Option<String>,
+    /// The document row `pixmap` starts at.
+    pub band_top: u32,
+    /// What another band would be painted from, when this page can paint one.
+    ///
+    /// Kept so that scrolling costs a paint rather than a re-layout: the
+    /// display list is in document coordinates and does not change between
+    /// bands. `None` for a frameset, whose canvas is composited from its
+    /// frames rather than built from one list — and which is never taller than
+    /// its own viewport, so no band beyond the one it has is ever asked for.
+    source: Option<Box<BandSource>>,
+}
+
+/// Everything painting a band of a page needs.
+struct BandSource {
+    list: paint::DisplayList,
+    images: paint::ImageStore,
 }
 
 impl Page {
+    /// Paints a different band of this page, without laying it out again.
+    ///
+    /// This is what makes a long page affordable: the parse, the cascade, and
+    /// the layout all stay done, and moving down the document costs only the
+    /// pixels asked for.
+    ///
+    /// `None` when this page cannot repaint — a frameset — which is safe
+    /// because a frameset's canvas is its viewport and never has rows beyond
+    /// the ones it already holds.
+    pub fn paint_band(&self, fonts: &mut FontStore, top: u32, height: u32) -> Option<Pixmap> {
+        let source = self.source.as_ref()?;
+        // Clipped to what the document has below `top`, the same way a first
+        // render is clipped to its content. A band running off the bottom
+        // otherwise comes back padded with canvas colour, and those rows are
+        // not rows of the document — they would scroll past the end.
+        let content_rows = self.content_height.ceil().max(1.0) as u32;
+        let height = height.min(content_rows.saturating_sub(top)).max(1);
+        paint::rasterise_band(
+            &source.list,
+            fonts,
+            &source.images,
+            self.pixmap.width(),
+            top as f32,
+            height,
+        )
+    }
+
+    /// Whether this page can paint a band other than the one it holds.
+    pub fn can_paint_bands(&self) -> bool {
+        self.source.is_some()
+    }
+
     /// The absolute URL of the link at a point, in canvas coordinates.
     ///
     /// Resolved here rather than handed back raw because the answer depends on
@@ -196,6 +244,27 @@ pub trait Loader {
     /// for all three and because telling the untrusted side which would leak
     /// the parent's configuration to it.
     fn load(&mut self, url: &str, document: Option<&Origin>, kind: RequestKind) -> Option<Loaded>;
+
+    /// Fetches several subresources at once, answering one per URL in order.
+    ///
+    /// Worth asking for as a group wherever the caller knows a group: across a
+    /// process boundary the parent can fetch them concurrently, which is the
+    /// difference between waiting for the sum of a page's latencies and waiting
+    /// for the longest of them.
+    ///
+    /// Defaults to asking one at a time, which is all an in-process loader can
+    /// usefully do — there is no boundary to overlap across, and the reference
+    /// tests and the command line go through this path.
+    fn load_many(
+        &mut self,
+        urls: &[String],
+        document: Option<&Origin>,
+        kind: RequestKind,
+    ) -> Vec<Option<Loaded>> {
+        urls.iter()
+            .map(|url| self.load(url, document, kind))
+            .collect()
+    }
 }
 
 /// A fetched subresource.
@@ -259,6 +328,7 @@ pub fn render_with_base(
     render_with_base_and_loader(
         html,
         width,
+        0,
         max_height,
         fonts,
         &mut DirectLoader::default(),
@@ -273,7 +343,8 @@ pub fn render_with_base(
 pub fn render_with_base_and_loader(
     html: &str,
     width: u32,
-    max_height: u32,
+    band_top: u32,
+    band_height: u32,
     fonts: &mut FontStore,
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
@@ -281,7 +352,8 @@ pub fn render_with_base_and_loader(
     render_sized(
         html,
         width,
-        max_height,
+        band_top,
+        band_height,
         Settings::default(),
         fonts,
         loader,
@@ -325,6 +397,7 @@ fn render_in_viewport_with(
     render_sized(
         html,
         width,
+        0,
         height,
         Settings {
             fill_height: true,
@@ -352,9 +425,38 @@ pub fn render_as_authored(
     render_as_authored_with(
         html,
         width,
+        0,
         max_height,
         fonts,
         &mut DirectLoader::default(),
+        base,
+    )
+}
+
+/// Renders as the document fallback whatever classification decided.
+///
+/// The counterpart to `render_as_authored_with`, for a reader who wants the
+/// simplified layout on a page that renders perfectly well without it.
+pub fn render_as_document_with(
+    html: &str,
+    width: u32,
+    band_top: u32,
+    band_height: u32,
+    fonts: &mut FontStore,
+    loader: &mut dyn Loader,
+    base: Option<(&Origin, &str)>,
+) -> Page {
+    render_sized(
+        html,
+        width,
+        band_top,
+        band_height,
+        Settings {
+            force_document: true,
+            ..Settings::default()
+        },
+        fonts,
+        loader,
         base,
     )
 }
@@ -363,7 +465,8 @@ pub fn render_as_authored(
 pub fn render_as_authored_with(
     html: &str,
     width: u32,
-    max_height: u32,
+    band_top: u32,
+    band_height: u32,
     fonts: &mut FontStore,
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
@@ -371,7 +474,8 @@ pub fn render_as_authored_with(
     render_sized(
         html,
         width,
-        max_height,
+        band_top,
+        band_height,
         Settings {
             force_authored: true,
             ..Settings::default()
@@ -389,12 +493,25 @@ struct Settings {
     fill_height: bool,
     /// Use the author's layout whatever classification decided.
     force_authored: bool,
+    /// Use the document fallback whatever classification decided.
+    ///
+    /// The other direction of `force_authored`, and not reachable by inverting
+    /// it: a page that classifies as `Authored` has no fallback to return to,
+    /// so asking for one is a different request rather than the absence of
+    /// this one.
+    force_document: bool,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
+              nothing else would use"
+)]
 fn render_sized(
     html: &str,
     width: u32,
-    max_height: u32,
+    band_top: u32,
+    band_height: u32,
     settings: Settings,
     fonts: &mut FontStore,
     loader: &mut dyn Loader,
@@ -409,7 +526,15 @@ fn render_sized(
         && let Some((origin, path)) = base
     {
         return render_frameset(
-            &doc, frameset, width, max_height, fonts, loader, origin, path, 0,
+            &doc,
+            frameset,
+            width,
+            band_height,
+            fonts,
+            loader,
+            origin,
+            path,
+            0,
         );
     }
 
@@ -422,6 +547,18 @@ fn render_sized(
         // The reader asked to see what the author wrote. Classification still
         // ran — the answer is just not being acted on.
         RenderMode::Authored
+    } else if settings.force_document {
+        // The reader asked for the fallback on a page that did not need one.
+        // Classification still runs and its measurement is kept, so the bar can
+        // go on saying how much of this page actually wanted newer layout —
+        // which on a page in this branch is usually none of it, and saying so
+        // is the honest answer rather than an embarrassing one.
+        match layout::classify(&doc, &styles) {
+            RenderMode::Authored => RenderMode::Document {
+                unsupported_share: 0.0,
+            },
+            already_a_fallback => already_a_fallback,
+        }
     } else {
         layout::classify(&doc, &styles)
     };
@@ -433,7 +570,9 @@ fn render_sized(
         // the reader sheet is applied over the UA defaults instead.
         RenderMode::Document { .. } | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
-            css::cascade::cascade(&doc, &[reader])
+            let mut styles = css::cascade::cascade(&doc, &[reader]);
+            collapse_blank_lines(&doc, &mut styles);
+            styles
         }
     };
 
@@ -456,12 +595,19 @@ fn render_sized(
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
+    // The band asked for, clipped to what the document actually has below it.
+    // A page shorter than the band gets a canvas its own height, which is what
+    // every page did before bands existed and is why a short page still paints
+    // exactly as it used to.
+    let content_rows = laid_out.height.ceil().max(1.0) as u32;
     let height = if settings.fill_height {
-        max_height.max(1)
+        band_height.max(1)
     } else {
-        (laid_out.height.ceil().max(1.0) as u32).min(max_height)
+        band_height
+            .min(content_rows.saturating_sub(band_top))
+            .max(1)
     };
-    let pixmap = rasterise(&list, fonts, &images, width, height)
+    let pixmap = paint::rasterise_band(&list, fonts, &images, width, band_top as f32, height)
         .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
     // The whole canvas is one document. `base` is what a link inside it
@@ -496,6 +642,8 @@ fn render_sized(
         images_loaded: images.len(),
         title,
         frames,
+        band_top,
+        source: Some(Box::new(BandSource { list, images })),
     }
 }
 
@@ -644,6 +792,12 @@ fn render_frameset(
 
     Page {
         pixmap,
+        band_top: 0,
+        // A frameset's canvas is composited from its frames rather than built
+        // from one display list, so there is nothing to repaint a band from —
+        // and nothing needs one, because a frameset is its viewport and never
+        // has rows below the ones it holds.
+        source: None,
         mode: RenderMode::Authored,
         content_height: height as f32,
         images_loaded: loaded,
@@ -666,29 +820,12 @@ fn load_images(
     origin: &Origin,
     path: &str,
 ) -> ImageStore {
-    let mut store = ImageStore::new();
-    let mut cache: std::collections::HashMap<String, Option<paint::DecodedImage>> =
-        std::collections::HashMap::new();
-
-    // The same image often appears many times on a page — a tile appears on
-    // every cell of a table — so fetching each URL once matters more here than
-    // usual, since every fetch is synchronous.
-    let load =
-        |url: &str,
-         loader: &mut dyn Loader,
-         cache: &mut std::collections::HashMap<String, Option<paint::DecodedImage>>| {
-            if let Some(hit) = cache.get(url) {
-                return hit.clone();
-            }
-            // Subresource, so ADR-0006's third-party rule applies — wherever the
-            // loader chooses to apply it.
-            let decoded = loader
-                .load(url, Some(origin), RequestKind::Subresource)
-                .and_then(|resource| paint::decode(&resource.bytes));
-            cache.insert(url.to_owned(), decoded.clone());
-            decoded
-        };
-
+    // Two passes: every image the page refers to is found first, and only then
+    // asked for. Interleaving the two meant each image was requested where it
+    // was discovered, so they went out one at a time and the page waited for
+    // the sum of their latencies. Nothing here needs the first image to know
+    // about the second, so nothing needs to.
+    let mut wanted: Vec<(paint::ImageKey, String)> = Vec::new();
     for node in doc.descendants(doc.root()) {
         let Some(element) = doc.element(node) else {
             continue;
@@ -696,19 +833,48 @@ fn load_images(
         if element.local_name() == "img"
             && let Some(src) = element.attr("src")
         {
-            let url = net::resolve(origin, path, src);
-            if let Some(image) = load(&url, loader, &mut cache) {
-                store.insert(paint::ImageKey::content(node), image);
-            }
+            wanted.push((
+                paint::ImageKey::content(node),
+                net::resolve(origin, path, src),
+            ));
         }
         if let Some(source) = styles
             .get(node)
             .and_then(|style| style.background_image.as_deref())
         {
-            let url = net::resolve(origin, path, source);
-            if let Some(image) = load(&url, loader, &mut cache) {
-                store.insert(paint::ImageKey::background(node), image);
-            }
+            wanted.push((
+                paint::ImageKey::background(node),
+                net::resolve(origin, path, source),
+            ));
+        }
+    }
+
+    // The same image often appears many times on a page — a tile on every cell
+    // of a table — so each distinct URL is asked for once. Order is kept so
+    // that what arrives can be matched back positionally.
+    let mut distinct: Vec<String> = Vec::new();
+    for (_, url) in &wanted {
+        if !distinct.contains(url) {
+            distinct.push(url.clone());
+        }
+    }
+
+    // Subresources, so ADR-0006's third-party rule applies — wherever the
+    // loader chooses to apply it.
+    let fetched = loader.load_many(&distinct, Some(origin), RequestKind::Subresource);
+    let decoded: std::collections::HashMap<&str, Option<paint::DecodedImage>> = distinct
+        .iter()
+        .map(String::as_str)
+        .zip(fetched)
+        // Decoded here rather than by the parent: an image format is a parser
+        // like any other, and parsers live on this side of the boundary.
+        .map(|(url, resource)| (url, resource.and_then(|got| paint::decode(&got.bytes))))
+        .collect();
+
+    let mut store = ImageStore::new();
+    for (key, url) in &wanted {
+        if let Some(Some(image)) = decoded.get(url.as_str()) {
+            store.insert(*key, image.clone());
         }
     }
     store
@@ -718,6 +884,52 @@ fn load_images(
 ///
 /// `<link rel=stylesheet>` is not followed here: fetching is the net crate's
 /// job, and same-origin policy (ADR-0006) applies to it.
+/// Keeps the first of every run of consecutive line breaks and drops the rest.
+///
+/// Only on the document fallback. A page that writes `<br><br><br><br>` between
+/// two paragraphs is using line breaks as a margin, which was how a great deal
+/// of the era's markup — and every WYSIWYG editor since — did its spacing. The
+/// author's layout is the place to honour that exactly; a document rendering
+/// has already thrown their stylesheet away on the grounds that it was not
+/// working, and reproducing their vertical spacing to the pixel while doing so
+/// only turns a page into a column of gaps with the occasional sentence in it.
+///
+/// One is kept rather than none, because a single break between two lines is
+/// almost always meant — an address, a verse, a signature — and a reader mode
+/// that ran those together would be destroying content rather than spacing.
+///
+/// Whitespace between the breaks does not interrupt a run: `<br>\n  <br>` is
+/// two breaks with a newline between them, and that newline collapses to
+/// nothing of its own.
+fn collapse_blank_lines(doc: &dom::Document, styles: &mut css::cascade::StyleMap) {
+    for node in doc.descendants(doc.root()) {
+        let mut breaks = 0usize;
+        for &child in doc.children(node) {
+            // Whitespace between two breaks is not content between them: it
+            // collapses away, so the breaks are still consecutive on the page
+            // even though they are not consecutive in the markup.
+            if let Some(text) = doc.text(child) {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                breaks = 0;
+                continue;
+            }
+            let is_break = doc
+                .element(child)
+                .is_some_and(|element| element.local_name() == "br");
+            if !is_break {
+                breaks = 0;
+                continue;
+            }
+            breaks += 1;
+            if breaks > 1 {
+                styles.hide(child);
+            }
+        }
+    }
+}
+
 /// How deeply `@import` may nest before we stop following it.
 ///
 /// A stylesheet can import itself, directly or through a cycle, and a browser
@@ -833,6 +1045,128 @@ fn collect_stylesheets(
 
 #[cfg(test)]
 mod tests {
+    /// The document fallback's height for a fragment, and the author's.
+    fn both_ways(html: &str) -> (f32, f32) {
+        let mut fonts = FontStore::new();
+        let document = render_as_document_with(
+            html,
+            600,
+            0,
+            9000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        let authored = render_as_authored_with(
+            html,
+            600,
+            0,
+            9000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        (document.content_height, authored.content_height)
+    }
+
+    #[test]
+    fn a_run_of_line_breaks_becomes_one_in_the_document_fallback() {
+        // Using `<br><br><br><br>` as a margin is how a great deal of the era's
+        // markup did its spacing, and how every WYSIWYG editor has done it
+        // since. Reproduced faithfully in a document rendering, it turns a page
+        // into a column of gaps with the occasional sentence in it — which is
+        // the complaint this exists for.
+        let one = both_ways("<body><p>one<br>two</p></body>");
+        let five = both_ways("<body><p>one<br><br><br><br><br>two</p></body>");
+        let twenty = both_ways(&format!("<body><p>one{}two</p></body>", "<br>".repeat(20)));
+
+        assert_eq!(
+            five.0, one.0,
+            "five breaks should read as one in the document fallback"
+        );
+        assert_eq!(twenty.0, one.0, "and so should twenty");
+
+        // The author's layout is left exactly alone. They asked for those
+        // breaks, and the authored rendering is where that is honoured.
+        assert!(
+            five.1 > one.1 && twenty.1 > five.1,
+            "the author's own layout lost breaks it asked for: {one:?} {five:?} {twenty:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_break_survives_and_so_does_one_with_words_around_it() {
+        // One break between two lines is almost always meant — an address, a
+        // verse, a signature — so collapsing to none would be destroying
+        // content rather than spacing. And two breaks with text between them
+        // are not a run at all.
+        let plain = both_ways("<body><p>one two</p></body>");
+        let broken = both_ways("<body><p>one<br>two</p></body>");
+        assert!(
+            broken.0 > plain.0,
+            "the one break a reader meant was dropped"
+        );
+
+        let apart = both_ways("<body><p>one<br>mid<br>two</p></body>");
+        assert!(
+            apart.0 > broken.0,
+            "two breaks with words between them are not a run"
+        );
+    }
+
+    #[test]
+    fn whitespace_between_two_breaks_does_not_keep_them_apart() {
+        // `<br>\n  <br>` is two breaks with a newline between them, and that
+        // newline collapses to nothing — so on the page they are consecutive
+        // even though they are not consecutive in the markup. Markup written by
+        // hand is full of this.
+        let tight = both_ways("<body><p>one<br><br><br>two</p></body>");
+        let spaced = both_ways("<body><p>one<br>\n  <br>\n\t<br>two</p></body>");
+        assert_eq!(
+            spaced.0, tight.0,
+            "newlines between the breaks stopped them being seen as a run"
+        );
+    }
+
+    #[test]
+    fn a_page_that_needs_no_fallback_can_still_be_given_one() {
+        // The capability `force_authored` had no counterpart. Inverting it does
+        // not produce this: an ordinary page classifies as `Authored`, so there
+        // was no way to ask for the document fallback on one, which is exactly
+        // what a reader wanting a simplified view of a working page asks for.
+        let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
+        let mut fonts = FontStore::new();
+
+        let ordinary = render(html, 800, 2000, &mut fonts);
+        assert!(
+            matches!(ordinary.mode, RenderMode::Authored),
+            "this fixture is only useful while it needs no fallback: {:?}",
+            ordinary.mode
+        );
+
+        let forced = render_as_document_with(
+            html,
+            800,
+            0,
+            2000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        assert!(
+            matches!(forced.mode, RenderMode::Document { .. }),
+            "asking for the fallback did not produce one: {:?}",
+            forced.mode
+        );
+        // And it is not the same rendering wearing a different label: the
+        // reader sheet replaces the author's, so the pixels have to differ.
+        assert_ne!(
+            ordinary.pixmap.data(),
+            forced.pixmap.data(),
+            "the forced fallback rendered identically to the author's layout"
+        );
+    }
+
     use super::*;
 
     #[test]

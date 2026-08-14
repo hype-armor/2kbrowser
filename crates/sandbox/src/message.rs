@@ -115,6 +115,26 @@ fn read_origin(reader: &mut Reader<'_>) -> Result<Origin, WireError> {
     })
 }
 
+/// One subresource the parent supplied, inside a [`ToChild::Resources`].
+///
+/// A refusal and a failure are the same shape on purpose: the child has no
+/// business knowing whether a resource was blocked by policy or merely
+/// missing, and telling it would leak the parent's configuration to the
+/// untrusted side.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Supplied {
+    /// The bytes, or empty when it could not be had.
+    pub body: Vec<u8>,
+    /// The `Content-Type` it was served with, when there was one.
+    ///
+    /// Carried because a stylesheet's character set can come from the header,
+    /// and dropping it here would silently change how a legacy stylesheet
+    /// decodes on the far side.
+    pub content_type: Option<String>,
+    /// Whether it was retrieved at all.
+    pub ok: bool,
+}
+
 /// Parent to child.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToChild {
@@ -128,32 +148,50 @@ pub enum ToChild {
         content_type: Option<String>,
         /// Viewport width.
         width: u32,
-        /// Maximum canvas height.
-        max_height: u32,
+        /// First document row to paint.
+        top: u32,
+        /// How many rows to paint, clipped to what the document has below
+        /// `top`. A page shorter than this gets a canvas its own height, which
+        /// is what every page got before bands existed.
+        height: u32,
         /// The document's own origin, for resolving what it references.
         origin: Option<Origin>,
         /// The document's path within that origin.
         path: String,
         /// Whether to overrule the document fallback (ADR-0009).
         force_authored: bool,
-    },
-    /// The answer to a [`ToParent::Fetch`].
-    ///
-    /// A refusal and a failure are the same shape on purpose: the child has no
-    /// business knowing whether a resource was blocked by policy or merely
-    /// missing, and telling it would leak the parent's configuration to the
-    /// untrusted side.
-    Resource {
-        /// The bytes, or empty when it could not be had.
-        body: Vec<u8>,
-        /// The `Content-Type` it was served with, when there was one.
+        /// Whether to ask for the document fallback on a page that classified
+        /// as authored (ADR-0009).
         ///
-        /// Carried because a stylesheet's character set can come from the
-        /// header, and dropping it here would silently change how a legacy
-        /// stylesheet decodes on the far side.
-        content_type: Option<String>,
-        /// Whether it was retrieved at all.
-        ok: bool,
+        /// Not the absence of `force_authored`, which is why it is a second
+        /// field rather than the other value of one: a page with no fallback
+        /// has nothing to return to, so wanting one is its own request. The two
+        /// are never both true, but that is the parent's business — the child
+        /// reads whatever arrives, and `render` gives `force_authored`
+        /// precedence rather than trusting a stranger to have kept the rule.
+        force_document: bool,
+    },
+    /// Paint a different band of the page already held.
+    ///
+    /// The point of the whole arrangement: the parse, the cascade, and the
+    /// layout stay done, so moving down a long document costs only the pixels
+    /// asked for. A band request never fetches anything.
+    Band {
+        /// First document row to paint.
+        top: u32,
+        /// How many rows to paint.
+        height: u32,
+    },
+    /// The answers to a [`ToParent::Fetch`], one per URL and in the same order.
+    ///
+    /// Order is the whole matching rule: the parent answers a batch with
+    /// exactly as many resources as were asked for, so nothing needs a request
+    /// id and neither side has to hold a map. A batch of one is an ordinary
+    /// single fetch, which is what a stylesheet is — its `@import` chain is
+    /// only discoverable a link at a time.
+    Resources {
+        /// One per URL asked for, positionally.
+        resources: Vec<Supplied>,
     },
     /// Asks where `query` appears on the page most recently rendered.
     ///
@@ -176,10 +214,12 @@ impl ToChild {
                 body,
                 content_type,
                 width,
-                max_height,
+                top,
+                height,
                 origin,
                 path,
                 force_authored,
+                force_document,
             } => {
                 writer.tag(0);
                 writer.bytes(body);
@@ -188,30 +228,36 @@ impl ToChild {
                     writer.str(content_type);
                 }
                 writer.u32(*width);
-                writer.u32(*max_height);
+                writer.u32(*top);
+                writer.u32(*height);
                 writer.some(origin.is_some());
                 if let Some(origin) = origin {
                     write_origin(&mut writer, origin);
                 }
                 writer.str(path);
                 writer.some(*force_authored);
+                writer.some(*force_document);
             }
             ToChild::Find { query } => {
                 writer.tag(2);
                 writer.str(query);
             }
-            ToChild::Resource {
-                body,
-                content_type,
-                ok,
-            } => {
+            ToChild::Band { top, height } => {
+                writer.tag(3);
+                writer.u32(*top);
+                writer.u32(*height);
+            }
+            ToChild::Resources { resources } => {
                 writer.tag(1);
-                writer.bytes(body);
-                writer.some(content_type.is_some());
-                if let Some(content_type) = content_type {
-                    writer.str(content_type);
+                writer.u32(resources.len() as u32);
+                for resource in resources {
+                    writer.bytes(&resource.body);
+                    writer.some(resource.content_type.is_some());
+                    if let Some(content_type) = &resource.content_type {
+                        writer.str(content_type);
+                    }
+                    writer.some(resource.ok);
                 }
-                writer.some(*ok);
             }
         }
         writer.finish()
@@ -229,7 +275,8 @@ impl ToChild {
                     None
                 };
                 let width = reader.u32()?;
-                let max_height = reader.u32()?;
+                let top = reader.u32()?;
+                let height = reader.u32()?;
                 let origin = if reader.some()? {
                     Some(read_origin(&mut reader)?)
                 } else {
@@ -239,27 +286,41 @@ impl ToChild {
                     body,
                     content_type,
                     width,
-                    max_height,
+                    top,
+                    height,
                     origin,
                     path: reader.str()?,
                     force_authored: reader.some()?,
+                    force_document: reader.some()?,
                 }
             }
             1 => {
-                let body = reader.bytes()?.to_vec();
-                let content_type = if reader.some()? {
-                    Some(reader.str()?)
-                } else {
-                    None
-                };
-                ToChild::Resource {
-                    body,
-                    content_type,
-                    ok: reader.some()?,
+                // A count, not a plain `u32`: bounded by the bytes left, so a
+                // claim of four billion resources cannot reserve for four
+                // billion resources.
+                let count = reader.count()?;
+                let mut resources = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    let body = reader.bytes()?.to_vec();
+                    let content_type = if reader.some()? {
+                        Some(reader.str()?)
+                    } else {
+                        None
+                    };
+                    resources.push(Supplied {
+                        body,
+                        content_type,
+                        ok: reader.some()?,
+                    });
                 }
+                ToChild::Resources { resources }
             }
             2 => ToChild::Find {
                 query: reader.str()?,
+            },
+            3 => ToChild::Band {
+                top: reader.u32()?,
+                height: reader.u32()?,
             },
             _ => return Err(WireError::Unknown),
         };
@@ -271,15 +332,23 @@ impl ToChild {
 /// Child to parent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToParent {
-    /// Asks for a subresource.
+    /// Asks for subresources.
     ///
     /// The child cannot reach the network itself, so this is the only way it
     /// gets anything — and the parent applies ADR-0006's policy to every one of
     /// them, somewhere a compromised renderer cannot reach.
+    ///
+    /// Several at once rather than one, because the parent can then fetch them
+    /// concurrently. Asking one at a time made a page wait for the sum of every
+    /// subresource's latency rather than the longest, which on a page of twenty
+    /// images is twenty round trips in a row. The child asks for as many as it
+    /// knows about — every image on the page, once the cascade has run — and
+    /// asks for one where one is all it can know, which is a stylesheet, whose
+    /// `@import` chain is only discoverable a link at a time.
     Fetch {
-        /// Absolute URL, resolved by the child against the document.
-        url: String,
-        /// What it is for, so the policy can tell a navigation from a
+        /// Absolute URLs, resolved by the child against the document.
+        urls: Vec<String>,
+        /// What they are for, so the policy can tell a navigation from a
         /// subresource.
         kind: RequestKind,
     },
@@ -308,8 +377,10 @@ pub struct Rendered {
     pub pixels: Vec<u8>,
     /// Canvas width.
     pub width: u32,
-    /// Canvas height.
+    /// Canvas height: how many document rows `pixels` holds.
     pub height: u32,
+    /// The document row `pixels` starts at.
+    pub top: u32,
     /// Height of the content, which may exceed the canvas.
     pub content_height: f32,
     /// How it was rendered (ADR-0009).
@@ -333,9 +404,12 @@ impl ToParent {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         match self {
-            ToParent::Fetch { url, kind } => {
+            ToParent::Fetch { urls, kind } => {
                 writer.tag(0);
-                writer.str(url);
+                writer.u32(urls.len() as u32);
+                for url in urls {
+                    writer.str(url);
+                }
                 writer.tag(match kind {
                     RequestKind::Navigation => 0,
                     RequestKind::Subresource => 1,
@@ -346,6 +420,7 @@ impl ToParent {
                 writer.bytes(&page.pixels);
                 writer.u32(page.width);
                 writer.u32(page.height);
+                writer.u32(page.top);
                 writer.f32(page.content_height);
                 page.mode.write(&mut writer);
                 writer.some(page.title.is_some());
@@ -380,18 +455,28 @@ impl ToParent {
     pub fn decode(frame: &[u8]) -> Result<Self, WireError> {
         let mut reader = Reader::new(frame);
         let message = match reader.tag()? {
-            0 => ToParent::Fetch {
-                url: reader.str()?,
-                kind: match reader.tag()? {
-                    0 => RequestKind::Navigation,
-                    1 => RequestKind::Subresource,
-                    _ => return Err(WireError::Unknown),
-                },
-            },
+            0 => {
+                // A count, so a claim of four billion URLs cannot reserve for
+                // four billion URLs.
+                let count = reader.count()?;
+                let mut urls = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    urls.push(reader.str()?);
+                }
+                ToParent::Fetch {
+                    urls,
+                    kind: match reader.tag()? {
+                        0 => RequestKind::Navigation,
+                        1 => RequestKind::Subresource,
+                        _ => return Err(WireError::Unknown),
+                    },
+                }
+            }
             1 => {
                 let pixels = reader.bytes()?.to_vec();
                 let width = reader.u32()?;
                 let height = reader.u32()?;
+                let top = reader.u32()?;
                 let content_height = reader.f32()?;
                 let mode = Mode::read(&mut reader)?;
                 let title = if reader.some()? {
@@ -428,6 +513,7 @@ impl ToParent {
                     pixels,
                     width,
                     height,
+                    top,
                     content_height,
                     mode,
                     title,
@@ -465,6 +551,7 @@ mod tests {
             pixels: vec![0; (width * height * 4) as usize],
             width,
             height,
+            top: 0,
             content_height: 123.5,
             mode: Mode::Document {
                 unsupported_share: 0.42,
@@ -491,7 +578,8 @@ mod tests {
             body: b"<p>hello</p>".to_vec(),
             content_type: Some("text/html; charset=utf-8".to_owned()),
             width: 800,
-            max_height: 2000,
+            top: 0,
+            height: 2000,
             origin: Some(
                 net::parse_url("https://example.com/a.html")
                     .expect("parses")
@@ -499,8 +587,39 @@ mod tests {
             ),
             path: "/a.html".to_owned(),
             force_authored: true,
+            force_document: false,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
+    }
+
+    #[test]
+    fn the_two_layout_overrides_do_not_cross_on_the_wire() {
+        // Adjacent fields of the same shape, written and read by position. A
+        // decoder that took them in the other order would round-trip both-false
+        // and both-true unchanged, so the only case that catches the swap is
+        // the one where they differ — which is also the only case either field
+        // is ever set in.
+        //
+        // Worth its own test because the two mean opposite things: one asks for
+        // the author's layout over the fallback, the other for the fallback
+        // over the author's layout. Crossed, the reader presses a button and
+        // gets the page they already had, with the bar saying they asked for
+        // the other one.
+        for (force_authored, force_document) in [(true, false), (false, true)] {
+            let message = ToChild::Render {
+                body: b"<p>hello</p>".to_vec(),
+                content_type: None,
+                width: 800,
+                top: 0,
+                height: 2000,
+                origin: None,
+                path: "/a.html".to_owned(),
+                force_authored,
+                force_document,
+            };
+            let decoded = ToChild::decode(&message.encode());
+            assert_eq!(decoded, Ok(message), "{force_authored} {force_document}");
+        }
     }
 
     #[test]
@@ -509,10 +628,12 @@ mod tests {
             body: Vec::new(),
             content_type: None,
             width: 1,
-            max_height: 1,
+            top: 0,
+            height: 1,
             origin: None,
             path: String::new(),
             force_authored: false,
+            force_document: false,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
     }
@@ -529,10 +650,12 @@ mod tests {
                 body: Vec::new(),
                 content_type: None,
                 width: 10,
-                max_height: 10,
+                top: 0,
+                height: 10,
                 origin: Some(origin),
                 path,
                 force_authored: false,
+                force_document: false,
             };
             assert_eq!(ToChild::decode(&message.encode()), Ok(message), "{url}");
         }
@@ -548,12 +671,21 @@ mod tests {
     fn a_fetch_and_a_failure_round_trip() {
         for message in [
             ToParent::Fetch {
-                url: "https://example.com/x.png".to_owned(),
+                urls: vec![
+                    "https://example.com/x.png".to_owned(),
+                    "https://example.com/y.css".to_owned(),
+                ],
                 kind: RequestKind::Subresource,
             },
             ToParent::Fetch {
-                url: "https://example.com/".to_owned(),
+                urls: vec!["https://example.com/".to_owned()],
                 kind: RequestKind::Navigation,
+            },
+            // No URLs at all. The child does not send this, and the decoder
+            // still has to have an answer for it.
+            ToParent::Fetch {
+                urls: Vec::new(),
+                kind: RequestKind::Subresource,
             },
             ToParent::Failed {
                 message: "could not render".to_owned(),
@@ -600,16 +732,32 @@ mod tests {
                 body: b"<p>x</p>".to_vec(),
                 content_type: Some("text/html".to_owned()),
                 width: 800,
-                max_height: 600,
+                top: 0,
+                height: 600,
                 origin: Some(net::parse_url("https://example.com/").expect("parses").0),
                 path: "/".to_owned(),
                 force_authored: false,
+                force_document: true,
             }
             .encode(),
             ToParent::Rendered(Box::new(rendered(3, 2))).encode(),
             ToParent::Fetch {
-                url: "https://example.com/a".to_owned(),
+                urls: vec![
+                    "https://example.com/a".to_owned(),
+                    "https://example.com/b".to_owned(),
+                ],
                 kind: RequestKind::Subresource,
+            }
+            .encode(),
+            ToChild::Resources {
+                resources: vec![
+                    Supplied {
+                        body: b"one".to_vec(),
+                        content_type: Some("text/css".to_owned()),
+                        ok: true,
+                    },
+                    Supplied::default(),
+                ],
             }
             .encode(),
         ];
@@ -627,6 +775,7 @@ mod tests {
         let mut writer = Writer::new();
         writer.tag(1);
         writer.bytes(&[]);
+        writer.u32(0);
         writer.u32(0);
         writer.u32(0);
         writer.f32(0.0);

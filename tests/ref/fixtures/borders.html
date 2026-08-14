@@ -8,6 +8,23 @@
   .partial{ border-left: 6px solid #999999; padding-left: 10px; margin-bottom: 10px; }
   .nostyle{ border-width: 20px; padding: 4px; margin-bottom: 10px; }
   .fixed  { width: 150px; border: 2px solid #000000; padding: 10px; }
+  /* Dotted and dashed, at a thin width and a thick one. The pattern scales
+     with the border, and each run is stretched to start and end flush with the
+     corner rather than leaving half a dash there. */
+  .dotted { border: 1px dotted #cc0000; padding: 6px; margin: 10px 0; }
+  .dotted-thick { border: 5px dotted #0055aa; padding: 6px; margin-bottom: 10px; }
+  .dashed { border: 1px dashed #cc0000; padding: 6px; margin-bottom: 10px; }
+  .dashed-thick { border: 4px dashed #007700; padding: 6px; margin-bottom: 10px; }
+  /* Too short to hold a pattern: degrades to a solid run rather than to a
+     ragged one. */
+  .tiny   { width: 6px; height: 6px; border: 3px dotted #333333; }
+  /* The three-dimensional styles, which fake a light source above and to the
+     left. Grey, because that is what the era put on buttons. */
+  .raised { border: 6px outset #c0c0c0; padding: 4px; margin: 10px 0; }
+  .sunken { border: 6px inset #c0c0c0; padding: 4px; margin-bottom: 10px; }
+  .carved { border: 6px groove #c0c0c0; padding: 4px; margin-bottom: 10px; }
+  .proud  { border: 6px ridge #c0c0c0; padding: 4px; margin-bottom: 10px; }
+  .twin   { border: 6px double #0055aa; padding: 4px; margin-bottom: 10px; }
 </style></head><body>
 <div class="plain">A uniform solid border.</div>
 <div class="thick">A thicker border with less padding.</div>
@@ -15,4 +32,14 @@
 <div class="partial">Only a left border, as used for blockquotes.</div>
 <div class="nostyle">border-width with no border-style occupies nothing.</div>
 <div class="fixed">Explicit width is the content width.</div>
+<div class="dotted">A dotted border, one pixel wide.</div>
+<div class="dotted-thick">A dotted border, five pixels wide.</div>
+<div class="dashed">A dashed border, one pixel wide.</div>
+<div class="dashed-thick">A dashed border, four pixels wide.</div>
+<div class="tiny"></div>
+<div class="raised">An outset border, as the era drew a button.</div>
+<div class="sunken">An inset border, the same light the other way.</div>
+<div class="carved">A groove: inset outside, outset inside.</div>
+<div class="proud">A ridge: a groove reversed.</div>
+<div class="twin">A double border, two lines and a gap.</div>
 </body></html>

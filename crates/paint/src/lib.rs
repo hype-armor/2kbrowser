@@ -60,6 +60,8 @@ pub enum DisplayItem {
         rect: Rect,
         /// Which axes the image repeats along.
         repeat: css::style::BackgroundRepeat,
+        /// Where within the box the image is anchored.
+        position: css::style::BackgroundPosition,
     },
     /// A single positioned glyph.
     Glyph {
@@ -84,7 +86,11 @@ pub struct DisplayList {
     /// page — and the background has to reach the bottom of it either way.
     pub canvas: Color,
     /// Image tiled across the whole canvas, for the same reason.
-    pub canvas_image: Option<(dom::NodeId, css::style::BackgroundRepeat)>,
+    pub canvas_image: Option<(
+        dom::NodeId,
+        css::style::BackgroundRepeat,
+        css::style::BackgroundPosition,
+    )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
 }
@@ -114,7 +120,7 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
     // §14.2 again: an element whose background was propagated to the canvas
     // does not paint it a second time. Drawing it twice is invisible while the
     // colour is opaque and wrong the moment it is not.
-    let propagated = layout.canvas_image.map(|(node, _)| node);
+    let propagated = layout.canvas_image.map(|(node, ..)| node);
     paint_box(&layout.root, 0.0, 0.0, propagated, &mut list);
     list
 }
@@ -158,6 +164,7 @@ fn paint_box(
                 height: box_.rect.height,
             },
             repeat: box_.style.background_repeat,
+            position: box_.style.background_position,
         });
     }
 
@@ -239,49 +246,255 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
     let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(box_.style.color);
 
     if border.top.style.is_visible() && top > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x,
                 y,
                 width,
                 height: top,
             },
-            color: color_of(&border.top),
-        });
+            border.top.style,
+            top,
+            Side::Top,
+            color_of(&border.top),
+        );
     }
     if border.bottom.style.is_visible() && bottom > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x,
                 y: y + height - bottom,
                 width,
                 height: bottom,
             },
-            color: color_of(&border.bottom),
-        });
+            border.bottom.style,
+            bottom,
+            Side::Bottom,
+            color_of(&border.bottom),
+        );
     }
     let side_height = (height - top - bottom).max(0.0);
     if border.left.style.is_visible() && left > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x,
                 y: y + top,
                 width: left,
                 height: side_height,
             },
-            color: color_of(&border.left),
-        });
+            border.left.style,
+            left,
+            Side::Left,
+            color_of(&border.left),
+        );
     }
     if border.right.style.is_visible() && right > 0.0 {
-        list.items.push(DisplayItem::Rect {
-            rect: Rect {
+        push_border_side(
+            list,
+            &Rect {
                 x: x + width - right,
                 y: y + top,
                 width: right,
                 height: side_height,
             },
-            color: color_of(&border.right),
-        });
+            border.right.style,
+            right,
+            Side::Right,
+            color_of(&border.right),
+        );
+    }
+}
+
+/// Which edge of the box a border side is.
+///
+/// More than the axis, because the three-dimensional styles need to know which
+/// edge they are on: what makes `outset` look raised is that the top and left
+/// catch the light while the bottom and right fall into shadow, and an engine
+/// that only knew "horizontal" would light both ends of the box the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl Side {
+    /// Whether the side runs left-to-right.
+    fn is_horizontal(self) -> bool {
+        matches!(self, Side::Top | Side::Bottom)
+    }
+
+    /// Whether this edge is the one a light source above and to the left would
+    /// strike. `inset` and `outset` are this predicate and a pair of shades.
+    fn faces_the_light(self) -> bool {
+        matches!(self, Side::Top | Side::Left)
+    }
+}
+
+/// A shade of the border's colour, for the styles that fake a light source.
+///
+/// The specification says only that `inset` "looks as though it were embedded
+/// in the canvas" and leaves the rest to the UA, so the two shades are a
+/// choice: the declared colour for the lit edges, and half of each channel for
+/// the shadowed ones. Half is what makes the era's default grey `outset` button
+/// look like a button rather than like a slightly uneven rectangle.
+fn shaded(color: Color, factor: f32) -> Color {
+    let channel = |value: u8| (value as f32 * factor).clamp(0.0, 255.0) as u8;
+    Color {
+        r: channel(color.r),
+        g: channel(color.g),
+        b: channel(color.b),
+        a: color.a,
+    }
+}
+
+/// How much darker a shadowed edge is drawn.
+const SHADOW: f32 = 0.5;
+
+/// A band across a side's *thickness*, measured from its outer edge.
+///
+/// `from` and `to` are fractions, so `(0.0, 0.5)` is the outer half of the
+/// side whichever edge it is — the outer half of a bottom border is its lower
+/// half, and of a top border its upper one.
+fn band(side: &Rect, edge: Side, thickness: f32, from: f32, to: f32) -> Rect {
+    let (near, far) = (thickness * from, thickness * to);
+    match edge {
+        Side::Top => Rect {
+            y: side.y + near,
+            height: far - near,
+            ..*side
+        },
+        Side::Bottom => Rect {
+            y: side.y + side.height - far,
+            height: far - near,
+            ..*side
+        },
+        Side::Left => Rect {
+            x: side.x + near,
+            width: far - near,
+            ..*side
+        },
+        Side::Right => Rect {
+            x: side.x + side.width - far,
+            width: far - near,
+            ..*side
+        },
+    }
+}
+
+/// How long a dash or a dot wants to be, as a multiple of the border's width.
+///
+/// CSS 2.1 §8.5.3 says a dotted border is "a series of dots" and a dashed one
+/// "a series of short line segments", and stops there — the pattern is the UA's
+/// to choose, which is why no two browsers match. Square dots the width of the
+/// border, and dashes three times that, are what the era's browsers converged
+/// on closely enough that a page authored against one does not look broken
+/// under this.
+const DOT_PERIOD: f32 = 1.0;
+const DASH_PERIOD: f32 = 3.0;
+
+/// Pushes one side of a border, as one rectangle or as a row of them.
+fn push_border_side(
+    list: &mut DisplayList,
+    side: &Rect,
+    style: css::style::BorderStyle,
+    thickness: f32,
+    edge: Side,
+    color: Color,
+) {
+    use css::style::BorderStyle;
+
+    let lit = color;
+    let dark = shaded(color, SHADOW);
+
+    let wanted = match style {
+        BorderStyle::Dotted => DOT_PERIOD * thickness,
+        BorderStyle::Dashed => DASH_PERIOD * thickness,
+        // Two lines with a gap, each a third of the border. Below three pixels
+        // there is no room for that, and the honest answer is the solid line
+        // the author would otherwise have got.
+        BorderStyle::Double if thickness >= 3.0 => {
+            for (from, to) in [(0.0, 1.0 / 3.0), (2.0 / 3.0, 1.0)] {
+                list.items.push(DisplayItem::Rect {
+                    rect: band(side, edge, thickness, from, to),
+                    color,
+                });
+            }
+            return;
+        }
+        // Embedded or raised: one flat shade per edge, lit from above and left.
+        BorderStyle::Inset | BorderStyle::Outset => {
+            let raised = style == BorderStyle::Outset;
+            let light = edge.faces_the_light() == raised;
+            list.items.push(DisplayItem::Rect {
+                rect: *side,
+                color: if light { lit } else { dark },
+            });
+            return;
+        }
+        // Carved or proud: the same idea twice across the thickness, with the
+        // halves the other way round. A groove is an inset outer half around an
+        // outset inner one, which is what gives it its lip; a ridge is the
+        // reverse. Needs two pixels to show at all.
+        BorderStyle::Groove | BorderStyle::Ridge if thickness >= 2.0 => {
+            let proud = style == BorderStyle::Ridge;
+            for (from, to, outer) in [(0.0, 0.5, true), (0.5, 1.0, false)] {
+                // The outer half is lit when this edge faces the light and the
+                // border stands proud; every other combination flips it, which
+                // is the whole of the effect.
+                let light = edge.faces_the_light() == (proud == outer);
+                list.items.push(DisplayItem::Rect {
+                    rect: band(side, edge, thickness, from, to),
+                    color: if light { lit } else { dark },
+                });
+            }
+            return;
+        }
+        // `solid`, and anything too thin to show the pattern it asked for.
+        _ => {
+            list.items.push(DisplayItem::Rect { rect: *side, color });
+            return;
+        }
+    };
+
+    let length = if edge.is_horizontal() {
+        side.width
+    } else {
+        side.height
+    };
+    if !(length.is_finite() && length > 0.0 && wanted.is_finite() && wanted > 0.0) {
+        return;
+    }
+
+    // `n` dashes with `n - 1` equal gaps between them, which is what makes the
+    // run start and end flush with the corners. Solving `length = n·d + (n−1)·d`
+    // for the dash size gives `d = length / (2n − 1)`, so the pattern is
+    // stretched a little rather than leaving a ragged end — the thing that
+    // makes a hand-rolled dashed border look wrong is a half dash at one end.
+    let count = (((length + wanted) / (2.0 * wanted)).round() as i32).max(1);
+    let dash = length / (2 * count - 1) as f32;
+    // One dash spanning the whole side is a solid line, which is the honest
+    // degradation for a side too short to show a pattern at all.
+    for index in 0..count {
+        let offset = index as f32 * 2.0 * dash;
+        let rect = if edge.is_horizontal() {
+            Rect {
+                x: side.x + offset,
+                width: dash,
+                ..*side
+            }
+        } else {
+            Rect {
+                y: side.y + offset,
+                height: dash,
+                ..*side
+            }
+        };
+        list.items.push(DisplayItem::Rect { rect, color });
     }
 }
 
@@ -295,6 +508,27 @@ pub fn rasterise(
     width: u32,
     height: u32,
 ) -> Option<Pixmap> {
+    rasterise_band(list, fonts, images, width, 0.0, height)
+}
+
+/// Rasterises the rows `[top, top + height)` of a document.
+///
+/// The display list is in document coordinates and does not change between
+/// bands — it is built once from the layout, and drawing a band is a matter of
+/// where the rows are taken from. That is what makes a band cheap: no parse, no
+/// cascade, no layout, just paint.
+///
+/// Items are shifted by `top` as they are drawn rather than the list being
+/// rewritten, so nothing is allocated per band and the drawable-range check
+/// still sees the coordinate that actually reaches the rasteriser.
+pub fn rasterise_band(
+    list: &DisplayList,
+    fonts: &mut FontStore,
+    images: &ImageStore,
+    width: u32,
+    top: f32,
+    height: u32,
+) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
     // Clearing to the canvas colour rather than white is what carries the
     // page's background down past the end of its content.
@@ -304,16 +538,32 @@ pub fn rasterise(
     ));
 
     // The canvas tile goes over the canvas colour and under everything else.
-    if let Some((node, repeat)) = list.canvas_image
+    if let Some((node, repeat, position)) = list.canvas_image
         && let Some(image) = images.get(&ImageKey::background(node))
     {
+        // The canvas is the whole document, so the anchor is measured against
+        // the document rather than the band — otherwise the tiling phase, and
+        // any percentage in the position, would move every time the reader
+        // scrolled.
         let full = Rect {
             x: 0.0,
             y: 0.0,
             width: pixmap.width() as f32,
-            height: pixmap.height() as f32,
+            height: top + pixmap.height() as f32,
         };
-        tile_image(&mut pixmap, image, &full, repeat);
+        let anchor = anchor_of(&full, position, image);
+        if let Some(slice) = banded(&full, top, pixmap.height() as f32) {
+            let slice = shifted(&slice, top);
+            if drawable(&slice) {
+                tile_image(
+                    &mut pixmap,
+                    image,
+                    &slice,
+                    (anchor.0, anchor.1 - top),
+                    repeat,
+                );
+            }
+        }
     }
 
     for item in &list.items {
@@ -322,22 +572,42 @@ pub fn rasterise(
         // place the check has to be.
         match item {
             DisplayItem::Rect { rect, color } => {
-                if drawable(rect) {
-                    fill_rect(&mut pixmap, rect, *color);
+                let rect = shifted(rect, top);
+                if drawable(&rect) {
+                    fill_rect(&mut pixmap, &rect, *color);
                 }
             }
             DisplayItem::Image { node, rect } => {
-                if drawable(rect)
+                let rect = shifted(rect, top);
+                if drawable(&rect)
                     && let Some(image) = images.get(&ImageKey::content(*node))
                 {
-                    draw_image(&mut pixmap, image, rect);
+                    draw_image(&mut pixmap, image, &rect);
                 }
             }
-            DisplayItem::Tile { node, rect, repeat } => {
-                if drawable(rect)
-                    && let Some(image) = images.get(&ImageKey::background(*node))
+            DisplayItem::Tile {
+                node,
+                rect,
+                repeat,
+                position,
+            } => {
+                if let Some(image) = images.get(&ImageKey::background(*node))
+                    && let Some(slice) = banded(rect, top, pixmap.height() as f32)
                 {
-                    tile_image(&mut pixmap, image, rect, *repeat);
+                    // The anchor comes from the element's own box in document
+                    // coordinates and is then shifted with everything else, so
+                    // a band draws the tiles a whole-page render would have.
+                    let anchor = anchor_of(rect, *position, image);
+                    let slice = shifted(&slice, top);
+                    if drawable(&slice) {
+                        tile_image(
+                            &mut pixmap,
+                            image,
+                            &slice,
+                            (anchor.0, anchor.1 - top),
+                            *repeat,
+                        );
+                    }
                 }
             }
             DisplayItem::Glyph {
@@ -346,13 +616,66 @@ pub fn rasterise(
                 origin_y,
                 color,
             } => {
-                if in_range(*origin_x) && in_range(*origin_y) {
-                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, *origin_y, *color);
+                let origin_y = *origin_y - top;
+                if in_range(*origin_x) && in_range(origin_y) {
+                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, origin_y, *color);
                 }
             }
         }
     }
     Some(pixmap)
+}
+
+/// The same rectangle, moved into a band's coordinates.
+fn shifted(rect: &Rect, top: f32) -> Rect {
+    Rect {
+        y: rect.y - top,
+        ..*rect
+    }
+}
+
+/// The rows of a rectangle a band can see, still in document coordinates.
+///
+/// This used to do more, and the more was a workaround. Tiling started at the
+/// rectangle's top-left corner, so a band had to be handed a rectangle whose
+/// top sat on a tile boundary or the pattern would jump every time the reader
+/// scrolled. `tile_image` now takes the anchor separately and works out which
+/// tiles overlap the clip, so the phase is carried by the anchor — which is
+/// where `background-position` had to put it anyway — and this is left doing
+/// the one thing it should: saying which rows are worth drawing.
+///
+/// Cost still depends on it. `tile_image` steps one image at a time, so a
+/// clip as tall as the document is how a one-pixel tile on a long page becomes
+/// millions of draws. Clipping to the band bounds that by the band's height
+/// however tall the element is.
+fn banded(rect: &Rect, top: f32, band_height: f32) -> Option<Rect> {
+    let visible_top = rect.y.max(top);
+    let visible_bottom = (rect.y + rect.height).min(top + band_height);
+    if visible_bottom <= visible_top {
+        return None;
+    }
+    Some(Rect {
+        x: rect.x,
+        y: visible_top,
+        width: rect.width,
+        height: visible_bottom - visible_top,
+    })
+}
+
+/// Where the image's top-left corner lands, in the same space as `rect`.
+///
+/// The whole of `background-position` at paint time: the property is stored as
+/// a length or a percentage, and the percentage cannot be resolved until the
+/// image's size is known, which is here and not in the cascade.
+fn anchor_of(
+    rect: &Rect,
+    position: css::style::BackgroundPosition,
+    image: &DecodedImage,
+) -> (f32, f32) {
+    (
+        rect.x + css::style::background_offset(position.x, rect.width, image.width()),
+        rect.y + css::style::background_offset(position.y, rect.height, image.height()),
+    )
 }
 
 /// Furthest from the canvas a coordinate may be and still be worth drawing.
@@ -410,48 +733,80 @@ fn draw_image(pixmap: &mut Pixmap, image: &DecodedImage, rect: &Rect) {
     );
 }
 
-/// Tiles a background image across `rect`, at its natural size.
+/// Where one tile begins, and how many are needed to cover `clip` along an axis.
+///
+/// The anchor is where `background-position` put the image, which is not
+/// necessarily inside the clip and not necessarily inside the box: a repeating
+/// background tiles outwards from it in both directions, so the first tile that
+/// shows is usually one at a negative index.
+///
+/// `None` where the arithmetic leaves the range worth drawing in — a tile count
+/// that is infinite or negative is a pathological input, not a background.
+fn tile_span(anchor: f32, size: f32, start: f32, length: f32, tiles: bool) -> Option<(f32, u32)> {
+    if !tiles {
+        // One tile, wherever the anchor is. It may miss the clip entirely, and
+        // the mask takes care of that.
+        return Some((anchor, 1));
+    }
+    let index = ((start - anchor) / size).floor();
+    if !index.is_finite() {
+        return None;
+    }
+    let first = anchor + index * size;
+    let count = ((start + length - first) / size).ceil();
+    if !count.is_finite() || count < 0.0 {
+        return None;
+    }
+    Some((first, count as u32))
+}
+
+/// Tiles a background image over `clip`, with one tile's corner at `anchor`.
 ///
 /// A background image is never scaled — that is what distinguishes it from a
 /// content image, and it is why a 20-pixel tile fills a page rather than being
-/// stretched across it. Tiles are drawn from the box's top-left corner, which
-/// is `background-position: 0 0`.
+/// stretched across it.
+///
+/// The anchor and the clip are separate arguments because
+/// `background-position` separated them. They used to be the same rectangle,
+/// on the assumption that tiling starts at the box's top-left corner; a
+/// position of `50% 20px` breaks that in both directions at once, since the
+/// phase moves and the first visible tile can begin above and to the left of
+/// the box.
+///
+/// Keeping them apart also bounds the work better than the old arrangement did.
+/// Tiles are counted from the *clip*, which for a banded render is the handful
+/// of rows on screen rather than the whole document, so a one-pixel tile on a
+/// very long page costs a band's worth of draws instead of a page's.
 fn tile_image(
     pixmap: &mut Pixmap,
     image: &DecodedImage,
-    rect: &Rect,
+    clip: &Rect,
+    anchor: (f32, f32),
     repeat: css::style::BackgroundRepeat,
 ) {
     let (width, height) = (image.width(), image.height());
-    if rect.width <= 0.0 || rect.height <= 0.0 || width < 1.0 || height < 1.0 {
+    if clip.width <= 0.0 || clip.height <= 0.0 || width < 1.0 || height < 1.0 {
         return;
     }
 
     let (tile_x, tile_y) = repeat.axes();
-    // A tile count rather than a while-loop on coordinates: with a 1px tile and
-    // a tall page the loop is long, and bounding it here keeps a pathological
-    // image from turning into an unbounded amount of work.
-    let columns = if tile_x {
-        (rect.width / width).ceil() as u32
-    } else {
-        1
+    let Some((first_x, columns)) = tile_span(anchor.0, width, clip.x, clip.width, tile_x) else {
+        return;
     };
-    let rows = if tile_y {
-        (rect.height / height).ceil() as u32
-    } else {
-        1
+    let Some((first_y, rows)) = tile_span(anchor.1, height, clip.y, clip.height, tile_y) else {
+        return;
     };
 
-    let clip = tiny_skia::IntRect::from_xywh(
-        rect.x.floor() as i32,
-        rect.y.floor() as i32,
-        rect.width.ceil() as u32,
-        rect.height.ceil() as u32,
+    let bounds = tiny_skia::IntRect::from_xywh(
+        clip.x.floor() as i32,
+        clip.y.floor() as i32,
+        clip.width.ceil() as u32,
+        clip.height.ceil() as u32,
     );
-    let Some(mask) = clip.and_then(|clip| {
+    let Some(mask) = bounds.and_then(|bounds| {
         let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
         let mut builder = PathBuilder::new();
-        builder.push_rect(clip.to_rect());
+        builder.push_rect(bounds.to_rect());
         let path = builder.finish()?;
         mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
         Some(mask)
@@ -463,8 +818,8 @@ fn tile_image(
     for row in 0..rows {
         for column in 0..columns {
             pixmap.draw_pixmap(
-                (rect.x + column as f32 * width).round() as i32,
-                (rect.y + row as f32 * height).round() as i32,
+                (first_x + column as f32 * width).round() as i32,
+                (first_y + row as f32 * height).round() as i32,
                 image.pixmap.as_ref(),
                 &paint,
                 Transform::identity(),
@@ -520,42 +875,70 @@ fn draw_glyph(
         return;
     };
 
-    // The shaper gives 8-bit coverage; colour is applied here. Premultiplied,
-    // because that is what tiny-skia composites in.
-    let mut glyph_pixmap = match Pixmap::new(width as u32, height as u32) {
-        Some(pixmap) => pixmap,
-        None => return,
-    };
-    for (index, pixel) in glyph_pixmap.pixels_mut().iter_mut().enumerate() {
-        let alpha = u32::from(coverage[index]) * u32::from(color.a) / 255;
-        let scale = |channel: u8| (u32::from(channel) * alpha / 255) as u8;
-        *pixel = tiny_skia::PremultipliedColorU8::from_rgba(
-            scale(color.r),
-            scale(color.g),
-            scale(color.b),
-            alpha as u8,
-        )
-        .unwrap_or_else(|| {
-            tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent")
-        });
-    }
-
-    // Checked rather than trusted even after the range guard above: `left`,
-    // `top`, and the bitmap's own size come from the rasteriser rather than
-    // from us, and what tiny-skia actually panics on is `x + width` leaving
-    // `i32` — so that is the sum to prove cannot.
-    let (Some(x), Some(y)) = ((x as i32).checked_add(left), (y as i32).checked_sub(top)) else {
-        return;
-    };
-    let (Some(_), Some(_)) = (
-        i32::try_from(width).ok().and_then(|w| x.checked_add(w)),
-        i32::try_from(height).ok().and_then(|h| y.checked_add(h)),
+    // `floor`, not a cast. A cast truncates toward zero, so -0.5 becomes 0
+    // while -1.5 becomes -1 — the rounding changes direction at zero. Nothing
+    // noticed while every canvas began at document row 0; a band's coordinates
+    // go negative above it.
+    //
+    // Checked rather than trusted: `left` and `top` come from the rasteriser
+    // rather than from us.
+    let (Some(x), Some(y)) = (
+        (x.floor() as i32).checked_add(left),
+        (y.floor() as i32).checked_sub(top),
     ) else {
         return;
     };
+
+    // The part of the glyph that lands on this canvas, cropped out of the
+    // coverage buffer rather than drawn at a negative offset and left to the
+    // rasteriser to clip.
+    //
+    // That distinction is not pedantry. `draw_pixmap` fills a rectangle with
+    // the bitmap as a *pattern*, and a pattern sampled outside its bounds pads
+    // with its edge — so a glyph straddling the top of a band came out with a
+    // duplicated row, and a band was not the rows it claimed. Cropping here
+    // means every draw lands at a non-negative offset and no sampling happens
+    // outside the bitmap at all.
+    let (glyph_width, glyph_height) = (width as i32, height as i32);
+    let (canvas_width, canvas_height) = (pixmap.width() as i32, pixmap.height() as i32);
+    let from_x = (-x).max(0);
+    let from_y = (-y).max(0);
+    let to_x = (canvas_width - x).min(glyph_width);
+    let to_y = (canvas_height - y).min(glyph_height);
+    if to_x <= from_x || to_y <= from_y {
+        return;
+    }
+    let (visible_width, visible_height) = ((to_x - from_x) as u32, (to_y - from_y) as u32);
+
+    // The shaper gives 8-bit coverage; colour is applied here. Premultiplied,
+    // because that is what tiny-skia composites in.
+    let mut glyph_pixmap = match Pixmap::new(visible_width, visible_height) {
+        Some(pixmap) => pixmap,
+        None => return,
+    };
+    let transparent =
+        tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent is valid");
+    for row in 0..visible_height {
+        for column in 0..visible_width {
+            let source =
+                (from_y as usize + row as usize) * width + from_x as usize + column as usize;
+            let alpha =
+                u32::from(coverage.get(source).copied().unwrap_or(0)) * u32::from(color.a) / 255;
+            let scale = |channel: u8| (u32::from(channel) * alpha / 255) as u8;
+            glyph_pixmap.pixels_mut()[(row * visible_width + column) as usize] =
+                tiny_skia::PremultipliedColorU8::from_rgba(
+                    scale(color.r),
+                    scale(color.g),
+                    scale(color.b),
+                    alpha as u8,
+                )
+                .unwrap_or(transparent);
+        }
+    }
+
     pixmap.draw_pixmap(
-        x,
-        y,
+        x + from_x,
+        y + from_y,
         glyph_pixmap.as_ref(),
         &PixmapPaint::default(),
         Transform::identity(),
@@ -579,6 +962,70 @@ mod tests {
         let height = layout.height.ceil().max(1.0) as u32;
         let images = ImageStore::new();
         rasterise(&list, &mut fonts, &images, width, height).expect("pixmap")
+    }
+
+    /// The display list, images, and height for a page, so a test can rasterise
+    /// it whole and in pieces and compare.
+    fn scene(html: &str, css_text: &str, width: u32) -> (DisplayList, FontStore, u32) {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css_text)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        let sizes = layout::IntrinsicSizes::new();
+        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
+        let height = layout.height.ceil().max(1.0) as u32;
+        (build_display_list(&layout), fonts, height)
+    }
+
+    #[test]
+    fn a_band_is_exactly_the_rows_it_names_from_the_whole_page() {
+        // The property banded rendering rests on, and the reason it is safe to
+        // stop rendering whole documents: a reader scrolling through bands must
+        // see the same pixels they would have seen from one canvas. Anything
+        // less and the fix for long pages is a rendering change in disguise.
+        //
+        // The fixture is chosen for the things that could go wrong rather than
+        // for looking like a page: a tiled background whose phase must not jump
+        // between bands, borders that straddle band edges, and enough text that
+        // glyphs land in every band.
+        let html = "<body><div class=tiled><p>one</p><p>two</p><p>three</p>\
+             <p>four</p><p>five</p><p>six</p><p>seven</p><p>eight</p></div></body>";
+        let css_text = "body { background: #eef; margin: 0 }
+             .tiled { border: 3px solid #333; padding: 7px }
+             p { margin: 9px 0; border-bottom: 1px solid #999 }";
+        let width = 120;
+
+        let (list, mut fonts, height) = scene(html, css_text, width);
+        assert!(height > 60, "the fixture is too short to band: {height}");
+        let images = ImageStore::new();
+        let whole = rasterise(&list, &mut fonts, &images, width, height).expect("whole page");
+
+        // Band heights that do and do not divide the page, and a band running
+        // off the bottom, because the last band of a real page always does.
+        for band_height in [7u32, 16, 23] {
+            let mut top = 0u32;
+            while top < height {
+                let band =
+                    rasterise_band(&list, &mut fonts, &images, width, top as f32, band_height)
+                        .expect("band");
+                for row in 0..band_height {
+                    let document_row = top + row;
+                    if document_row >= height {
+                        break;
+                    }
+                    let from_band =
+                        &band.pixels()[(row * width) as usize..((row + 1) * width) as usize];
+                    let from_whole = &whole.pixels()
+                        [(document_row * width) as usize..((document_row + 1) * width) as usize];
+                    assert_eq!(
+                        from_band, from_whole,
+                        "band of {band_height} at {top}: row {row} is not document row \
+                         {document_row}"
+                    );
+                }
+                top += band_height;
+            }
+        }
     }
 
     fn count_non_white(pixmap: &Pixmap) -> usize {
@@ -810,6 +1257,176 @@ mod tests {
 }
 
 #[cfg(test)]
+mod border_tests {
+    use super::*;
+    use css::style::BorderStyle;
+
+    fn side(style: BorderStyle, length: f32, thickness: f32) -> Vec<Rect> {
+        let mut list = DisplayList::default();
+        push_border_side(
+            &mut list,
+            &Rect {
+                x: 10.0,
+                y: 20.0,
+                width: length,
+                height: thickness,
+            },
+            style,
+            thickness,
+            Side::Top,
+            Color::BLACK,
+        );
+        list.items
+            .into_iter()
+            .map(|item| match item {
+                DisplayItem::Rect { rect, .. } => rect,
+                other => panic!("a border drew {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_solid_border_is_still_one_rectangle() {
+        let segments = side(BorderStyle::Solid, 100.0, 2.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].width, 100.0);
+    }
+
+    #[test]
+    fn a_dotted_border_is_a_row_of_squares_the_border_wide() {
+        let segments = side(BorderStyle::Dotted, 100.0, 2.0);
+        assert!(segments.len() > 10, "got {} dots", segments.len());
+        // Square, or as near as stretching to fit allows.
+        for dot in &segments {
+            assert!(
+                (dot.width - 2.0).abs() < 0.5,
+                "a dot is {} wide against a 2px border",
+                dot.width
+            );
+        }
+    }
+
+    #[test]
+    fn a_dashed_border_uses_longer_segments_than_a_dotted_one() {
+        let dashes = side(BorderStyle::Dashed, 100.0, 2.0);
+        let dots = side(BorderStyle::Dotted, 100.0, 2.0);
+        assert!(
+            dashes.len() * 2 < dots.len(),
+            "{} dashes against {} dots is not a visible difference",
+            dashes.len(),
+            dots.len()
+        );
+    }
+
+    #[test]
+    fn a_pattern_starts_and_ends_flush_with_the_corners() {
+        // The thing that makes a hand-rolled dashed border look wrong is half a
+        // dash at one end, so the run is stretched to fit a whole number.
+        for style in [BorderStyle::Dotted, BorderStyle::Dashed] {
+            for length in [7.0, 31.0, 100.0, 253.0] {
+                let segments = side(style, length, 3.0);
+                let first = segments.first().expect("at least one segment");
+                let last = segments.last().expect("at least one segment");
+                assert_eq!(first.x, 10.0, "{style:?} at {length} starts short");
+                assert!(
+                    ((last.x + last.width) - (10.0 + length)).abs() < 0.01,
+                    "{style:?} at {length} ends at {} rather than {}",
+                    last.x + last.width,
+                    10.0 + length,
+                );
+            }
+        }
+    }
+
+    fn colours(style: BorderStyle, edge: Side, thickness: f32) -> Vec<Color> {
+        let mut list = DisplayList::default();
+        push_border_side(
+            &mut list,
+            &Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: thickness,
+            },
+            style,
+            thickness,
+            edge,
+            Color::rgb(200, 200, 200),
+        );
+        list.items
+            .into_iter()
+            .map(|item| match item {
+                DisplayItem::Rect { color, .. } => color,
+                other => panic!("a border drew {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outset_lights_the_top_and_shadows_the_bottom() {
+        // The whole of the effect: an edge that a light source above and to the
+        // left would strike keeps the declared colour, and the opposite edge is
+        // darkened. Reversed for `inset`, which is what makes one look raised
+        // and the other pressed in.
+        let top = colours(BorderStyle::Outset, Side::Top, 4.0);
+        let bottom = colours(BorderStyle::Outset, Side::Bottom, 4.0);
+        assert_eq!(top.len(), 1);
+        assert!(top[0].r > bottom[0].r, "{:?} vs {:?}", top[0], bottom[0]);
+
+        let top = colours(BorderStyle::Inset, Side::Top, 4.0);
+        let bottom = colours(BorderStyle::Inset, Side::Bottom, 4.0);
+        assert!(
+            top[0].r < bottom[0].r,
+            "inset is outset the other way up: {:?} vs {:?}",
+            top[0],
+            bottom[0],
+        );
+    }
+
+    #[test]
+    fn groove_and_ridge_split_the_thickness_into_two_shades() {
+        // Two bands across the border rather than one, and a ridge is a groove
+        // with the halves exchanged — which is the whole difference between
+        // carved and proud.
+        let groove = colours(BorderStyle::Groove, Side::Top, 4.0);
+        let ridge = colours(BorderStyle::Ridge, Side::Top, 4.0);
+        assert_eq!(groove.len(), 2, "an outer half and an inner one");
+        assert_eq!(ridge.len(), 2);
+        assert_ne!(groove[0], groove[1], "the two halves must differ");
+        assert_eq!(groove[0], ridge[1], "a ridge is a groove reversed");
+        assert_eq!(groove[1], ridge[0]);
+    }
+
+    #[test]
+    fn double_draws_two_lines_and_falls_back_when_there_is_no_room() {
+        let wide = colours(BorderStyle::Double, Side::Top, 6.0);
+        assert_eq!(wide.len(), 2, "two lines with a gap between them");
+
+        // Under three pixels there is nowhere to put a gap, so the author gets
+        // the solid line they would have got anyway rather than two lines
+        // rounded into one.
+        let thin = colours(BorderStyle::Double, Side::Top, 2.0);
+        assert_eq!(thin.len(), 1);
+    }
+
+    #[test]
+    fn a_side_too_short_for_a_pattern_degrades_to_a_solid_run() {
+        // Two dots on a six-pixel side is not a pattern, it is noise. One run
+        // is the honest answer, and it is what the arithmetic already gives.
+        let segments = side(BorderStyle::Dashed, 4.0, 3.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].width, 4.0);
+    }
+
+    #[test]
+    fn a_zero_length_side_draws_nothing_rather_than_dividing_by_it() {
+        assert!(side(BorderStyle::Dotted, 0.0, 2.0).is_empty());
+        assert!(side(BorderStyle::Dotted, 100.0, 0.0).is_empty());
+        assert!(side(BorderStyle::Dashed, f32::INFINITY, 2.0).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tile_tests {
     use super::*;
     use css::style::BackgroundRepeat;
@@ -818,6 +1435,28 @@ mod tile_tests {
     fn red_tile() -> DecodedImage {
         let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
         pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        DecodedImage { pixmap }
+    }
+
+    /// A 4x4 image with a red top row and left column, white elsewhere.
+    ///
+    /// A *patterned* tile, because a uniform one cannot show where the tile
+    /// boundaries fall. That is not hypothetical: the band test below was
+    /// written with `red_tile` and passed with the phase deliberately broken,
+    /// since tiling a solid colour covers everything whatever the offset. Any
+    /// test about position or phase needs a tile that looks different in
+    /// different places.
+    fn corner_tile() -> DecodedImage {
+        let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::WHITE);
+        let red = PremultipliedColor::from_rgba(255, 0, 0, 255).expect("opaque red");
+        let pixels = pixmap.pixels_mut();
+        for pixel in pixels.iter_mut().take(4) {
+            *pixel = red;
+        }
+        for y in 0..4usize {
+            pixels[y * 4] = red;
+        }
         DecodedImage { pixmap }
     }
 
@@ -852,7 +1491,13 @@ mod tile_tests {
             width: 20.0,
             height: 20.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::Repeat);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::Repeat,
+        );
         assert_eq!(red_pixels(&pixmap), 400, "every pixel covered");
     }
 
@@ -867,7 +1512,13 @@ mod tile_tests {
             width: 20.0,
             height: 4.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::RepeatX);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::RepeatX,
+        );
         assert!(is_red(&pixmap, 19, 3), "the last tile is drawn");
         assert!(!is_red(&pixmap, 0, 4), "and nothing below the box");
     }
@@ -885,12 +1536,19 @@ mod tile_tests {
             &mut horizontal,
             &red_tile(),
             &rect,
+            (rect.x, rect.y),
             BackgroundRepeat::RepeatX,
         );
         assert_eq!(red_pixels(&horizontal), 80, "one row of tiles");
 
         let mut vertical = canvas();
-        tile_image(&mut vertical, &red_tile(), &rect, BackgroundRepeat::RepeatY);
+        tile_image(
+            &mut vertical,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::RepeatY,
+        );
         assert_eq!(red_pixels(&vertical), 80, "one column of tiles");
     }
 
@@ -903,8 +1561,134 @@ mod tile_tests {
             width: 20.0,
             height: 20.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::NoRepeat);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::NoRepeat,
+        );
         assert_eq!(red_pixels(&pixmap), 16);
+    }
+
+    #[test]
+    fn a_positioned_tile_starts_where_it_was_put() {
+        // `background-position: 5px 3px`, no repeat: exactly one 4x4 tile, and
+        // its corner is where the offset says rather than the box's.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x + 5.0, rect.y + 3.0),
+            BackgroundRepeat::NoRepeat,
+        );
+        assert_eq!(red_pixels(&pixmap), 16, "still one tile");
+        assert!(is_red(&pixmap, 5, 3), "its corner");
+        assert!(is_red(&pixmap, 8, 6), "its far corner");
+        assert!(!is_red(&pixmap, 4, 3), "nothing to the left of it");
+        assert!(!is_red(&pixmap, 5, 2), "nothing above it");
+    }
+
+    #[test]
+    fn a_percentage_lines_the_image_up_with_the_box_rather_than_offsetting_it() {
+        // The half of §14.2.1 that is easy to get wrong. `50%` on a 20px box
+        // holding a 4px tile is *not* 10px across — it is 50% of (20 − 4) = 8,
+        // which is what puts the middle of the image at the middle of the box.
+        let position = css::style::BackgroundPosition {
+            x: css::value::Length::Percent(50.0),
+            y: css::value::Length::Percent(100.0),
+        };
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let anchor = anchor_of(&rect, position, &red_tile());
+        assert_eq!(anchor, (8.0, 16.0), "centred across, flush to the bottom");
+
+        // And it goes negative when the image is bigger than the box, which is
+        // the case that reads as wrong and is correct: the middle of a large
+        // image still lands at the middle of a small box.
+        let narrow = Rect { width: 2.0, ..rect };
+        assert_eq!(anchor_of(&narrow, position, &red_tile()).0, -1.0);
+    }
+
+    #[test]
+    fn a_repeating_tile_extends_backwards_from_its_position() {
+        // A positioned repeat tiles in both directions, so the box's own corner
+        // is covered by a tile at a negative index. Getting this wrong leaves a
+        // gap along the top and left that only appears once a position is set.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x + 5.0, rect.y + 3.0),
+            BackgroundRepeat::Repeat,
+        );
+        assert_eq!(red_pixels(&pixmap), 400, "no gap anywhere");
+    }
+
+    #[test]
+    fn a_band_tiles_a_positioned_background_where_the_whole_page_would() {
+        // What the anchor/clip split was for. A band renders rows from part-way
+        // down the document, and the tiling phase has to come from the
+        // element's box rather than from wherever the band starts — with a
+        // position on top of that, which shifts the phase again.
+        //
+        // Drawn twice: once as one tall canvas, once as bands, and compared.
+        // The tile is patterned, which is load-bearing — see `corner_tile`.
+        let tile = corner_tile();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 30.0,
+        };
+        let anchor = (rect.x + 1.0, rect.y + 3.0);
+
+        let mut whole = Pixmap::new(20, 30).expect("pixmap");
+        whole.fill(tiny_skia::Color::WHITE);
+        tile_image(&mut whole, &tile, &rect, anchor, BackgroundRepeat::Repeat);
+
+        for top in [0.0, 7.0, 11.0, 22.0] {
+            let height = 8.0_f32.min(30.0 - top);
+            let mut band = Pixmap::new(20, height as u32).expect("pixmap");
+            band.fill(tiny_skia::Color::WHITE);
+            let slice = banded(&rect, top, height).expect("the band overlaps");
+            tile_image(
+                &mut band,
+                &tile,
+                &shifted(&slice, top),
+                (anchor.0, anchor.1 - top),
+                BackgroundRepeat::Repeat,
+            );
+
+            for y in 0..height as u32 {
+                for x in 0..20 {
+                    assert_eq!(
+                        is_red(&band, x, y),
+                        is_red(&whole, x, y + top as u32),
+                        "row {} of the band from {top} differs at x={x}",
+                        y,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -918,7 +1702,13 @@ mod tile_tests {
             width: 6.0,
             height: 6.0,
         };
-        tile_image(&mut pixmap, &red_tile(), &rect, BackgroundRepeat::Repeat);
+        tile_image(
+            &mut pixmap,
+            &red_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::Repeat,
+        );
         assert!(is_red(&pixmap, 7, 7), "inside the box");
         assert!(!is_red(&pixmap, 8, 7), "past its right edge");
         assert!(!is_red(&pixmap, 1, 1), "before its top-left corner");
@@ -953,7 +1743,7 @@ mod canvas_background_tests {
         // merely wasteful; with a translucent one it doubles the alpha.
         let (list, doc) = list_for(r#"<body background="tile.gif"><p>x</p></body>"#);
         let body = doc.find_element("body").expect("body");
-        assert_eq!(list.canvas_image.map(|(node, _)| node), Some(body));
+        assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(body));
         assert_eq!(tiles(&list), 0, "the body must not tile itself as well");
     }
 
@@ -972,7 +1762,7 @@ mod canvas_background_tests {
              <body background=\"body.gif\"><p>x</p></body></html>",
         );
         let html = doc.find_element("html").expect("html");
-        assert_eq!(list.canvas_image.map(|(node, _)| node), Some(html));
+        assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(html));
         // The body's own tile is not propagated, so it still paints normally.
         assert_eq!(tiles(&list), 1);
     }

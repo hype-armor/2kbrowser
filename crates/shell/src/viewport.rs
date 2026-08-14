@@ -62,28 +62,13 @@ pub struct Document {
     pub path: String,
 }
 
-/// Whether a rectangle has any pixels on a canvas this tall.
-///
-/// A page taller than one frame is rendered up to the canvas and no further
-/// ([`Viewport::is_truncated`]), and everything past that has no pixels at all.
-/// Offering it anyway is worse than leaving it out: a find match down there
-/// would be counted in "3 of 7" and then highlight nothing when stepped to, and
-/// a link down there would take keyboard focus and be outlined nowhere. Neither
-/// is something the reader can act on.
-///
-/// The *top* of the rectangle is what decides it, so something straddling the
-/// bottom edge counts — part of it is visible, and that part is worth
-/// highlighting.
-fn on_canvas(rect: &Rect, canvas_height: f32) -> bool {
-    rect.y < canvas_height
-}
-
 /// A page held by a live renderer.
 pub struct Viewport {
     session: sandbox::Session,
     document: Document,
     page: Rendered,
     force_authored: bool,
+    force_document: bool,
 }
 
 impl Viewport {
@@ -92,23 +77,27 @@ impl Viewport {
         renderer: &Renderer,
         document: Document,
         width: u32,
-        max_height: u32,
+        band_height: u32,
         force_authored: bool,
+        force_document: bool,
     ) -> Result<Self, Error> {
         let (session, page) = renderer.open(
             document.body.clone(),
             document.content_type.clone(),
             width,
-            max_height,
+            0,
+            band_height,
             Some(document.origin.clone()),
             document.path.clone(),
             force_authored,
+            force_document,
         )?;
         Ok(Self {
             session,
             document,
             page,
             force_authored,
+            force_document,
         })
     }
 
@@ -149,28 +138,67 @@ impl Viewport {
         self.page.content_height
     }
 
-    /// How far the page can be scrolled, in pixels of canvas.
-    ///
-    /// The canvas rather than the content, which are the same number for every
-    /// page short enough. Beyond the canvas there is nothing to show — the blit
-    /// fills white — so scrolling there is scrolling into a void that looks like
-    /// the document ending. Better to stop where the pixels stop and say why.
-    pub fn scrollable_height(&self) -> f32 {
-        self.page.height as f32
+    /// The document row the painted band starts at.
+    pub fn band_top(&self) -> u32 {
+        self.page.top
     }
 
-    /// Whether the document is taller than the canvas it was rendered onto.
+    /// How far the page can be scrolled, in document pixels.
     ///
-    /// The frame bound in [`sandbox::max_canvas_height`] made this reachable:
-    /// one canvas covers the whole document so scrolling costs a blit, and one
-    /// frame is bounded so a compromised renderer cannot make the parent
-    /// allocate without limit. About 20,000 rows at 800 pixels wide.
+    /// The whole document, now that any row of it can be painted on demand.
+    /// This used to be the canvas, because past the canvas there was nothing to
+    /// show; a page is no longer cut off at one.
     ///
-    /// Rounded up before comparing, because the canvas is a whole number of
-    /// rows and the content height is not — a page 400.5 pixels tall gets a
-    /// 401-row canvas and is not truncated.
-    pub fn is_truncated(&self) -> bool {
-        self.page.content_height.ceil() > self.page.height as f32
+    /// A frameset is its own viewport — its canvas is composited from its
+    /// frames and its content is exactly as tall as its canvas — so the `max`
+    /// covers it without a special case.
+    pub fn scrollable_height(&self) -> f32 {
+        self.page.content_height.max(self.page.height as f32)
+    }
+
+    /// Asks for the rows around `top` without waiting for them.
+    ///
+    /// The speculative half of scrolling a long page: the rows ahead of the
+    /// reader are painted while the window carries on drawing the rows it has.
+    pub fn request_band(&mut self, top: u32, height: u32) -> Result<(), Error> {
+        self.session.request_band(top, height)
+    }
+
+    /// Whether a band has been asked for and not yet arrived.
+    pub fn band_outstanding(&self) -> bool {
+        self.session.band_outstanding()
+    }
+
+    /// Takes a band that has arrived and shows it. Never blocks.
+    ///
+    /// Returns whether anything changed, which is what decides a redraw.
+    pub fn accept_band(&mut self) -> bool {
+        match self.session.take_band() {
+            // A band that failed to paint leaves the one on screen alone. The
+            // rows the reader is looking at are still correct; the ones ahead
+            // simply have not arrived, and blanking the page to say so would be
+            // worse than the wait.
+            Some(Ok(band)) => {
+                self.page = band;
+                true
+            }
+            Some(Err(_)) | None => false,
+        }
+    }
+
+    /// Sets what to call when a band arrives.
+    pub fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.session.set_wake(wake);
+    }
+
+    /// The renderer process holding this page.
+    ///
+    /// For asking the operating system about it — the budget harness measures
+    /// the pair, since a browser that moved its memory into a child did not
+    /// save anyone anything, and a test checks the child is gone once the page
+    /// is dropped.
+    pub fn child_id(&self) -> u32 {
+        self.session.child_id()
     }
 
     /// Where the document came from.
@@ -193,6 +221,12 @@ impl Viewport {
         self.force_authored
     }
 
+    /// Whether the reader is currently asking for the fallback on a page that
+    /// classification did not give one to.
+    pub fn forcing_document(&self) -> bool {
+        self.force_document
+    }
+
     /// How the page was rendered.
     ///
     /// Translated back from the wire type rather than shared with it: the
@@ -213,13 +247,7 @@ impl Viewport {
     pub fn links(&self) -> Vec<Link> {
         let mut out: Vec<Link> = Vec::new();
         let mut groups: Vec<u32> = Vec::new();
-        let height = self.page.height as f32;
-        for link in self
-            .page
-            .links
-            .iter()
-            .filter(|link| on_canvas(&link.rect, height))
-        {
+        for link in &self.page.links {
             match groups.iter().position(|group| *group == link.group) {
                 Some(at) => out[at].rects.push(link.rect),
                 None => {
@@ -255,28 +283,31 @@ impl Viewport {
 
     /// Where `query` appears, asked of the child holding the page.
     pub fn find(&mut self, query: &str) -> Vec<Rect> {
-        let height = self.page.height as f32;
-        self.session
-            .find(query)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|rect| on_canvas(rect, height))
-            .collect()
+        // Every match, wherever it is. These used to be filtered to the painted
+        // canvas, because a match below it would have been counted in "3 of 7"
+        // and then highlighted nothing when stepped to. Bands removed the
+        // reason: any row can be painted, so any match can be scrolled to.
+        self.session.find(query).unwrap_or_default()
     }
 
     /// Re-renders at a new width, in the same child.
     ///
     /// Cheaper than a fresh page — the document is already parsed — and it is
     /// what stops a resize re-fetching every image.
-    pub fn resize(&mut self, width: u32, max_height: u32) -> Result<(), Error> {
+    pub fn resize(&mut self, width: u32, band_height: u32) -> Result<(), Error> {
+        // Back to the top of the document. A resize re-flows everything, so the
+        // row that was on screen is not the row that will be, and pretending
+        // otherwise would land the reader somewhere arbitrary.
         self.page = self.session.render(
             self.document.body.clone(),
             self.document.content_type.clone(),
             width,
-            max_height,
+            0,
+            band_height,
             Some(self.document.origin.clone()),
             self.document.path.clone(),
             self.force_authored,
+            self.force_document,
         )?;
         Ok(())
     }
@@ -288,7 +319,36 @@ impl Viewport {
         width: u32,
         max_height: u32,
     ) -> Result<(), Error> {
-        self.force_authored = forcing;
+        self.set_forcing(forcing, false, width, max_height)
+    }
+
+    /// Asks for the document fallback on a page that classified as authored,
+    /// or gives it back (ADR-0009).
+    pub fn set_forcing_document(
+        &mut self,
+        forcing: bool,
+        width: u32,
+        max_height: u32,
+    ) -> Result<(), Error> {
+        self.set_forcing(false, forcing, width, max_height)
+    }
+
+    /// Both overrides at once, which is how the window pushes what the tab
+    /// holds into the child that is going to act on it.
+    ///
+    /// Taken together rather than one at a time because they are two halves of
+    /// one answer to "what layout is this page in": setting either without
+    /// clearing the other would leave a tab claiming both, and the child
+    /// resolves that in favour of the author — silently undoing a press.
+    pub fn set_forcing(
+        &mut self,
+        authored: bool,
+        document: bool,
+        width: u32,
+        max_height: u32,
+    ) -> Result<(), Error> {
+        self.force_authored = authored;
+        self.force_document = document;
         self.resize(width, max_height)
     }
 }

@@ -37,7 +37,7 @@ use std::io::{Read, Write};
 
 pub use confine::Confinement;
 pub use message::{Link, Mode, Rendered, ToChild, ToParent};
-pub use parent::{Renderer, Session};
+pub use parent::{MAX_RESOURCES, Renderer, Session};
 pub use wire::{MAX_FRAME, WireError};
 
 /// Argument that turns this binary into a renderer child.

@@ -45,7 +45,7 @@ fn a_site_that_offers_only_legacy_tls_is_refused_in_so_many_words() {
     let port = listener.local_addr().expect("has an address").port();
     let server = std::thread::spawn(move || refuse_once(listener));
 
-    let outcome = net::Fetcher::default().fetch_bytes(
+    let outcome = net::Fetcher::default().fetch_raw(
         &format!("https://127.0.0.1:{port}/"),
         None,
         net::RequestKind::Navigation,
@@ -84,7 +84,7 @@ fn a_server_that_is_simply_down_is_not_reported_as_an_old_one() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds a port");
         listener.local_addr().expect("has an address").port()
     };
-    let outcome = net::Fetcher::default().fetch_bytes(
+    let outcome = net::Fetcher::default().fetch_raw(
         &format!("https://127.0.0.1:{port}/"),
         None,
         net::RequestKind::Navigation,

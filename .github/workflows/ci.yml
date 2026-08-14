@@ -5,27 +5,89 @@ on:
     branches: ["**"]
   pull_request:
 
+# A run whose commit has already been superseded is a run whose answer nobody
+# will read. 38 of the first 117 runs were still building when the next push to
+# the same branch arrived; grouping by ref and cancelling in progress ends them
+# at the point they stop mattering.
+#
+# `main` is exempt, and deliberately so: every commit there is one somebody
+# could ship, and a cancelled build is a commit nobody measured. Pull-request
+# runs group under `refs/pull/N/merge`, which is a different ref from the branch
+# — a push run and its pull-request run never cancel each other, so a check the
+# PR is waiting on cannot be taken out by a race.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Incremental compilation is a bet that the next build will share a working
+  # directory with this one. A CI job's never does. It bought nothing and left
+  # 1.2 GB of state behind to be cached and never read.
+  CARGO_INCREMENTAL: 0
+
+# The prune-and-save steps below are shell scripts, and Windows would otherwise
+# run them under PowerShell. Every runner has bash; nothing here needs anything
+# else.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # Linux, macOS, and Windows are all first-class from M1 (ADR-0005), so the
   # matrix is not "Linux plus two afterthoughts" — a failure on any of the three
   # is a failure. No third-party actions: rustup honours rust-toolchain.toml and
   # installs the pinned components on its own.
+  #
+  # What *is* an afterthought is running all three against a work-in-progress
+  # commit on a branch nobody has proposed merging yet. macOS minutes bill at
+  # 10x and Windows at 2x, so a full matrix costs ~75 weighted minutes against
+  # Linux's 5 — and 83 of this repository's first 117 runs were exactly that:
+  # intermediate commits on one branch, before its pull request existed.
+  #
+  # So the platform question is asked when the answer can still change a merge
+  # decision — on a pull request, and on `main` — and a branch push gets Linux
+  # on two architectures. Every commit that could be merged is still measured on
+  # all four targets, because `pull_request` fires on `synchronize` too: the
+  # last commit of a branch is checked everywhere before it can go anywhere.
   check:
     name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON((github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Toolchain versions
-        run: rustc --version && cargo --version
+        id: toolchain
+        run: |
+          rustc --version && cargo --version
+          echo "id=$(rustc --version | tr -c '[:alnum:]' '-')" >> "$GITHUB_OUTPUT"
+
+      # 318 of this workspace's 332 packages come from crates.io, and until now
+      # every job compiled all of them from scratch — three times over, once for
+      # clippy, once for the test build, once for the release build. On the
+      # Windows job that was 376 of 396 seconds: 95% of the bill spent
+      # recompiling dependencies that had not changed.
+      #
+      # Restore and save are separate so that the workspace's own artifacts can
+      # be dropped in between (see "Trim the cache"). `actions/cache` is
+      # first-party, so the no-third-party-actions rule above still holds.
+      - name: Restore dependency cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.toolchain.outputs.id }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.toolchain.outputs.id }}-
 
       - name: Format
         run: cargo fmt --all --check
@@ -69,6 +131,30 @@ jobs:
           cargo build -p shell
           ./scripts/smoke-window.sh
 
+      # The smoke test proves a window opens and survives. This proves it
+      # answers a pointer — the part `cargo test` cannot reach, and the part
+      # that was broken for a reader while every check here stayed green.
+      - name: Window click test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get install -y -qq xvfb xdotool libxkbcommon-x11-0
+          ./scripts/window-clicks.sh
+
+      - name: Trim the cache
+        if: always()
+        run: bash scripts/trim-target-dir.sh
+
+      - name: Save dependency cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
   # The syscall filter names syscalls by number, and syscall numbers are
   # per-architecture. That made `crates/sandbox` quietly x86_64-only in two
   # ways at once: `libc` has no `SYS_open` on aarch64 because Linux has none
@@ -78,25 +164,94 @@ jobs:
   # program and the mismatch branch is `SECCOMP_RET_KILL_PROCESS`, so an ARM
   # renderer would have been killed on its next syscall.
   #
-  # A cross-compile is enough to catch both. It is a check, not a build: no ARM
-  # machine is needed, and nothing here runs.
-  cross-arch:
-    name: cross-compile (linux-aarch64)
-    runs-on: ubuntu-latest
+  # This was a cross-compile for a while, and said so: "a check, not a build —
+  # no ARM machine is needed, and nothing here runs". Compiling was enough for
+  # the bug that prompted it, and stopped being enough when the filter became an
+  # allowlist (ADR-0016). Which syscalls *exist* on an architecture is a
+  # compile-time fact; which ones the renderer *makes* is not, and an allowlist
+  # measured only on x86_64 is a filter that could refuse something an ARM
+  # renderer needs, on a machine nobody here has.
+  #
+  # So it runs now, on every event. Unlike the other three this one is not
+  # rationed by branch: it is a second architecture rather than a second
+  # operating system, the bug it exists for is the kind that compiles fine and
+  # dies at runtime, and Linux arm64 is the cheapest runner GitHub rents. Free
+  # for public repositories, which this is; a private fork would need to pay for
+  # these runners or drop back to `cargo check` against
+  # `aarch64-unknown-linux-gnu`.
+  arm:
+    name: test (linux-aarch64)
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain and cross linker
+      - name: Toolchain versions
+        id: toolchain
         run: |
-          rustup target add aarch64-unknown-linux-gnu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          rustc --version && cargo --version
+          echo "id=$(rustc --version | tr -c '[:alnum:]' '-')" >> "$GITHUB_OUTPUT"
 
-      # The whole workspace, not just `sandbox`. The bug that prompted this was
-      # in `sandbox`, and the reason it existed — code written against one
+      - name: Restore dependency cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.toolchain.outputs.id }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.toolchain.outputs.id }}-
+
+      # The whole workspace, not just `sandbox`. The bug that prompted this job
+      # was in `sandbox`, and the reason it existed — code written against one
       # architecture's constants without anything ever compiling it for another
       # — is not specific to that crate.
-      - name: Check
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --target aarch64-unknown-linux-gnu
+      #
+      # It includes the reference tests, so this is also a fourth platform
+      # agreeing on the baselines byte for byte (ADR-0005), and the isolation
+      # tests, which install the real filter and probe it from inside.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Upload reference-test diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reftest-actual-linux-aarch64
+          path: tests/ref/baselines/*.actual.png
+          if-no-files-found: ignore
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Budgets
+        run: cargo run --release -p budgets
+
+      # What the allowlist was missing until now: the set of calls a renderer
+      # makes on a second architecture, measured rather than inferred from the
+      # fact that it compiled. Informational — the script prints what was used
+      # and what was refused, and only fails outright if no child installed a
+      # filter at all. Reading the two lists is a person's job.
+      - name: Measure the renderer's syscalls
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq strace
+          cargo build --release -p sandbox --example confined-failure
+          ./scripts/renderer-syscalls.sh
+
+      - name: Trim the cache
+        if: always()
+        run: bash scripts/trim-target-dir.sh
+
+      - name: Save dependency cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -36,7 +36,7 @@ all four kinds of slop fall out of one decision:
 | --- | --- |
 | **Browser bloat** | No JS engine means no JIT, no sync account, no extension host, no AI sidebar, no sponsored tiles. There is nowhere to put the bloat. |
 | **Page-level junk** | Consent modals, popups, autoplay, and infinite scroll are script-driven. They simply do not run. |
-| **Resource weight** | No JIT, no JS heap, CPU rasterisation. Tens of MB of RAM, not hundreds. |
+| **Resource weight** | No JIT, no JS heap, CPU rasterisation. Tens of MB of RAM, not hundreds — measured at ~27 MB for the era fixture across both processes, and enforced as a budget. |
 | **AI-generated content** | Not solved by the engine — needs its own layer (§7). It is the hardest of the four and is deliberately scheduled last. |
 
 The sites that break without JS are, to a striking degree, the same sites that
@@ -142,6 +142,14 @@ specific crates above, which is not true of the alternatives.
 GPU rasterisation is a later optimisation, not a dependency. "Fast on a
 ten-year-old laptop" is the constraint, and that laptop's GPU drivers are the
 least reliable thing about it.
+
+`tiny-skia` **stays taken, and will not be reimplemented** — the sharpest form
+of issue #4, now settled. It is the largest single block of `unsafe` this
+project depends on, which is what kept the question open, and rasterising in
+this project's own code would be trading a reviewed implementation of a hard,
+well-specified problem for an unreviewed one. What that surface actually costs
+is answered elsewhere and better: it is why ADR-0012 put a process boundary in
+front of it and why ADR-0016 and ADR-0017 confine what is behind it.
 
 ### Cross-platform rendering is nearly free, and we should exploit it
 
@@ -320,7 +328,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, dashed and dotted borders painting solid, `background-position`, and
+layout, `inline-block` laid out as
+plain `inline` — and counted as unsupported layout for that reason, so a page
+depending on it falls back to a document rather than failing quietly — and
 proper block-in-inline splitting — an inline element containing a block is
 laid out as a block instead, which matches for the shapes that occur but is
 not what CSS 2.1 §9.2.1.1 describes.
@@ -380,6 +390,16 @@ item in this milestone that is not itself security work, which is what made it
 the one to move.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
+Where that stands: the work in this milestone is done. All three platforms
+confine the renderer, each is checked from inside on every push, the parsers are
+fuzzed continuously and a hang is now a finding rather than a hang, and the TLS
+configuration is asserted rather than inherited. What is left is not a task on
+this list — **nobody outside this project has read any of it.** The milestone's
+test is whether we would tell a stranger to browse untrusted sites with it, and
+the honest answer stays no while we are the only people who have looked. That is
+the sentence the README should keep, with the reason narrowed to the one that is
+still true.
+
 **Fuzzing — done, and it found things.** `tests/fuzz` mutates the reference
 fixtures into the HTML parser, the CSS parser, image decoding, URL parsing, and
 the whole render pipeline. Written here rather than taken from `cargo-fuzz`:
@@ -422,11 +442,26 @@ hole, and it comes from long unbroken runs of characters inside nested tables
 being re-measured once per table level. Not a denial of service on the evidence
 so far, and not scheduled.
 
-**The fuzzer cannot catch a true hang.** It times each input after the fact, so
-something that never returns hangs the harness rather than being reported. The
-renderer process below can be killed, which is where that gap closes for the
-browser; the fuzzer itself still runs in-process and still cannot be
-interrupted.
+**The fuzzer catches a true hang now.** It used to time each input after the
+fact, which means an input that never returns is never timed: the harness hung
+along with it and the only evidence was a process that had stopped printing. A
+hang is a denial of service on a browser — the thing this milestone is about —
+so being unable to *name* one was the gap worth closing.
+
+A watchdog thread closes it. The fuzzing loop publishes when the current input
+started; the watchdog wakes four times a second and, past ten times the slow
+threshold, prints which input and ends the process with a distinct exit status.
+It does not interrupt the stuck thread, and that is deliberate rather than a
+limitation accepted: Rust has no safe way to, and an unsafe one would be worse
+than the problem — a harness that can stop arbitrary code at an arbitrary point
+is a harness whose findings nobody can trust. What it converts is "the fuzzer
+stopped printing" into a named file and a non-zero exit.
+
+Checked from outside the process, because what it does is end one: the binary
+hangs on purpose behind `--hang-selftest` and a test reads the corpse. That test
+has a deadline of its own, since the obvious version of it does not fail when
+the watchdog breaks — it hangs, which would be an unusually pointed way to get
+this wrong.
 
 **Process model — decided and half-built.** [ADR-0012](docs/adr/0012-process-isolation.md):
 the parent keeps the chrome, the network, and the disk; a child parses, lays
@@ -455,12 +490,23 @@ rendered without: verified on the era fixture, 0 differing bytes of 2.5 MB.
 
 Two consequences worth recording rather than discovering later:
 
-- **A page taller than one frame is clipped.** The canvas covers the whole
-  document so scrolling costs a blit rather than a re-layout, and a frame is
-  bounded so a compromised child cannot make the parent allocate without limit.
-  At 800 pixels wide that allows roughly 20,000 rows. The honest fix is to
-  render a band around the scroll position instead of the whole document, which
-  changes how scrolling works and is not something to fold into the boundary.
+- **A page taller than one frame was clipped, and is not any more.** The canvas
+  used to cover the whole document, which made scrolling a blit and made a page
+  past roughly 20,000 rows stop dead. The fix named here — render a band around
+  the scroll position — is now written. The display list is in document
+  coordinates and does not change between bands, so a band is paint-only: no
+  parse, no cascade, no layout. The conversation moved onto a thread so the rows
+  ahead can be asked for while the window carries on drawing, which is what
+  keeps ordinary scrolling from waiting on anything.
+
+  Two bugs came out of building it, both invisible until a canvas started
+  somewhere other than document row zero. `draw_pixmap` fills a rectangle with
+  the glyph bitmap as a *pattern*, and a pattern sampled outside its bounds pads
+  with its edge, so a glyph straddling the top of a band gained a duplicated
+  row; glyphs are cropped to the canvas now and never drawn at a negative
+  offset. And the placement cast truncated toward zero, which changes rounding
+  direction at zero. Both were found by asserting a band is exactly the rows it
+  names.
 - **Find and resize keep the child alive.** One *page* per process, not one
   message: a page's lifetime includes the questions asked of it while it is on
   screen, and the text those questions search never crosses. The child is killed
@@ -476,14 +522,69 @@ attaching to processes. Proven from inside: the binary confines itself and
 reports, and the era fixture still renders byte-identically with all three
 images arriving over the pipe.
 
-It is a **denylist**, and that is a real weakening worth stating. An allowlist
-refuses anything nobody named, including a syscall nobody thought about; it is
-also what breaks a browser in the field, because the set a renderer touches is
-decided by the allocator, the shaper, and the standard library and moves under
-you on a toolchain bump. Denied calls return `EPERM` rather than killing the
-process, so a legitimate call that meets the filter degrades into an error the
-renderer already handles. An allowlist is the stronger end state and wants a
-measured set of what the renderer actually uses.
+It began as a **denylist**, which this section recorded as a real weakening: an
+allowlist refuses anything nobody named, including a syscall nobody thought
+about, and the condition for switching was named here — *a measured set of what
+the renderer actually uses*. That measurement was taken, and it changed the
+answer. **The filter is an allowlist now**
+([ADR-0016](docs/adr/0016-syscall-allowlist-measured.md)).
+
+Rendering a page uses nine syscalls. That is the whole surprise: read a pipe,
+write a pipe, four ways of asking for memory, one seed for the hash tables, the
+signal stack, and exit. It is small because of decisions already made — fonts
+compiled in (ADR-0010), every subresource a request the parent answers
+(ADR-0012), no JavaScript and so no JIT (ADR-0003) — and a browser without those
+would not have the option. Failing uses calls rendering never does, so a panic,
+an abort, and a stack overflow from a deeply nested document were traced
+separately; guessing at those is how an allowlist turns a crash into a hang.
+
+Two properties are kept rather than inverted. Unnamed calls still return `EPERM`
+rather than killing the process, so a call nobody measured costs a page instead
+of the browser — which is what makes shipping a stronger filter honest on a
+measurement taken from one machine. And the old denylist is kept as an
+*assertion*: `socket` and `io_uring_enter` no longer need naming, but the
+reasoning about why each family is dangerous outlived the list, and it is now
+what a test checks the allowlist against.
+
+The measurement is `scripts/renderer-syscalls.sh`, not a paragraph in a commit
+message. It traces real children across every fixture, the fuzzer's corpus,
+bands, find, resize, and subresources over the pipe, and prints what was used
+and what was refused. Rerun it after a toolchain bump.
+
+**It was run twice, against two C libraries, and the second run found the gap
+the first could not.** A set decided by the libc is not evidence about the libc,
+so the browser was built against musl and measured again. Rendering: identical.
+Failing: not. glibc's `abort` raises its signal with `tgkill`, musl's with
+`tkill`, and the first list named only the one it had seen. The failure was
+milder than predicted and worse than it sounds — musl does not hang when the
+call is refused, it falls through to crashing on purpose, so a panicking
+renderer died of `SIGSEGV` rather than `SIGABRT`. In a project that forbids
+`unsafe` and says so, a panic that reports itself as a memory fault is a false
+alarm about the one claim worth protecting. Both calls are allowed now; neither
+reaches further than the other.
+
+musl is a *probe*, not a supported target, and CI does not build it — enforcing
+it would claim support that is not offered. The script takes a target directory
+so the probe can be repeated:
+`scripts/renderer-syscalls.sh target/x86_64-unknown-linux-musl/release`.
+
+**And on a second architecture, in CI, on every push.** The aarch64 job used to
+be a cross-compile that said so — "a check, not a build; nothing here runs" —
+which was enough when the question was whether `sandbox` compiled and stopped
+being enough when the filter became an allowlist. Which syscalls *exist* on an
+architecture is a compile-time fact; which ones the renderer *makes* is not.
+GitHub's aarch64 Linux runners are free for public repositories, so it runs the
+tests, the reference baselines, the budgets, and the measurement itself.
+
+aarch64 needs nothing x86_64 did not: its set is a strict *subset* of the glibc
+x86_64 one — fourteen calls against fifteen, the difference being `futex`, which
+the x86_64 panic path takes and the aarch64 one does not. Which is the outcome
+worth having and not the one to have assumed: musl's `tkill` proved the set can
+differ, so aarch64 agreeing is evidence rather than a formality.
+
+Two C libraries, two architectures, and the measurement runs on every push. What
+is still not covered is a toolchain bump changing the set under all of them at
+once, which is what the `EPERM` default is for.
 
 **Windows is confined too, by a different mechanism.** seccomp is
 self-restriction; an AppContainer is not. The parent creates a package profile,
@@ -511,21 +612,73 @@ seccomp (it fails the syscall) and wrong for AppContainer (the firewall resets
 the connection, so blocked and dead are indistinguishable). It now connects to a
 listener the parent binds, and both sides echo what they aimed at.
 
+**macOS is confined too, and it needed the exception ADR-0002 anticipated.**
+`sandbox_init` is a C function with no safe wrapper anywhere, so unlike Linux
+and Windows there was no crate holding the `unsafe` for us. `crates/seatbelt` is
+that crate now: one call, no policy, a page long, and two tests keeping it that
+way — one fails if it grows past 200 lines, the other if any second crate stops
+inheriting the workspace lints ([ADR-0017](docs/adr/0017-one-unsafe-crate-for-macos.md)).
+The profile is `(deny default)` with two exceptions, one of which is a lesson
+imported rather than guessed: refusing a process the ability to signal itself
+does not stop it aborting, it changes how it dies, which the musl measurement
+had already shown one platform over.
+
+**And the check that says all this is true stopped being able to lie.** The
+self-test skipped when no sandbox had installed, and the skip was an `eprintln!`
+— captured by `cargo test` on a passing test. So a verified sandbox and a silent
+skip printed the same thing, which is the third check-that-cannot-fail in this
+milestone's work and the worst, because it covered the other two. A skip is now
+legitimate on a laptop and a failure in CI, which is where the claim is made.
+
+It found something on its first run: **Windows CI had never verified the
+AppContainer.** It was failing to launch one on every push, with the
+`ERROR_ENVVAR_NOT_FOUND` a user had reported from their own machine and this
+repository believed fixed. It was not fixed; the explicit environment block
+meant to cure it was causing it. Windows needs `USERPROFILE`, `LOCALAPPDATA`,
+and `APPDATA` in that block to work out where an AppContainer's package profile
+lives, because it redirects `TEMP` into it as the process starts. Three attempts
+went into that, two of them guesses; what ended it was making the failure print
+what the launch had actually been handed.
+
 Still not done:
 
-1. **macOS is unconfined.** The App Sandbox is not implemented, and it is not
-   stubbed to look done — the parent reports `Unavailable` and says so on
-   stderr. A sandbox that claims to work and does not is worse than one that
-   says it is missing. Unlike Windows there is no third way round ADR-0002:
-   Seatbelt has no safe wrapper on crates.io, only raw FFI bindings, so it needs
-   either a lint exception or a quarantined crate — and neither of us can test
-   it. See [issue #4](https://github.com/hype-armor/2kbrowser/issues/4).
-2. **Landlock is not used.** It would add filesystem confinement beyond
-   "cannot call `open`", and `landlock_create_ruleset` returns `ENOSYS` on the
-   kernel this was developed against, so it could not be tested. Filesystem
-   access is denied at the syscall level instead, which covers opening but not
-   every path to a descriptor.
-3. **Only loopback is probed on Windows.** Loopback and outbound are separate
+1. **Landlock is not used, and the reason has changed.** It used to be "could
+   not be tested" — `landlock_create_ruleset` returns `ENOSYS` on the kernel
+   this was developed against, which is still true and is no longer the point.
+
+   Landlock restricts a process's access to filesystem *objects*: "may read
+   under `/usr/share/fonts` and nothing else". seccomp cannot express that,
+   because a path is a pointer into user memory that can change between the
+   check and the kernel's use of it — so seccomp can say "no `openat` at all"
+   and never "`openat`, but only there". The two are complementary by design.
+
+   What Landlock was for here was the sentence this entry used to end with:
+   syscall filtering "covers opening but not every path to a descriptor". That
+   was the right worry about a **denylist**, which has to name every route to a
+   file descriptor — `openat`, `openat2`, `open_by_handle_at`, `open_tree`,
+   `fsopen`, `pidfd_getfd`, io_uring — and leaves a hole for each one missed.
+
+   ADR-0016 removed that class of miss. The allowlist's twenty-four calls
+   contain no way to obtain a descriptor: no `open*`, no `socket`, no `dup`, no
+   `fcntl`, no `memfd_create`, no `pidfd_getfd`, no `open_by_handle_at`. `close`
+   is there and nothing that creates one is. The renderer holds exactly the
+   pipes the parent gave it and can never acquire another — closed by
+   construction rather than by enumeration, which is the whole difference an
+   allowlist makes.
+
+   So what is left is defence in depth: a second, independent mechanism, so that
+   a mistake in how the seccomp filter is *built* does not leave the filesystem
+   open. Real, and modest. Against it: another dependency or another `unsafe`
+   exception, ABI negotiation across five versions with different capabilities,
+   a second policy to keep in step with the first, and one more thing that can
+   install successfully and restrict nothing — which is the failure this
+   milestone hit three times.
+
+   Revisit the moment the renderer has to be allowed `openat` — if the fonts
+   ever stop being embedded, say. At that point Landlock stops being a second
+   layer over a closed hole and becomes the only tool that can express what is
+   wanted.
+2. **Only loopback is probed on Windows.** Loopback and outbound are separate
    AppContainer rules, and reaching the internet from a test is not something to
    depend on. What rules out outbound is the capability set being empty, which
    is asserted directly instead.
@@ -616,7 +769,7 @@ that it has one home and can be closed:
 | ~~[1](https://github.com/hype-armor/2kbrowser/issues/1)~~ | ~~Period-authentic chrome, or a modern shell?~~ Resolved: a modern shell around a period engine (ADR-0011) | — |
 | ~~[2](https://github.com/hype-armor/2kbrowser/issues/2)~~ | ~~Move reader mode earlier than M5?~~ Resolved: yes, M3 (ADR-0009) | — |
 | ~~[3](https://github.com/hype-armor/2kbrowser/issues/3)~~ | ~~Legacy TLS: marked downgrade, or unreachable?~~ Resolved: unreachable — refused outright (ADR-0013) | — |
-| [4](https://github.com/hype-armor/2kbrowser/issues/4) | Revisit dependency posture? | nothing |
+| ~~[4](https://github.com/hype-armor/2kbrowser/issues/4)~~ | ~~Revisit dependency posture?~~ Resolved: keep taking `tiny-skia` and do not reimplement it; macOS gets one quarantined `unsafe` crate instead (ADR-0017) | — |
 | ~~[5](https://github.com/hype-armor/2kbrowser/issues/5)~~ | ~~No metric-compatible clone for Verdana/Tahoma~~ Resolved: accept the reflow | — |
 | ~~[6](https://github.com/hype-armor/2kbrowser/issues/6)~~ | ~~`cursive`/`fantasy` resolve to sans-serif~~ Resolved: fall back, do not chase it | — |
 | ~~[7](https://github.com/hype-armor/2kbrowser/issues/7)~~ | ~~Vendor fonts in git, or fetch with pinned checksums?~~ Resolved: fetch with pins (ADR-0010) | — |
@@ -636,7 +789,163 @@ no: there is no sandbox, the parsers have never been fuzzed, and the TLS
 configuration has not been reviewed. Issue #3 blocks part of it; nothing else
 in §9 does.
 
-The engine's known gaps — collapsed borders, fixed table layout, dashed and
-dotted borders, `background-position`, proper block-in-inline splitting — are
-listed under M2 and are not scheduled. They are places the browser is wrong
-rather than places it falls over, and none of them is what makes this unsafe.
+### What the CSS 2.1 test suite says
+
+§2 rests this project's entire scope boundary on one fact: CSS 2.1 is a
+completed specification *with an official test suite*, which is what gives the
+work a finish line. That argument had never been checked against the suite it
+names. It has now — `tests/conformance`, pointed at web-platform-tests
+`css/CSS2` (revision `54f8f93`, the suite's current home; the old
+`test.csswg.org` URLs now serve a wiki page for every path).
+
+**1385 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
+thousand renders of CSS this engine had never seen, which is the fuzzing in M4
+earning its place.
+
+Three things about that number, in the order they matter.
+
+**It is an upper bound, not a score.** A reftest passes when a test and its
+reference render the same, and an engine that ignores a property draws both
+sides the same way. Reftests find inconsistency, not absence.
+
+**Most of the failures are real.** That was not obvious and had to be checked:
+a reftest can also fail because the pair was loosely matched during the suite's
+import into wpt, which is nothing to do with us. Running the same pairs through
+headless Chromium on a random sample of 150 failures: **140 render identically
+there**. So roughly 93% of the ~3,500 failures are this engine's, not the
+suite's.
+
+**The harness was wrong three times before the number meant anything.** The
+first published figure, 20.6%, was an artefact of my own tooling, and the errors
+are more instructive than the number.
+
+The worst of them compared *whole-page* renders rather than a viewport. A
+reftest is a screenshot of a window; comparing full pages instead fails every
+pair that differs only in a trailing margin, because the two images come out
+different sizes while everything a reader sees is identical. That one did not
+merely add noise — it **inverted a measurement**. Sibling margin collapsing,
+scored against full-page renders, appeared to fix zero tests and break ten. The
+same change measured against an 800x600 viewport fixes 163 and moves the total
+from 25.3% to 28.7%. Had the first number been trusted, the correct change would
+have looked like a regression and been reverted.
+
+It was caught by a result that made no sense: a fix that repairs nothing at all,
+in a suite of five thousand tests, is not a fix that failed — it is a
+measurement that is not measuring.
+
+The other two flattered nobody and just added noise. Ahem-flagged tests were being
+counted as failures when they cannot be run here at all: the suite uses that
+font to draw a block of known size, and a test rendering `X` at `100px/1 Ahem`
+against a 100×100 `div` is not a colour test we fail but a test we cannot
+perform, since fonts are compiled in and never loaded from a document
+(ADR-0010). And references named with a server-absolute path — `/css/CSS2/…` —
+were being looked for relative to the test, which made 268 present files look
+missing.
+
+**The biggest single finding was one the known-gaps list did not contain:
+margins did not collapse at all** (§8.3.1). Two blocks with 40px margins between
+them got 80px of space where they should get 40 — not implemented, not written
+down as missing, and affecting essentially every page with more than one
+paragraph. It was found by pulling on one selector test that should have passed
+and did not: the test used a `div` where its reference used a `p`, which in a
+browser is the *same* rendering precisely because the margins collapse.
+
+**Adjacent siblings collapse now**, which is the case that governs consecutive
+paragraphs and is therefore most of the value. Nineteen of the twenty-one
+reference baselines moved, all of them tighter and all of them closer to what
+Chromium draws for the same fixture.
+
+**A parent collapses with its first and last child too** — §8.3.1's second and
+third rules — which needed `layout_block` to return the margins it collapsed at
+each end rather than one height. Worth recording what that bought, because it is
+not what the effort suggested: **four tests**, against two it broke. The reason
+is that collapsing a margin out of a parent usually moves it from inside the box
+to outside without moving anything a reader can see; the child ends up in the
+same place and only the *parent's* box changes size. That is invisible until the
+parent has a background or a border, which most of the suite's boxes do not —
+and very visible on real pages, which are full of bordered panels sized to their
+content.
+
+So the honest summary is that the second and third rules are correct, are
+verified against a browser, are worth having, and are not measurable by this
+harness. That is a limit of reftests rather than a reason to skip the rules,
+but it does mean the conformance number cannot be the only thing steering this
+work.
+
+Both regressions were then chased rather than absorbed into the net figure, and
+they turned out to be different in kind.
+
+`normal-flow/negative-margin-shrinking-container-size-002` was real, and found
+something absent rather than something wrong: `overflow` was **not modelled at
+all**. Any value but `visible` makes a box establish a block formatting context,
+and a margin cannot escape one — the test has a container with
+`overflow: hidden` whose last child carries `margin-bottom: -200px`, sized so
+the margin cancels the child exactly if it stays inside and reveals a red block
+if it does not. It escaped. `overflow` is parsed now and used for that effect
+only; the clipping is still not implemented, which is worth being uneasy about
+and is still better than ignoring the property, since ignoring it does not make
+the clipping appear and also gets the margins wrong.
+
+`visuren/right-offset-position-fixed-001` was not real. It combines
+`direction: rtl` with `position: fixed`, neither of which this engine
+implements, so it had been passing because both sides were wrong in the same
+way — the reftest weakness this section opens with, met in person. Changing the
+margins broke the coincidence. Left failing, because the honest fix is to
+implement `direction` and fixed positioning, not to restore the accident.
+
+Still missing: an empty block collapsing through itself. That one needs the
+running collapsed margin kept *uncommitted* as the walk proceeds rather than
+added to the cursor as each child is placed — the proper adjoining-margins
+algorithm — because a self-collapsing box has one margin rather than two and
+joins a chain that may already be open. A larger restructure of block layout
+than the three rules that are done, and not one to start without room to finish
+it.
+
+**The conformance run's next finding, recorded rather than fixed: an invalid
+selector does not invalidate its rule.** CSS 2.1 §4.1.7 says a statement with an
+error anywhere in its selector is ignored entirely, so
+`[1digit], div { color: red }` must style nothing — the malformed attribute name
+takes the valid `div` with it. This engine keeps the `div` and applies the red.
+The suite catches it the way it catches everything: a page whose whole assertion
+is "no red". `selectors` is the worst-scoring chapter with content — 59 of 463 —
+and this looks like a large share of it.
+
+Being strict is not the fix, which is the interesting part. Two different
+failures reach the parser as the same "did not parse": syntax that is *invalid*,
+which no browser accepts and which must drop the rule, and syntax that is
+*unsupported here* but valid CSS 2.1 — `p:first-child`, `a::before` — which
+browsers apply. Dropping whole rules for the second kind would lose styling real
+browsers show, trading page rendering for test scores. The fix is to tell them
+apart, which wants a three-way result threaded through selector parsing and
+wants measuring against the reference baselines as well as the suite, since it
+can move real pages either way.
+
+That is what a conformance run is for. The known-wrong list was the list of
+things we had noticed; this is the list.
+
+The engine's known gaps — an empty block collapsing through itself, an invalid
+selector not invalidating its rule, collapsed borders, fixed table
+layout, `inline-block`, proper block-in-inline splitting — are listed
+under M2 and are not scheduled. They are places the browser is wrong rather
+than places it falls over, and none of them is what makes this unsafe.
+
+The three-dimensional border styles came off it as well — `double`, `groove`,
+`ridge`, `inset`, `outset` — and they are the most era-appropriate thing on the
+list: `outset` is what a button looked like before anyone had a gradient. The
+whole effect is one predicate and two shades, since the pattern is UA-defined
+here too: an edge a light source above and to the left would strike keeps the
+declared colour, the opposite edge is halved, and a groove is a ridge with its
+two halves exchanged. Checked against Chromium, which lights them the same way.
+
+Dotted and dashed borders came off that list too, which was a smaller job than
+it looked: the pattern is UA-defined, so the only real decision was to stretch
+each run to a whole number of dashes so it starts and ends flush with the
+corner. A half dash at one end is what makes a hand-rolled dashed border look
+wrong.
+
+`background-position` came off that list. It was the most self-contained of
+them and it paid for itself twice over: implementing it needed the tiling code
+to separate *where a tile is anchored* from *which rows are being painted*,
+which the banded renderer had been conflating, and writing its fixture turned
+up two bugs that had nothing to do with backgrounds — `inline-block` collapsing
+to nothing, and `clear` falling short by a container's top padding.

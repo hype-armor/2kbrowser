@@ -60,6 +60,13 @@ struct Check {
     outcome: Outcome,
 }
 
+/// The browser binary, which this harness needs beside it to spawn a renderer.
+const BROWSER: &str = if cfg!(target_os = "windows") {
+    "2kbrowser.exe"
+} else {
+    "2kbrowser"
+};
+
 fn main() -> ExitCode {
     let checks = vec![
         binary_size(),
@@ -70,18 +77,176 @@ fn main() -> ExitCode {
                 blocked_on: "the window; headless render works, startup path does not exist",
             },
         },
-        Check {
-            name: "RSS rendering a reference page",
-            limit: "<= 100 MB".to_owned(),
-            outcome: Outcome::Pending {
-                blocked_on: "memory instrumentation; rendering itself now works",
-            },
-        },
+        resident_memory(),
         third_party_requests(),
         font_payload(),
     ];
 
     report(&checks)
+}
+
+/// Peak resident memory for the browser rendering a real page.
+///
+/// One of the four claims in PLAN.md §1 is "tens of MB, not hundreds", and it
+/// has been reporting PENDING since it was written. It is measurable now
+/// because the renderer is a separate process with a process id the parent can
+/// ask about: the number that matters is the *pair*, since a browser that moved
+/// its memory into a child did not save anyone anything.
+///
+/// Peak rather than current. Rendering allocates a canvas, a box tree, and
+/// decoded images and then lets most of it go, so sampling afterwards would
+/// measure the tidying up rather than the work.
+///
+/// Linux only, and it says so elsewhere rather than passing quietly. `VmHWM` in
+/// `/proc/<pid>/status` is the high-water mark the kernel already tracks;
+/// macOS and Windows both have an equivalent and both need FFI to reach, which
+/// ADR-0002 forbids here. A check that runs on one of three platforms is worth
+/// more than one that runs nowhere, and this is the platform CI renders on
+/// most.
+fn resident_memory() -> Check {
+    let name = "peak memory rendering a page";
+    // Generous against the claim it is checking: PLAN.md says tens of MB, and
+    // this is the number at which "tens" has stopped being true. A budget set
+    // at the current measurement would fail on the first honest change.
+    let limit_mb = 100u64;
+    let limit = format!("<= {limit_mb} MB total");
+
+    if !cfg!(target_os = "linux") {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Pending {
+                blocked_on: "reading peak RSS off Linux, which needs FFI (ADR-0002)",
+            },
+        };
+    }
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../ref/fixtures/era-page.html")
+        .canonicalize();
+    let Ok(fixture) = fixture else {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Fail {
+                measured: "-".to_owned(),
+                reason: "the era reference fixture is missing".to_owned(),
+            },
+        };
+    };
+    let Ok(body) = std::fs::read(&fixture) else {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Fail {
+                measured: "-".to_owned(),
+                reason: "the era reference fixture could not be read".to_owned(),
+            },
+        };
+    };
+    let url = net::file_url(&fixture);
+    let Ok((origin, path)) = net::parse_url(&url) else {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Fail {
+                measured: "-".to_owned(),
+                reason: "could not parse the fixture URL".to_owned(),
+            },
+        };
+    };
+
+    // The browser, not this harness. `Renderer::new` re-invokes whatever is
+    // running, which here is `budgets` — and `budgets --render-child` is not a
+    // renderer, so the first thing the parent read was garbage. The wire layer
+    // caught it ("length field does not fit the frame"), which is the bounds
+    // checking working, and the measurement was still wrong.
+    let browser = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(BROWSER)))
+        .filter(|path| path.exists());
+    let Some(browser) = browser else {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Pending {
+                blocked_on: "a release build of the browser beside this harness",
+            },
+        };
+    };
+    let renderer = sandbox::Renderer::with_program(browser);
+    // Held open on purpose: the child is read while it is alive, because a
+    // process that has exited has no `/proc` entry to ask.
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body,
+            content_type: None,
+            origin,
+            path,
+        },
+        800,
+        2400,
+        // Neither layout override: what is being measured is an ordinary page.
+        false,
+        false,
+    );
+    let page = match page {
+        Ok(page) => page,
+        Err(error) => {
+            return Check {
+                name,
+                limit,
+                outcome: Outcome::Fail {
+                    measured: "-".to_owned(),
+                    reason: format!("the page did not render: {error}"),
+                },
+            };
+        }
+    };
+
+    let parent = peak_rss_kib("self");
+    let child = peak_rss_kib(&page.child_id().to_string());
+    drop(page);
+
+    let (Some(parent), Some(child)) = (parent, child) else {
+        return Check {
+            name,
+            limit,
+            outcome: Outcome::Fail {
+                measured: "-".to_owned(),
+                reason: "could not read VmHWM from /proc".to_owned(),
+            },
+        };
+    };
+    let total_mb = (parent + child) as f64 / 1024.0;
+    let measured = format!(
+        "{total_mb:.1} MB — {:.1} parent + {:.1} renderer",
+        parent as f64 / 1024.0,
+        child as f64 / 1024.0
+    );
+    Check {
+        name,
+        limit,
+        outcome: if total_mb <= limit_mb as f64 {
+            Outcome::Pass { measured }
+        } else {
+            Outcome::Fail {
+                measured,
+                reason: "PLAN.md §1 claims tens of megabytes, not hundreds".to_owned(),
+            }
+        },
+    }
+}
+
+/// Peak resident set size in KiB, from the kernel's own high-water mark.
+fn peak_rss_kib(pid: &str) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|number| number.parse().ok())
 }
 
 /// Renders a page whose every subresource is third-party, and checks that none

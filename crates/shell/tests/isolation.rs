@@ -30,10 +30,12 @@ fn request(html: &str, width: u32) -> ToChild {
         body: html.as_bytes().to_vec(),
         content_type: None,
         width,
-        max_height: 2000,
+        top: 0,
+        height: 2000,
         origin: None,
         path: String::new(),
         force_authored: false,
+        force_document: false,
     }
 }
 
@@ -107,10 +109,8 @@ fn a_child_given_nonsense_refuses_it_rather_than_crashing() {
         let mut stdin = process.stdin.take().expect("stdin");
         write_frame(
             &mut stdin,
-            &ToChild::Resource {
-                body: Vec::new(),
-                content_type: None,
-                ok: true,
+            &ToChild::Resources {
+                resources: Vec::new(),
             }
             .encode(),
         )
@@ -170,9 +170,11 @@ fn session(html: &str, width: u32) -> (sandbox::Session, sandbox::Rendered) {
             html.as_bytes().to_vec(),
             None,
             width,
+            0,
             2000,
             Some(origin),
             at,
+            false,
             false,
         )
         .expect("the renderer opens the page")
@@ -220,9 +222,11 @@ fn the_same_child_re_renders_at_a_new_width() {
             html.as_bytes().to_vec(),
             None,
             600,
+            0,
             2000,
             Some(origin),
             at,
+            false,
             false,
         )
         .expect("re-renders");
@@ -332,6 +336,7 @@ fn viewport(html: &str, width: u32) -> shell::viewport::Viewport {
         width,
         2000,
         false,
+        false,
     )
     .expect("the page opens")
 }
@@ -425,6 +430,586 @@ fn overruling_the_document_fallback_changes_the_mode_it_reports() {
     );
 }
 
+/// An HTTP server answering one path for as long as the test binary runs,
+/// counting how many times it was actually asked.
+///
+/// Written out rather than pulled in. The questions below need a real header
+/// off a real socket, and none of them can be asked of anything on disk: a
+/// `file:` URL carries no `Content-Type`, and reading a file again is not the
+/// cost that fetching one again is.
+fn serve(
+    path: &'static str,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    // Detached, and it never stops: the test binary exiting is what ends it.
+    // Joining would mean deciding in advance how many requests to expect, which
+    // is the thing being measured.
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let wanted = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let response = if wanted == path {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(&body);
+                out
+            } else {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            };
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        }
+    });
+    (port, served)
+}
+
+/// Opens a page served from `port` in a real child, at 200px.
+fn over_http(port: u16, html: &str) -> shell::viewport::Viewport {
+    let (origin, at) = net::parse_url(&format!("http://127.0.0.1:{port}/p.html")).expect("parses");
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+    )
+    .expect("the page opens")
+}
+
+/// How much green some pixels hold, which is how these tests tell a stylesheet
+/// arrived and was applied rather than merely asked for.
+fn green_in(pixels: &[u8]) -> usize {
+    pixels
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
+        .count()
+}
+
+fn green_pixels(page: &shell::viewport::Viewport) -> usize {
+    green_in(page.pixels())
+}
+
+#[test]
+fn a_subresource_remembered_for_one_page_is_not_served_to_another() {
+    // The cache sits behind the policy, never in front of it. ADR-0006's rule
+    // is about who is asking as much as about what for, and a live child
+    // outlives the document it was started for — `Session::render` can be
+    // handed a new one. A cache consulted before the check would let a page ask
+    // once from somewhere it was allowed and be answered for ever after, from
+    // anywhere, which is the whole third-party rule undone by an optimisation.
+    let (port, served) = serve("/s.css", "text/css", GREEN_SHEET.to_vec());
+    let html = format!(
+        "<html><head><link rel=stylesheet href=\"http://127.0.0.1:{port}/s.css\">\
+         </head><body><p>green</p></body></html>"
+    );
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+
+    // First: the document and the sheet share a host, so it is first-party.
+    let (origin, at) = net::parse_url(&format!("http://127.0.0.1:{port}/p.html")).expect("parses");
+    let (mut session, first) = renderer
+        .open(
+            html.as_bytes().to_vec(),
+            Some("text/html".to_owned()),
+            200,
+            0,
+            200,
+            Some(origin),
+            at,
+            false,
+            false,
+        )
+        .expect("the renderer opens the page");
+
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+    assert!(
+        green_in(&first.pixels) > 0,
+        "a first-party sheet should have applied"
+    );
+
+    // Then the same live child renders a document from a different host.
+    // `localhost` and `127.0.0.1` are different hosts by `is_same_site`, so the
+    // very same stylesheet URL is now third-party and has to be refused.
+    let (other, other_at) =
+        net::parse_url(&format!("http://localhost:{port}/p.html")).expect("parses");
+    let second = session
+        .render(
+            html.as_bytes().to_vec(),
+            Some("text/html".to_owned()),
+            200,
+            0,
+            200,
+            Some(other),
+            other_at,
+            false,
+            false,
+        )
+        .expect("renders");
+
+    assert_eq!(
+        green_in(&second.pixels),
+        0,
+        "a sheet remembered for one document was handed to another that may not have it"
+    );
+}
+
+/// The stylesheet these tests serve, and the colour they look for.
+const GREEN_SHEET: &[u8] = b"p { background-color: #00ff00 }";
+
+/// A server that answers any path slowly, one connection per thread, recording
+/// how many requests were in flight at once.
+///
+/// The delay is the instrument. Whether fetches overlap cannot be seen from
+/// their results — the page looks the same either way — so it has to be seen
+/// from the server's side, by asking how many were being served at the same
+/// moment.
+fn serve_slowly(
+    body: Vec<u8>,
+    delay: std::time::Duration,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let live = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let (live_here, most_here) = (live.clone(), most.clone());
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let (body, live, most) = (body.clone(), live_here.clone(), most_here.clone());
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(delay);
+                live.fetch_sub(1, Ordering::SeqCst);
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(&body);
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, most)
+}
+
+/// A solid PNG of one colour, as bytes.
+fn solid_png(width: u32, height: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
+    let mut pixmap = paint::Pixmap::new(width, height).expect("a pixmap");
+    pixmap.fill(paint::RasterColor::from_rgba8(rgb.0, rgb.1, rgb.2, 0xff));
+    let file = std::env::temp_dir().join(format!("2kbrowser-solid-{width}x{height}-{rgb:?}.png"));
+    pixmap.save_png(&file).expect("writes a png");
+    std::fs::read(&file).expect("reads it back")
+}
+
+/// A server that answers each path with its own body.
+fn serve_each(
+    routes: Vec<(&'static str, Vec<u8>)>,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let (routes, counter) = (routes.clone(), counter.clone());
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let wanted = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let response = match routes.iter().find(|(path, _)| *path == wanted) {
+                    Some((_, body)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(body);
+                        out
+                    }
+                    None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                };
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, served)
+}
+
+#[test]
+fn one_image_used_all_over_a_page_is_fetched_once() {
+    // The era's markup leans on a single spacer or bullet repeated everywhere,
+    // and now that images are asked for as a batch, the collapsing has to
+    // happen inside one — the cache is only written once the batch is done, so
+    // duplicates within it would all miss and all go to the network together.
+    let (port, served) = serve_each(vec![("/dot.png", solid_png(8, 8, (0, 0xff, 0)))]);
+    let images: String = std::iter::repeat_n("<img src=\"/dot.png\">", 8).collect();
+    let page = over_http(port, &format!("<html><body>{images}</body></html>"));
+
+    let count = served.load(std::sync::atomic::Ordering::SeqCst);
+    if count == 0 {
+        eprintln!("SKIP: the image requests never reached the test server");
+        return;
+    }
+    assert_eq!(
+        count, 1,
+        "one image, used eight times, fetched {count} times"
+    );
+    assert_eq!(
+        page.images_loaded(),
+        8,
+        "every use of it should still have got the image"
+    );
+}
+
+#[test]
+fn a_page_asking_for_more_resources_than_the_ceiling_is_refused() {
+    // The ceiling exists because the conversation is driven by the child: a
+    // compromised renderer that kept asking would have the parent fetching for
+    // ever, which is a denial of service against whatever it is pointed at.
+    //
+    // Batching is exactly how that bound could have been lost. Counting one per
+    // message rather than one per URL would let a page ask for any number of
+    // things in a single breath, so this asks for more than the ceiling in as
+    // few messages as possible.
+    let dir = std::env::temp_dir().join("2kbrowser-ceiling");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let (origin, at) = net::parse_url(&net::file_url(&dir.join("page.html"))).expect("parses");
+    let images: String = (0..sandbox::MAX_RESOURCES + 1)
+        .map(|n| format!("<img src=\"missing{n}.png\">"))
+        .collect();
+    let html = format!("<html><body>{images}</body></html>");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let outcome = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+    );
+
+    match outcome {
+        Err(error) => assert!(
+            error.to_string().contains("more than"),
+            "refused for the wrong reason: {error}"
+        ),
+        Ok(_) => panic!("a page asked for more than the ceiling and was allowed to"),
+    }
+}
+
+#[test]
+fn a_batch_of_images_lands_on_the_elements_that_asked_for_them() {
+    // Nothing in a batch carries an id: answers are matched to requests by
+    // position, all the way from the parent's fetch through the pipe to the
+    // element the image belongs to. Concurrency is exactly what makes that
+    // fragile — the fetches finish in whatever order the network decides — so
+    // this asks whether the *page* came out right rather than whether the
+    // requests did.
+    //
+    // Red above green in the markup, so red must be above green on the canvas.
+    // Swap any two answers anywhere along that path and this inverts.
+    let (port, served) = serve_each(vec![
+        ("/red.png", solid_png(40, 40, (0xff, 0, 0))),
+        ("/green.png", solid_png(40, 40, (0, 0xff, 0))),
+    ]);
+    let page = over_http(
+        port,
+        "<html><body><p><img src=\"/red.png\"></p><p><img src=\"/green.png\"></p></body></html>",
+    );
+
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the image requests never reached the test server");
+        return;
+    }
+    assert_eq!(page.images_loaded(), 2, "both images should have arrived");
+
+    // The topmost row holding each colour. Both must be found, and red's must
+    // come first.
+    let row_of = |wanted: (u8, u8)| -> Option<u32> {
+        let width = page.width() as usize;
+        page.pixels()
+            .chunks_exact(4)
+            .enumerate()
+            .find(|(_, pixel)| {
+                pixel[0] as i32 - i32::from(wanted.0) == 0 && pixel[1] == wanted.1 && pixel[2] == 0
+            })
+            .map(|(at, _)| (at / width) as u32)
+    };
+    let red = row_of((0xff, 0)).expect("the red image was never painted");
+    let green = row_of((0, 0xff)).expect("the green image was never painted");
+    assert!(
+        red < green,
+        "green was painted above red, so the answers landed on the wrong elements \
+         (red at row {red}, green at row {green})"
+    );
+}
+
+#[test]
+fn a_pages_images_are_fetched_at_the_same_time_rather_than_one_after_another() {
+    // The reason the protocol asks for several at once. Every subresource used
+    // to be its own request/response over the pipe, so a page waited for the
+    // sum of their latencies instead of the longest — twenty images meant
+    // twenty round trips one after another.
+    //
+    // Overlap is invisible in the result, so it is measured where it happens:
+    // the server counts how many requests it was serving at the same moment.
+    let tile = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/ref/fixtures/assets/tile.png"),
+    )
+    .expect("the reference fixture tile");
+    let (port, most_at_once) = serve_slowly(tile, std::time::Duration::from_millis(300));
+
+    // Distinct URLs, because identical ones are answered once by the cache and
+    // would prove nothing about concurrency.
+    let images: String = (0..6)
+        .map(|n| format!("<img src=\"/tile{n}.png\">"))
+        .collect();
+    let page = over_http(port, &format!("<html><body>{images}</body></html>"));
+
+    let most = most_at_once.load(std::sync::atomic::Ordering::SeqCst);
+    if most == 0 {
+        eprintln!("SKIP: the image requests never reached the test server");
+        return;
+    }
+    assert!(
+        most > 1,
+        "every image was fetched on its own, one after another: {most} at once"
+    );
+    assert_eq!(
+        page.images_loaded(),
+        6,
+        "the images did not all arrive and decode"
+    );
+}
+
+#[test]
+fn re_rendering_a_page_does_not_fetch_its_subresources_again() {
+    // What a resize costs. Laying a page out again re-runs the whole pipeline
+    // in the child, subresource requests included, and the parent had no cache
+    // of any kind — so every stylesheet and every image went back to the
+    // network on every re-render, at whatever rate the window was resizing.
+    let (port, served) = serve("/s.css", "text/css", GREEN_SHEET.to_vec());
+    let mut page = over_http(
+        port,
+        "<html><head><link rel=stylesheet href=\"s.css\"></head>\
+         <body><p>green</p></body></html>",
+    );
+
+    // Skipped rather than failed when the request never reached the server: a
+    // machine with a proxy in its environment sends it somewhere else entirely,
+    // and a check that could not run must not look like one that passed.
+    let after_first = served.load(std::sync::atomic::Ordering::SeqCst);
+    if after_first == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+    assert_eq!(after_first, 1, "the first render fetches it once");
+
+    for width in [220, 240, 260] {
+        page.resize(width, 200).expect("re-renders");
+    }
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a re-render went back to the network for a stylesheet it already had"
+    );
+    assert!(
+        green_pixels(&page) > 0,
+        "the remembered stylesheet stopped reaching the paint"
+    );
+}
+
+#[test]
+fn the_same_subresource_twice_on_one_page_is_fetched_once() {
+    // The half that helps a page's *first* load rather than its second. The
+    // era's markup leans on one spacer image used all over a layout, and every
+    // use of it was its own trip to the network.
+    let (port, served) = serve("/s.css", "text/css", GREEN_SHEET.to_vec());
+    let page = over_http(
+        port,
+        "<html><head>\
+         <link rel=stylesheet href=\"s.css\"><link rel=stylesheet href=\"s.css\">\
+         <link rel=stylesheet href=\"s.css\"><link rel=stylesheet href=\"s.css\">\
+         </head><body><p>green</p></body></html>",
+    );
+
+    let count = served.load(std::sync::atomic::Ordering::SeqCst);
+    if count == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+    assert_eq!(count, 1, "one sheet, asked for four times, fetched {count}");
+    assert!(green_pixels(&page) > 0, "the sheet did not reach the paint");
+}
+
+#[test]
+fn a_subresource_keeps_the_charset_its_own_header_declared() {
+    // The sibling of `a_charset_that_only_the_header_knows_still_reaches_the_
+    // renderer`, which asks this of the *document*. That path kept its header
+    // and this one did not, which is exactly the sort of inconsistency nobody
+    // would think to look for — the same bug, one boundary further in.
+    //
+    // The parent used to build every answer with `content_type: None`, throwing
+    // away what the transport said — while `ToChild::Resource` documented the
+    // field as existing precisely so "a stylesheet's character set can come
+    // from the header". A sheet declared only in its header decoded as
+    // something else, silently, which on the old web is most of them.
+    //
+    // The selector is the instrument. `.café` is written in UTF-8 and the
+    // header says so; read as windows-1252 — the fallback when nothing says
+    // otherwise — those two bytes are `Ã©` and the rule matches nothing at all.
+    let css = ".caf\u{e9} { background-color: #00ff00 }"
+        .as_bytes()
+        .to_vec();
+    let (port, served) = serve("/s.css", "text/css; charset=utf-8", css);
+
+    let html = "<html><head><link rel=stylesheet href=\"s.css\"></head>\
+                <body><p class=\"caf\u{e9}\">green if the header arrived</p></body></html>";
+    let (origin, at) = net::parse_url(&format!("http://127.0.0.1:{port}/p.html")).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+    )
+    .expect("the page opens");
+
+    // Skipped rather than failed when the request never reached the server. A
+    // machine with a proxy in the environment sends this somewhere else
+    // entirely, and a check that could not run must not look like one that
+    // passed — the same rule `legacy_tls.rs` follows for the same reason.
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the stylesheet request never reached the test server");
+        return;
+    }
+
+    let green = page
+        .pixels()
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
+        .count();
+    assert!(
+        green > 0,
+        "the sheet was decoded as something other than the charset it was served with"
+    );
+}
+
+#[test]
+fn an_ordinary_page_can_be_asked_for_the_fallback_and_given_it_back() {
+    // The other direction of the same override, across the same boundary. Not
+    // the absence of the test above: an ordinary page classifies as `Authored`
+    // and has no fallback to return to, so wanting one is its own request
+    // (ADR-0009).
+    let mut page = viewport(
+        "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>",
+        300,
+    );
+    assert!(
+        matches!(page.mode(), layout::RenderMode::Authored),
+        "this fixture is only useful while it needs no fallback: {:?}",
+        page.mode()
+    );
+    assert!(
+        !page.can_toggle_layout(),
+        "nothing has been decided about this page yet"
+    );
+    assert!(!page.forcing_document());
+    let plain = page.pixels().to_vec();
+
+    page.set_forcing_document(true, 300, 2000)
+        .expect("re-renders");
+    assert!(
+        matches!(page.mode(), layout::RenderMode::Document { .. }),
+        "asking for the fallback across the boundary did not produce one: {:?}",
+        page.mode()
+    );
+    assert!(page.forcing_document());
+    assert!(
+        page.can_toggle_layout(),
+        "a reader who asked for this needs the way back"
+    );
+    assert_ne!(
+        plain,
+        page.pixels(),
+        "the forced fallback rendered identically to the author's layout"
+    );
+
+    // And the way back actually goes back, rather than leaving the reader in a
+    // rendering they cannot get out of.
+    page.set_forcing_document(false, 300, 2000)
+        .expect("re-renders");
+    assert!(matches!(page.mode(), layout::RenderMode::Authored));
+    assert!(!page.can_toggle_layout());
+    assert_eq!(plain, page.pixels(), "going back did not go back");
+}
+
 #[test]
 fn the_renderer_cannot_open_a_socket_or_a_file() {
     // The only honest way to test a sandbox is from inside it: a filter that
@@ -436,20 +1021,51 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
     // there is no call a process can make to put *itself* in one.
     let output = Command::new(env!("CARGO_BIN_EXE_2kbrowser"))
         .arg(sandbox::confine::SELFTEST_ARGUMENT)
+        // `rappct`'s own diagnostic, which prints what it handed `CreateProcessW`
+        // — the flags, whether a command line and a working directory were
+        // present, and the raw last-error. Asked for here rather than in the CI
+        // workflow so that a developer reproducing a Windows failure gets the
+        // same detail without having to know the variable exists. It prints
+        // only when a launch fails, so it costs nothing the rest of the time.
+        .env("RAPPCT_DEBUG_LAUNCH", "1")
         .output()
         .expect("the selftest runs");
     let report = String::from_utf8_lossy(&output.stdout);
+    // Everything the selftest said that was not the report. On the failure path
+    // this is where the useful part is: `os error 203` on its own is not
+    // something anyone can act on, and two pushes were spent guessing at it
+    // before this was here to read.
+    let aside = String::from_utf8_lossy(&output.stderr);
 
     // Skipped rather than failed where the sandbox is unavailable — an old
-    // kernel, a container that forbids installing a filter, macOS. A check that
-    // cannot run must not look like a check that passed, so it says so.
+    // kernel, a container that forbids installing a filter. A check that cannot
+    // run must not look like a check that passed, so it says so.
+    //
+    // Except that it did look like one, for as long as the skip was only an
+    // `eprintln!`. `cargo test` captures the output of a test that passes, so a
+    // skipped run and a verified one both printed `... ok` and nothing else —
+    // the third time this project has produced a check that could not fail, and
+    // the worst of the three, because it covered the other two.
+    //
+    // So: a skip is legitimate on a developer's machine and never in CI. CI is
+    // where the claim gets made, and a sandbox that could not be installed
+    // there is the finding, not a reason to say nothing. The distinction is the
+    // `CI` variable every runner sets.
     if report.contains("confinement=Failed") || report.contains("confinement=Unavailable") {
-        eprintln!("SKIP: no sandbox is available here\n{report}");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no sandbox was installed, and this is CI — where a skip is a \
+             failure, because a green run here is what the README's claims \
+             rest on:\n{report}\n--- stderr ---\n{aside}"
+        );
+        eprintln!("SKIP: no sandbox is available here\n{report}\n{aside}");
         return;
     }
 
     let expected = if cfg!(target_os = "windows") {
         "confinement=AppContainer"
+    } else if cfg!(target_os = "macos") {
+        "confinement=AppSandbox"
     } else {
         "confinement=Seccomp"
     };
@@ -499,6 +1115,22 @@ fn the_renderer_cannot_open_a_socket_or_a_file() {
         file, "OPENED",
         "the renderer could still open a file:\n{report}"
     );
+    // The direction of the filter, which the two assertions above cannot show.
+    // A denylist that names `socket` and `openat` produces exactly the same two
+    // refusals as an allowlist naming neither — so the check that ADR-0016
+    // actually landed is a call *nobody named*, refused because it was not on
+    // the list. Reading the working directory is that call.
+    //
+    // Linux only. An AppContainer restricts resources rather than filtering
+    // calls, so this succeeds inside one and is not evidence of anything there.
+    if cfg!(target_os = "linux") {
+        assert_ne!(
+            field("unnamed-call="),
+            "ALLOWED",
+            "the filter permits calls it does not name — it is not an allowlist:\n{report}"
+        );
+    }
+
     // And it is still able to do its actual job, which a sandbox that broke
     // everything would also satisfy the two assertions above.
     assert!(report.contains("compute=55"), "{report}");
@@ -535,6 +1167,7 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
         800,
         4000,
         false,
+        false,
     )
     .expect("the confined renderer opens the page");
 
@@ -558,17 +1191,11 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
 }
 
 #[test]
-fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
-    // The one limitation of the process boundary a reader can actually hit.
-    // The canvas covers the whole document so scrolling costs a blit, and it
-    // has to fit in one frame so a compromised renderer cannot make the parent
-    // allocate without limit — about 20,000 rows at 800 pixels wide. Past that
-    // the page simply stopped, with white below it, indistinguishable from the
-    // document ending.
-    //
-    // Provoked with a small canvas rather than a 20,000-row document: the
-    // property is "content taller than canvas", and rendering twenty thousand
-    // rows to assert it would cost seconds for nothing.
+fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
+    // What banded rendering is for. A page used to stop at the canvas it was
+    // given: the rows past it had no pixels, the scroll stopped there, and the
+    // bar said the end was not shown. Now the canvas is a *band*, the scroll
+    // range is the document, and the rows arrive when they are reached.
     let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("tall.html");
@@ -585,91 +1212,44 @@ fn a_page_taller_than_its_canvas_says_so_instead_of_ending_in_white() {
         path: at,
     };
 
-    let tall = shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false)
-        .expect("the page opens");
-    assert!(
-        tall.content_height() > tall.height() as f32,
-        "the fixture was not tall enough to be clipped: {} content, {} canvas",
-        tall.content_height(),
-        tall.height()
-    );
-    assert!(tall.is_truncated());
-    // And the scroll stops where the pixels stop, rather than running on into
-    // rows that were never rendered.
-    assert_eq!(tall.scrollable_height(), tall.height() as f32);
-
-    // The same document with room for all of it is not truncated, which is what
-    // makes the assertion above about the page rather than about the type.
-    let whole = shell::viewport::Viewport::open(&renderer, document, 400, 20_000, false)
-        .expect("the page opens");
-    assert!(
-        !whole.is_truncated(),
-        "{} content, {} canvas",
-        whole.content_height(),
-        whole.height()
-    );
-}
-
-#[test]
-fn a_truncated_page_offers_no_matches_or_links_it_cannot_show() {
-    // A page cut off at the canvas still *has* text and links below the cut —
-    // the child holds the whole box tree and answers from it. Passing those on
-    // would give the reader "3 of 7" where four of the seven highlight nothing
-    // when stepped to, and links that take keyboard focus and are outlined
-    // nowhere.
-    let dir = std::env::temp_dir().join("2kbrowser-truncation-test");
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("tall-links.html");
-    let html = format!(
-        "<body>{}</body>",
-        "<p><a href=\"a.html\">needle</a></p>".repeat(200)
-    );
-    std::fs::write(&path, &html).expect("write");
-    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
-
-    let renderer =
-        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
-    let document = shell::viewport::Document {
-        body: html.as_bytes().to_vec(),
-        content_type: None,
-        origin,
-        path: at,
-    };
-
-    let mut whole =
-        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 20_000, false)
+    let mut page =
+        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false, false)
             .expect("the page opens");
-    assert!(!whole.is_truncated());
-    let (all_matches, all_links) = (whole.find("needle").len(), whole.links().len());
-    assert_eq!(all_matches, 200, "the fixture should match once per line");
-    assert_eq!(all_links, 200);
-
-    let mut cut = shell::viewport::Viewport::open(&renderer, document, 400, 300, false)
-        .expect("the page opens");
-    assert!(cut.is_truncated());
-
-    let canvas = cut.height() as f32;
-    let matches = cut.find("needle");
     assert!(
-        matches.len() < all_matches && !matches.is_empty(),
-        "expected some but not all of {all_matches} matches, got {}",
-        matches.len()
+        page.content_height() > page.height() as f32,
+        "the fixture is too short to band: {} content, {} band",
+        page.content_height(),
+        page.height()
     );
-    for rect in &matches {
-        assert!(rect.y < canvas, "a match at {} is off the canvas", rect.y);
-    }
+    // The whole document, not the band. This is the assertion that used to say
+    // the opposite.
+    assert_eq!(page.scrollable_height(), page.content_height());
+    assert_eq!(page.band_top(), 0);
 
-    let links = cut.links();
-    assert!(
-        links.len() < all_links && !links.is_empty(),
-        "expected some but not all of {all_links} links, got {}",
-        links.len()
-    );
-    for link in &links {
-        for rect in &link.rects {
-            assert!(rect.y < canvas, "a link at {} is off the canvas", rect.y);
+    // And the last rows of the document are reachable.
+    let last = page.content_height() as u32 - 100;
+    page.request_band(last, 300).expect("asks");
+    let arrived = loop {
+        if page.accept_band() {
+            break true;
         }
-    }
+        if !page.band_outstanding() {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(arrived, "the band never arrived");
+    assert_eq!(page.band_top(), last);
+
+    // Every match is offered, wherever it is. They used to be filtered to the
+    // painted canvas because a match below it could not be shown; now it can.
+    let matches = page.find("line");
+    assert_eq!(matches.len(), 200, "every line should match");
+    assert!(
+        matches.iter().any(|rect| rect.y > page.height() as f32),
+        "matches beyond the band should still be offered"
+    );
+    assert_eq!(page.links().len(), 0);
 }
 
 #[test]
@@ -747,9 +1327,11 @@ fn renderers_built_at_the_same_time_all_start() {
                         format!("<body><p>thread {index}</p></body>").into_bytes(),
                         None,
                         200,
+                        0,
                         400,
                         None,
                         String::new(),
+                        false,
                         false,
                     )
                     .map(|page| page.width)
@@ -771,5 +1353,230 @@ fn renderers_built_at_the_same_time_all_start() {
         "{} of {} concurrent renderers failed to start: {failures:?}",
         failures.len(),
         outcomes.len()
+    );
+}
+
+#[test]
+fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
+    // The same property `paint` asserts of `rasterise_band`, demanded of the
+    // whole arrangement: parent asks a live child for rows it does not have,
+    // and gets exactly the rows it would have got from one enormous canvas.
+    //
+    // This is what makes banding a fix for long pages rather than a rendering
+    // change wearing one as a disguise.
+    let html = format!(
+        "<body bgcolor=\"#eef\">{}</body>",
+        (0..120)
+            .map(|n| format!("<p>line {n} with some words on it</p>"))
+            .collect::<String>()
+    );
+    let dir = std::env::temp_dir().join("2kbrowser-band-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall.html");
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let (mut session, whole) = renderer
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            300,
+            0,
+            8000,
+            Some(origin),
+            at,
+            false,
+            false,
+        )
+        .expect("the renderer opens the page");
+    assert!(
+        whole.height > 600,
+        "the fixture is too short to band: {}",
+        whole.height
+    );
+    assert_eq!(whole.top, 0);
+
+    let row = |page: &sandbox::Rendered, n: u32| {
+        let stride = (page.width * 4) as usize;
+        page.pixels[n as usize * stride..(n as usize + 1) * stride].to_vec()
+    };
+
+    for (top, height) in [
+        (0u32, 90u32),
+        (137, 90),
+        (400, 250),
+        (whole.height - 30, 90),
+    ] {
+        let band = session.band(top, height).expect("the child paints a band");
+        assert_eq!(band.top, top);
+        assert_eq!(band.width, whole.width);
+        // Clipped to what the document has below `top`, exactly as a first
+        // render is clipped to the content.
+        assert_eq!(band.height, height.min(whole.height - top));
+        assert_eq!(
+            band.content_height, whole.content_height,
+            "moving down the page changed how tall it is"
+        );
+        for n in 0..band.height {
+            assert_eq!(
+                row(&band, n),
+                row(&whole, top + n),
+                "band at {top}: row {n} is not document row {}",
+                top + n
+            );
+        }
+    }
+
+    // A band is pixels, not a re-render: what the parent knows about the page
+    // must survive one. A band that blanked the title or the links would empty
+    // the tab strip and every keyboard target on the page.
+    let band = session.band(0, 100).expect("paints");
+    assert_eq!(band.links.len(), whole.links.len());
+    assert_eq!(band.title, whole.title);
+    assert_eq!(band.can_toggle_layout, whole.can_toggle_layout);
+}
+
+/// A tall page in a live session, for the band tests.
+fn tall_session(lines: usize, width: u32) -> (sandbox::Session, sandbox::Rendered) {
+    let html = format!(
+        "<body bgcolor=\"#eef\">{}</body>",
+        (0..lines)
+            .map(|n| format!("<p>line {n} with some words on it</p>"))
+            .collect::<String>()
+    );
+    let dir = std::env::temp_dir().join("2kbrowser-band-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("tall.html");
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")))
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            width,
+            0,
+            8000,
+            Some(origin),
+            at,
+            false,
+            false,
+        )
+        .expect("the renderer opens the page")
+}
+
+#[test]
+fn a_band_asked_for_speculatively_arrives_without_being_waited_on() {
+    // The point of putting the conversation on a thread. A reader approaching
+    // the edge of what has been painted should not have to stop there, so the
+    // rows ahead are asked for while the window carries on drawing — which
+    // only works if asking does not block and arriving is announced.
+    let (mut session, whole) = tall_session(120, 300);
+
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&woken);
+    session.set_wake(Box::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    session.request_band(200, 150).expect("asks");
+    assert!(session.band_outstanding(), "the band should be in flight");
+
+    let band = loop {
+        if let Some(band) = session.take_band() {
+            break band.expect("the band paints");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(band.top, 200);
+    assert!(
+        !session.band_outstanding(),
+        "nothing should be left in flight"
+    );
+    assert!(
+        woken.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the wake callback never fired, so a window would never redraw"
+    );
+
+    let stride = (whole.width * 4) as usize;
+    for n in 0..band.height {
+        let from_band = &band.pixels[n as usize * stride..(n as usize + 1) * stride];
+        let document_row = (200 + n) as usize;
+        let from_whole = &whole.pixels[document_row * stride..(document_row + 1) * stride];
+        assert_eq!(from_band, from_whole, "row {n} of the band");
+    }
+}
+
+#[test]
+fn a_blocking_question_does_not_swallow_a_band_in_flight() {
+    // Answers come back in the order they were asked for, so waiting for a find
+    // means reading past the band that was asked for first. Dropping it there
+    // would leave the window waiting for pixels that already came and went —
+    // and it would happen exactly when the reader is scrolling *and* searching,
+    // which is not a rare combination.
+    let (mut session, _) = tall_session(120, 300);
+
+    session.request_band(300, 120).expect("asks for a band");
+    let matches = session.find("line 7").expect("the child answers");
+    assert!(!matches.is_empty(), "the fixture should contain the query");
+
+    let band = session
+        .take_band()
+        .expect("the band asked for before the find was kept")
+        .expect("the band paints");
+    assert_eq!(band.top, 300);
+}
+
+#[test]
+fn a_charset_that_only_the_header_knows_still_reaches_the_renderer() {
+    // The bytes stay undecoded across the boundary because the encoding sniffer
+    // lives with every other parser on the far side (ADR-0012). The header has
+    // to travel with them: on a page that declares its encoding nowhere else,
+    // the header is the only thing that knows.
+    //
+    // Found by looking at a screenshot. Hacker News says `charset=utf-8` in the
+    // header and nothing at all in the markup, and the command line was passing
+    // `content_type: None` — so every em dash and curly quote on it came out as
+    // windows-1252 mojibake. The same page reached through a *link* decoded
+    // correctly, because that path kept the header, which is the sort of
+    // inconsistency nobody would think to look for.
+    let utf8 = "<title>Möbius — 1,060 texts</title><body><p>Möbius</p></body>";
+    assert!(
+        !utf8.is_ascii(),
+        "the fixture has to contain something that decodes differently"
+    );
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let titled = |content_type: Option<&str>| {
+        renderer
+            .render(
+                utf8.as_bytes().to_vec(),
+                content_type.map(str::to_owned),
+                300,
+                0,
+                400,
+                None,
+                String::new(),
+                false,
+                false,
+            )
+            .expect("renders")
+            .title
+    };
+
+    assert_eq!(
+        titled(Some("text/html; charset=utf-8")).as_deref(),
+        Some("Möbius — 1,060 texts"),
+        "the header's charset did not reach the renderer"
+    );
+    // And without it the browser falls back to the era's default, which is what
+    // makes the assertion above about the header rather than about the bytes.
+    assert_ne!(
+        titled(None).as_deref(),
+        Some("Möbius — 1,060 texts"),
+        "the fixture decodes the same either way, so it proves nothing"
     );
 }

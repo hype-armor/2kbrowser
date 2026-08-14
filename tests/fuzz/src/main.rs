@@ -25,6 +25,13 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Not in the usage text: it is how `tests/watchdog.rs` checks that the
+    // watchdog ends the process, which cannot be checked from inside a process
+    // the watchdog would end.
+    if args.iter().any(|a| a == HANG_SELFTEST) {
+        fuzz::hang_selftest();
+    }
+
     let settings = match Settings::parse(&args) {
         Ok(settings) => settings,
         Err(message) => {
@@ -59,12 +66,13 @@ fn main() -> ExitCode {
             println!("  SLOW   {} ({:.1?})", path.display(), elapsed);
         }
         println!(
-            "  {} {} run, worst {:.1?} (baseline {:.1?}, slow past {:.1?})\n",
+            "  {} {} run, worst {:.1?} (baseline {:.1?}, slow past {:.1?}, hang past {:.1?})\n",
             if report.is_clean() { "ok" } else { "FAILED" },
             report.iterations,
             report.worst,
             report.baseline,
-            report.threshold
+            report.threshold,
+            report.hang
         );
         failed |= !report.is_clean();
     }
@@ -85,6 +93,10 @@ usage: cargo run -p fuzz -- [--target NAME] [--seed N] [--iterations N]
 
 Findings are written to tests/fuzz/corpus/<target>/ and are picked up as seeds
 by later runs, so a fixed bug stays fixed.";
+
+/// Argument that makes the binary hang on purpose, so the watchdog can be
+/// caught doing its job.
+pub const HANG_SELFTEST: &str = "--hang-selftest";
 
 struct Settings {
     targets: Vec<Target>,

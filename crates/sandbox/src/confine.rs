@@ -14,33 +14,62 @@
 //! the parent answers.
 //!
 //! So: no sockets, no opening files, no starting processes, no attaching to
-//! them.
+//! them — and, because this is an allowlist, no anything else either.
 //!
-//! Two of those need more than the obvious call named. A file descriptor can be
-//! got without `openat` — `open_by_handle_at` takes a handle rather than a path,
-//! and the mount API's `open_tree` and `fsopen` return descriptors of their own
-//! — so those are denied too. And **io_uring is denied outright**, which is the
-//! entry here that matters most: a ring performs opens, reads, writes, and
-//! network operations on the kernel side, so a filter watching syscalls sees
-//! `io_uring_enter` and nothing about what was queued into it. Every denial in
-//! this file is reachable around it. Nothing in a renderer that reads one pipe
-//! and computes has any use for it.
+//! # An allowlist, and how its contents were arrived at
 //!
-//! # A denylist, and why
+//! This was a denylist first, and said so: an allowlist is stronger, because a
+//! syscall nobody thought of is refused rather than allowed, but it is also the
+//! one that breaks a browser in the field. The set a renderer touches is decided
+//! by the allocator, the shaper, and the standard library, and guessing at it
+//! from the outside is how you ship a filter that kills the renderer on a page
+//! nobody tested.
 //!
-//! An allowlist is stronger: anything not named is refused, so a syscall nobody
-//! thought about is refused too. It is also the one that breaks the browser in
-//! the field, because the set a renderer touches is decided by the allocator,
-//! the shaper, and the standard library, and it changes underneath you on a
-//! toolchain bump.
+//! So it was not guessed at. Every call named in [`allowed`] was either
+//! *observed* — `strace` on real renderer children, across every reference
+//! fixture, the fuzzer's corpus, band and find requests, a re-render at a new
+//! width, and subresources arriving over the pipe — or is in a short, named
+//! margin of calls whose absence is unfixable rather than degrading.
+//! `scripts/renderer-syscalls.sh` is that measurement, so the list can be
+//! rechecked after a toolchain bump instead of trusted.
 //!
-//! This denies the families that matter and returns `EPERM` rather than killing
-//! the process. Two consequences, both deliberate: a syscall nobody listed is
-//! *allowed*, and a legitimate call that runs into the filter degrades into an
-//! error the renderer already knows how to handle instead of a crash a reader
-//! sees. An allowlist is the stronger end state and wants a measured set of what
-//! the renderer actually uses; this is the version that can ship without
-//! guessing.
+//! The measurement's surprise was how small the set is: rendering a page uses
+//! nine calls. That is what makes an allowlist practical here and would not in a
+//! browser that opened its own fonts, resolved its own hostnames, or ran a
+//! thread pool.
+//!
+//! **Measured on two C libraries and two architectures**, because one
+//! measurement of a set decided by the libc is not evidence about the libc. The
+//! rendering set is identical under glibc and musl. Failing is not: glibc's
+//! `abort` raises its signal with `tgkill` and musl's with `tkill`, and the
+//! first version of this list named only the one it had seen. That is what a
+//! second measurement is for, and it is the shape of the difference to expect —
+//! the *failure* paths vary where the working path does not.
+//!
+//! aarch64 then needed nothing x86_64 did not; its set is a strict subset,
+//! short by `futex`, which the x86_64 panic path takes and the aarch64 one does
+//! not. CI measures it on every push, so this is a check rather than a claim.
+//!
+//! What is *not* in the list is the point. No `socket`, no `openat`, no
+//! `execve`, no `ptrace`, no `io_uring` — and no `open_by_handle_at`, `fsopen`,
+//! or `open_tree`, which are the routes to a file descriptor that a denylist
+//! naming `openat` and stopping there leaves open. Under an allowlist those stop
+//! being entries anyone has to remember, which is the whole argument for one.
+//! [`must_stay_denied`] keeps naming them anyway, as an assertion rather than a
+//! filter: it is the test that a future edit widening this list does not quietly
+//! let one back in.
+//!
+//! The default action is still `EPERM` rather than killing the process. A
+//! syscall this list forgot degrades into an error — usually a page that fails
+//! to render, which the parent already reports — rather than a renderer that
+//! dies where a reader sees it. That is a deliberate softening of an allowlist's
+//! usual posture, and it is what makes the stronger filter safe to ship on a
+//! measurement taken on one machine.
+//!
+//! Deliberately not done: refusing `PROT_EXEC` on `mmap` and `mprotect`. It is
+//! easy from here — seccomp can filter on arguments — and it is worth less than
+//! it looks, because code that has got far enough to map a page has already got
+//! far enough not to need to.
 //!
 //! # Where each platform's confinement lives
 //!
@@ -50,16 +79,31 @@
 //! there is no call it can make to put itself in one. That half lives in
 //! [`crate::contain`], and on Windows [`apply`] correctly does nothing.
 //!
-//! Landlock would add filesystem confinement on top of seccomp and is not
-//! usable here — `landlock_create_ruleset` returns `ENOSYS` on this kernel — so
-//! filesystem access is denied at the syscall level instead, which covers
-//! opening but not every path to a file descriptor.
+//! Landlock is not used, and the reason is worth stating because it stopped
+//! being the obvious one. It restricts access to filesystem *objects* — "may
+//! read under this directory and nothing else" — which seccomp cannot express
+//! at all, since a path is a pointer that can change between the check and the
+//! use of it. It was wanted here to cover the gap a denylist leaves: every
+//! route to a file descriptor has to be named, and each one missed is a hole.
 //!
-//! macOS has an equivalent (the App Sandbox) and it is not implemented. It is
-//! *not* stubbed out to look done: [`Confinement::Unavailable`] is what is
-//! reported there, and the README says which platforms are actually confined. A
-//! sandbox that claims to work and does not is worse than one that says it is
-//! missing.
+//! [`allowed`] closed that gap by inverting the filter rather than by listing
+//! better. Nothing in it can obtain a descriptor — no `open*`, no `socket`, no
+//! `dup`, no `fcntl`, no `memfd_create`, no `pidfd_getfd`. The renderer holds
+//! the pipes it was given and can never acquire another. What Landlock would
+//! still add is a second, independent mechanism in case this one is built
+//! wrong, which is real and is not worth a second policy to keep in step and
+//! one more thing that can install successfully and restrict nothing. Revisit
+//! if `openat` ever has to be allowed.
+//!
+//! macOS *is* self-restriction, like Linux: `sandbox_init` applies a profile to
+//! the calling process and cannot be undone. So [`apply`] does the work here
+//! too, and the profile it applies lives in this file with the other two
+//! platforms' policy. What does not live here is the call, which is C and needs
+//! `unsafe`: that is [`seatbelt`], the one crate in this workspace exempt from
+//! ADR-0002, kept to a page so the exception stays as small as the argument for
+//! it ([ADR-0017]).
+//!
+//! [ADR-0017]: ../../../docs/adr/0017-one-unsafe-crate-for-macos.md
 
 /// What confinement was actually applied.
 ///
@@ -71,6 +115,8 @@ pub enum Confinement {
     Seccomp,
     /// The renderer is running in an AppContainer with no capabilities.
     AppContainer,
+    /// A macOS sandbox profile denying everything is in force.
+    AppSandbox,
     /// This platform has no implementation here yet.
     Unavailable,
     /// The platform has one and it could not be installed.
@@ -84,15 +130,24 @@ pub enum Confinement {
 impl Confinement {
     /// Whether the renderer is actually confined.
     pub fn is_confined(self) -> bool {
-        matches!(self, Confinement::Seccomp | Confinement::AppContainer)
+        matches!(
+            self,
+            Confinement::Seccomp | Confinement::AppContainer | Confinement::AppSandbox
+        )
     }
 
     /// A phrase for a log line or a status message.
     pub fn describe(self) -> &'static str {
         match self {
-            Confinement::Seccomp => "confined: no sockets, no file opens, no new processes",
+            Confinement::Seccomp => {
+                "confined: only the syscalls a renderer was measured to need — no sockets, \
+                 no file opens, no new processes"
+            }
             Confinement::AppContainer => {
                 "confined: an AppContainer with no capabilities — no network, no filesystem"
+            }
+            Confinement::AppSandbox => {
+                "confined: a sandbox profile denying everything — no network, no filesystem"
             }
             Confinement::Unavailable => "NOT confined: no sandbox is implemented on this platform",
             Confinement::Failed => "NOT confined: the sandbox could not be installed",
@@ -120,15 +175,22 @@ pub fn apply() -> Confinement {
     };
 
     let rules: BTreeMap<i64, Vec<SeccompRule>> =
-        denied().iter().map(|nr| (*nr, Vec::new())).collect();
+        allowed().iter().map(|nr| (*nr, Vec::new())).collect();
 
-    // Denied calls return EPERM; everything else is allowed. The default has to
-    // be `Allow` for a denylist, and that is the trade this file's header
-    // states plainly.
+    // Everything not named returns EPERM; the named calls are allowed. The
+    // second argument is the default and the third is what a *matched* rule
+    // does, so an allowlist is this pair the other way round from a denylist —
+    // a two-line edit that inverts the filter without changing a syscall name.
+    // Which is why the self-test probes a call *nobody* named: refusing
+    // `socket` proves the list, and only refusing something absent from it
+    // proves the direction.
+    //
+    // `Errno` rather than `KillProcess` for the default: see this module's
+    // header. A call this list forgot should cost a page, not the browser.
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
         architecture,
     );
     let Ok(filter) = filter else {
@@ -180,12 +242,109 @@ const fn architecture() -> Option<seccompiler::TargetArch> {
     }
 }
 
-/// The syscalls the renderer is not allowed to make.
+/// The only syscalls the renderer is allowed to make.
+///
+/// Two groups, and the difference between them is the difference between a
+/// measurement and a judgement, so they are kept apart rather than merged into
+/// one alphabetical list.
+///
+/// Everything in the first group was *seen*, by `strace` on real renderer
+/// children — `scripts/renderer-syscalls.sh` is the measurement and prints this
+/// set. Everything in the second was not seen and is here anyway, because
+/// denying it is either unfixable or would turn a rare event into a hang.
+#[cfg(target_os = "linux")]
+fn allowed() -> Vec<i64> {
+    vec![
+        // ---- Measured: rendering a page ----
+        //
+        // Nine calls, and they do not vary. The pipes, the allocator, and one
+        // seed for the hash tables — that is the whole of what a renderer that
+        // parses, lays out, and rasterises asks the kernel for. Fonts are in the
+        // binary (ADR-0010) and every subresource is a request the parent
+        // answers (ADR-0012), which is why nothing here opens or connects to
+        // anything.
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_mmap,
+        libc::SYS_munmap,
+        libc::SYS_mremap,
+        libc::SYS_brk,
+        libc::SYS_getrandom,
+        libc::SYS_sigaltstack,
+        libc::SYS_exit_group,
+        // ---- Measured: failing ----
+        //
+        // The paths a hostile page can drive the renderer down, which no
+        // fixture reaches and which were measured separately: a panic, an
+        // abort, and a stack overflow from a document nested deeply enough.
+        libc::SYS_getpid,
+        libc::SYS_gettid,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_futex,
+        // How `abort` raises its own signal — and there are two of them, which
+        // is the one thing measuring a second libc found. glibc uses `tgkill`;
+        // musl uses `tkill`. Refusing the one your libc uses does not prevent
+        // the abort: musl falls through to crashing on purpose, so the renderer
+        // dies of `SIGSEGV` rather than `SIGABRT`. Nothing hangs, and the
+        // outcome is still wrong — in a codebase that forbids `unsafe`, a panic
+        // that reports itself as a segmentation fault is a false alarm about the
+        // one thing this project claims not to have.
+        //
+        // Allowing both costs nothing. `tkill` reaches no further than `tgkill`:
+        // either can signal any thread the user could signal anyway, and
+        // `tgkill` was already here.
+        libc::SYS_tgkill,
+        libc::SYS_tkill,
+        // ---- Not measured, and here on purpose ----
+        //
+        // `restart_syscall` is issued by the kernel rather than by the program,
+        // to resume a call a signal interrupted. Refusing it turns a signal into
+        // a spurious error on a read that was going fine.
+        libc::SYS_restart_syscall,
+        // Ending a thread, as opposed to the process. Nothing here has a second
+        // thread today and one library version could change that.
+        libc::SYS_exit,
+        // Memory the allocator manages rather than the program: returning pages
+        // (`madvise`), and the permissions on its own arenas (`mprotect`).
+        // Whether either is called at all depends on the libc, its version, and
+        // how much the page allocated, so their absence from one machine's
+        // measurement says very little. Neither can reach anything outside this
+        // process's own address space.
+        libc::SYS_madvise,
+        libc::SYS_mprotect,
+        // `close` is the one entry seen in a confined child that was not seen
+        // in a *render*: the self-test's probes release the descriptors they
+        // failed to get. Rendering never closes anything, because it never opens
+        // anything. Allowed regardless, since giving up a descriptor cannot gain
+        // the caller anything.
+        libc::SYS_close,
+        // `sched_yield` is what a spin lock does before it gives up and sleeps.
+        // `clock_gettime` is normally answered by the vDSO without a syscall at
+        // all — but not on every kernel and not in every container, and a
+        // browser whose clock reads fail is a baffling thing to debug.
+        libc::SYS_sched_yield,
+        libc::SYS_clock_gettime,
+    ]
+}
+
+/// The syscalls that must never appear in [`allowed`].
+///
+/// This is the old denylist, kept as an assertion rather than a filter. Once
+/// the filter refuses everything it does not name, none of these needs naming —
+/// which is the argument for an allowlist and also the thing that makes the
+/// reasoning behind them easy to lose. Held here so that widening [`allowed`]
+/// has to get past a test that says why each of them was refused.
 ///
 /// Everything here is a family, not a single call. Denying `socket` while
 /// leaving `socketpair` is not a denial.
-#[cfg(target_os = "linux")]
-fn denied() -> Vec<i64> {
+///
+/// Compiled only for tests, because that is all it is now: an oracle, not a
+/// filter. Building it into the shipped binary would suggest it does something
+/// at run time.
+#[cfg(all(target_os = "linux", test))]
+fn must_stay_denied() -> Vec<i64> {
     let mut denied = vec![
         // Network. The renderer has no business reaching anything; the parent
         // fetches on its behalf.
@@ -301,12 +460,76 @@ fn denied() -> Vec<i64> {
     denied
 }
 
+/// The macOS profile: everything denied, and two things named.
+///
+/// Sandbox Policy Language, passed to `sandbox_init` in full rather than by
+/// naming one of Apple's canned profiles, which are coarser and even more
+/// deprecated than the call itself.
+///
+/// `(deny default)` is the whole policy. Unlike the Linux filter this is an
+/// allowlist from the first line — there is no seccomp-shaped choice to make
+/// here, because SBPL has no other sensible default and no `EPERM`-instead-of-
+/// kill escape either. What that costs is the softening the Linux side has:
+/// a resource this profile forgot is refused outright.
+///
+/// Two allowances, each for a reason found the hard way on another platform:
+///
+/// * **Signalling itself.** `abort` raises a signal at its own process, and
+///   `panic = "abort"` in the release profile means every panic goes through
+///   it. Denying that does not stop the abort — it changes how the process
+///   dies, and a panic that reports itself as something else is a false alarm
+///   about memory safety in a project whose central claim is that it has none.
+///   That is not a guess: it is exactly what refusing `tkill` did to a musl
+///   renderer on Linux, found by measurement, and this is the same lesson
+///   applied one platform over.
+/// * **Reading sysctls.** How the standard library answers "how many
+///   processors" and how the allocator sizes itself. Read-only, reaches nothing
+///   outside this machine's own description of itself, and its absence would
+///   surface as a renderer that fails to start for no visible reason.
+///
+/// Not allowed, and worth naming because a reader will look for them:
+/// `file-read*` of any kind, because the fonts are in the binary (ADR-0010);
+/// `network*`, because every subresource is a request the parent answers
+/// (ADR-0012); `process-exec*`; and `mach-lookup`, which is the macOS-shaped
+/// hole equivalent to io_uring — a channel to other processes that would make
+/// the rest of this decorative.
+/// Compiled in for tests everywhere, not just on macOS. The profile is a string
+/// that only one platform ever parses, so on the other two an edit to it is
+/// invisible — no compiler sees inside it and nothing runs it. The structural
+/// test below is what a Linux or Windows machine can still say about it.
+#[cfg(any(target_os = "macos", test))]
+const PROFILE: &str = "\
+(version 1)
+(deny default)
+(allow signal (target self))
+(allow sysctl-read)
+";
+
+/// Drops the privileges the renderer does not need.
+///
+/// Call once, in the child, *before* reading anything the parent sends. macOS
+/// is self-restriction like Linux and unlike Windows: `sandbox_init` applies to
+/// the calling process and cannot be undone, so the child does it to itself.
+#[cfg(target_os = "macos")]
+pub fn apply() -> Confinement {
+    match seatbelt::confine(PROFILE) {
+        Ok(()) => Confinement::AppSandbox,
+        // Reported rather than swallowed, and the reason survives: a profile
+        // that fails to install leaves the renderer with no sandbox at all, and
+        // the only sign of it is this.
+        Err(reason) => {
+            eprintln!("2kbrowser: the renderer could not be confined: {reason}");
+            Confinement::Failed
+        }
+    }
+}
+
 /// Drops the privileges the renderer does not need.
 ///
 /// Not implemented on this platform. Deliberately not a silent success — see
 /// the note in this module's header about why a sandbox that claims to work is
 /// worse than one that says it is missing.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn apply() -> Confinement {
     Confinement::Unavailable
 }
@@ -318,10 +541,14 @@ pub fn apply() -> Confinement {
 /// That distinction matters: a warning printed twenty times in one test run is
 /// a warning people learn to scroll past.
 ///
-/// True on Linux and Windows by two different mechanisms — see this module's
-/// header for why they are not interchangeable.
+/// True on all three, by three different mechanisms — see this module's header
+/// for why they are not interchangeable.
 pub const fn available() -> bool {
-    cfg!(any(target_os = "linux", target_os = "windows"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ))
 }
 
 /// Argument that makes the binary check its own confinement and report.
@@ -434,9 +661,14 @@ fn windows_selftest(targets: &Targets) -> String {
         targets.port,
         targets.file.display()
     );
-    let inside =
-        crate::contain::capture(&container, &arguments, std::time::Duration::from_secs(30));
-    format!("confinement=AppContainer\n{}", inside.trim_end())
+    match crate::contain::capture(&container, &arguments, std::time::Duration::from_secs(30)) {
+        Ok(inside) => format!("confinement=AppContainer\n{}", inside.trim_end()),
+        // Not `AppContainer`: nothing ran inside one. Printing that above a
+        // line explaining the launch failed is the self-test lying about the
+        // one thing it exists to check, and it did — a real machine reported
+        // `confinement=AppContainer` and `spawn-failed=` together.
+        Err(reason) => format!("confinement=Failed\nreason={reason}"),
+    }
 }
 
 /// Tries the things confinement is supposed to prevent, and says what happened.
@@ -470,6 +702,25 @@ fn probes(targets: &Targets) -> String {
     lines.push(format!("port={}", targets.port));
     lines.push(format!("file-path={}", targets.file.display()));
 
+    // A call nothing here has ever named, and which is harmless: reading the
+    // working directory. It is the probe that tells an allowlist from a
+    // denylist, and neither of the two above can. `socket` and `openat` were
+    // refused under the old filter too, so a report showing them refused is
+    // consistent with a filter that permits everything nobody thought of —
+    // which is precisely what this replaced.
+    //
+    // Only meaningful on Linux. An AppContainer restricts access to resources
+    // rather than filtering calls, so `GetCurrentDirectory` inside one succeeds
+    // and should: the line is still printed there, and the test that reads it
+    // asserts only where the mechanism is a syscall filter.
+    lines.push(format!(
+        "unnamed-call={}",
+        match std::env::current_dir() {
+            Ok(_) => "ALLOWED".to_owned(),
+            Err(error) => format!("{:?}", error.kind()),
+        }
+    ));
+
     // Something harmless, to prove the sandbox did not simply break everything —
     // two refusals above are also what a filter that killed the whole process
     // would produce if it somehow got this far.
@@ -501,36 +752,178 @@ mod tests {
 
     #[test]
     fn availability_matches_the_platforms_that_have_an_implementation() {
+        // A mirror of the `cfg!` inside `available()`, which is close to
+        // tautological and earns its place anyway: this is the assertion that
+        // caught macOS being added to one list and not the other, on the only
+        // runner where the difference is visible.
         assert_eq!(
             available(),
-            cfg!(any(target_os = "linux", target_os = "windows"))
+            cfg!(any(
+                target_os = "linux",
+                target_os = "windows",
+                target_os = "macos"
+            ))
         );
     }
 
     #[test]
     fn self_confinement_is_only_claimed_where_it_is_the_mechanism() {
-        // `apply` is the child restricting itself, which is Linux only. On
-        // Windows the answer here is `Unavailable` *and the platform still has*
-        // *a sandbox* — the parent builds it. Asserted because the obvious
-        // shortcut, `available() implies apply() != Unavailable`, was true until
-        // Windows landed and is now wrong.
-        if cfg!(target_os = "linux") {
-            assert_ne!(apply(), Confinement::Unavailable);
-        } else {
-            assert_eq!(apply(), Confinement::Unavailable);
+        // `apply` is the child restricting itself, which is what seccomp and
+        // `sandbox_init` both are. On Windows the answer here is `Unavailable`
+        // *and the platform still has a sandbox* — the parent builds it, and
+        // the child cannot put itself in one. Asserted because the obvious
+        // shortcut, `available() implies apply() != Unavailable`, was true
+        // until Windows landed and has been wrong ever since.
+        //
+        // **Not run on macOS**, and the asymmetry is the point rather than an
+        // oversight. Calling `apply` here really does confine whatever is
+        // running it, and the two platforms differ in how far that reaches:
+        // `seccompiler::apply_filter` restricts the calling *thread*, so a test
+        // that installs a filter takes only its own thread down with it, while
+        // `sandbox_init` restricts the whole *process*, permanently. Since the
+        // macOS profile denies `process-exec*`, one unit test calling `apply`
+        // left every later test in the binary unable to spawn a child — which
+        // is exactly how it surfaced: a sandbox test that spawns a renderer
+        // failing with `Operation not permitted`, on macOS only, in one CI run
+        // and not the one before, because libtest's thread ordering decides
+        // whether the confining test goes first.
+        //
+        // macOS is covered where it should be, in a subprocess: the self-test
+        // applies the profile and then probes it, and the isolation tests fail
+        // the build if that reports anything but `AppSandbox`.
+        // Written per-platform with `cfg` rather than as one `if cfg!()` chain
+        // so that no platform ends up in a branch that asserts nothing. A macOS
+        // arm that quietly did nothing would be the same shape of mistake as
+        // the skip this project has already had to fix twice.
+        #[cfg(target_os = "linux")]
+        assert_ne!(apply(), Confinement::Unavailable);
+
+        #[cfg(target_os = "macos")]
+        assert!(
+            available(),
+            "macOS claims a sandbox; that it installs is asserted by the \
+             self-test, which runs in a process it is allowed to confine"
+        );
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(apply(), Confinement::Unavailable);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nothing_dangerous_is_reachable_through_the_allowlist() {
+        // The check that matters after the inversion. An allowlist does not
+        // name `socket` or `io_uring_enter`, so nothing stops someone widening
+        // it until one of them is reachable again — except this, which walks the
+        // families the denylist used to name and asserts none of them made it
+        // in.
+        let allowed = allowed();
+        for dangerous in must_stay_denied() {
+            assert!(
+                !allowed.contains(&dangerous),
+                "syscall {dangerous} is allowed and must not be",
+            );
+        }
+
+        // No duplicates, and not empty: a duplicate is harmless to the filter
+        // and a sign that two `cfg` blocks overlap.
+        let mut sorted = allowed.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), allowed.len(), "a syscall is named twice");
+        assert!(!allowed.is_empty());
+
+        // The measured core. Named individually rather than counted, because a
+        // renderer that cannot `read` its pipe or `write` its answer is not
+        // confined, it is broken, and the failure would look like a hang.
+        for essential in [
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_mmap,
+            libc::SYS_exit_group,
+            // The abort path. Refusing this does not stop a renderer aborting;
+            // it stops it *finishing* aborting.
+            libc::SYS_tgkill,
+        ] {
+            assert!(
+                allowed.contains(&essential),
+                "syscall {essential} is needed"
+            );
         }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_denied_list_is_built_for_this_architecture() {
+    fn the_renderer_cannot_obtain_a_new_descriptor() {
+        // The claim the Landlock decision rests on, so it is a test rather than
+        // a sentence in three documents. Landlock exists to say "this file and
+        // not that one"; it is not used here because the renderer cannot reach
+        // *any* file, having no way to turn anything into a descriptor. That is
+        // true by construction under an allowlist and would stop being true the
+        // moment one of these was added for some unrelated reason.
+        //
+        // Wider than `must_stay_denied`, deliberately. That list is about
+        // families a denylist had to name because they are dangerous; this one
+        // is about anything at all that hands back a descriptor, including the
+        // dull ones. `eventfd2` is not a security problem, and it is a
+        // descriptor, and the argument here is about the whole category.
+        //
+        // Every name checked to exist on x86_64, aarch64, and riscv64, so there
+        // is no `cfg` in it and nothing silently absent on an architecture.
+        let allowed = allowed();
+        for opens in [
+            // From a path, a handle, or a mount.
+            libc::SYS_openat,
+            libc::SYS_openat2,
+            libc::SYS_name_to_handle_at,
+            libc::SYS_open_by_handle_at,
+            libc::SYS_open_tree,
+            libc::SYS_fsopen,
+            libc::SYS_fsmount,
+            // From a descriptor the process already has.
+            libc::SYS_dup,
+            libc::SYS_dup3,
+            libc::SYS_fcntl,
+            // From the network.
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            // From another process.
+            libc::SYS_pidfd_open,
+            libc::SYS_pidfd_getfd,
+            // From the kernel, out of nothing.
+            libc::SYS_memfd_create,
+            libc::SYS_memfd_secret,
+            libc::SYS_pipe2,
+            libc::SYS_eventfd2,
+            libc::SYS_epoll_create1,
+            libc::SYS_timerfd_create,
+            libc::SYS_signalfd4,
+            libc::SYS_inotify_init1,
+            libc::SYS_userfaultfd,
+            libc::SYS_perf_event_open,
+            libc::SYS_bpf,
+            libc::SYS_io_uring_setup,
+        ] {
+            assert!(
+                !allowed.contains(&opens),
+                "syscall {opens} hands back a descriptor and is allowed. The \
+                 renderer holding only the pipes it was given is what makes \
+                 Landlock unnecessary here; adding this means revisiting that.",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_denied_families_are_built_for_this_architecture() {
         // Syscall numbers are per-architecture, so a list assembled with the
-        // wrong `cfg` denies whatever happens to share a number. Two things
+        // wrong `cfg` names whatever happens to share a number. Two things
         // worth asserting cheaply: that the list is not empty on a platform
         // that claims to confine, and that no number appears twice — a
-        // duplicate is harmless to the filter and a sign the `cfg` blocks
-        // overlap.
-        let denied = denied();
+        // duplicate is harmless and a sign the `cfg` blocks overlap.
+        let denied = must_stay_denied();
         assert!(!denied.is_empty());
         let mut sorted = denied.clone();
         sorted.sort_unstable();
@@ -578,10 +971,61 @@ mod tests {
     }
 
     #[test]
+    fn the_macos_profile_denies_by_default_and_allows_nothing_that_matters() {
+        // Runs on every platform, and is written for the two that never parse
+        // this string. `sandbox_init` is the only thing that reads it, so on
+        // Linux and Windows an edit to the profile compiles, passes, and means
+        // nothing — the mistake would surface on a Mac, which neither author
+        // has.
+        assert!(PROFILE.starts_with("(version 1)"), "{PROFILE}");
+        assert!(PROFILE.contains("(deny default)"), "{PROFILE}");
+
+        // Unbalanced parentheses are the failure worth catching cheaply: SBPL
+        // refuses to parse, `sandbox_init` fails, and the renderer runs
+        // unconfined. Loud at run time — `apply` reports it — and this catches
+        // it before anyone ships.
+        let mut depth = 0i32;
+        for character in PROFILE.chars() {
+            match character {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "a `)` with nothing open:\n{PROFILE}");
+        }
+        assert_eq!(depth, 0, "unbalanced parentheses:\n{PROFILE}");
+
+        // The same job `must_stay_denied` does for Linux, one platform over:
+        // an allowlist does not name these, so nothing stops someone widening
+        // it until one is reachable. `mach-lookup` is the entry that matters
+        // most here — it is a channel to other processes, and the macOS-shaped
+        // equivalent of io_uring in that granting it makes the rest decorative.
+        for reachable in [
+            "file-read",
+            "file-write",
+            "network",
+            "process-exec",
+            "process-fork",
+            "mach-lookup",
+            "mach-register",
+            "iokit-open",
+        ] {
+            assert!(
+                !PROFILE.contains(&format!("(allow {reachable}")),
+                "the profile allows {reachable}:\n{PROFILE}"
+            );
+        }
+    }
+
+    #[test]
     fn the_description_says_plainly_whether_it_is_confined() {
         // The word "NOT" is load-bearing: this string ends up where someone
         // decides whether to trust the browser with a strange page.
-        for confined in [Confinement::Seccomp, Confinement::AppContainer] {
+        for confined in [
+            Confinement::Seccomp,
+            Confinement::AppContainer,
+            Confinement::AppSandbox,
+        ] {
             assert!(confined.is_confined());
             assert!(!confined.describe().contains("NOT"));
         }

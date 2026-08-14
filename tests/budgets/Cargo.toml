@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 net = { path = "../../crates/net" }
+sandbox = { path = "../../crates/sandbox" }
 shell = { path = "../../crates/shell" }
 text = { path = "../../crates/text" }
 

@@ -151,6 +151,24 @@ impl Resource {
     }
 }
 
+/// A navigation's bytes, undecoded, with what is known about how they arrived.
+#[derive(Debug, Clone)]
+pub struct Fetched {
+    /// The body, exactly as it came off the wire.
+    pub body: Vec<u8>,
+    /// The `Content-Type` header, when there was one.
+    ///
+    /// Travels with the bytes because on a page that declares its encoding
+    /// nowhere else, this is the only thing that knows.
+    pub content_type: Option<String>,
+    /// Where it came from.
+    pub origin: Origin,
+    /// Its path within that origin.
+    pub path: String,
+    /// How its certificate chain was verified.
+    pub trust: Trust,
+}
+
 /// Fetches resources subject to a [`Policy`].
 #[derive(Debug, Default, Clone)]
 pub struct Fetcher {
@@ -176,10 +194,10 @@ impl Fetcher {
 
         count_if_third_party(document, &origin, kind);
 
-        let (bytes, content_type) = match origin.scheme {
+        let (bytes, content_type, _) = match origin.scheme {
             // A file has no transport, so its encoding comes from the document
             // or the default.
-            Scheme::File => (read_file(&path)?, None),
+            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted),
             Scheme::Http | Scheme::Https => fetch_http(url)?,
         };
         // Not UTF-8 by assumption: most of the surviving old web is not, and
@@ -207,39 +225,24 @@ impl Fetcher {
         url: &str,
         document: Option<&Origin>,
         kind: RequestKind,
-    ) -> Result<(Vec<u8>, Option<String>, Origin, String), FetchError> {
+    ) -> Result<Fetched, FetchError> {
         let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
         self.policy
             .check(document, &origin, kind)
             .map_err(FetchError::Refused)?;
         count_if_third_party(document, &origin, kind);
 
-        let (bytes, content_type) = match origin.scheme {
-            Scheme::File => (read_file(&path)?, None),
+        let (body, content_type, trust) = match origin.scheme {
+            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted),
             Scheme::Http | Scheme::Https => fetch_http(url)?,
         };
-        Ok((bytes, content_type, origin, path))
-    }
-
-    /// Fetches a URL, keeping only the raw bytes.
-    pub fn fetch_bytes(
-        &self,
-        url: &str,
-        document: Option<&Origin>,
-        kind: RequestKind,
-    ) -> Result<Vec<u8>, FetchError> {
-        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        self.policy
-            .check(document, &origin, kind)
-            .map_err(FetchError::Refused)?;
-        count_if_third_party(document, &origin, kind);
-
-        match origin.scheme {
-            Scheme::File => read_file(&path),
-            // The content type is irrelevant here: bytes fetched as bytes are
-            // images, and an image's encoding is its own format's business.
-            Scheme::Http | Scheme::Https => fetch_http(url).map(|(bytes, _)| bytes),
-        }
+        Ok(Fetched {
+            body,
+            content_type,
+            origin,
+            path,
+            trust,
+        })
     }
 }
 
@@ -252,26 +255,60 @@ fn read_file(url_path: &str) -> Result<Vec<u8>, FetchError> {
     std::fs::read(path).map_err(FetchError::Io)
 }
 
-/// Fetches over HTTP, returning the body and the `Content-Type` it was served
+/// How the connection's certificate chain was verified.
+///
+/// Carried rather than discarded, because the difference is the whole reason
+/// ADR-0015 allows the second attempt at all: a chain nothing public signed is
+/// a fact about who can read the traffic, and this browser marks facts like
+/// that rather than assuming the reader will guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// No certificate was involved: a local file, or plain HTTP.
+    ///
+    /// Not "safe" and not "unsafe" — the scheme already says what it says, and
+    /// the chrome marks plain HTTP on its own.
+    NotEncrypted,
+    /// Verified against Mozilla's roots. The ordinary case.
+    Public,
+    /// Verified only against a root in this computer's own trust store.
+    ///
+    /// Which means something on this machine or this network is standing
+    /// between the browser and the site and is able to read what passes.
+    /// Usually a corporate proxy, sometimes an antivirus, occasionally an
+    /// attacker — the browser cannot tell those apart and does not pretend to.
+    LocalRoot,
+}
+
+/// Fetches over HTTP, returning the body, the `Content-Type` it was served
 /// with — the header being what decides the encoding when the page itself does
-/// not say.
-fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>), FetchError> {
+/// not say — and how its certificate was verified.
+///
+/// Two attempts at most, and the second only for one specific refusal. See
+/// [`Trust`] and ADR-0015: a chain nothing public signed is retried against
+/// this computer's own roots so that a machine behind an intercepting proxy has
+/// a working browser, and the fact that it took local roots travels back so the
+/// chrome can say so. Any other certificate failure — expired, wrong name — is
+/// final, because those are wrong whoever signed them.
+fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
+    match get(tls::agent(), url) {
+        Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
+        Err(error) => {
+            if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
+                return Err(into_fetch_error(error));
+            }
+            let (bytes, content_type) =
+                get(tls::platform_agent(), url).map_err(into_fetch_error)?;
+            Ok((bytes, content_type, Trust::LocalRoot))
+        }
+    }
+}
+
+/// One request through a given agent.
+fn get(agent: &ureq::Agent, url: &str) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
     // No custom User-Agent games: this browser does not run scripts, and
     // pretending otherwise to get the script path served would produce exactly
     // the silent breakage ADR-0003 rejects.
-    // Through our own agent, not `ureq::get`, so the TLS posture is the one
-    // `tls::agent` states rather than whatever the library defaults to at the
-    // version we happen to be pinned at.
-    let response = tls::agent().get(url).call().map_err(|error| match error {
-        ureq::Error::StatusCode(code) => FetchError::Status { code },
-        // Asked before falling back to a generic transport error, so that the
-        // one failure this browser causes on purpose says so.
-        other => match tls::classify(&other) {
-            Some(tls::Handshake::LegacyVersion) => FetchError::LegacyTls,
-            Some(tls::Handshake::Certificate(reason)) => FetchError::Certificate(reason),
-            None => FetchError::Transport(other.to_string()),
-        },
-    })?;
+    let response = agent.get(url).call()?;
 
     let content_type = response
         .headers()
@@ -283,9 +320,25 @@ fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>), FetchError> {
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
-        .read_to_vec()
-        .map_err(|error| FetchError::Transport(error.to_string()))?;
+        .read_to_vec()?;
     Ok((bytes, content_type))
+}
+
+/// Turns a `ureq` failure into one this browser can explain.
+fn into_fetch_error(error: ureq::Error) -> FetchError {
+    if let ureq::Error::StatusCode(code) = error {
+        return FetchError::Status { code };
+    }
+    // Asked before falling back to a generic transport error, so that the
+    // failures this browser causes on purpose say so.
+    match tls::classify(&error) {
+        Some(tls::Handshake::LegacyVersion) => FetchError::LegacyTls,
+        Some(tls::Handshake::UntrustedRoot) => {
+            FetchError::Certificate("nothing this computer trusts signed it".to_owned())
+        }
+        Some(tls::Handshake::Certificate(reason)) => FetchError::Certificate(reason),
+        None => FetchError::Transport(error.to_string()),
+    }
 }
 
 #[cfg(test)]

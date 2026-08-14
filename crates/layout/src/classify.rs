@@ -187,6 +187,41 @@ mod tests {
     }
 
     #[test]
+    fn a_page_laid_out_with_inline_blocks_falls_back_too() {
+        // The quietest of the unimplemented layouts, and so the one most worth
+        // asserting. Flex and grid produce nothing at all if they are ignored,
+        // which is obvious; an inline-block laid out as a plain inline still
+        // shows its text and merely loses its box, so a page built on them used
+        // to come out subtly wrong with nothing said.
+        let html = format!(
+            r#"<body><div id="app">{}</div></body>"#,
+            paragraphs(10, "x")
+        );
+        let mode = classify_html(&html, "#app { display: inline-block }");
+        assert!(
+            matches!(mode, RenderMode::Document { .. }),
+            "page wrapped in an inline-block should fall back, got {mode:?}"
+        );
+    }
+
+    #[test]
+    fn a_navigation_bar_of_inline_blocks_does_not_move_an_article() {
+        // The other half, and the reason this is a share rather than a switch.
+        // Inline-block is the commonest of the three in incidental use — a row
+        // of navigation links, a set of badges — and a page whose *article* is
+        // ordinary must keep the author's layout.
+        let html = format!(
+            "<body><nav>{}</nav><main>{}</main></body>",
+            (0..8)
+                .map(|i| format!(r##"<a class="nav" href="#">Link {i}</a>"##))
+                .collect::<String>(),
+            paragraphs(20, "x"),
+        );
+        let mode = classify_html(&html, ".nav { display: inline-block }");
+        assert_eq!(mode, RenderMode::Authored, "got {mode:?}");
+    }
+
+    #[test]
     fn an_empty_spa_shell_reports_that_it_needs_scripting() {
         let html = r#"<body><div id="root"></div><script src="app.js"></script></body>"#;
         assert_eq!(classify_html(html, ""), RenderMode::RequiresScripting);

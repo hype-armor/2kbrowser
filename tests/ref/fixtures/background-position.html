@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Background position</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 0; background: #f4f4f4 }
+    .panel {
+      background: #ffffff;
+      margin: 16px;
+      padding: 12px;
+      border: 1px solid #888888;
+    }
+    /* Every box below is 70x70 with a 16x16 tile in it, so the offsets are
+       readable against each other: the tile divides the box unevenly, which is
+       what makes a shifted phase visible at all. */
+    .box {
+      background-image: url(assets/tile.png);
+      width: 70px;
+      height: 70px;
+      border: 1px solid #888888;
+      /* Floated rather than `inline-block`, which this engine recognises and
+         does not lay out — an empty one collapses to nothing, taking the box
+         this fixture is about with it. */
+      float: left;
+      margin-right: 8px;
+    }
+    .once { background-repeat: no-repeat }
+
+    /* The corner, which is the initial value and the control. */
+    .corner { background-position: 0 0 }
+    /* A length, which is a plain offset from the padding box's corner. */
+    .length { background-position: 12px 6px }
+    /* Percentages, which are not offsets: 50% lines the middle of the *image*
+       up with the middle of the box, so on a 70px box holding a 16px tile it
+       resolves to 27px rather than 35. */
+    .middle { background-position: 50% 50% }
+    .far { background-position: 100% 100% }
+    /* Keywords, including the reversed order only keywords may use. */
+    .keywords { background-position: bottom right }
+    .reversed { background-position: top center }
+    /* One value centres the other axis — and `top` cannot be horizontal, so
+       this is centred across rather than pushed left. */
+    .single { background-position: top }
+
+    /* A repeating background tiles outwards from its position in both
+       directions, so these have no gap at the top or the left even though the
+       first tile starts part-way in. */
+    .tiled { background-position: 6px 10px }
+    .tiled-percent { background-position: 40% 60% }
+
+    .label { font-size: 12px; color: #444444; margin: 6px 0 2px; clear: both }
+    .after { clear: both }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h2>Where the image goes</h2>
+
+    <p class="label">Drawn once: corner, 12px 6px, 50% 50%, 100% 100%</p>
+    <div class="box once corner"></div>
+    <div class="box once length"></div>
+    <div class="box once middle"></div>
+    <div class="box once far"></div>
+
+    <p class="label">Drawn once, by keyword: bottom right, top center, top</p>
+    <div class="box once keywords"></div>
+    <div class="box once reversed"></div>
+    <div class="box once single"></div>
+
+    <p class="label">Repeating from a position, which tiles both ways</p>
+    <div class="box tiled"></div>
+    <div class="box tiled-percent"></div>
+    <div class="after"></div>
+  </div>
+</body>
+</html>

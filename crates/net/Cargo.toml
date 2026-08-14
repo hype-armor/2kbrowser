@@ -10,7 +10,10 @@ encoding_rs = "0.8"
 # Named directly only so the TLS posture in `tls.rs` can be asserted against
 # the library rather than remembered. Comes in through `ureq` regardless.
 rustls = { version = "0.23", default-features = false }
-ureq = "3"
+# `platform-verifier` is what lets a chain be checked against this computer's
+# own trust store as well as Mozilla's (ADR-0015). Only ever reached after the
+# public roots have already refused.
+ureq = { version = "3", features = ["platform-verifier"] }
 
 [lints]
 workspace = true
