@@ -132,12 +132,17 @@ jobs:
           ./scripts/smoke-window.sh
 
       # The smoke test proves a window opens and survives. This proves it
-      # answers a pointer — the part `cargo test` cannot reach, and the part
-      # that was broken for a reader while every check here stayed green.
+      # answers a pointer, and that what it paints reaches the screen — the
+      # parts `cargo test` cannot reach, and the parts that were broken for a
+      # reader while every check here stayed green.
+      #
+      # `x11-apps` is for `xwd`, which is how the checks that look at pixels
+      # take their screenshot. The script fails rather than skips without it:
+      # a check that cannot run must not look like a check that passed.
       - name: Window click test
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo apt-get install -y -qq xvfb xdotool libxkbcommon-x11-0
+          sudo apt-get install -y -qq xvfb xdotool x11-apps libxkbcommon-x11-0
           ./scripts/window-clicks.sh
 
       - name: Trim the cache
