@@ -1592,7 +1592,6 @@ mod tests {
                 "the measured centre matches the old guess, so this proves nothing"
             );
         }
-
     }
 
     #[test]
