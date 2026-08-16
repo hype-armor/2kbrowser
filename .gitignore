@@ -3,3 +3,8 @@
 # Written by `tests/conformance`, and derived from whichever revision of the
 # CSS 2.1 suite it was pointed at. Regenerate it rather than reading an old one.
 /conformance-failures.txt
+
+# Written by `tests/ref` beside a baseline when a fixture does not match it, so
+# the two can be compared by eye. A diff, not a result: the baseline is the
+# committed artefact and this is what failed against it.
+/tests/ref/baselines/*.actual.png

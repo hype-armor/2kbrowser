@@ -591,6 +591,17 @@ fn render_sized(
         RenderMode::Document { .. } | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
             let mut styles = css::cascade::cascade(&doc, &[reader]);
+            // The author's furniture goes with the author's layout. Without
+            // this the navigation, the sidebar and the footer no longer sit
+            // beside the article — they stack above and below it, so a reading
+            // view opens on every link the site has (ADR-0009).
+            //
+            // Hidden rather than removed, so the document the child is holding
+            // is still the whole document and pressing "as authored" does not
+            // cost a re-parse.
+            for node in slop::extract(&doc).dropped {
+                styles.hide(node);
+            }
             collapse_blank_lines(&doc, &mut styles);
             styles
         }
