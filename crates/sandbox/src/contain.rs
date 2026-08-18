@@ -252,6 +252,68 @@ fn environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     environment
 }
 
+/// Set to make the renderer inherit the parent's environment instead.
+///
+/// Named rather than a `cfg`, because the machine that needs it is a user's and
+/// the build that reaches it is a release one.
+#[cfg(target_os = "windows")]
+pub const INHERIT_ENVIRONMENT: &str = "2KBROWSER_INHERIT_ENVIRONMENT";
+
+/// Whether the operator asked for the parent's environment.
+#[cfg(target_os = "windows")]
+fn inheriting_environment() -> bool {
+    std::env::var_os(INHERIT_ENVIRONMENT).is_some()
+}
+
+/// The block the launch is handed, or `None` to inherit the parent's.
+///
+/// # Why this switch exists
+///
+/// `ERROR_ENVVAR_NOT_FOUND (203)` names the environment, and this file has
+/// twice taken it at its word and been right. It has now been reported from a
+/// machine where every input that error could plausibly mean has been checked
+/// and is correct: the block holds the three variables that Windows needs to
+/// place a package profile, `PATH` is ordinary, the profile directory is there,
+/// the capability list is the one CI launches on every push, and the failure
+/// follows the executable to a plain local directory rather than staying with
+/// the working directory or the sync-backed folder it was first seen in.
+///
+/// So the question the error cannot answer on its own is whether it is about
+/// the environment at all. Passing `None` makes `CreateProcessW` use the
+/// parent's own environment — the one thing that is certainly complete on that
+/// machine, since the parent is running. A launch that succeeds this way is a
+/// launch whose block was the problem despite looking correct, and one that
+/// fails the same way exonerates [`environment`] entirely and moves the search
+/// to the container. Either answer removes half of what is left, which is more
+/// than another round of reading this file can do.
+///
+/// # What it costs, and why it is opt-in
+///
+/// Inheriting is the trade [`environment`] exists to refuse: a browser's
+/// environment holds API tokens, proxy credentials, and the shape of someone's
+/// home directory, and this hands all of it to the process that parses hostile
+/// documents. The renderer is still an AppContainer — it cannot open the files
+/// those variables name — but it can read them, and a diagnostic that silently
+/// widened what the sandbox sees would be a worse bug than the one it is
+/// chasing. Hence a variable nobody sets by accident, and a line on stderr
+/// every time it is honoured, so a machine left in this state says so.
+///
+/// `rappct` makes the same trade under `RAPPCT_TEST_FORCE_ENV`, which does not
+/// work here: it is only consulted when the caller passes no block, and this
+/// caller always passed one.
+#[cfg(target_os = "windows")]
+fn environment_for_launch() -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    if inheriting_environment() {
+        eprintln!(
+            "{INHERIT_ENVIRONMENT} is set: the renderer is inheriting this \
+             process's environment, which hands it every variable this process \
+             has. Diagnostic only — unset it when you are done."
+        );
+        return None;
+    }
+    Some(environment())
+}
+
 /// What this machine handed the launch, for a failure only it can see.
 ///
 /// `CreateProcessW` reports a container it would not build as a three-digit
@@ -320,14 +382,22 @@ fn launch_inputs(capabilities: &SecurityCapabilities) -> String {
         None => "unknown, LOCALAPPDATA is not set",
     };
 
+    // Which block the failure was actually handed. A report that did not say
+    // this would read identically whether or not [`INHERIT_ENVIRONMENT`] was
+    // set, and telling those two apart is the entire point of setting it.
+    let (source, count) = if inheriting_environment() {
+        ("inherited", std::env::vars_os().count())
+    } else {
+        ("explicit", environment().len())
+    };
+
     format!(
         "launch inputs: capabilities={} lpac={} package-sid={} \
-         package-directory={package_directory} \
-         environment-variables={} wanted-but-absent={absent}",
+         package-directory={package_directory} environment={source} \
+         environment-variables={count} wanted-but-absent={absent}",
         capabilities.caps.len(),
         capabilities.lpac,
         capabilities.package.as_string(),
-        environment().len(),
     )
 }
 
@@ -418,7 +488,7 @@ impl Container {
             exe: self.program.clone(),
             cmdline: Some(command),
             stdio: StdioConfig::Pipe,
-            env: Some(environment()),
+            env: environment_for_launch(),
             join_job: Some(JobLimits {
                 // The renderer dies when this handle closes, which happens when
                 // the session is dropped *and* if the browser is killed outright.
@@ -631,6 +701,33 @@ mod tests {
         assert!(
             !report.contains(&system_root),
             "the report printed a variable's value:\n{report}"
+        );
+
+        // Which block was handed over, so a report from a machine running with
+        // the switch set cannot be mistaken for one running without it.
+        assert!(
+            report.contains("environment=explicit"),
+            "the report does not say which block the launch got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn the_renderer_gets_a_named_environment_unless_asked_otherwise() {
+        // The switch is a diagnostic that widens what the sandbox can read, so
+        // the invariant worth pinning is the default: absent the variable, the
+        // launch gets the curated block and nothing else. The set case is left
+        // to the machine it exists for — reading it here would mean mutating
+        // the process environment out from under every other test in this
+        // binary, and this file already has one bug from shared mutable state.
+        assert!(
+            !inheriting_environment(),
+            "{INHERIT_ENVIRONMENT} is set in this test process",
+        );
+        let handed = environment_for_launch().expect("the curated block, by default");
+        assert_eq!(
+            handed.len(),
+            environment().len(),
+            "the default launch got something other than `environment()`",
         );
     }
 }

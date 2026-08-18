@@ -356,9 +356,18 @@ the outside.
 > because the test that should have caught it was skipping rather than failing.
 > **It is not a closed problem.** A user has reported the same launch failure
 > from a release build on their own machine since, with CI green on every push
-> either side of it, and it is unexplained: everything about that launch which
-> does not vary by machine is ruled out by CI succeeding, and what is left needs
-> a report from the machine that fails. The failure now prints those inputs.
+> either side of it, and it is unexplained. The failure now prints what that
+> machine handed the launch, and the first report back ruled out more than it
+> confirmed: the capability list and the LPAC flag are the ones CI launches, the
+> package profile directory is present, the block holds all three variables that
+> place that profile, `PATH` is ordinary, and the failure follows the executable
+> to a plain local directory rather than staying with the working directory or
+> the sync-backed folder it was first seen in. What has not been established is
+> whether `ERROR_ENVVAR_NOT_FOUND` is about the environment at all, which is
+> what `2KBROWSER_INHERIT_ENVIRONMENT` is for: it hands the renderer this
+> process's own environment, so a launch that then succeeds indicts the curated
+> block and one that fails the same way exonerates it. It widens what the
+> renderer can read and says so on stderr; it is a diagnostic, not a setting.
 > Only loopback is probed there; what rules out outbound is the capability set
 > being empty, asserted directly. Until an outside reader has been through this,
 > it is a tool for its authors.
