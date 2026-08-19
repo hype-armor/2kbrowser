@@ -700,6 +700,22 @@ pub fn bisect(program: &Path) -> String {
         },
     );
 
+    // A binary this container is allowed to run without anything in this file
+    // having arranged it: `System32` grants `ALL APPLICATION PACKAGES` read and
+    // execute by default, so `cmd.exe` needs no grant from us. That splits the
+    // two things `container-only` still holds together — a container the
+    // machine will not create at all, and a container that cannot read *our*
+    // executable because the grant this file makes did not take. Both fail the
+    // same way, and only one of them is ours to fix.
+    report.push(rung(
+        "system-binary",
+        LaunchOptions {
+            exe: PathBuf::from("C:\\Windows\\System32\\cmd.exe"),
+            cmdline: Some("\"C:\\Windows\\System32\\cmd.exe\" /c exit".to_owned()),
+            ..base.clone()
+        },
+    ));
+
     // The container with as little asked of it as the API allows.
     report.push(rung("container-only", base.clone()));
 
