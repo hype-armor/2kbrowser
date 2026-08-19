@@ -558,6 +558,30 @@ pub const fn available() -> bool {
 /// the outside.
 pub const SELFTEST_ARGUMENT: &str = "--confine-selftest";
 
+/// Argument that bisects a failing container launch.
+///
+/// Separate from [`SELFTEST_ARGUMENT`] because it answers a different question.
+/// The self-test asks whether this machine confines the renderer; this asks
+/// *which part* of the launch it will not accept, by making the same launch
+/// several times with one thing added each time. Only useful on a machine where
+/// the self-test already says `confinement=Failed`.
+pub const BISECT_ARGUMENT: &str = "--confine-bisect";
+
+/// Runs the launch ladder, or says why it is not the tool for this platform.
+pub fn bisect() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        match std::env::current_exe() {
+            Ok(program) => crate::contain::bisect(&program),
+            Err(error) => format!("bisect: cannot find this executable: {error}"),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "bisect: only the Windows container launch is built in rungs".to_owned()
+    }
+}
+
 /// Argument that runs only the probes, for a process that is already confined.
 ///
 /// Windows needs this because the confinement is applied from outside: the

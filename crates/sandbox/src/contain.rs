@@ -620,6 +620,147 @@ pub fn capture(
     })
 }
 
+/// Launches the same container repeatedly, adding one thing at a time.
+///
+/// # Why this exists
+///
+/// A launch failure here is a security control degrading on a machine nobody
+/// working on this can reach, and the only way to learn anything about it is to
+/// ask someone to run something and report back. That round trip is the scarce
+/// resource, and the way it has been spent so far is one guess at a time:
+/// the capability list, the package profile, the environment block, the
+/// executable's directory, the working directory. Each cost a round trip and
+/// each came back innocent, which is what a guess usually does.
+///
+/// So this stops guessing and bisects. The launch that fails is the one at the
+/// bottom of this ladder, and every rung above it removes exactly one thing
+/// from it. The first rung that fails is the thing, and one run reports all of
+/// them — including, at the top, a launch with no container at all, so a
+/// machine that cannot start the executable *at all* says so rather than
+/// looking like a sandbox problem.
+///
+/// Nothing here is a fix and nothing here should be shipped as one. It is a
+/// question asked in a form that a single run can answer.
+#[cfg(target_os = "windows")]
+pub fn bisect(program: &Path) -> String {
+    // Every field is named, on every rung. Inheriting the rest from
+    // `LaunchOptions::default()` is how this launch came to have a working
+    // directory of `C:\Windows\System32` that nobody here chose and no reader
+    // of this file could see — which cost a round trip to rule out, after an
+    // earlier one had been spent ruling out the *parent's* working directory
+    // in the belief that none was set at all.
+    let rung = |name: &str, options: LaunchOptions| -> String {
+        match launch_in_container_with_io(
+            &match Container::new(program) {
+                Ok(container) => container.capabilities,
+                Err(error) => return format!("  {name}: no container: {error}"),
+            },
+            &options,
+        ) {
+            // `--help` exits on its own, and dropping the job guard on the
+            // rungs that have one takes the child with it.
+            Ok(io) => {
+                drop(io);
+                format!("  {name}: launched")
+            }
+            Err(error) => format!("  {name}: FAILED: {}", chain(&error)),
+        }
+    };
+
+    // Exits immediately and reads nothing, because whether the child *works* is
+    // not the question — whether `CreateProcessW` returned is.
+    let command = format!("\"{}\" --help", program.display());
+    let base = LaunchOptions {
+        exe: program.to_path_buf(),
+        cmdline: Some(command.clone()),
+        cwd: None,
+        env: None,
+        stdio: StdioConfig::Null,
+        suspended: false,
+        join_job: None,
+        startup_timeout: None,
+    };
+
+    let mut report = vec!["bisect:".to_owned()];
+
+    // The control. Not a container at all, so a failure here is about the
+    // executable or the machine and none of the rest of this means anything.
+    report.push(
+        match std::process::Command::new(program)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.kill();
+                "  uncontained: launched".to_owned()
+            }
+            Err(error) => format!("  uncontained: FAILED: {error}"),
+        },
+    );
+
+    // The container with as little asked of it as the API allows.
+    report.push(rung("container-only", base.clone()));
+
+    // Then one addition each, so a failure names the addition. Ordered by how
+    // much of the launch they touch, cheapest first.
+    report.push(rung(
+        "+explicit-environment",
+        LaunchOptions {
+            env: Some(environment()),
+            ..base.clone()
+        },
+    ));
+    report.push(rung(
+        "+working-directory",
+        LaunchOptions {
+            cwd: Some(PathBuf::from("C:\\Windows\\System32")),
+            ..base.clone()
+        },
+    ));
+    report.push(rung(
+        "+inherited-pipes",
+        LaunchOptions {
+            stdio: StdioConfig::Pipe,
+            ..base.clone()
+        },
+    ));
+    report.push(rung(
+        "+job",
+        LaunchOptions {
+            join_job: Some(JobLimits {
+                kill_on_job_close: true,
+                memory_bytes: None,
+                cpu_rate_percent: None,
+            }),
+            ..base.clone()
+        },
+    ));
+
+    // Everything at once: what `spawn` actually asks for. If every rung above
+    // launched and this one does not, the fault is in a combination rather
+    // than any single addition, which is worth knowing and is not otherwise
+    // visible.
+    report.push(rung(
+        "as-shipped",
+        LaunchOptions {
+            cmdline: Some(command),
+            cwd: Some(PathBuf::from("C:\\Windows\\System32")),
+            env: environment_for_launch(),
+            stdio: StdioConfig::Pipe,
+            join_job: Some(JobLimits {
+                kill_on_job_close: true,
+                memory_bytes: None,
+                cpu_rate_percent: None,
+            }),
+            ..base
+        },
+    ));
+
+    report.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

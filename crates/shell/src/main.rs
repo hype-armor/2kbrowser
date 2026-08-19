@@ -56,6 +56,13 @@ fn main() -> ExitCode {
         // The far half of the self-test, for platforms where the confinement is
         // applied from outside and so cannot be applied by the process running
         // the probes. Not in the usage text: the self-test runs this on itself.
+        // Asks which part of a failing container launch this machine refuses.
+        // Not in the usage text: it is for a machine that has already reported
+        // `confinement=Failed`, not something to run by hand.
+        Some(sandbox::confine::BISECT_ARGUMENT) => {
+            println!("{}", sandbox::confine::bisect());
+            ExitCode::SUCCESS
+        }
         Some(sandbox::confine::SELFTEST_PROBE_ARGUMENT) => {
             println!("{}", sandbox::confine::selftest_probe(&args[1..]));
             ExitCode::SUCCESS
