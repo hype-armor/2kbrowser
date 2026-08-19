@@ -707,13 +707,32 @@ pub fn bisect(program: &Path) -> String {
         },
     );
 
-    // A binary this container is allowed to run without anything in this file
-    // having arranged it: `System32` grants `ALL APPLICATION PACKAGES` read and
-    // execute by default, so `cmd.exe` needs no grant from us. That splits the
-    // two things `container-only` still holds together — a container the
-    // machine will not create at all, and a container that cannot read *our*
-    // executable because the grant this file makes did not take. Both fail the
-    // same way, and only one of them is ours to fix.
+    // The least this API can be asked to do: a binary the container may already
+    // run, and no handles of any kind. `System32` grants `ALL APPLICATION
+    // PACKAGES` read and execute by default, so `cmd.exe` needs no grant from
+    // this file, and `Inherit` opens no `NUL` handles, sets no standard
+    // handles, and passes no handle list — the attribute list holds the
+    // security capabilities and nothing else.
+    //
+    // This rung exists because the first version of this ladder did not have
+    // it, and every rung that ladder *did* have used either `NUL` handles or
+    // pipes. It failed all of them and was read as proving the machine refuses
+    // AppContainers outright. It proved no such thing: the failures were
+    // `ERROR_INVALID_HANDLE`, which is an error about handles, and no launch
+    // without any had ever been tried. If this rung launches, the container is
+    // fine and the fault is in how stdio is set up for it.
+    report.push(rung(
+        "system-binary-no-handles",
+        LaunchOptions {
+            exe: PathBuf::from("C:\\Windows\\System32\\cmd.exe"),
+            cmdline: Some("\"C:\\Windows\\System32\\cmd.exe\" /c exit".to_owned()),
+            stdio: StdioConfig::Inherit,
+            ..base.clone()
+        },
+    ));
+
+    // The same binary with the `NUL` handles the rest of the ladder uses, so
+    // that stdio is one addition rather than a constant.
     report.push(rung(
         "system-binary",
         LaunchOptions {

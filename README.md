@@ -354,16 +354,22 @@ the outside.
 > container falls back to an unconfined renderer, saying so on stderr and in
 > `--confine-selftest` — a fallback that stayed silently broken in CI for weeks,
 > because the test that should have caught it was skipping rather than failing.
-> **A machine has been found that cannot confine the renderer at all**, and the
-> reason is not in this repository. `--confine-bisect` makes the same container
-> launch repeatedly with one thing added each time, and on that machine the
-> uncontained control starts while every contained rung fails — including
-> `cmd.exe`, which needs no grant from us because `System32` is readable by
-> `ALL APPLICATION PACKAGES` by default, and including the minimal launch with
-> no environment block, no working directory, no pipes and no job. `icacls`
-> confirms the package SID holds read and execute on the executable. Windows
-> will not create an AppContainer process there for anything, which is a machine
-> policy question rather than a code one.
+> **A machine has been found that cannot confine the renderer at all.**
+> `--confine-bisect` makes the same container launch repeatedly with one thing
+> added each time, and on that machine the uncontained control starts while
+> every contained rung fails — including `cmd.exe`, which needs no grant from us
+> because `System32` is readable by `ALL APPLICATION PACKAGES` by default, and
+> including a launch with no environment block, no working directory and no job.
+> `icacls` confirms the package SID holds read and execute on the executable,
+> and the machine has no AppLocker policy and no user-mode Code Integrity
+> enforcement, so nothing obvious is refusing it.
+>
+> What has *not* been shown is that the container itself is refused. Every rung
+> run there so far passed either `NUL` handles or pipes, and the failures
+> without pipes were `ERROR_INVALID_HANDLE` — an error about handles, from
+> launches that all had some. The ladder now has a rung with none at all; until
+> it reports, "this machine cannot make AppContainers" is a guess, and guesses
+> about this failure have been wrong seven times.
 >
 > Getting there cost seven round trips to that machine, each spent ruling out
 > one input — the capability list, the package profile, the registry mapping,
@@ -375,9 +381,13 @@ the outside.
 > it. **An error naming a cause is not evidence of that cause.** Bisecting the
 > launch answered in one run what seven guesses at the error's wording did not.
 >
-> What this does *not* settle is what the browser should do about it. A machine
-> that cannot build the container still gets a renderer, unconfined, with a line
-> on stderr — the same fallback that stayed silently broken in CI for weeks.
+> A machine that cannot build the container still gets a renderer, unconfined,
+> with a line on stderr. That is a deliberate choice rather than an oversight:
+> refusing to render at all would be the safer posture, and the fallback is kept
+> anyway so that a machine like this one stays usable. It is the weakest point
+> in this design, it is now known to be reachable on ordinary hardware, and the
+> line on stderr is the only thing standing between it and going unnoticed —
+> which is exactly how it stayed broken in CI for weeks.
 > Only loopback is probed there; what rules out outbound is the capability set
 > being empty, asserted directly. Until an outside reader has been through this,
 > it is a tool for its authors.
