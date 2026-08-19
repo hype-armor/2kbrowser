@@ -514,8 +514,15 @@ impl Container {
         // spent three times.
         let mut io =
             launch_in_container_with_io(&self.capabilities, &options).map_err(|error| {
+                // The inputs, and then where to go next. A machine has already
+                // been found where every one of these is correct and the
+                // container is refused anyway, so a report that offered only
+                // the inputs would invite exactly the hunt that found nothing
+                // there: the error names the environment and is not about it.
                 format!(
-                    "could not start a contained renderer: {}; {}",
+                    "could not start a contained renderer: {}; {}; \
+                     run `--confine-bisect` to find which part of the launch \
+                     this machine refuses — the error's wording is not evidence",
                     chain(&error),
                     launch_inputs(&self.capabilities)
                 )

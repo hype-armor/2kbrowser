@@ -354,20 +354,30 @@ the outside.
 > container falls back to an unconfined renderer, saying so on stderr and in
 > `--confine-selftest` — a fallback that stayed silently broken in CI for weeks,
 > because the test that should have caught it was skipping rather than failing.
-> **It is not a closed problem.** A user has reported the same launch failure
-> from a release build on their own machine since, with CI green on every push
-> either side of it, and it is unexplained. The failure now prints what that
-> machine handed the launch, and the first report back ruled out more than it
-> confirmed: the capability list and the LPAC flag are the ones CI launches, the
-> package profile directory is present, the block holds all three variables that
-> place that profile, `PATH` is ordinary, and the failure follows the executable
-> to a plain local directory rather than staying with the working directory or
-> the sync-backed folder it was first seen in. What has not been established is
-> whether `ERROR_ENVVAR_NOT_FOUND` is about the environment at all, which is
-> what `2KBROWSER_INHERIT_ENVIRONMENT` is for: it hands the renderer this
-> process's own environment, so a launch that then succeeds indicts the curated
-> block and one that fails the same way exonerates it. It widens what the
-> renderer can read and says so on stderr; it is a diagnostic, not a setting.
+> **A machine has been found that cannot confine the renderer at all**, and the
+> reason is not in this repository. `--confine-bisect` makes the same container
+> launch repeatedly with one thing added each time, and on that machine the
+> uncontained control starts while every contained rung fails — including
+> `cmd.exe`, which needs no grant from us because `System32` is readable by
+> `ALL APPLICATION PACKAGES` by default, and including the minimal launch with
+> no environment block, no working directory, no pipes and no job. `icacls`
+> confirms the package SID holds read and execute on the executable. Windows
+> will not create an AppContainer process there for anything, which is a machine
+> policy question rather than a code one.
+>
+> Getting there cost seven round trips to that machine, each spent ruling out
+> one input — the capability list, the package profile, the registry mapping,
+> the environment block, the executable's directory, the working directory — and
+> every one came back innocent. `ERROR_ENVVAR_NOT_FOUND` is what led that hunt,
+> and it was never about the environment: handing the renderer this whole
+> process's environment fails identically, and the code is simply what surfaces
+> when the handle list is present, where `ERROR_INVALID_HANDLE` surfaces without
+> it. **An error naming a cause is not evidence of that cause.** Bisecting the
+> launch answered in one run what seven guesses at the error's wording did not.
+>
+> What this does *not* settle is what the browser should do about it. A machine
+> that cannot build the container still gets a renderer, unconfined, with a line
+> on stderr — the same fallback that stayed silently broken in CI for weeks.
 > Only loopback is probed there; what rules out outbound is the capability set
 > being empty, asserted directly. Until an outside reader has been through this,
 > it is a tool for its authors.
