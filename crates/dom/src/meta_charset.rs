@@ -27,6 +27,12 @@
 //! with the `=` turned into a `"`, which ends the attribute value early and
 //! leaves it terminating in `charset` — a one-byte typo away from a real page.
 //!
+//! It is not only `<meta>`. `html5ever` runs the scan for the whole "in head"
+//! tag group, so `<link http-equiv=content-type content=charset>` is exactly as
+//! fatal — see [`SCANNED_TAGS`]. That half was found by the soak *after* the
+//! `<meta>`-only fix went in, which is the case for re-running a fuzzer against
+//! a fix rather than treating the bug as closed.
+//!
 //! # Why the fix is here rather than upstream
 //!
 //! It *is* upstream. `servo/html5ever`'s `main` reads
@@ -55,7 +61,7 @@
 //! `html5ever` lets the tokenizer and the tree builder be assembled by hand,
 //! and they are two separate objects with a `TokenSink` between them. The bug
 //! is in the tree builder; the tokenizer is fine. So this sits in the join and
-//! looks at `<meta>` start tags on the way past.
+//! looks at the start tags in [`SCANNED_TAGS`] on the way past.
 //!
 //! When a `content` value would send that cursor off the end, one `=` is
 //! appended to it. The scan then stops on the `=` exactly as step 4 intends,
@@ -81,6 +87,29 @@
 use html5ever::tokenizer::{StartTag, Tag, Token, TokenSink, TokenSinkResult};
 use html5ever::{LocalName, local_name, ns};
 
+/// The start tags that reach the scan.
+///
+/// Not just `<meta>`, which is the trap in reading this code and was the first
+/// version of this fix. The spec's algorithm is about meta elements and
+/// `html5ever` runs it for the whole "in head" group:
+///
+/// ```text
+/// Token::Tag(tag @ tag!(<base> | <basefont> | <bgsound> | <link> | <meta>)) => {
+/// ```
+///
+/// A `<link http-equiv=content-type content=charset>` is therefore just as
+/// fatal as the `<meta>` version and nothing about it looks like a charset
+/// declaration. The fuzzer found that one too, on the next soak after the
+/// `<meta>`-only fix landed — which is the argument for re-running a fuzzer
+/// after fixing what it found, rather than crossing the bug off.
+const SCANNED_TAGS: [LocalName; 5] = [
+    local_name!("base"),
+    local_name!("basefont"),
+    local_name!("bgsound"),
+    local_name!("link"),
+    local_name!("meta"),
+];
+
 /// Sits between the tokenizer and the tree builder and defuses the one token
 /// shape that makes the tree builder index past the end of a string.
 pub(crate) struct DefuseMetaCharset<Sink>(pub(crate) Sink);
@@ -96,7 +125,7 @@ impl<Sink: TokenSink> TokenSink for DefuseMetaCharset<Sink> {
         // matches its own tags.
         if let Token::TagToken(tag) = &mut token
             && tag.kind == StartTag
-            && tag.name == local_name!("meta")
+            && SCANNED_TAGS.contains(&tag.name)
         {
             // Every condition the tree builder applies before it reaches the
             // scan, in its order, so nothing is rewritten on an element that

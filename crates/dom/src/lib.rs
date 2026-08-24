@@ -526,6 +526,23 @@ mod tests {
     }
 
     #[test]
+    fn the_other_four_tags_that_reach_the_same_scan() {
+        // `html5ever` runs the charset extraction for the whole "in head" tag
+        // group, not for `<meta>` alone. The first version of this fix matched
+        // `<meta>` and the next soak found a `<link>` carrying the same
+        // attributes — a document with nothing about it that reads as a charset
+        // declaration.
+        for tag in ["base", "basefont", "bgsound", "link"] {
+            let document = format!("<{tag} http-equiv=content-type content='text/html; charset '>");
+            let doc = parse(&document);
+            assert!(
+                doc.find_element(tag).is_some(),
+                "{document:?} lost its {tag} element"
+            );
+        }
+    }
+
+    #[test]
     fn a_defused_meta_keeps_the_rest_of_the_document() {
         // The workaround rewrites a token on the way past. If it rewrote the
         // wrong one, or dropped it, the page after it would be the casualty.
