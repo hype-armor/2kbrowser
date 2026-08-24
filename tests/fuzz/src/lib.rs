@@ -434,6 +434,8 @@ pub struct Session {
     corpus: Vec<Vec<u8>>,
     directory: PathBuf,
     fonts: text::FontStore,
+    /// Wall-clock limit on a run, if [`Session::stop_after`] set one.
+    budget: Option<Duration>,
 }
 
 impl Session {
@@ -495,12 +497,35 @@ impl Session {
             corpus,
             directory: root.join("corpus").join(target.name()),
             fonts: text::FontStore::new(),
+            budget: None,
         }
     }
 
     /// How many seeds this session starts from.
     pub fn corpus_len(&self) -> usize {
         self.corpus.len()
+    }
+
+    /// Ends a run after `budget`, however many iterations it had left.
+    ///
+    /// The scheduled soak needs a run that stops on time rather than one that
+    /// stops after a count. A count is not portable: the number that fills
+    /// twenty minutes on a laptop fills five on a fast runner and two hours on
+    /// a slow one, and both ways of guessing wrong are bad. Too few wastes the
+    /// night. Too many overruns the job's own timeout, and *that* is the one
+    /// that costs a finding — the runner kills the process, nothing is printed,
+    /// and the crasher is a file in a workspace about to be deleted. A deadline
+    /// the harness keeps itself means the run always reaches its own report.
+    ///
+    /// Calibration is not charged to the budget. It is the fixed cost of
+    /// starting rather than time spent looking, and on a heavy target it is a
+    /// large enough share of a short run to be worth not confusing the two.
+    ///
+    /// It cannot cut an input short, only decline to start another. An input
+    /// that has already stopped coming back is the watchdog's problem
+    /// ([`HANG_FACTOR`]), not this one's.
+    pub fn stop_after(&mut self, budget: Duration) {
+        self.budget = Some(budget);
     }
 
     /// Times the unmutated seeds, which is what "too slow" is measured against.
@@ -545,7 +570,14 @@ impl Session {
             in_flight.clone(),
         );
 
+        // Started after calibration, so a budget means "spend this long
+        // fuzzing" rather than "spend this long, some of it on setup".
+        let deadline = self.budget.map(|budget| Instant::now() + budget);
+
         for iteration in 0..iterations {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
             let base = rng.choose(&self.corpus).cloned().unwrap_or_default();
             let input = mutate(&mut rng, &base, &self.corpus);
 
@@ -987,6 +1019,37 @@ mod tests {
                 target.name()
             );
         }
+    }
+
+    #[test]
+    fn a_budget_ends_the_run_early() {
+        // What the nightly job rests on. A budget that were quietly ignored
+        // would turn a twenty-minute soak into an overnight one and get the
+        // whole run killed by the runner, which reports nothing.
+        let mut session = Session::new(Target::Url);
+        session.stop_after(Duration::from_millis(50));
+        let started = Instant::now();
+        let report = session.run(11, usize::MAX);
+        let elapsed = started.elapsed();
+
+        assert!(report.iterations > 0, "it stopped before starting");
+        assert!(
+            report.iterations < usize::MAX,
+            "it ran the count rather than the clock"
+        );
+        // Generous, because the deadline is only checked between inputs and
+        // calibration runs first: this asserts the run *ends*, not that it ends
+        // to the millisecond.
+        assert!(elapsed < Duration::from_secs(30), "ran for {elapsed:?}");
+    }
+
+    #[test]
+    fn a_run_without_a_budget_still_runs_every_iteration() {
+        // The other half: `cargo test`'s soak asserts an exact count, and a
+        // deadline that applied when none was asked for would make that
+        // assertion fail on a slow machine and pass on a fast one.
+        let mut session = Session::new(Target::Url);
+        assert_eq!(session.run(12, 25).iterations, 25);
     }
 
     #[test]
