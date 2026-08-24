@@ -232,14 +232,27 @@ a line break is outlined in every piece, because it is one link.
 
 M3 is complete, and M4 has started with fuzzing. `cargo test` runs a short pass
 that mutates the reference fixtures into the HTML parser, the CSS parser, image
-decoding, URL parsing, and the whole render pipeline; `cargo run -p fuzz` soaks
-for as long as you leave it. The first soak found three panics reachable from
-an ordinary stylesheet — `font-size: 0`, `font-size: 99999px`, and
-`margin: 1e40px` — each of which stopped the browser. A later one found a
-fourth: a glyph shifted far enough by its own run offset that the rectangle
-built for it left `i32`, which the check on the text origin did not catch
-because the origin was not where the glyph landed. All four are fixed, and each
-has a regression test where the bug was rather than where it surfaced.
+decoding, URL parsing, the process-boundary protocol, and the whole render
+pipeline; `cargo run -p fuzz` soaks for as long as you leave it, and
+`.github/workflows/fuzz.yml` leaves it for twenty minutes a target every night.
+That last part is newer than the rest: for a while the only thing that ever ran
+was the short fixed-seed pass, which re-runs inputs already seen and by
+construction finds nothing new. A fuzzer nobody schedules is a regression test.
+
+The first soak found three panics reachable from an ordinary stylesheet —
+`font-size: 0`, `font-size: 99999px`, and `margin: 1e40px` — each of which
+stopped the browser. A later one found a fourth: a glyph shifted far enough by
+its own run offset that the rectangle built for it left `i32`, which the check
+on the text origin did not catch because the origin was not where the glyph
+landed. The first soak that ran for longer than a few seconds found a fifth in
+about four minutes, and it is not ours: `html5ever` 0.39.0 indexes one past the
+end of a string when a `<meta http-equiv=content-type>` element's `content`
+attribute ends in the word `charset`. Forty-five bytes of HTML, and the renderer
+is gone. It is fixed in upstream's `main` and unreleased, so `crates/dom` steps
+between the tokenizer and the tree builder and defuses that one attribute value
+on the way past — `catch_unwind` would have been useless, because the release
+profile aborts rather than unwinds. All five are fixed, and each has a
+regression test where the bug was rather than where it surfaced.
 
 A hang is a finding too, and for a while it was the one kind the fuzzer could
 not report: it times an input once it returns, and an input that never returns
