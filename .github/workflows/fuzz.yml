@@ -37,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       minutes:
-        description: "Wall-clock budget per target, in minutes"
+        description: "Wall-clock budget per target, in minutes (capped at 30)"
         default: "20"
       seed:
         description: "Starting seed (blank: derived from the run id)"
@@ -54,6 +54,13 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: 0
+  # The two halves of the same decision, kept next to each other because
+  # raising one without the other is how a soak gets killed by its own runner.
+  # `JOB_TIMEOUT` is the backstop the runner enforces; `MAX_MINUTES` is the
+  # largest budget the fuzzer will accept, and has to leave room for the build
+  # and for a target whose last input started just before the deadline.
+  JOB_TIMEOUT: 45
+  MAX_MINUTES: 30
 
 defaults:
   run:
@@ -80,7 +87,8 @@ jobs:
     # A backstop, not the budget. The fuzzer stops itself (`--minutes`); this
     # only catches the case where it cannot — and it is set well clear of the
     # budget so that tripping it means something is actually wrong rather than
-    # that the runner was slow.
+    # that the runner was slow. See `JOB_TIMEOUT` above, which is the same
+    # number where the clamp can read it.
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -133,7 +141,18 @@ jobs:
           if [ -z "$seed" ]; then
             seed=$(( ${{ github.run_id }} + ${{ github.run_attempt }} ))
           fi
+          # Clamped against the job's own `timeout-minutes`. Dispatching a
+          # budget larger than the backstop is the one way to get back exactly
+          # the failure the budget exists to prevent: the runner kills the job
+          # part way through, prints nothing, and destroys the workspace the
+          # finding was written to. Refusing outright would be worse than
+          # trimming — somebody asking for a longer soak should get the longest
+          # one available, and be told that is what happened.
           minutes='${{ inputs.minutes || 20 }}'
+          if [ "$minutes" -gt "$MAX_MINUTES" ]; then
+            echo "::warning title=Budget clamped::asked for ${minutes}m, running ${MAX_MINUTES}m — the job times out at ${{ env.JOB_TIMEOUT }}m. Raise timeout-minutes and MAX_MINUTES together to go longer."
+            minutes="$MAX_MINUTES"
+          fi
 
           {
             echo "### ${{ matrix.target }}"
