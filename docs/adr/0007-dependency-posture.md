@@ -60,6 +60,16 @@ what M1 and M2 are expected to pull in.
 
 - The security-critical parsing surface is maintained by people who specialise
   in it, and CVEs there arrive as version bumps.
+- That last clause is the one to hold loosely. Fuzzing found a panic in
+  `html5ever` 0.39.0 — a `<meta>` `content` attribute ending in the word
+  `charset` indexes one past the end of a string, and forty-five bytes of HTML
+  takes the renderer down. It is fixed in upstream's `main` and there is no
+  released version carrying the fix. So a bug can be *known upstream* and still
+  have no version to bump to, and this repository has to be able to stand in
+  front of one in the meantime. `crates/dom/src/meta_charset.rs` is what that
+  looks like: narrow, tested against the input that found it, and written to be
+  deleted. The posture above is right; "someone else maintains it" is a reason
+  to take the dependency, not a reason to stop fuzzing what it does.
 - Using a modern HTML parser for old content is correct, not a compromise: the
   HTML5 parsing algorithm was derived from how browsers handled exactly this
   era's markup.

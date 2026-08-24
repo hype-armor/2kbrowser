@@ -8,11 +8,18 @@
 //! `RefCell` *during parsing only*. [`parse`] hands back a plain [`Document`]
 //! with no interior mutability left in it.
 
+mod meta_charset;
+
 use std::cell::{Ref, RefCell};
 
-use html5ever::tendril::{StrTendril, TendrilSink};
-use html5ever::tree_builder::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use html5ever::{Attribute, LocalName, Namespace, ParseOpts, QualName, parse_document};
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{BufferQueue, Tokenizer};
+use html5ever::tree_builder::{
+    ElemName, ElementFlags, NodeOrText, QuirksMode, TreeBuilder, TreeSink,
+};
+use html5ever::{Attribute, LocalName, Namespace, ParseOpts, QualName, TokenizerResult};
+
+use meta_charset::DefuseMetaCharset;
 
 /// Index of a node within a [`Document`]'s arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -435,11 +442,31 @@ impl ElemName for ElemNameRef<'_> {
 ///
 /// Never fails: the HTML parsing algorithm defines recovery for every input,
 /// so malformed markup yields a tree rather than an error (ADR-0007).
+///
+/// This is `html5ever::parse_document` assembled by hand rather than called,
+/// because one extra layer has to go between the tokenizer and the tree
+/// builder — see [`meta_charset`] for the bug that needs it and for what to
+/// delete when it is fixed upstream. Everything else here is what
+/// `parse_document` and `TendrilSink::one` do between them: feed the whole
+/// string, run the tokenizer dry, end it, and take the tree.
 pub fn parse(html: &str) -> Document {
     let sink = DomSink {
         doc: RefCell::new(Document::new()),
     };
-    parse_document(sink, ParseOpts::default()).one(html)
+    let options = ParseOpts::default();
+    let tree_builder = TreeBuilder::new(sink, options.tree_builder);
+    let tokenizer = Tokenizer::new(DefuseMetaCharset(tree_builder), options.tokenizer);
+
+    let input = BufferQueue::default();
+    input.push_back(StrTendril::from(html));
+    while !matches!(tokenizer.feed(&input), TokenizerResult::Done) {
+        // The other result is `Script`, which upstream's own loop also does
+        // nothing with. There is no script engine here to hand the element to
+        // (ADR-0003), so the tokenizer is simply asked to carry on.
+    }
+    debug_assert!(input.is_empty(), "the parser stopped with input left");
+    tokenizer.end();
+    tokenizer.sink.0.sink.finish()
 }
 
 #[cfg(test)]
@@ -470,6 +497,68 @@ mod tests {
         let doc = parse("<p>one<b>two<p>three</b>");
         let body = doc.find_element("body").expect("body");
         assert_eq!(doc.text_content(body), "onetwothree");
+    }
+
+    #[test]
+    fn defuses_a_meta_charset_that_would_index_past_the_end() {
+        // Found by `tests/fuzz`, seed 0xa1, as a mutation of the reference
+        // fixtures' own `<meta http-equiv="Content-Type" content="text/html;
+        // charset=iso-8859-1">` with the `=` turned into a `"`. That ends the
+        // attribute value early and leaves it terminating in `charset`, which
+        // walks `html5ever` 0.39.0's cursor one past the end of the string and
+        // panics inside the tree builder. See `meta_charset`.
+        //
+        // Every shape of it, because the whitespace-skipping step is a second
+        // way to arrive one past the end and a fix for the first would not
+        // necessarily catch it.
+        for document in [
+            "<meta http-equiv=content-type content=charset>",
+            r#"<meta http-equiv="Content-Type" content="text/html; charset">"#,
+            "<meta http-equiv=content-type content='text/html; charset  '>",
+            "<html><head><meta http-equiv=CONTENT-TYPE content=charsetcharset>",
+        ] {
+            let doc = parse(document);
+            assert!(
+                doc.find_element("meta").is_some(),
+                "{document:?} lost its meta element"
+            );
+        }
+    }
+
+    #[test]
+    fn a_defused_meta_keeps_the_rest_of_the_document() {
+        // The workaround rewrites a token on the way past. If it rewrote the
+        // wrong one, or dropped it, the page after it would be the casualty.
+        let doc = parse(
+            "<html><head><meta http-equiv=content-type content=charset>\
+             <title>Still here</title></head><body><p>and so is this</p></body></html>",
+        );
+        let body = doc.find_element("body").expect("body");
+        assert_eq!(doc.text_content(body), "and so is this");
+        let title = doc.find_element("title").expect("title");
+        assert_eq!(doc.text_content(title), "Still here");
+    }
+
+    #[test]
+    fn a_charset_attribute_stops_the_content_branch_being_reached() {
+        // The tree builder takes `charset` first and only falls through to
+        // `content` if there is none, so this is not a trap and must come out
+        // byte for byte. A workaround that rewrote it anyway would be changing
+        // a document for no reason at all.
+        let doc = parse("<meta charset=utf-8 http-equiv=content-type content=charset>");
+        let meta = doc.find_element("meta").expect("meta");
+        let element = doc.element(meta).expect("meta is an element");
+        assert_eq!(element.attr("content"), Some("charset"));
+    }
+
+    #[test]
+    fn an_ordinary_meta_charset_is_left_alone() {
+        // The workaround must not touch a well-formed page, which is nearly
+        // all of them. `content` comes back byte for byte.
+        let doc = parse(r#"<meta http-equiv="Content-Type" content="text/html; charset=utf-8">"#);
+        let meta = doc.find_element("meta").expect("meta");
+        let element = doc.element(meta).expect("meta is an element");
+        assert_eq!(element.attr("content"), Some("text/html; charset=utf-8"));
     }
 
     #[test]
