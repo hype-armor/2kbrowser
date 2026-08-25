@@ -254,6 +254,15 @@ on the way past — `catch_unwind` would have been useless, because the release
 profile aborts rather than unwinds. All five are fixed, and each has a
 regression test where the bug was rather than where it surfaced.
 
+Two things the long soak found that were not bugs in the browser at all. The
+image target had been mutating two PNGs, so the GIF and JPEG decoders had never
+been handed a byte — a clean run over a decoder nothing reaches is not evidence
+about that decoder, and the corpus now has one of each. And the harness was
+reporting slow renders that could not be reproduced from the bytes it recorded:
+it kept one font cache across millions of unrelated documents, which saturates
+and then caches nothing, while a real renderer holds one page per process. Each
+input is now measured against a fresh page's cache.
+
 A hang is a finding too, and for a while it was the one kind the fuzzer could
 not report: it times an input once it returns, and an input that never returns
 is never timed — the harness hung along with it. A watchdog thread now names the

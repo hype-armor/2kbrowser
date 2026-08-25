@@ -497,6 +497,45 @@ hole, and it comes from long unbroken runs of characters inside nested tables
 being re-measured once per table level. Not a denial of service on the evidence
 so far, and not scheduled.
 
+**And the fuzzer was measuring that badly.** The first long render soak reported
+an input at 6.1 seconds against a 3.3 second threshold, reproducibly, with
+nothing else on the machine. The recorded file rendered in 21 milliseconds.
+
+`FontStore` memoises shaped segments, `MAX_SHAPED` caps that map at 8192, and
+when it fills it stops inserting rather than evicting — reasoned about in its
+own comment as being "within one page's life", which the architecture enforces:
+`sandbox::child::serve` holds one page per process and the child is killed when
+the page is replaced. `Session` holds one store for a whole run. It saturates a
+few hundred inputs in, and everything after that is shaped from nothing — while
+`calibrate` ran at the start, with the cache working. The baseline came from a
+fast store and every measurement from a permanently cold one, so the harness
+was reporting the death of its own cache as a property of whatever document
+happened to be in its hands.
+
+`FontStore::forget_page` now clears the shaped segments before each input,
+keeping the loaded faces, so each one is measured against the store a renderer
+child would actually hand it. The 6.1 seconds becomes 1.5 and the run comes back
+clean.
+
+Worth being blunt about why this mattered more than the number. A slow finding
+that cannot be reproduced from the file it recorded is worse than no finding:
+it puts something in the corpus that looks like a reproduction, and the next
+person renders it in 21 milliseconds and stops trusting the tool. The nightly
+job would have produced these on a schedule.
+
+**The corpus decides what gets fuzzed, and nobody had checked it.** The image
+target mutated the reference fixtures, and the reference fixtures hold two PNGs
+and nothing else — while ADR-0007 takes GIF, JPEG and PNG and `crates/paint`
+builds all three. A dumb mutator cannot invent a container it has never seen, so
+two of the three decoders that meet the open internet had never been handed a
+byte, across every soak ever run. The runs came back clean, which is exactly
+what that looks like from outside.
+
+Measured over 200,000 mutations of the old corpus: 188,205 kept a PNG
+signature, 0 a GIF one, 0 a JPEG one, and 4,425 decoded. With an 8x8 GIF and
+JPEG added to `corpus/image/`: 93,984 PNG, 47,763 GIF, 49,547 JPEG, 22,632
+decoded. The same question is worth asking of every other target's seed list.
+
 **The fuzzer catches a true hang now.** It used to time each input after the
 fact, which means an input that never returns is never timed: the harness hung
 along with it and the only evidence was a process that had stopped printing. A
