@@ -542,6 +542,7 @@ impl Session {
         let mut worst = Duration::ZERO;
         for index in 0..self.genuine {
             let seed = self.corpus[index].clone();
+            self.fonts.forget_page();
             let started = Instant::now();
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_once(self.target, &seed, &mut self.fonts);
@@ -587,6 +588,16 @@ impl Session {
             // watchdog names when an input never returns, which is why the file
             // has to be on disk before the call rather than after it.
             let _ = write_input(&in_flight, &input);
+
+            // Each input gets the store a renderer child would get: the faces
+            // loaded, and nothing remembered from any other page. Without this
+            // the shaping cache saturates a few hundred inputs in and never
+            // evicts, so every later input is measured against a store that
+            // can no longer cache anything — while `calibrate` ran before that
+            // happened. The gap is not small: one recorded document took 5.7s
+            // in a soaked store and 21ms in a fresh one, and the "finding" it
+            // produced could not be reproduced from the file it wrote.
+            self.fonts.forget_page();
 
             let started = Instant::now();
             if let Ok(mut watched) = watched.lock() {
