@@ -402,8 +402,8 @@ the one to move.
 
 Where that stands: the work in this milestone is done. All three platforms
 confine the renderer, each is checked from inside on every push, the parsers are
-fuzzed continuously and a hang is now a finding rather than a hang, and the TLS
-configuration is asserted rather than inherited. What is left is not a task on
+fuzzed — on every `cargo test` and again on a schedule — a hang is now a finding
+rather than a hang, and the TLS configuration is asserted rather than inherited. What is left is not a task on
 this list — **nobody outside this project has read any of it.** The milestone's
 test is whether we would tell a stranger to browse untrusted sites with it, and
 the honest answer stays no while we are the only people who have looked. That is
@@ -444,6 +444,51 @@ The check now sits at the position actually drawn at, and the sum that overflows
 — `x + width` — is checked rather than assumed. Found by mutating the fixture
 written for the first three.
 
+**"Continuous" was a word, not a fact, and that is what actually got fixed.**
+The harness was here and good. `cargo test` ran `tests/soak.rs`, which says in
+its own header that it is a fixed-seed regression pass and that catching *new*
+bugs is the long soak's job. Nothing ran the long soak. `ci.yml` had no
+`schedule:` trigger and no fuzz step, so the run that discovers something had
+never happened anywhere except on somebody's laptop, by hand, when they
+remembered. A fuzzer that only ever re-runs the inputs it has already seen is a
+regression test with a fuzzer's name on it.
+
+`.github/workflows/fuzz.yml` runs it now: nightly, Linux only, one runner per
+target, twenty minutes each, seeded from the run id so tonight's inputs are ones
+nobody has tried. It is a second workflow rather than a job in `ci.yml` because
+that file's matrix is event-scoped to keep macOS and Windows off intermediate
+commits, and hanging a nightly trigger on it would fire the whole matrix in the
+small hours — the exact spend those comments exist to prevent. Findings are
+uploaded as an artifact before the runner is destroyed, including the in-flight
+file, which is the only record a hang leaves.
+
+**A fifth panic, and it is in a dependency.** The first proper soak found it in
+about four minutes: `html5ever` 0.39.0's meta-charset scan indexes one past the
+end of a string whose `content` attribute ends in the word `charset`.
+`<meta http-equiv=content-type content=charset>` is forty-five bytes and takes
+the renderer down. It is fixed in upstream's `main` and unreleased — 0.39.0 is
+the newest crate there is — so there was nothing to upgrade to.
+
+The fix is in `crates/dom`, and the reason it is shaped the way it is says
+something about this repository's own constraints. Catching the panic is not an
+option: `[profile.release]` sets `panic = "abort"`, so a `catch_unwind` would
+pass every test and every fuzz run and do nothing at all in the browser people
+run — fixed-looking and unfixed, which is worse than the bug. Pinning
+`[patch.crates.io]` at upstream's `main` would work and would bring every other
+unreleased change to the parser with it, against reference baselines compared
+byte for byte (ADR-0005). So instead the tokenizer and the tree builder are
+assembled by hand with one `TokenSink` between them, which is where the value
+that would run the cursor off the end gets an `=` appended — the scan then stops
+where the spec's step 4 intends and returns "no encoding found", which is
+exactly what the fixed upstream returns. `crates/dom/src/meta_charset.rs` says
+what to delete when 0.40 lands.
+
+Worth naming plainly: this is the first bug found by fuzzing here that was not
+ours. The mutator reached it from the reference fixtures' own
+`<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">` by
+turning one `=` into a `"`. A one-byte typo away from a real page, sitting in a
+dependency, for however long it takes upstream to cut a release.
+
 **Known and not fixed: layout is slow on pathological input.** The fuzzer's
 worst render is about 11x the slowest real fixture — a 9 KB document at 99 ms
 in release, against a few ms for a normal page of that size. It is linear
@@ -451,6 +496,45 @@ rather than quadratic, so it is a poor constant rather than an algorithmic
 hole, and it comes from long unbroken runs of characters inside nested tables
 being re-measured once per table level. Not a denial of service on the evidence
 so far, and not scheduled.
+
+**And the fuzzer was measuring that badly.** The first long render soak reported
+an input at 6.1 seconds against a 3.3 second threshold, reproducibly, with
+nothing else on the machine. The recorded file rendered in 21 milliseconds.
+
+`FontStore` memoises shaped segments, `MAX_SHAPED` caps that map at 8192, and
+when it fills it stops inserting rather than evicting — reasoned about in its
+own comment as being "within one page's life", which the architecture enforces:
+`sandbox::child::serve` holds one page per process and the child is killed when
+the page is replaced. `Session` holds one store for a whole run. It saturates a
+few hundred inputs in, and everything after that is shaped from nothing — while
+`calibrate` ran at the start, with the cache working. The baseline came from a
+fast store and every measurement from a permanently cold one, so the harness
+was reporting the death of its own cache as a property of whatever document
+happened to be in its hands.
+
+`FontStore::forget_page` now clears the shaped segments before each input,
+keeping the loaded faces, so each one is measured against the store a renderer
+child would actually hand it. The 6.1 seconds becomes 1.5 and the run comes back
+clean.
+
+Worth being blunt about why this mattered more than the number. A slow finding
+that cannot be reproduced from the file it recorded is worse than no finding:
+it puts something in the corpus that looks like a reproduction, and the next
+person renders it in 21 milliseconds and stops trusting the tool. The nightly
+job would have produced these on a schedule.
+
+**The corpus decides what gets fuzzed, and nobody had checked it.** The image
+target mutated the reference fixtures, and the reference fixtures hold two PNGs
+and nothing else — while ADR-0007 takes GIF, JPEG and PNG and `crates/paint`
+builds all three. A dumb mutator cannot invent a container it has never seen, so
+two of the three decoders that meet the open internet had never been handed a
+byte, across every soak ever run. The runs came back clean, which is exactly
+what that looks like from outside.
+
+Measured over 200,000 mutations of the old corpus: 188,205 kept a PNG
+signature, 0 a GIF one, 0 a JPEG one, and 4,425 decoded. With an 8x8 GIF and
+JPEG added to `corpus/image/`: 93,984 PNG, 47,763 GIF, 49,547 JPEG, 22,632
+decoded. The same question is worth asking of every other target's seed list.
 
 **The fuzzer catches a true hang now.** It used to time each input after the
 fact, which means an input that never returns is never timed: the harness hung
@@ -794,10 +878,20 @@ text stack lands rather than at the start of the milestone.
 ## 10. Immediate next step
 
 M4, hardening. The browser is now usable enough that the honest next question is
-whether it is safe to point at something you did not write, and the answer is
-no: there is no sandbox, the parsers have never been fuzzed, and the TLS
-configuration has not been reviewed. Issue #3 blocks part of it; nothing else
-in §9 does.
+whether it is safe to point at something you did not write.
+
+This section used to answer that with "no: there is no sandbox, the parsers have
+never been fuzzed, and the TLS configuration has not been reviewed", and it went
+on saying so for the whole of M4. All three had stopped being true. The renderer
+is confined on all three platforms (ADR-0012, ADR-0016, ADR-0017), the parsers
+are fuzzed — by `tests/fuzz`, on every `cargo test` and again every night — and
+the TLS configuration is asserted rather than inherited (ADR-0013). A plan that
+describes the repository it was written against rather than the one on disk is
+worse than no plan, because it is read as if it were current.
+
+What is actually left is the sentence at the end of §5's M4 entry: nobody
+outside this project has read any of it. Issue #3 is resolved. Nothing in §9
+blocks the milestone.
 
 ### What the CSS 2.1 test suite says
 

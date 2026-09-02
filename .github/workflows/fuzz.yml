@@ -1,0 +1,225 @@
+name: Nightly fuzz
+
+# `tests/fuzz` has been a real fuzzer for a while and nothing ever ran it for
+# longer than a few seconds. `cargo test` runs `tests/soak.rs`, which says in
+# its own header that it is a fixed-seed regression test and that catching *new*
+# bugs is somebody else's job — and nobody was doing that job. This is that job.
+#
+# # Why a second workflow rather than a job in `ci.yml`
+#
+# Read the comments at the top of `ci.yml` before changing either file; that one
+# is shaped by its bill. Two of its decisions make a fuzz job a bad fit there.
+#
+# Its matrix is event-scoped: a `pull_request` or a push to `main` fans out to
+# macOS and Windows, which bill at 10x and 2x. Adding `schedule:` to that `on:`
+# block fires the whole thing nightly — the exact spend those comments exist to
+# avoid — unless both existing jobs grow an `if:` guard against an event they
+# have nothing to do with.
+#
+# And its concurrency group cancels in-progress runs per ref. A scheduled run's
+# ref is `refs/heads/main`, which is the one ref exempted, so today it would
+# survive; but that exemption is about not losing a measurement of a shippable
+# commit, and resting an hour-long soak on it is resting it on a rule written
+# for something else. A soak that has been running for fifty minutes is the most
+# valuable thing on the machine and must not be cancellable by a push.
+on:
+  schedule:
+    # 04:17 UTC nightly. Off the hour on purpose: GitHub queues scheduled
+    # workflows platform-wide and the top of the hour is where everybody else
+    # put theirs, so a job asking for six runners waits behind them.
+    #
+    # GitHub disables scheduled workflows in a repository with no activity for
+    # 60 days. If this stops running, that is the first thing to check.
+    - cron: "17 4 * * *"
+  # So a soak can be started deliberately — after a change to a parser, or to
+  # chase a finding with a longer budget — rather than waiting for the small
+  # hours to find out.
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Wall-clock budget per target, in minutes (capped at 30)"
+        default: "20"
+      seed:
+        description: "Starting seed (blank: derived from the run id)"
+        default: ""
+
+# One soak at a time, and never cancelled. A run part-way through its budget has
+# already bought most of what it is going to find; ending it to start an
+# identical one is throwing that away.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+  # The two halves of the same decision, kept next to each other because
+  # raising one without the other is how a soak gets killed by its own runner.
+  # `JOB_TIMEOUT` is the backstop the runner enforces; `MAX_MINUTES` is the
+  # largest budget the fuzzer will accept, and has to leave room for the build
+  # and for a target whose last input started just before the deadline.
+  JOB_TIMEOUT: 45
+  MAX_MINUTES: 30
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Linux only, and not because the other platforms do not matter — ADR-0005
+  # says they do, and `ci.yml` checks all four on anything mergeable. What is
+  # being looked for here is a panic in a parser, and a parser that panics on
+  # these bytes panics on all four: the code under test is portable Rust with no
+  # `unsafe` in it (ADR-0002) and no platform branches on the paths a mutated
+  # document reaches. Paying macOS's 10x for a second opinion on the same
+  # arithmetic would buy nothing. Standard Linux runners are free on a public
+  # repository, which is what makes six of them nightly reasonable at all.
+  #
+  # One runner per target rather than six targets on one, for three reasons.
+  # Each gets a whole machine, so the budget buys iterations instead of context
+  # switches. A crash in `html` does not cut short the `render` soak that had
+  # forty minutes left. And the findings arrive as six separately named
+  # artifacts rather than one pile.
+  soak:
+    name: soak (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # A backstop, not the budget. The fuzzer stops itself (`--minutes`); this
+    # only catches the case where it cannot — and it is set well clear of the
+    # budget so that tripping it means something is actually wrong rather than
+    # that the runner was slow. See `JOB_TIMEOUT` above, which is the same
+    # number where the clamp can read it.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [html, css, image, url, render, wire]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        id: toolchain
+        run: |
+          rustc --version && cargo --version
+          echo "id=$(rustc --version | tr -c '[:alnum:]' '-')" >> "$GITHUB_OUTPUT"
+
+      # Restore only. `ci.yml` owns this cache; a nightly job that also saved
+      # would write six entries a night under keys the daytime jobs read,
+      # pushing the ones they actually want out of a 10 GB allowance. Missing it
+      # entirely costs this job a few minutes of compiling and nothing else.
+      - name: Restore dependency cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.toolchain.outputs.id }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ steps.toolchain.outputs.id }}-
+
+      # The default profile, deliberately, and this is the one thing in this
+      # file that is easy to get wrong. The release profile sets
+      # `panic = "abort"` (see the root `Cargo.toml`), and an abort cannot be
+      # caught — the run would end at the first crash instead of recording it
+      # and carrying on, so a night that could have found four bugs finds one.
+      # It is slower. That is the trade, and it is the right way round.
+      - name: Build the fuzzer
+        run: cargo build -p fuzz
+
+      - name: Soak
+        run: |
+          set -o pipefail
+
+          # A fixed seed would feed the same inputs every night, and a nightly
+          # job that re-runs last night's inputs discovers nothing after the
+          # first night — it becomes `tests/soak.rs` on a timer. The run id is
+          # unique and monotonic, and it is printed in the output below, so
+          # tonight's inputs are new and any night's are reproducible by name.
+          seed='${{ inputs.seed }}'
+          if [ -z "$seed" ]; then
+            seed=$(( ${{ github.run_id }} + ${{ github.run_attempt }} ))
+          fi
+          # Clamped against the job's own `timeout-minutes`. Dispatching a
+          # budget larger than the backstop is the one way to get back exactly
+          # the failure the budget exists to prevent: the runner kills the job
+          # part way through, prints nothing, and destroys the workspace the
+          # finding was written to. Refusing outright would be worse than
+          # trimming — somebody asking for a longer soak should get the longest
+          # one available, and be told that is what happened.
+          minutes='${{ inputs.minutes || 20 }}'
+          if [ "$minutes" -gt "$MAX_MINUTES" ]; then
+            echo "::warning title=Budget clamped::asked for ${minutes}m, running ${MAX_MINUTES}m — the job times out at ${{ env.JOB_TIMEOUT }}m. Raise timeout-minutes and MAX_MINUTES together to go longer."
+            minutes="$MAX_MINUTES"
+          fi
+
+          {
+            echo "### ${{ matrix.target }}"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          status=0
+          cargo run -q -p fuzz -- \
+            --target '${{ matrix.target }}' \
+            --seed "$seed" \
+            --minutes "$minutes" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+
+          {
+            echo '```'
+            echo
+            echo "Reproduce with:"
+            echo
+            echo '```'
+            echo "cargo run -p fuzz -- --target ${{ matrix.target }} --seed $seed --minutes $minutes"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 3 is the watchdog: an input stopped coming back and the harness
+          # ended the process rather than hanging with it. Named separately
+          # because the two need different responses — findings are on disk and
+          # the run finished, against a run that did not finish and whose
+          # remaining budget was never spent.
+          artifact="fuzz-findings-${{ matrix.target }}"
+          if [ "$status" -eq 3 ]; then
+            echo "::error title=Hang in ${{ matrix.target }}::an input never returned; its bytes are in the $artifact artifact, as in-flight.bin"
+          elif [ "$status" -ne 0 ]; then
+            echo "::error title=Findings in ${{ matrix.target }}::the inputs are in the $artifact artifact"
+          fi
+          exit "$status"
+
+      # The whole point of running this on a schedule. A soak that finds a
+      # crasher at four in the morning and then deletes the runner is worse than
+      # no soak at all: it has spent the machine, told nobody what it found, and
+      # left a red X that cannot be acted on.
+      #
+      # `always()`, not `failure()`, and three patterns rather than one:
+      #
+      #   crash-*.bin      an input that panicked
+      #   slow-*.bin       an input past the slow threshold, which is a finding
+      #                    the run records and continues from
+      #   in-flight.bin    whatever the loop was holding when it stopped. This is
+      #                    the only record of a hang — the watchdog ends the
+      #                    process, so there is no chance to write anything after
+      #                    the fact, which is why the harness writes each input
+      #                    before running it.
+      #
+      # `in-flight.bin` is a duplicate of a recorded crasher on a clean exit and
+      # noise on a cancellation, which is why `corpus/.gitignore` excludes it
+      # from the repository. It is still worth uploading: on the one run where
+      # it is the finding, it is the whole finding.
+      - name: Keep what it found
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings-${{ matrix.target }}
+          path: |
+            tests/fuzz/corpus/${{ matrix.target }}/crash-*.bin
+            tests/fuzz/corpus/${{ matrix.target }}/slow-*.bin
+            tests/fuzz/corpus/${{ matrix.target }}/in-flight.bin
+          if-no-files-found: ignore
+          # Longer than the 90-day default. A crasher found on a Friday night
+          # may wait out a holiday before anyone reads it, and the artifact is a
+          # few kilobytes.
+          retention-days: 180

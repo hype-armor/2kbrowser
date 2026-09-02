@@ -374,6 +374,30 @@ impl FontStore {
         }
     }
 
+    /// Forgets every shaped segment, keeping the loaded faces.
+    ///
+    /// For a caller that renders unrelated documents through one store, which
+    /// in this project means `tests/fuzz` and nothing else. The browser does
+    /// not need it: a renderer child holds exactly one page and is killed when
+    /// that page is replaced (see `sandbox::child::serve`), which is why
+    /// [`MAX_SHAPED`] can reason about a ceiling "within one page's life" and
+    /// refuse to evict.
+    ///
+    /// A harness that keeps one store for millions of documents breaks that
+    /// assumption in the way that matters most to it. The cache saturates a few
+    /// hundred documents in; from then on nothing new is ever cached, so every
+    /// later document is shaped from nothing — while the baseline it is being
+    /// compared against was measured before saturation. That is not a slow
+    /// document, it is a slow *store*, and it made the fuzzer report a finding
+    /// that could not be reproduced from the bytes it recorded.
+    ///
+    /// Faces are kept deliberately. Building the bundled database is the one
+    /// cost a real child does pay at startup, and paying it per input would
+    /// make the render target dramatically slower to no purpose.
+    pub fn forget_page(&mut self) {
+        self.shaped.clear();
+    }
+
     /// Number of loaded faces. Twelve for the M1 bundle.
     pub fn face_count(&self) -> usize {
         self.system.db().len()
@@ -1157,6 +1181,60 @@ mod tests {
                 "style {index} was handed a segment shaped for another one"
             );
         }
+    }
+
+    #[test]
+    fn forgetting_a_page_changes_the_speed_and_not_the_glyphs() {
+        // `forget_page` exists so `tests/fuzz` can measure each input against
+        // the store a renderer child would hand it. It must be a pure
+        // memoisation reset: the same text, shaped before and after, has to
+        // come out identical, or it would move the reference baselines
+        // (ADR-0005) rather than just the clock.
+        let text = "the quick brown fox";
+        let style = style(16.0);
+
+        let mut store = FontStore::new();
+        let faces = store.face_count();
+        let before = store.shape_segment(text, &style);
+
+        store.forget_page();
+
+        assert_eq!(
+            store.face_count(),
+            faces,
+            "the faces went with the cache; only the shaping is meant to"
+        );
+        assert_eq!(
+            visible(&before),
+            visible(&store.shape_segment(text, &style)),
+            "the same text shaped differently after the cache was cleared"
+        );
+    }
+
+    #[test]
+    fn a_saturated_cache_is_what_forgetting_is_for() {
+        // The mechanism behind a fuzzer finding that could not be reproduced.
+        // `MAX_SHAPED` stops inserting rather than evicting, on the stated
+        // grounds that a store lives one page — so a caller that runs unrelated
+        // documents through one store fills it and then caches nothing at all,
+        // for the rest of its life. Filling it here and clearing it proves the
+        // way out exists.
+        let mut store = FontStore::new();
+        for n in 0..(MAX_SHAPED + 64) {
+            let _ = store.shape_segment(&format!("segment number {n}"), &style(16.0));
+        }
+        // Saturated: a segment never seen before cannot get in.
+        assert_eq!(store.shaped.len(), MAX_SHAPED);
+        let _ = store.shape_segment("a stranger", &style(16.0));
+        assert_eq!(store.shaped.len(), MAX_SHAPED, "it evicted after all");
+
+        store.forget_page();
+        assert!(
+            store.shaped.is_empty(),
+            "the cache survived being forgotten"
+        );
+        let _ = store.shape_segment("a stranger", &style(16.0));
+        assert_eq!(store.shaped.len(), 1, "it still cannot cache anything");
     }
 
     #[test]

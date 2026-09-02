@@ -7,6 +7,7 @@
 //! ```text
 //! cargo run -p fuzz                                     # every target, 5000 each
 //! cargo run -p fuzz -- --target render --iterations 1e6 # one target, hard
+//! cargo run -p fuzz -- --target css --minutes 20        # one target, for a while
 //! cargo run -p fuzz -- --seed 0x1234 --iterations 100   # reproduce a finding
 //! ```
 //!
@@ -15,6 +16,7 @@
 //! crasher is still written to disk, but the run ends at the first one.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use fuzz::{Session, Target};
 
@@ -50,11 +52,17 @@ fn main() -> ExitCode {
     let mut failed = false;
     for target in settings.targets {
         let mut session = Session::new(target);
+        if let Some(budget) = settings.budget {
+            session.stop_after(budget);
+        }
         println!(
-            "{:<8} {} seed(s), {} iteration(s), seed {:#018x}",
+            "{:<8} {} seed(s), {}, seed {:#018x}",
             target.name(),
             session.corpus_len(),
-            settings.iterations,
+            match settings.budget {
+                Some(budget) => format!("{} minute(s)", budget.as_secs() / 60),
+                None => format!("{} iteration(s)", settings.iterations),
+            },
             settings.seed
         );
         let report = session.run(settings.seed, settings.iterations);
@@ -85,11 +93,12 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "\
-usage: cargo run -p fuzz -- [--target NAME] [--seed N] [--iterations N]
+usage: cargo run -p fuzz -- [--target NAME] [--seed N] [--iterations N] [--minutes N]
 
-    --target NAME      html, css, image, url, render (default: all)
+    --target NAME      html, css, image, url, render, wire (default: all)
     --seed N           starting seed; decimal or 0x-prefixed (default: 1)
     --iterations N     inputs per target (default: 5000)
+    --minutes N        wall-clock budget per target; ends the run early
 
 Findings are written to tests/fuzz/corpus/<target>/ and are picked up as seeds
 by later runs, so a fixed bug stays fixed.";
@@ -102,6 +111,8 @@ struct Settings {
     targets: Vec<Target>,
     seed: u64,
     iterations: usize,
+    /// Wall-clock limit per target, from `--minutes`.
+    budget: Option<Duration>,
 }
 
 impl Settings {
@@ -110,7 +121,11 @@ impl Settings {
             targets: Target::ALL.to_vec(),
             seed: 1,
             iterations: 5000,
+            budget: None,
         };
+        // Whether the count came from the command line or from the default
+        // above, which decides what `--minutes` on its own means. See below.
+        let mut counted = false;
         let mut rest = args.iter();
         while let Some(flag) = rest.next() {
             let value = || {
@@ -133,10 +148,28 @@ impl Settings {
                 }
                 "--iterations" => {
                     settings.iterations = parse_number(value()?)? as usize;
+                    counted = true;
+                    rest.next();
+                }
+                "--minutes" => {
+                    let minutes = parse_number(value()?)?;
+                    // Saturating rather than checked: a number of minutes large
+                    // enough to overflow seconds is a deadline nothing reaches
+                    // either way, and refusing it would be an error message
+                    // about arithmetic in place of a run.
+                    settings.budget = Some(Duration::from_secs(minutes.saturating_mul(60)));
                     rest.next();
                 }
                 other => return Err(format!("unknown argument `{other}`")),
             }
+        }
+        // `--minutes` alone means "fuzz until the clock says stop". Leaving the
+        // default count in place would end the run after 5000 inputs — a second
+        // or two — and report a clean pass, which is the shape of failure this
+        // harness exists to avoid. An explicit `--iterations` still wins as a
+        // ceiling: asking for both means whichever comes first.
+        if settings.budget.is_some() && !counted {
+            settings.iterations = usize::MAX;
         }
         Ok(settings)
     }
@@ -195,6 +228,34 @@ mod tests {
         assert!(settings(&["--iteration", "10"]).is_err());
         assert!(settings(&["--seed"]).is_err());
         assert!(settings(&["--seed", "twelve"]).is_err());
+    }
+
+    #[test]
+    fn a_budget_on_its_own_lifts_the_iteration_ceiling() {
+        // The nightly job passes `--minutes` and no count. If the default 5000
+        // survived that, the soak would finish in a second and report a clean
+        // pass having tested almost nothing.
+        let parsed = settings(&["--minutes", "20"]).expect("parses");
+        assert_eq!(parsed.budget, Some(Duration::from_secs(1200)));
+        assert_eq!(parsed.iterations, usize::MAX);
+    }
+
+    #[test]
+    fn an_explicit_count_survives_a_budget() {
+        // Both given means whichever comes first, so reproducing a finding with
+        // a count under a budget still runs exactly that count.
+        let parsed = settings(&["--minutes", "5", "--iterations", "100"]).expect("parses");
+        assert_eq!(parsed.iterations, 100);
+        assert!(parsed.budget.is_some());
+
+        // Order must not matter.
+        let parsed = settings(&["--iterations", "100", "--minutes", "5"]).expect("parses");
+        assert_eq!(parsed.iterations, 100);
+    }
+
+    #[test]
+    fn without_a_budget_there_is_no_deadline() {
+        assert_eq!(settings(&[]).expect("parses").budget, None);
     }
 
     #[test]
