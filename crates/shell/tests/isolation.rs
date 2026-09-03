@@ -507,7 +507,9 @@ fn over_http(port: u16, html: &str) -> shell::viewport::Viewport {
 /// arrived and was applied rather than merely asked for.
 fn green_in(pixels: &[u8]) -> usize {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
         .count()
 }
@@ -784,7 +786,9 @@ fn a_batch_of_images_lands_on_the_elements_that_asked_for_them() {
     let row_of = |wanted: (u8, u8)| -> Option<u32> {
         let width = page.width() as usize;
         page.pixels()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .find(|(_, pixel)| {
                 pixel[0] as i32 - i32::from(wanted.0) == 0 && pixel[1] == wanted.1 && pixel[2] == 0
@@ -952,7 +956,9 @@ fn a_subresource_keeps_the_charset_its_own_header_declared() {
 
     let green = page
         .pixels()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
         .count();
     assert!(

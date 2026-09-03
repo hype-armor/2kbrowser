@@ -1150,7 +1150,9 @@ mod tests {
     fn green_pixels(page: &Page) -> usize {
         page.pixmap
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
             .count()
     }
@@ -1216,7 +1218,9 @@ mod tests {
                 let start = (*row * page.pixmap.width() * 4) as usize;
                 let end = start + (page.pixmap.width() * 4) as usize;
                 page.pixmap.data()[start..end]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
             })
             .count();
@@ -1285,7 +1289,7 @@ mod tests {
     fn ink_columns(page: &Page) -> (u32, u32) {
         let width = page.pixmap.width();
         let mut span: Option<(u32, u32)> = None;
-        for (index, pixel) in page.pixmap.data().chunks_exact(4).enumerate() {
+        for (index, pixel) in page.pixmap.data().as_chunks::<4>().0.iter().enumerate() {
             // Anything that is not the blank canvas. Every fixture below is
             // black text on white, so "not white" is exactly "content".
             if pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 {
