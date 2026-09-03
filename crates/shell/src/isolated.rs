@@ -735,7 +735,9 @@ mod tests {
         // body green, which nothing else in this page does.
         let green = page
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 80 && p[1] > 150 && p[2] < 80)
             .count();
         assert!(green > 0, "the imported stylesheet did not reach the paint");
