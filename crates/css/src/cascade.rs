@@ -8,8 +8,9 @@ use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
     DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
-    parse_border_style, parse_clear, parse_display, parse_float, parse_list_style_type,
-    parse_overflow, parse_position, parse_text_decoration, parse_vertical_align,
+    parse_border_collapse, parse_border_style, parse_clear, parse_display, parse_float,
+    parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
+    parse_vertical_align,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -463,6 +464,16 @@ fn apply(
         "border-spacing" => {
             if let Some(length) = parse_length(first) {
                 style.border_spacing = length;
+            }
+        }
+        // Ahead of the `border-*` longhand fallback at the bottom of this
+        // match, which would otherwise hand `collapse` to the code that parses
+        // edge names and get nothing for it.
+        "border-collapse" => {
+            if let Raw::Ident(name) = first
+                && let Some(collapse) = parse_border_collapse(name)
+            {
+                style.border_collapse = collapse;
             }
         }
         "white-space" => {
@@ -1047,7 +1058,7 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
 mod tests {
     use super::*;
     use crate::style::{
-        BackgroundPosition, BackgroundRepeat, Display, ListStyleType, VerticalAlign,
+        BackgroundPosition, BackgroundRepeat, BorderCollapse, Display, ListStyleType, VerticalAlign,
     };
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
@@ -1867,6 +1878,65 @@ mod tests {
 
         let default = standards_style_of("<table><tr><td>x</td></tr></table>", "", "table");
         assert_eq!(default.border_spacing, Length::Px(2.0));
+    }
+
+    #[test]
+    fn border_collapse_parses_and_reaches_the_cells() {
+        // Inherited, and that is the whole reason it works: the property is
+        // written on the table and every cell has to agree with it about where
+        // its borders are. A cell reading the initial value while its table
+        // read `collapse` would lay out against a grid nobody drew.
+        let doc = dom::parse("<table><tr><td>x</td></tr></table>");
+        let sheets = [Stylesheet::parse("table { border-collapse: collapse }")];
+        let styles = cascade(&doc, &sheets);
+        let of = |tag: &str| {
+            styles
+                .get(doc.find_element(tag).expect("an element"))
+                .expect("a styled element")
+                .border_collapse
+        };
+        assert_eq!(of("table"), BorderCollapse::Collapse);
+        assert_eq!(of("td"), BorderCollapse::Collapse, "did not inherit");
+
+        // The initial value, and the one the whole engine rendered as before
+        // this property existed.
+        let plain = cascade(&doc, &[]);
+        assert_eq!(
+            plain
+                .get(doc.find_element("table").expect("table"))
+                .expect("a styled table")
+                .border_collapse,
+            BorderCollapse::Separate
+        );
+    }
+
+    #[test]
+    fn border_collapse_is_not_read_as_a_border_edge() {
+        // `border-collapse` shares its prefix with `border-top` and the rest,
+        // and the longhand fallback at the bottom of `apply` will take anything
+        // starting `border-`. An arm that arrived after it would silently do
+        // nothing, which is the failure this guards: the property would parse,
+        // cascade, and have no effect.
+        let style = standards_style_of(
+            "<table><tr><td>x</td></tr></table>",
+            "table { border-collapse: collapse }",
+            "table",
+        );
+        assert_eq!(style.border_collapse, BorderCollapse::Collapse);
+        assert_eq!(
+            style.border,
+            Borders::default(),
+            "`collapse` was read as a border edge"
+        );
+
+        // A value the property does not take leaves it alone rather than
+        // half-applying, as an invalid declaration must.
+        let nonsense = standards_style_of(
+            "<table><tr><td>x</td></tr></table>",
+            "table { border-collapse: sideways }",
+            "table",
+        );
+        assert_eq!(nonsense.border_collapse, BorderCollapse::Separate);
     }
 
     #[test]

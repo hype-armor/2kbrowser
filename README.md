@@ -52,8 +52,11 @@ shaped against bundled Liberation faces, and rasterised on the CPU.
 
 Working: the cascade with selectors, specificity, and inheritance; the box
 model with borders and backgrounds; inline layout with per-span styles and
-Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`, and
-`cellspacing`; images,
+Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`,
+`cellspacing`, and **both border models** — including
+`border-collapse: collapse`, where adjoining borders resolve into one line
+centred on the grid line between them, which is what a Wikipedia infobox or
+wikitable is built out of; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
@@ -79,13 +82,18 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **1385 of 4821 reference tests pass,
-28.7%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **1451 of 4821 reference tests pass,
+30.1%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way — but the
 failures are largely real: on a random sample of 150 of them, headless Chromium
 renders 140 identically. `cargo run --profile conformance -p conformance` does
 it; the suite is not vendored.
+
+The figure moves in small amounts and is worth reading that way. Collapsed
+borders were worth **eight** tests, seven of them named for the thing they
+test — and a rise of eight is the weakest evidence in this file, which is why
+the reference tests below carry committed baselines instead.
 
 The first run of that reported 20.6%, and the number was wrong three times over
 before it was worth anything — see PLAN.md, because the harness's own bugs are
@@ -95,7 +103,11 @@ Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
 not clipped; an invalid selector does not invalidate its rule, so
 `[1digit], div { color: red }` styles the `div` where a browser would style
-nothing; collapsed borders; fixed
+nothing; `empty-cells`, which is parsed by nobody here and so is ignored in the
+separated model where it applies — it is correctly ignored in the collapsing
+one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
+CSS 2.1 leaves undefined and which this engine settles by giving the corner to
+the wider of them rather than mitring it diagonally as browsers do; fixed
 table layout; and `inline-block`,
 which is recognised and then laid out as though it were plain `inline` — an
 empty one with a width and a height collapses to nothing at all. That last one

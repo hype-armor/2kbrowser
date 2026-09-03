@@ -12,7 +12,8 @@ pub mod table;
 
 use css::cascade::StyleMap;
 use css::style::{
-    ComputedStyle, Display, Float, Overflow, Position, TextAlign, VerticalAlign, WhiteSpace,
+    BorderCollapse, ComputedStyle, Display, Float, Overflow, Position, TextAlign, VerticalAlign,
+    WhiteSpace,
 };
 use css::value::Length;
 use dom::{Document, NodeId};
@@ -843,9 +844,11 @@ fn subtree_widths(
         return (width + surround, width + surround);
     }
 
+    // Already an outer width: a collapsing table's surround is half of its
+    // outermost grid lines rather than the border it declared, and only
+    // `table_widths` has resolved them.
     if style.display == Display::Table {
-        let (min, max) = table_widths(doc, styles, fonts, node, style, intrinsic, available, depth);
-        return (min + surround, max + surround);
+        return table_widths(doc, styles, fonts, node, style, intrinsic, available, depth);
     }
 
     // The box's own inline content, then every block child, whichever is
@@ -888,7 +891,12 @@ fn subtree_widths(
     (min + surround, max.max(min) + surround)
 }
 
-/// Intrinsic widths of a table's content box, summed across its columns.
+/// Intrinsic widths of a table's *border box*, summed across its columns.
+///
+/// Outer rather than content widths because the two border models surround a
+/// table differently — `border-spacing` and a declared border in one, half of
+/// the outermost grid lines and no padding at all in the other — and only this
+/// function has resolved which.
 #[expect(
     clippy::too_many_arguments,
     reason = "layout context, threaded explicitly for clarity"
@@ -903,27 +911,57 @@ fn table_widths(
     available: f32,
     depth: usize,
 ) -> (f32, f32) {
-    let grid = table::build_grid(doc, styles, node);
+    // Measured the same way it will be laid out: in the collapsing model a
+    // cell's used borders are halves of the grid lines rather than what it
+    // declared, and measuring it against the declared ones sizes the columns
+    // for a table that is never drawn.
+    let collapsed = (style.border_collapse == BorderCollapse::Collapse)
+        .then(|| table::collapse_borders(doc, styles, node, style));
+    let owned_grid;
+    let grid = match &collapsed {
+        Some(collapsed) => &collapsed.grid,
+        None => {
+            owned_grid = table::build_grid(doc, styles, node);
+            &owned_grid
+        }
+    };
     if grid.columns == 0 {
         return (0.0, 0.0);
     }
-    let spacing = style
-        .border_spacing
-        .to_px(style.font_size, available)
-        .max(0.0);
+    // No gap between cells in the collapsing model: they share their borders.
+    let spacing = if collapsed.is_some() {
+        0.0
+    } else {
+        style
+            .border_spacing
+            .to_px(style.font_size, available)
+            .max(0.0)
+    };
 
     let mut mins = vec![0.0f32; grid.columns];
     let mut maxes = vec![0.0f32; grid.columns];
     let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
 
-    for row in &grid.rows {
+    let rows = grid.rows.len();
+    for (index, row) in grid.rows.iter().enumerate() {
         for cell in &row.cells {
+            let cell_style = match &collapsed {
+                Some(collapsed) => table::with_reserved_borders(
+                    &cell.style,
+                    collapsed.reserved(
+                        (index, (index + cell.rowspan).min(rows)),
+                        (cell.column, (cell.column + cell.colspan).min(grid.columns)),
+                    ),
+                    false,
+                ),
+                None => cell.style.clone(),
+            };
             let (min, max) = subtree_widths(
                 doc,
                 styles,
                 fonts,
                 cell.node,
-                &cell.style,
+                &cell_style,
                 intrinsic,
                 available,
                 depth + 1,
@@ -945,10 +983,25 @@ fn table_widths(
         table::apply_span(&mut maxes, column, colspan, max, spacing);
     }
 
-    let gaps = spacing * (grid.columns + 1) as f32;
+    // What the table costs beyond its columns. In the separated model that is
+    // `border-spacing` once per column boundary and once outside each end, plus
+    // the table's own padding and border. In the collapsing model it is half of
+    // each outermost grid line and nothing else — the table has no padding
+    // there (§17.6.2), and its declared border was already spent on the
+    // conflict the grid lines resolved.
+    let surround = match &collapsed {
+        Some(collapsed) => collapsed.half_vertical(0) + collapsed.half_vertical(grid.columns),
+        None => {
+            spacing * (grid.columns + 1) as f32
+                + style.padding.left.to_px(style.font_size, available)
+                + style.padding.right.to_px(style.font_size, available)
+                + style.border.left.used_width(style.font_size)
+                + style.border.right.used_width(style.font_size)
+        }
+    };
     (
-        mins.iter().sum::<f32>() + gaps,
-        maxes.iter().sum::<f32>() + gaps,
+        mins.iter().sum::<f32>() + surround,
+        maxes.iter().sum::<f32>() + surround,
     )
 }
 
@@ -1088,6 +1141,30 @@ fn layout_block(
     containing: ContainingBlock,
     parent: &mut LayoutBox,
 ) -> Consumed {
+    // A collapsing table is not a box with a border around a grid; it *is* the
+    // grid, and its own border is the outer half of the outermost grid lines
+    // (§17.6.2). So the borders have to be resolved before anything measures
+    // this box, and the style everything below reads is the rewritten one: half
+    // widths that reserve space and paint nothing, and no padding, which the
+    // collapsing model does not give a table at all.
+    let collapsed = (style.display == Display::Table
+        && style.border_collapse == BorderCollapse::Collapse)
+        .then(|| table::collapse_borders(doc, styles, node, style));
+    let collapsed_style;
+    let style = match &collapsed {
+        Some(collapsed) => {
+            let rows = collapsed.grid.rows.len();
+            let columns = collapsed.grid.columns;
+            collapsed_style = table::with_reserved_borders(
+                style,
+                collapsed.reserved((0, rows), (0, columns)),
+                true,
+            );
+            &collapsed_style
+        }
+        None => style,
+    };
+
     let font_size = style.font_size;
     let mut margin_left = style.margin.left.to_px(font_size, available_width);
     let mut margin_right = style.margin.right.to_px(font_size, available_width);
@@ -1314,6 +1391,7 @@ fn layout_block(
             fonts,
             node,
             style,
+            collapsed.as_ref(),
             intrinsic,
             padding_left + border_left,
             padding_top + border_top,
@@ -1785,22 +1863,59 @@ fn layout_table(
     fonts: &mut FontStore,
     node: NodeId,
     style: &ComputedStyle,
+    collapsed: Option<&table::Collapsed>,
     intrinsic: &IntrinsicSizes,
     x: f32,
     y: f32,
     available_width: f32,
     parent: &mut LayoutBox,
 ) -> (f32, f32) {
-    let grid = table::build_grid(doc, styles, node);
+    // The grid was already built to resolve the borders; building it a second
+    // time would read the same DOM to the same answer.
+    let owned_grid;
+    let grid = match collapsed {
+        Some(collapsed) => &collapsed.grid,
+        None => {
+            owned_grid = table::build_grid(doc, styles, node);
+            &owned_grid
+        }
+    };
     if grid.columns == 0 {
         return (0.0, 0.0);
     }
     // `border-spacing` is the table's own, not a constant: `cellspacing="0"`
     // is how a table used for page layout closed the seams between its cells.
-    let spacing = style
-        .border_spacing
-        .to_px(style.font_size, available_width)
-        .max(0.0);
+    // It does not apply in the collapsing model, where there is no gap for it
+    // to describe — the cells share their borders rather than being separated.
+    let spacing = if collapsed.is_some() {
+        0.0
+    } else {
+        style
+            .border_spacing
+            .to_px(style.font_size, available_width)
+            .max(0.0)
+    };
+
+    // In the collapsing model a cell's used border is half of the grid line it
+    // sits against, whatever it declared — the declared value was spent on
+    // winning (or losing) the conflict. Everything downstream measures and lays
+    // out against this style rather than the cascaded one.
+    let rows = grid.rows.len();
+    let effective = |cell: &table::Cell, row: usize| -> ComputedStyle {
+        match collapsed {
+            Some(collapsed) => table::with_reserved_borders(
+                &cell.style,
+                // Clamped, because a `rowspan` may run off the bottom of the
+                // table and the grid line it would name does not exist.
+                collapsed.reserved(
+                    (row, (row + cell.rowspan).min(rows)),
+                    (cell.column, (cell.column + cell.colspan).min(grid.columns)),
+                ),
+                false,
+            ),
+            None => cell.style.clone(),
+        }
+    };
 
     // Intrinsic widths per column, from the cells that span exactly one.
     let mut mins = vec![0.0f32; grid.columns];
@@ -1808,17 +1923,18 @@ fn layout_table(
     let mut declared = vec![false; grid.columns];
     let mut spans: Vec<(usize, usize, f32, f32)> = Vec::new();
 
-    for row in &grid.rows {
+    for (index, row) in grid.rows.iter().enumerate() {
         for cell in &row.cells {
             // The whole subtree, not just the cell's text: a cell holding a
             // nested table measures as nothing otherwise, and its column
             // collapses to zero width.
+            let cell_style = effective(cell, index);
             let (min, max) = subtree_widths(
                 doc,
                 styles,
                 fonts,
                 cell.node,
-                &cell.style,
+                &cell_style,
                 intrinsic,
                 available_width,
                 0,
@@ -1923,6 +2039,7 @@ fn layout_table(
                 + spacing * cell.column as f32;
 
             // Each cell is an ordinary block in a box of its column's width.
+            let cell_style = effective(cell, index);
             let mut holder = LayoutBox {
                 rect: Rect {
                     x: 0.0,
@@ -1930,7 +2047,7 @@ fn layout_table(
                     width,
                     height: 0.0,
                 },
-                style: cell.style.clone(),
+                style: cell_style.clone(),
                 text: None,
                 content_origin: (0.0, 0.0),
                 content_width: width,
@@ -1945,7 +2062,7 @@ fn layout_table(
                 styles,
                 fonts,
                 cell.node,
-                &cell.style,
+                &cell_style,
                 intrinsic,
                 cell_x,
                 // Placed on the second pass; only the height matters here.
@@ -2005,6 +2122,13 @@ fn layout_table(
     let row_width: f32 =
         widths.iter().sum::<f32>() + spacing * (widths.len().saturating_sub(1)) as f32;
     for (index, row) in grid.rows.iter().enumerate() {
+        // A row's edges are grid lines in the collapsing model, and whatever
+        // border it declared has already been offered to them. Drawing it here
+        // as well would put a second line beside the one it helped decide.
+        let mut row_style = row.style.clone();
+        if collapsed.is_some() {
+            row_style.border = css::style::Borders::default();
+        }
         parent.children.push(LayoutBox {
             rect: Rect {
                 x: x + spacing,
@@ -2012,7 +2136,7 @@ fn layout_table(
                 width: row_width,
                 height: heights[index],
             },
-            style: row.style.clone(),
+            style: row_style,
             text: None,
             content_origin: (0.0, 0.0),
             content_width: row_width,
@@ -2051,10 +2175,152 @@ fn layout_table(
         parent.children.push(cell.box_);
     }
 
+    if let Some(collapsed) = collapsed {
+        // Last, so the borders draw over the cells and rows whose halves of
+        // them were only ever reserved space.
+        emit_collapsed_borders(collapsed, x, y, &widths, &heights, parent);
+    }
+
     // The table's own width: its columns, the gaps between them, and the gap
     // outside the first and last.
     let width = widths.iter().sum::<f32>() + spacing * (grid.columns + 1) as f32;
     (width, cursor_y - y)
+}
+
+/// Emits one box per resolved grid line segment, drawn centred on the line.
+///
+/// The cells reserved half of each border and painted none of it, so this is
+/// where a collapsed border actually becomes visible. Each segment is a box
+/// whose rect *is* the border: one side set to the resolved style at the full
+/// resolved width, the other three left at `none`. Which side is not a detail —
+/// `inset`, `outset`, `groove` and `ridge` are lit from above and to the left,
+/// so the winning border is drawn as the edge it was declared on, and a cell's
+/// `border-bottom: inset` looks like a bottom border rather than like the top
+/// border of the cell underneath.
+///
+/// `widths` and `heights` are the distances between grid line centres, so
+/// `x` — the table's content origin — is the centre of vertical grid line 0.
+fn emit_collapsed_borders(
+    collapsed: &table::Collapsed,
+    x: f32,
+    y: f32,
+    widths: &[f32],
+    heights: &[f32],
+    parent: &mut LayoutBox,
+) {
+    // Centres of the grid lines, which is what every segment is measured from.
+    let mut line_x = Vec::with_capacity(widths.len() + 1);
+    let mut cursor = x;
+    line_x.push(cursor);
+    for width in widths {
+        cursor += width;
+        line_x.push(cursor);
+    }
+    let mut line_y = Vec::with_capacity(heights.len() + 1);
+    let mut cursor = y;
+    line_y.push(cursor);
+    for height in heights {
+        cursor += height;
+        line_y.push(cursor);
+    }
+
+    let segment = |rect: Rect, border: &table::Candidate| {
+        let side = css::style::BorderSide {
+            width: Length::Px(border.width),
+            style: border.style,
+            color: Some(border.color),
+        };
+        let mut style = ComputedStyle::default();
+        match border.edge {
+            table::BorderEdge::Top => style.border.top = side,
+            table::BorderEdge::Right => style.border.right = side,
+            table::BorderEdge::Bottom => style.border.bottom = side,
+            table::BorderEdge::Left => style.border.left = side,
+        }
+        // `used_width` resolves `em` against the font size, and these widths
+        // are already pixels — but the default is 16px and a stray `em` here
+        // would scale them, so it is pinned rather than left to chance.
+        style.font_size = 1.0;
+        LayoutBox {
+            rect,
+            style,
+            text: None,
+            content_origin: (0.0, 0.0),
+            content_width: rect.width,
+            children: Vec::new(),
+            replaced: None,
+            node: None,
+        }
+    };
+
+    // Every segment runs the full way over the crossings at both of its ends,
+    // so a corner is always covered by both of the borders that meet there and
+    // never by neither — a gap at every crossing is what "undefined" looks
+    // like if nothing decides. CSS 2.1 does leave the corner undefined, so what
+    // decides it here is width: the segments are drawn narrowest first, and the
+    // wider border takes the corner. That is the rule that matches what a
+    // reader expects, because the thick border is the one they are looking at:
+    // a 12px rule crossed by a 1px one should not come away notched.
+    let mut segments: Vec<(f32, LayoutBox)> = Vec::new();
+    for (line, borders) in collapsed.horizontal.iter().enumerate() {
+        let Some(&centre) = line_y.get(line) else {
+            continue;
+        };
+        for (column, border) in borders.iter().enumerate() {
+            let (Some(border), Some(&left), Some(&right)) =
+                (border.as_ref(), line_x.get(column), line_x.get(column + 1))
+            else {
+                continue;
+            };
+            let left = left - collapsed.half_vertical(column);
+            let right = right + collapsed.half_vertical(column + 1);
+            segments.push((
+                border.width,
+                segment(
+                    Rect {
+                        x: left,
+                        y: centre - border.width / 2.0,
+                        width: right - left,
+                        height: border.width,
+                    },
+                    border,
+                ),
+            ));
+        }
+    }
+    for (line, borders) in collapsed.vertical.iter().enumerate() {
+        let Some(&centre) = line_x.get(line) else {
+            continue;
+        };
+        for (row, border) in borders.iter().enumerate() {
+            let (Some(border), Some(&top), Some(&bottom)) =
+                (border.as_ref(), line_y.get(row), line_y.get(row + 1))
+            else {
+                continue;
+            };
+            let top = top - collapsed.half_horizontal(row);
+            let bottom = bottom + collapsed.half_horizontal(row + 1);
+            segments.push((
+                border.width,
+                segment(
+                    Rect {
+                        x: centre - border.width / 2.0,
+                        y: top,
+                        width: border.width,
+                        height: bottom - top,
+                    },
+                    border,
+                ),
+            ));
+        }
+    }
+    // A stable sort, so two borders of the same width settle it the same way
+    // every time: the vertical wins, because it was collected second. Nothing
+    // about a rendering this engine produces may depend on which run it is.
+    segments.sort_by(|a, b| a.0.total_cmp(&b.0));
+    parent
+        .children
+        .extend(segments.into_iter().map(|(_, box_)| box_));
 }
 
 /// Lays out a floated child and places it in `context`.
@@ -2684,6 +2950,181 @@ mod tests {
         );
         // Same row, so the same top edge.
         assert!((cells[0].rect.y - cells[1].rect.y).abs() < 0.01);
+    }
+
+    /// The table box of a rendered page.
+    fn table_box(rendered: &Rendered) -> &LayoutBox {
+        content_boxes(rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("a table box")
+    }
+
+    #[test]
+    fn collapsing_borders_are_shared_rather_than_doubled() {
+        // Two 10px borders meeting between two cells become one 10px border,
+        // not twenty pixels of them. The whole point of the model, and the
+        // width of the table is the cleanest place to see it: three grid lines
+        // of 10px rather than six borders plus `border-spacing`.
+        let markup = "<body><table><tr><td>a</td><td>b</td></tr></table></body>";
+        let sheet = "body { margin: 0 } table { width: auto } \
+                     td { border: 10px solid black; padding: 0; width: 40px }";
+        let separate = run(markup, sheet, 600.0);
+        let collapsed = run(
+            markup,
+            &format!("{sheet} table {{ border-collapse: collapse }}"),
+            600.0,
+        );
+
+        // Separated: two 40px columns, four 10px borders, and `border-spacing`
+        // outside each cell and between them.
+        let gaps = css::style::DEFAULT_BORDER_SPACING * 3.0;
+        assert!(
+            (table_box(&separate).rect.width - (40.0 * 2.0 + 10.0 * 4.0 + gaps)).abs() < 0.01,
+            "separated table is {:?}",
+            table_box(&separate).rect
+        );
+        // Collapsed: two 40px columns and *three* grid lines, with no spacing.
+        assert!(
+            (table_box(&collapsed).rect.width - (40.0 * 2.0 + 10.0 * 3.0)).abs() < 0.01,
+            "collapsed table is {:?}",
+            table_box(&collapsed).rect
+        );
+    }
+
+    #[test]
+    fn a_collapsed_cell_reserves_half_of_each_grid_line() {
+        // Half in, half out: the cell's own used border is 5px on each side of
+        // a 10px grid line, which is what puts its content where the reader
+        // sees it. Reserved and not painted — the border is drawn once, by the
+        // table, rather than twice in halves.
+        let rendered = run(
+            "<body><table><tr><td>a</td><td>b</td></tr></table></body>",
+            "body { margin: 0 } table { border-collapse: collapse } \
+             td { border: 10px solid black; padding: 0 }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 2);
+        for cell in &cells {
+            assert!(
+                (cell.style.border.left.used_width(cell.style.font_size) - 5.0).abs() < 0.01,
+                "cell reserved {:?}",
+                cell.style.border.left
+            );
+            assert_eq!(
+                cell.style.border.left.style,
+                css::style::BorderStyle::Hidden,
+                "a cell must not paint its half of a collapsed border"
+            );
+        }
+        // The cells meet: the first ends exactly where the second begins,
+        // because they share the grid line their halves sit on.
+        let first = &cells[0].rect;
+        assert!(
+            (first.x + first.width - cells[1].rect.x).abs() < 0.01,
+            "cells at {:?} and {:?} do not share a grid line",
+            first,
+            cells[1].rect
+        );
+    }
+
+    #[test]
+    fn the_collapsing_model_ignores_border_spacing_and_table_padding() {
+        // §17.6.2: neither applies. `cellspacing` is the same property under
+        // its era name, and the era's markup sets it constantly — a table that
+        // honoured it here would be pushed apart at every seam it just closed.
+        let base = "body { margin: 0 } table { border-collapse: collapse } \
+                    td { border: 2px solid black; padding: 0; width: 30px }";
+        let plain = run(
+            "<body><table><tr><td>a</td><td>b</td></tr></table></body>",
+            base,
+            600.0,
+        );
+        let spaced = run(
+            r#"<body><table cellspacing="20"><tr><td>a</td><td>b</td></tr></table></body>"#,
+            &format!("{base} table {{ border-spacing: 20px; padding: 15px }}"),
+            600.0,
+        );
+        assert_eq!(
+            table_box(&plain).rect.width,
+            table_box(&spaced).rect.width,
+            "border-spacing or padding moved a collapsing table"
+        );
+        assert_eq!(
+            table_box(&plain).rect.height,
+            table_box(&spaced).rect.height
+        );
+    }
+
+    #[test]
+    fn a_collapsing_table_draws_each_grid_line_once() {
+        // The borders are boxes of their own, emitted after the cells so they
+        // paint over the halves nobody drew. A 2x2 grid has three vertical and
+        // three horizontal lines, and each is one box per segment: 6 + 6.
+        let rendered = run(
+            "<body><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></body>",
+            "body { margin: 0 } table { border-collapse: collapse } \
+             td { border: 2px solid black; padding: 0 }",
+            600.0,
+        );
+        let painted = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| {
+                b.node.is_none()
+                    && [
+                        b.style.border.top.style,
+                        b.style.border.right.style,
+                        b.style.border.bottom.style,
+                        b.style.border.left.style,
+                    ]
+                    .iter()
+                    .any(|style| style.is_visible())
+            })
+            .count();
+        assert_eq!(painted, 12, "one box per grid line segment");
+    }
+
+    #[test]
+    fn a_hidden_border_removes_a_grid_line_segment_and_nothing_else() {
+        // `hidden` beats everything, so the segment it touches is not drawn —
+        // and only that segment. The rest of the same grid line survives.
+        let rendered = run(
+            "<body><table><tr><td>a</td><td>b</td></tr>\
+             <tr><td class=\"gone\">c</td><td>d</td></tr></table></body>",
+            "body { margin: 0 } table { border-collapse: collapse } \
+             td { border: 2px solid black; padding: 0 } \
+             .gone { border-top-style: hidden }",
+            600.0,
+        );
+        let doc = dom::parse(
+            "<table><tr><td>a</td><td>b</td></tr>\
+             <tr><td class=\"gone\">c</td><td>d</td></tr></table>",
+        );
+        let sheets = [Stylesheet::parse(
+            "table { border-collapse: collapse } td { border: 2px solid black } \
+             .gone { border-top-style: hidden }",
+        )];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let table = doc.find_element("table").expect("table");
+        let collapsed = table::collapse_borders(
+            &doc,
+            &styles,
+            table,
+            styles.get(table).expect("a styled table"),
+        );
+        assert!(collapsed.horizontal[1][0].is_none(), "the hidden segment");
+        assert!(
+            collapsed.horizontal[1][1].is_some(),
+            "the rest of the line went with it"
+        );
+        // The line still reserves its width, so the hole is a hole rather than
+        // a place where the table closes up.
+        assert_eq!(collapsed.horizontal_widths[1], 2.0);
+        assert!(rendered.layout.height > 0.0);
     }
 
     #[test]
