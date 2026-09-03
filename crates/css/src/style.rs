@@ -715,6 +715,36 @@ pub fn parse_clear(name: &str) -> Option<Clear> {
     }
 }
 
+/// The `border-collapse` property (CSS 2.1 §17.6).
+///
+/// Which of the two border models a table uses, and the two are not variations
+/// on each other. In the separated model every cell draws its own border and
+/// `border-spacing` sits between them. In the collapsing model the borders of
+/// adjoining cells — and of the rows, row groups, columns, column groups and
+/// the table itself — are resolved against one another into a single border
+/// centred on the grid line between them, `border-spacing` and `empty-cells`
+/// stop applying, and the table has no padding.
+///
+/// Inherited, which is what makes `table { border-collapse: collapse }` on a
+/// page of nested tables do what its author meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderCollapse {
+    /// Each cell draws its own border. The initial value.
+    #[default]
+    Separate,
+    /// Adjoining borders collapse into one, centred on the grid line.
+    Collapse,
+}
+
+/// Parses a `border-collapse` keyword.
+pub fn parse_border_collapse(name: &str) -> Option<BorderCollapse> {
+    match name {
+        "separate" => Some(BorderCollapse::Separate),
+        "collapse" => Some(BorderCollapse::Collapse),
+        _ => None,
+    }
+}
+
 /// The `border-style` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BorderStyle {
@@ -885,7 +915,10 @@ pub struct ComputedStyle {
     ///
     /// On a table only. Kept as a length rather than pixels because it is
     /// resolved against the table's own font size, like any other length.
+    /// Ignored entirely when `border_collapse` is `Collapse`.
     pub border_spacing: Length,
+    /// `border-collapse`, inherited, which model a table's borders use.
+    pub border_collapse: BorderCollapse,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -954,6 +987,7 @@ impl Default for ComputedStyle {
             overflow: Overflow::Visible,
             vertical_align: VerticalAlign::Middle,
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
+            border_collapse: BorderCollapse::Separate,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -991,6 +1025,9 @@ impl ComputedStyle {
             text_align: parent.text_align,
             white_space: parent.white_space,
             list_style_type: parent.list_style_type,
+            // §17.6: inherited, so a rule on `table` reaches the cells that
+            // have to agree with it about where their borders are.
+            border_collapse: parent.border_collapse,
             ..Self::default()
         }
     }

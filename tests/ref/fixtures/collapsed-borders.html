@@ -1,0 +1,95 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  table { border-collapse: collapse; margin-bottom: 8px; }
+  td, th { padding: 4px; }
+
+  /* A plain collapsed grid: every seam is one line, not two. */
+  .plain td, .plain th { border: 1px solid #333333; }
+  .plain th { background-color: #eeeeee; }
+
+  /* A row asking for more than its cells: the widest border wins on the
+     grid lines the row owns, and the cells keep the rest. */
+  .width td { border: 1px solid #333333; }
+  .width tr.rule { border: 6px solid #009900; }
+
+  /* Equal widths, so the style order decides: double beats solid, solid
+     beats dashed, dashed beats dotted. */
+  .style td { border: 4px solid #333333; }
+  .style .double { border: 4px double #cc0000; }
+  .style .dashed { border: 4px dashed #0000cc; }
+  .style .dotted { border: 4px dotted #777777; }
+
+  /* `hidden` beats everything, including a border four times its width. */
+  .hidden td { border: 3px solid #333333; }
+  .hidden .hole { border-right-style: hidden; }
+  .hidden .loud { border: 12px solid #cc0000; }
+
+  /* One edge of a spanning cell facing several different neighbours, which
+     is the case a single border per cell cannot express. */
+  .spans td { border: 2px solid #333333; }
+  .spans .red { border-top: 7px solid #cc0000; }
+  .spans .blue { border-top: 7px solid #0000cc; }
+  .spans .tall { border-right: 7px solid #009900; }
+
+  /* Row groups and columns are border sources of their own. */
+  .parts { border: 5px solid #333333; }
+  .parts td, .parts th { border: 1px solid #999999; }
+  .parts thead { border-bottom: 4px solid #cc00cc; }
+  .parts .marked { border-left: 4px solid #ff8800; }
+</style></head><body>
+
+<h3>A collapsed grid</h3>
+<table class="plain">
+  <tr><th>Element</th><th>Purpose</th></tr>
+  <tr><td>table</td><td>Tabular data, and the era's page layout</td></tr>
+  <tr><td>td</td><td>A cell</td></tr>
+</table>
+
+<h3>Widest wins: a 6px row against 1px cells</h3>
+<table class="width">
+  <tr><td>above</td><td>the rule</td></tr>
+  <tr class="rule"><td>the row</td><td>itself</td></tr>
+  <tr><td>below</td><td>the rule</td></tr>
+</table>
+
+<h3>Equal widths, settled by style</h3>
+<table class="style">
+  <tr><td class="double">double</td><td>solid</td><td class="dashed">dashed</td><td class="dotted">dotted</td></tr>
+</table>
+
+<h3>Hidden beats a border four times its width</h3>
+<table class="hidden">
+  <tr><td class="hole">hole to</td><td class="loud">its right</td><td>plain</td></tr>
+  <tr><td>a</td><td>b</td><td>c</td></tr>
+</table>
+
+<h3>One edge, several grid lines</h3>
+<table class="spans">
+  <tr><td class="tall" rowspan="2">spans two rows</td><td colspan="2">spans two columns</td></tr>
+  <tr><td class="red">red above</td><td class="blue">blue above</td></tr>
+  <tr><td>a</td><td>b</td><td>c</td></tr>
+</table>
+
+<h3>Table, row group and column all offering a border</h3>
+<table class="parts">
+  <colgroup><col><col class="marked"><col></colgroup>
+  <thead><tr><th>head</th><th>marked</th><th>head</th></tr></thead>
+  <tbody>
+    <tr><td>a</td><td>b</td><td>c</td></tr>
+    <tr><td>d</td><td>e</td><td>f</td></tr>
+  </tbody>
+</table>
+
+<h3>The era's own idiom, collapsed</h3>
+<table border="1" cellspacing="10" style="border-collapse: collapse">
+  <tr><td>border=1</td><td>and cellspacing,</td><td>which collapsing ignores</td></tr>
+  <tr><td>so this</td><td>is one grid</td><td>with no seams</td></tr>
+</table>
+
+<h3>And separate, which must be unchanged</h3>
+<table style="border-collapse: separate" border="1" cellspacing="4">
+  <tr><td>each cell</td><td>keeps its own</td><td>border</td></tr>
+</table>
+
+</body></html>

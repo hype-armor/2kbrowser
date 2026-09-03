@@ -292,8 +292,11 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    size, and collapse whitespace across run boundaries.
 3. **Tables** — *done.* Automatic column sizing from cell content, `colspan`
    and `rowspan`, row groups, declared widths, shrink-to-fit boxes, row
-   backgrounds, and `border-spacing` including the `cellspacing` attribute.
-   Missing: collapsed borders and fixed layout
+   backgrounds, `border-spacing` including the `cellspacing` attribute, and
+   **both border models** — `border-collapse: collapse` with §17.6.2.1's
+   conflict resolution in full, resolved per grid line *segment* so that one
+   edge of a spanning cell can carry a different border against each neighbour
+   it faces. Missing: fixed layout
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
@@ -327,8 +330,11 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    margins centre a block; and an inline element wrapping a block one still
    lays that block out
 
-Known-wrong and recorded rather than hidden: collapsed borders, fixed table
-layout, `inline-block` laid out as
+Known-wrong and recorded rather than hidden: fixed table
+layout, `empty-cells` — ignored in the separated model, where it applies, and
+correctly ignored in the collapsing one, where it does not — the corner where
+two collapsed borders cross, which CSS 2.1 leaves undefined and which is
+settled here by width rather than by a diagonal mitre, `inline-block` laid out as
 plain `inline` — and counted as unsupported layout for that reason, so a page
 depending on it falls back to a document rather than failing quietly — and
 proper block-in-inline splitting — an inline element containing a block is
@@ -1028,10 +1034,59 @@ That is what a conformance run is for. The known-wrong list was the list of
 things we had noticed; this is the list.
 
 The engine's known gaps — an empty block collapsing through itself, an invalid
-selector not invalidating its rule, collapsed borders, fixed table
+selector not invalidating its rule, fixed table
 layout, `inline-block`, proper block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
+
+Collapsed borders came off that list, and they were the one on it with the
+most direct claim on §M2's finish line: the era's markup is tables, and the
+tables a reader actually meets — a Wikipedia infobox, a wikitable — ask for
+`border-collapse: collapse` throughout. Without it every seam in one of those
+was drawn twice, once by each neighbour, with `border-spacing` holding the two
+apart.
+
+The part worth recording is that the collapsing model is not a way of *drawing*
+the separated one. It is a different geometry: there are no cell borders at
+all, there are grid lines, and each carries a single border resolved from the
+cell, row, row group, column, column group and table that touch it, drawn
+centred on the line so that half of it falls into the cell on either side.
+That is why the resolution has to happen before anything measures the table —
+the table's own border is the outer half of its outermost grid lines, and its
+padding does not apply at all, so the box everything else reads is not the one
+the cascade produced.
+
+A grid line is resolved per *segment* rather than per edge, which is the
+detail an implementation is most likely to skip and the one that shows. A cell
+spanning two columns has one bottom edge and two neighbours under it, and if
+those two declare different borders then that single edge is red for half its
+length and blue for the other half. A border stored on the cell cannot say
+that; the reference fixture has the case in it precisely because it is the one
+that a per-cell shortcut renders plausibly and wrongly.
+
+The conflict resolution itself is worth getting exactly right rather than
+approximately, because it is fully specified and it is what makes real tables
+look correct. `hidden` beats everything — it is the only way a page can punch a
+hole in a grid — `none` loses to everything, then the widest wins, then the
+style order `double > solid > dashed > dotted > ridge > outset > groove >
+inset`, then the origin order `cell > row > row group > column > column group >
+table`, and a tie past all of that goes to whichever is further left and
+further up. Each of those rules is held by a test that was watched to fail when
+the rule was deliberately broken, which is a different claim from each of them
+having a test.
+
+Corners are the one thing CSS 2.1 declines to specify, and declining to decide
+looks like a gap at every crossing. Browsers mitre them diagonally; this engine
+gives the corner to the wider of the two borders, which was chosen after
+looking at the picture rather than at the test names — a 12px rule crossed by a
+1px one came away notched under the first rule tried, which passed every test
+that existed at the time.
+
+Eight tests in the suite, seven of them named for collapsed borders and none
+regressing. That is a real but small number, and it is exactly the kind the
+README warns not to lean on: the reference fixture and its committed baseline
+are the evidence, and Chromium rendering the same fixture was what checked the
+baseline was worth blessing.
 
 The three-dimensional border styles came off it as well — `double`, `groove`,
 `ridge`, `inset`, `outset` — and they are the most era-appropriate thing on the

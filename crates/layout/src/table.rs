@@ -3,12 +3,21 @@
 //! The 2000s web laid out with tables (ADR-0004), so this is load-bearing
 //! rather than a compatibility footnote.
 //!
-//! Implements CSS 2.1's *automatic* table layout in the separated-borders
-//! model: column widths come from cell content, and the table is only as wide
-//! as it needs to be unless a width is declared. Fixed layout, collapsed
-//! borders, and row spanning are not here yet — see the notes on [`Grid`].
+//! Implements CSS 2.1's *automatic* table layout in both border models:
+//! column widths come from cell content, and the table is only as wide as it
+//! needs to be unless a width is declared. Fixed layout (`table-layout: fixed`)
+//! is not here yet.
+//!
+//! The two border models are genuinely different geometries rather than two
+//! ways of drawing the same one, which is why [`Collapsed`] exists at all. In
+//! the separated model each cell owns its four borders and `border-spacing`
+//! sits between them. In the collapsing model there are no cell borders: there
+//! are *grid lines*, each carrying one border resolved from everything that
+//! touches it (§17.6.2.1), drawn centred on the line so half of it falls into
+//! the cell on either side.
 
-use css::style::{ComputedStyle, Display};
+use css::style::{BorderStyle, ComputedStyle, Display};
+use css::value::Color;
 use dom::{Document, NodeId};
 
 /// Largest span honoured on a `colspan` or `rowspan` attribute.
@@ -47,6 +56,36 @@ pub struct Row {
     pub style: ComputedStyle,
     /// Cells in document order.
     pub cells: Vec<Cell>,
+    /// Index into [`Grid::row_groups`] of the `thead`, `tbody` or `tfoot` this
+    /// row sits in, where there is one.
+    pub group: Option<usize>,
+}
+
+/// A `thead`, `tbody` or `tfoot`, and the rows it covers.
+///
+/// Kept only because the collapsing model needs it: a row group is one of the
+/// six things §17.6.2.1 lets contribute a border, and its top and bottom edges
+/// are grid lines that no row or cell can speak for. In the separated model it
+/// is transparent, which is why the rows are still flattened.
+#[derive(Debug, Clone)]
+pub struct RowBand {
+    /// Its computed style.
+    pub style: ComputedStyle,
+    /// Index of its first row in [`Grid::rows`].
+    pub first: usize,
+    /// One past its last row. Equal to `first` when the group held no rows.
+    pub end: usize,
+}
+
+/// A `col` or `colgroup`, and the columns it covers.
+#[derive(Debug, Clone)]
+pub struct ColumnBand {
+    /// Its computed style.
+    pub style: ComputedStyle,
+    /// First column covered.
+    pub start: usize,
+    /// One past the last column covered.
+    pub end: usize,
 }
 
 /// A table flattened into rows of cells.
@@ -56,6 +95,37 @@ pub struct Grid {
     pub rows: Vec<Row>,
     /// Number of columns, accounting for spans.
     pub columns: usize,
+    /// Row groups in document order, referenced by [`Row::group`].
+    pub row_groups: Vec<RowBand>,
+    /// `col` elements, in document order.
+    pub columns_declared: Vec<ColumnBand>,
+    /// `colgroup` elements, in document order.
+    pub column_groups: Vec<ColumnBand>,
+}
+
+impl Grid {
+    /// Which cell occupies each `(row, column)` slot, as an index into
+    /// `rows[r].cells`.
+    ///
+    /// Spans are expanded, so a `rowspan="3"` cell appears in three rows. That
+    /// is the whole point: the collapsing model asks "what is on either side of
+    /// this grid line segment", and a spanning cell is on the side of several
+    /// of them.
+    pub fn occupancy(&self) -> Vec<Vec<Option<(usize, usize)>>> {
+        let mut map = vec![vec![None; self.columns]; self.rows.len()];
+        for (index, row) in self.rows.iter().enumerate() {
+            for (position, cell) in row.cells.iter().enumerate() {
+                let last_row = (index + cell.rowspan).min(self.rows.len());
+                let last_column = (cell.column + cell.colspan).min(self.columns);
+                for slot in map.iter_mut().take(last_row).skip(index) {
+                    for entry in slot.iter_mut().take(last_column).skip(cell.column) {
+                        *entry = Some((index, position));
+                    }
+                }
+            }
+        }
+        map
+    }
 }
 
 /// Reads a table subtree into a grid, descending through row groups.
@@ -69,7 +139,7 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
     // down from above. Without this a `rowspan` cell's column is handed to the
     // next row's first cell, and every row below it shifts left.
     let mut occupied: Vec<usize> = Vec::new();
-    collect_rows(doc, styles, table, &mut occupied, &mut grid);
+    collect_rows(doc, styles, table, None, &mut occupied, &mut grid);
     // The rightmost column any cell reaches, not the widest row: with row
     // spanning a row's own cells no longer cover every column.
     grid.columns = grid
@@ -79,13 +149,90 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
         .map(|cell| cell.column + cell.colspan)
         .max()
         .unwrap_or(0);
+    collect_columns(doc, styles, table, &mut grid);
     grid
+}
+
+/// Reads `col` and `colgroup` elements into column bands.
+///
+/// They contribute nothing to the separated model — this engine sizes columns
+/// from cell content, and a `<col width>` already reaches the cascade through
+/// the presentational attributes — but §17.6.2.1 lets both offer a border, and
+/// a band cannot be recovered from the cells once it is thrown away.
+fn collect_columns(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    table: NodeId,
+    grid: &mut Grid,
+) {
+    let span_of = |element: &dom::ElementData| {
+        element
+            .attr("span")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, MAX_SPAN)
+    };
+    let mut column = 0;
+    for &child in doc.children(table) {
+        let Some(element) = doc.element(child) else {
+            continue;
+        };
+        match element.local_name() {
+            "col" => {
+                let span = span_of(element);
+                if let Some(style) = styles.get(child) {
+                    grid.columns_declared.push(ColumnBand {
+                        style: style.clone(),
+                        start: column,
+                        end: column + span,
+                    });
+                }
+                column += span;
+            }
+            "colgroup" => {
+                let start = column;
+                // A group's own `span` counts only when it has no `col`
+                // children; with them, the children decide how wide it is.
+                let mut has_children = false;
+                for &inner in doc.children(child) {
+                    let Some(col) = doc.element(inner) else {
+                        continue;
+                    };
+                    if col.local_name() != "col" {
+                        continue;
+                    }
+                    has_children = true;
+                    let span = span_of(col);
+                    if let Some(style) = styles.get(inner) {
+                        grid.columns_declared.push(ColumnBand {
+                            style: style.clone(),
+                            start: column,
+                            end: column + span,
+                        });
+                    }
+                    column += span;
+                }
+                if !has_children {
+                    column += span_of(element);
+                }
+                if let Some(style) = styles.get(child) {
+                    grid.column_groups.push(ColumnBand {
+                        style: style.clone(),
+                        start,
+                        end: column,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_rows(
     doc: &Document,
     styles: &css::cascade::StyleMap,
     node: NodeId,
+    group: Option<usize>,
     occupied: &mut Vec<usize>,
     grid: &mut Grid,
 ) {
@@ -159,13 +306,486 @@ fn collect_rows(
                         node: child,
                         style: style.clone(),
                         cells,
+                        group,
                     });
                 }
             }
-            // Row groups, and any other wrapper, are descended through.
-            _ => collect_rows(doc, styles, child, occupied, grid),
+            // A row group is still descended through — its rows are flattened
+            // into the grid exactly as before — but it is recorded on the way
+            // past, because the collapsing model needs its borders and its
+            // first and last rows.
+            "thead" | "tbody" | "tfoot" => {
+                let band = grid.row_groups.len();
+                let first = grid.rows.len();
+                grid.row_groups.push(RowBand {
+                    style: style.clone(),
+                    first,
+                    end: first,
+                });
+                collect_rows(doc, styles, child, Some(band), occupied, grid);
+                // Set once the rows are in. A group that held none keeps an
+                // empty range, which no row points at and nothing reads.
+                grid.row_groups[band].end = grid.rows.len();
+            }
+            // Any other wrapper is transparent, and a row inside one keeps the
+            // group it is nested in.
+            _ => collect_rows(doc, styles, child, group, occupied, grid),
         }
     }
+}
+
+/// Which edge of a box a candidate border came from.
+///
+/// Kept because it decides how the border is *drawn*, not only how wide it is:
+/// `inset`, `outset`, `groove` and `ridge` are lit from above and to the left,
+/// so a cell's `border-bottom` and the cell below it's `border-top` are two
+/// different pictures of the same width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderEdge {
+    /// The box's top edge.
+    Top,
+    /// Its right edge.
+    Right,
+    /// Its bottom edge.
+    Bottom,
+    /// Its left edge.
+    Left,
+}
+
+/// What kind of box offered a border, for §17.6.2.1's last tie-break.
+///
+/// Declared in precedence order — a cell beats a row, a row beats a row group,
+/// and so on down — so `Ord` is the rule rather than a restatement of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BorderOrigin {
+    /// A `td` or `th`.
+    Cell,
+    /// A `tr`.
+    Row,
+    /// A `thead`, `tbody` or `tfoot`.
+    RowGroup,
+    /// A `col`.
+    Column,
+    /// A `colgroup`.
+    ColumnGroup,
+    /// The `table` itself.
+    Table,
+}
+
+/// One border offered to a grid line, before the conflict is resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Candidate {
+    /// Used width in pixels — zero when the style reserves no space.
+    pub width: f32,
+    /// Line style.
+    pub style: BorderStyle,
+    /// Line colour, already defaulted to the contributing box's `color`.
+    pub color: Color,
+    /// Which edge of that box it came from.
+    pub edge: BorderEdge,
+    /// What kind of box it came from.
+    pub origin: BorderOrigin,
+}
+
+/// The border this box offers on one of its edges.
+fn candidate(style: &ComputedStyle, edge: BorderEdge, origin: BorderOrigin) -> Candidate {
+    let side = match edge {
+        BorderEdge::Top => &style.border.top,
+        BorderEdge::Right => &style.border.right,
+        BorderEdge::Bottom => &style.border.bottom,
+        BorderEdge::Left => &style.border.left,
+    };
+    Candidate {
+        width: side.used_width(style.font_size),
+        style: side.style,
+        // `border-color` defaults to the element's own `color`, and the element
+        // is gone by the time this border is drawn — so it is resolved here,
+        // while there is still something to ask.
+        color: side.color.unwrap_or(style.color),
+        edge,
+        origin,
+    }
+}
+
+/// Where a style sits in §17.6.2.1's ordering, lowest first.
+///
+/// `double` over `solid` is the surprising one and it is not arbitrary: the
+/// list runs from the styles that look most deliberate to the ones a browser
+/// might have supplied itself.
+fn style_precedence(style: BorderStyle) -> u8 {
+    match style {
+        BorderStyle::Double => 0,
+        BorderStyle::Solid => 1,
+        BorderStyle::Dashed => 2,
+        BorderStyle::Dotted => 3,
+        BorderStyle::Ridge => 4,
+        BorderStyle::Outset => 5,
+        BorderStyle::Groove => 6,
+        BorderStyle::Inset => 7,
+        // Neither reaches the comparison: `hidden` has already won outright and
+        // `none` has already been discarded.
+        BorderStyle::None | BorderStyle::Hidden => 8,
+    }
+}
+
+/// Resolves a border conflict, per CSS 2.1 §17.6.2.1.
+///
+/// `None` means nothing is drawn on this grid line and it takes no space —
+/// either something asked for `hidden`, or every candidate was `none`.
+///
+/// The rules, in order: `hidden` beats everything; `none` loses to everything;
+/// then the widest wins; then the style order `double > solid > dashed >
+/// dotted > ridge > outset > groove > inset`; then the origin order `cell >
+/// row > row group > column > column group > table`.
+///
+/// The sixth rule — two boxes of the same kind, where the one further to the
+/// left and further to the top wins — is carried by the order of `candidates`
+/// rather than by a comparison here, because "further to the left" is not
+/// something a border knows about itself. Callers push the upper and the
+/// left-hand contributor first, and a tie keeps the one already held.
+pub fn resolve_conflict(candidates: &[Candidate]) -> Option<Candidate> {
+    // Checked before anything else and over the whole set: `hidden` on any one
+    // contributor suppresses the border however wide or emphatic the others
+    // are. This is the rule that lets a page punch a hole in a grid.
+    if candidates
+        .iter()
+        .any(|border| border.style == BorderStyle::Hidden)
+    {
+        return None;
+    }
+    candidates
+        .iter()
+        .filter(|border| border.style != BorderStyle::None)
+        .copied()
+        .reduce(|best, next| if wins_over(next, best) { next } else { best })
+}
+
+/// Whether `next` beats the best candidate so far. Ties keep `best`.
+fn wins_over(next: Candidate, best: Candidate) -> bool {
+    if next.width > best.width {
+        return true;
+    }
+    if next.width < best.width {
+        return false;
+    }
+    let (challenger, holder) = (style_precedence(next.style), style_precedence(best.style));
+    if challenger != holder {
+        return challenger < holder;
+    }
+    next.origin < best.origin
+}
+
+/// A table's borders, resolved into one per grid line segment (§17.6.2).
+///
+/// The grid lines run *between* the cells: `columns + 1` vertical ones and
+/// `rows + 1` horizontal ones. Each is divided into segments — one per row for
+/// a vertical line, one per column for a horizontal one — and each segment
+/// carries its own resolved border, because a `rowspan` cell can face two
+/// different neighbours down one edge.
+#[derive(Debug, Clone)]
+pub struct Collapsed {
+    /// The grid these borders belong to.
+    pub grid: Grid,
+    /// `vertical[line][row]`, with `line` in `0..=columns`.
+    pub vertical: Vec<Vec<Option<Candidate>>>,
+    /// `horizontal[line][column]`, with `line` in `0..=rows`.
+    pub horizontal: Vec<Vec<Option<Candidate>>>,
+    /// The widest border on each vertical grid line.
+    ///
+    /// The geometry uses this rather than the per-segment width, because a
+    /// column edge is one straight line: cells on both sides of it are inset
+    /// by half of the widest border anywhere along it, or a table whose first
+    /// row has a thick border and whose second has a thin one would have a
+    /// ragged column.
+    pub vertical_widths: Vec<f32>,
+    /// The same for each horizontal grid line.
+    pub horizontal_widths: Vec<f32>,
+}
+
+/// Resolves every grid line of `table`, which must be a collapsing table.
+pub fn collapse_borders(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    node: NodeId,
+    style: &ComputedStyle,
+) -> Collapsed {
+    let grid = build_grid(doc, styles, node);
+    let (rows, columns) = (grid.rows.len(), grid.columns);
+    let occupancy = grid.occupancy();
+
+    // The cell occupying a slot, or `None` past the edge of the table.
+    let cell_at = |row: usize, column: usize| -> Option<(usize, usize)> {
+        occupancy.get(row)?.get(column).copied().flatten()
+    };
+    let cell_style = |slot: (usize, usize)| &grid.rows[slot.0].cells[slot.1].style;
+    let band_covering = |bands: &[ColumnBand], column: usize| -> Option<usize> {
+        bands
+            .iter()
+            .position(|band| band.start <= column && column < band.end)
+    };
+
+    let mut horizontal = Vec::with_capacity(rows + 1);
+    for line in 0..=rows {
+        let mut segments = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let mut candidates = Vec::new();
+            let above = (line > 0).then(|| cell_at(line - 1, column)).flatten();
+            let below = (line < rows).then(|| cell_at(line, column)).flatten();
+            // A cell spanning this line has no border in the middle of itself,
+            // so neither side contributes — the grid line runs through it.
+            if above != below {
+                // Upper contributor first, so §17.6.2.1's "further to the top
+                // wins" falls out of the tie keeping what it already holds.
+                if let Some(slot) = above {
+                    candidates.push(candidate(
+                        cell_style(slot),
+                        BorderEdge::Bottom,
+                        BorderOrigin::Cell,
+                    ));
+                }
+                if let Some(slot) = below {
+                    candidates.push(candidate(
+                        cell_style(slot),
+                        BorderEdge::Top,
+                        BorderOrigin::Cell,
+                    ));
+                }
+            }
+            if line > 0 {
+                candidates.push(candidate(
+                    &grid.rows[line - 1].style,
+                    BorderEdge::Bottom,
+                    BorderOrigin::Row,
+                ));
+            }
+            if line < rows {
+                candidates.push(candidate(
+                    &grid.rows[line].style,
+                    BorderEdge::Top,
+                    BorderOrigin::Row,
+                ));
+            }
+            // A row group's own edges, which are grid lines no row speaks for:
+            // the bottom of a `thead` is not the bottom of the table.
+            if let Some(band) = (line > 0)
+                .then(|| grid.rows[line - 1].group)
+                .flatten()
+                .filter(|band| grid.row_groups[*band].end == line)
+            {
+                candidates.push(candidate(
+                    &grid.row_groups[band].style,
+                    BorderEdge::Bottom,
+                    BorderOrigin::RowGroup,
+                ));
+            }
+            if let Some(band) = (line < rows)
+                .then(|| grid.rows[line].group)
+                .flatten()
+                .filter(|band| grid.row_groups[*band].first == line)
+            {
+                candidates.push(candidate(
+                    &grid.row_groups[band].style,
+                    BorderEdge::Top,
+                    BorderOrigin::RowGroup,
+                ));
+            }
+            // A column runs the whole height of the table, so its horizontal
+            // edges are the table's own top and bottom and nowhere else.
+            if line == 0 || line == rows {
+                let edge = if line == 0 {
+                    BorderEdge::Top
+                } else {
+                    BorderEdge::Bottom
+                };
+                if let Some(band) = band_covering(&grid.columns_declared, column) {
+                    candidates.push(candidate(
+                        &grid.columns_declared[band].style,
+                        edge,
+                        BorderOrigin::Column,
+                    ));
+                }
+                if let Some(band) = band_covering(&grid.column_groups, column) {
+                    candidates.push(candidate(
+                        &grid.column_groups[band].style,
+                        edge,
+                        BorderOrigin::ColumnGroup,
+                    ));
+                }
+                candidates.push(candidate(style, edge, BorderOrigin::Table));
+            }
+            segments.push(resolve_conflict(&candidates));
+        }
+        horizontal.push(segments);
+    }
+
+    let mut vertical = Vec::with_capacity(columns + 1);
+    for line in 0..=columns {
+        let mut segments = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut candidates = Vec::new();
+            let left = (line > 0).then(|| cell_at(row, line - 1)).flatten();
+            let right = (line < columns).then(|| cell_at(row, line)).flatten();
+            if left != right {
+                // Left-hand contributor first, for the same reason.
+                if let Some(slot) = left {
+                    candidates.push(candidate(
+                        cell_style(slot),
+                        BorderEdge::Right,
+                        BorderOrigin::Cell,
+                    ));
+                }
+                if let Some(slot) = right {
+                    candidates.push(candidate(
+                        cell_style(slot),
+                        BorderEdge::Left,
+                        BorderOrigin::Cell,
+                    ));
+                }
+            }
+            // A column's vertical edges are its own two sides; the boundaries
+            // *inside* a `<col span="3">` are not edges of anything.
+            if line > 0 {
+                if let Some(band) = band_covering(&grid.columns_declared, line - 1)
+                    .filter(|band| grid.columns_declared[*band].end == line)
+                {
+                    candidates.push(candidate(
+                        &grid.columns_declared[band].style,
+                        BorderEdge::Right,
+                        BorderOrigin::Column,
+                    ));
+                }
+                if let Some(band) = band_covering(&grid.column_groups, line - 1)
+                    .filter(|band| grid.column_groups[*band].end == line)
+                {
+                    candidates.push(candidate(
+                        &grid.column_groups[band].style,
+                        BorderEdge::Right,
+                        BorderOrigin::ColumnGroup,
+                    ));
+                }
+            }
+            if line < columns {
+                if let Some(band) = band_covering(&grid.columns_declared, line)
+                    .filter(|band| grid.columns_declared[*band].start == line)
+                {
+                    candidates.push(candidate(
+                        &grid.columns_declared[band].style,
+                        BorderEdge::Left,
+                        BorderOrigin::Column,
+                    ));
+                }
+                if let Some(band) = band_covering(&grid.column_groups, line)
+                    .filter(|band| grid.column_groups[*band].start == line)
+                {
+                    candidates.push(candidate(
+                        &grid.column_groups[band].style,
+                        BorderEdge::Left,
+                        BorderOrigin::ColumnGroup,
+                    ));
+                }
+            }
+            // A row spans the table's whole width, so its left and right edges
+            // are the table's — as are its group's, and the table's own.
+            if line == 0 || line == columns {
+                let edge = if line == 0 {
+                    BorderEdge::Left
+                } else {
+                    BorderEdge::Right
+                };
+                candidates.push(candidate(&grid.rows[row].style, edge, BorderOrigin::Row));
+                if let Some(band) = grid.rows[row].group {
+                    candidates.push(candidate(
+                        &grid.row_groups[band].style,
+                        edge,
+                        BorderOrigin::RowGroup,
+                    ));
+                }
+                candidates.push(candidate(style, edge, BorderOrigin::Table));
+            }
+            segments.push(resolve_conflict(&candidates));
+        }
+        vertical.push(segments);
+    }
+
+    let widest = |segments: &Vec<Option<Candidate>>| {
+        segments
+            .iter()
+            .flatten()
+            .map(|border| border.width)
+            .fold(0.0f32, f32::max)
+    };
+    let vertical_widths = vertical.iter().map(widest).collect();
+    let horizontal_widths = horizontal.iter().map(widest).collect();
+
+    Collapsed {
+        grid,
+        vertical,
+        horizontal,
+        vertical_widths,
+        horizontal_widths,
+    }
+}
+
+impl Collapsed {
+    /// Half the width of vertical grid line `line`, which is how far it reaches
+    /// into the cell on either side.
+    pub fn half_vertical(&self, line: usize) -> f32 {
+        self.vertical_widths.get(line).copied().unwrap_or(0.0) / 2.0
+    }
+
+    /// Half the width of horizontal grid line `line`.
+    pub fn half_horizontal(&self, line: usize) -> f32 {
+        self.horizontal_widths.get(line).copied().unwrap_or(0.0) / 2.0
+    }
+
+    /// The borders a box occupying these grid lines reserves space for, as
+    /// `(top, right, bottom, left)`.
+    ///
+    /// Half-widths, and [`BorderStyle::Hidden`] rather than the resolved style:
+    /// the space has to be reserved so the content sits where it should, but
+    /// the border itself is drawn once, by the table, centred on the grid line
+    /// — not twice, half by each neighbour, which is what asking the cells to
+    /// draw it would mean.
+    pub fn reserved(&self, rows: (usize, usize), columns: (usize, usize)) -> (f32, f32, f32, f32) {
+        (
+            self.half_horizontal(rows.0),
+            self.half_vertical(columns.1),
+            self.half_horizontal(rows.1),
+            self.half_vertical(columns.0),
+        )
+    }
+}
+
+/// Rewrites a style so its borders reserve `(top, right, bottom, left)` and
+/// paint nothing, and it has no padding if `drop_padding`.
+///
+/// The collapsing model gives a table no padding at all (§17.6.2), which is
+/// separate from the cells: a cell keeps its padding, and only the table loses
+/// its own.
+pub fn with_reserved_borders(
+    style: &ComputedStyle,
+    reserved: (f32, f32, f32, f32),
+    drop_padding: bool,
+) -> ComputedStyle {
+    use css::style::{BorderSide, Edges};
+    use css::value::Length;
+
+    let side = |width: f32| BorderSide {
+        width: Length::Px(width),
+        // Reserves space, paints nothing — exactly what is wanted, and already
+        // what `hidden` means everywhere else in the engine.
+        style: BorderStyle::Hidden,
+        color: None,
+    };
+    let mut out = style.clone();
+    out.border.top = side(reserved.0);
+    out.border.right = side(reserved.1);
+    out.border.bottom = side(reserved.2);
+    out.border.left = side(reserved.3);
+    if drop_padding {
+        out.padding = Edges::ZERO;
+    }
+    out
 }
 
 /// Distributes `available` width across columns given their intrinsic widths.
@@ -339,6 +959,247 @@ mod tests {
             "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>d</td></tr></tbody></table>",
         );
         assert_eq!(grid.rows.len(), 2);
+    }
+
+    /// A candidate of a given width and style, from a given kind of box.
+    ///
+    /// The edge is fixed and the colour is arbitrary: neither takes part in the
+    /// conflict, which is the point worth keeping in front of these tests.
+    fn offered(width: f32, style: BorderStyle, origin: BorderOrigin) -> Candidate {
+        Candidate {
+            width,
+            style,
+            color: Color::BLACK,
+            edge: BorderEdge::Top,
+            origin,
+        }
+    }
+
+    #[test]
+    fn hidden_beats_every_other_candidate() {
+        // Not "the widest of the visible ones" — `hidden` suppresses the border
+        // outright, however emphatic its rivals. It is the only way a page can
+        // punch a hole in a collapsed grid, so losing this rule loses the
+        // feature rather than shifting a pixel.
+        let resolved = resolve_conflict(&[
+            offered(20.0, BorderStyle::Double, BorderOrigin::Cell),
+            offered(1.0, BorderStyle::Hidden, BorderOrigin::Table),
+        ]);
+        assert!(resolved.is_none(), "a 20px double outranked `hidden`");
+    }
+
+    #[test]
+    fn none_loses_to_everything_and_to_nothing() {
+        let over = resolve_conflict(&[
+            offered(0.0, BorderStyle::None, BorderOrigin::Cell),
+            offered(1.0, BorderStyle::Dotted, BorderOrigin::Table),
+        ])
+        .expect("the dotted border");
+        assert_eq!(over.style, BorderStyle::Dotted);
+
+        // Every candidate `none` is not the same as `hidden`, but it draws the
+        // same nothing.
+        assert!(
+            resolve_conflict(&[
+                offered(0.0, BorderStyle::None, BorderOrigin::Cell),
+                offered(0.0, BorderStyle::None, BorderOrigin::Row),
+            ])
+            .is_none()
+        );
+        assert!(resolve_conflict(&[]).is_none(), "nothing offered at all");
+    }
+
+    #[test]
+    fn the_widest_border_wins_regardless_of_style_or_origin() {
+        // Width is checked before style and before origin, so a thick border on
+        // the table beats a thin one on a cell even though both later rules
+        // would go the other way.
+        let resolved = resolve_conflict(&[
+            offered(1.0, BorderStyle::Double, BorderOrigin::Cell),
+            offered(5.0, BorderStyle::Inset, BorderOrigin::Table),
+        ])
+        .expect("a border");
+        assert_eq!(resolved.width, 5.0);
+        assert_eq!(resolved.style, BorderStyle::Inset);
+    }
+
+    #[test]
+    fn equal_widths_are_settled_by_the_style_order() {
+        // §17.6.2.1 in full: double > solid > dashed > dotted > ridge > outset
+        // > groove > inset. Checked pairwise down the whole chain, and in both
+        // presentation orders, so a rule that happens to work because the
+        // winner was listed first does not pass.
+        let order = [
+            BorderStyle::Double,
+            BorderStyle::Solid,
+            BorderStyle::Dashed,
+            BorderStyle::Dotted,
+            BorderStyle::Ridge,
+            BorderStyle::Outset,
+            BorderStyle::Groove,
+            BorderStyle::Inset,
+        ];
+        for (rank, stronger) in order.iter().enumerate() {
+            for weaker in &order[rank + 1..] {
+                for pair in [[*stronger, *weaker], [*weaker, *stronger]] {
+                    let candidates = [
+                        offered(3.0, pair[0], BorderOrigin::Cell),
+                        offered(3.0, pair[1], BorderOrigin::Cell),
+                    ];
+                    let won = resolve_conflict(&candidates).expect("a border").style;
+                    assert_eq!(
+                        won, *stronger,
+                        "{stronger:?} should beat {weaker:?}, offered as {pair:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tie_on_width_and_style_is_settled_by_where_it_came_from() {
+        // cell > row > row group > column > column group > table, checked
+        // pairwise and in both orders for the same reason as the style chain.
+        let order = [
+            BorderOrigin::Cell,
+            BorderOrigin::Row,
+            BorderOrigin::RowGroup,
+            BorderOrigin::Column,
+            BorderOrigin::ColumnGroup,
+            BorderOrigin::Table,
+        ];
+        for (rank, stronger) in order.iter().enumerate() {
+            for weaker in &order[rank + 1..] {
+                for pair in [[*stronger, *weaker], [*weaker, *stronger]] {
+                    let candidates = [
+                        offered(2.0, BorderStyle::Solid, pair[0]),
+                        offered(2.0, BorderStyle::Solid, pair[1]),
+                    ];
+                    let won = resolve_conflict(&candidates).expect("a border").origin;
+                    assert_eq!(
+                        won, *stronger,
+                        "{stronger:?} should beat {weaker:?}, offered as {pair:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_borders_alike_in_every_way_keep_the_one_offered_first() {
+        // The sixth rule — further to the left, further to the top — is carried
+        // by the caller's ordering rather than by a comparison, so what has to
+        // hold here is that a tie does not swap. Distinguished by colour, which
+        // takes no part in the conflict and so is the only thing left to tell
+        // two otherwise identical candidates apart.
+        let first = Candidate {
+            color: Color::BLACK,
+            ..offered(2.0, BorderStyle::Solid, BorderOrigin::Cell)
+        };
+        let second = Candidate {
+            color: Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            ..offered(2.0, BorderStyle::Solid, BorderOrigin::Cell)
+        };
+        let won = resolve_conflict(&[first, second]).expect("a border");
+        assert_eq!(won.color, Color::BLACK, "the later candidate took a tie");
+    }
+
+    #[test]
+    fn a_collapsed_grid_line_is_resolved_once_per_segment() {
+        // The case a per-cell border cannot express: one edge of a spanning
+        // cell facing two different neighbours. The colspan's bottom edge is a
+        // single edge of a single box and has to come out red on one half and
+        // blue on the other.
+        let doc = dom::parse(
+            r#"<table><tr><td colspan="2">wide</td></tr>
+               <tr><td class="red">r</td><td class="blue">b</td></tr></table>"#,
+        );
+        let sheets = [css::Stylesheet::parse(
+            "table { border-collapse: collapse }
+             td { border: 1px solid black }
+             .red { border-top: 6px solid #ff0000 }
+             .blue { border-top: 6px solid #0000ff }",
+        )];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let table = doc.find_element("table").expect("table");
+        let style = styles.get(table).expect("a styled table");
+        let collapsed = collapse_borders(&doc, &styles, table, style);
+
+        let line = &collapsed.horizontal[1];
+        assert_eq!(line.len(), 2, "one segment per column");
+        assert_eq!(line[0].expect("a border").color.r, 255, "left half red");
+        assert_eq!(line[1].expect("a border").color.b, 255, "right half blue");
+        assert_eq!(
+            collapsed.horizontal_widths[1], 6.0,
+            "the line is as wide as its widest segment"
+        );
+    }
+
+    #[test]
+    fn a_row_group_offers_its_own_edges_and_only_those() {
+        // A `thead`'s bottom edge is a grid line no row and no cell speaks for,
+        // and it is where the era's tables put the rule under their headings.
+        let doc = dom::parse(
+            "<table><thead><tr><td>h</td></tr></thead>
+             <tbody><tr><td>a</td></tr><tr><td>b</td></tr></tbody></table>",
+        );
+        let sheets = [css::Stylesheet::parse(
+            "table { border-collapse: collapse }
+             td { border: 1px solid black }
+             thead { border-bottom: 7px solid black }",
+        )];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let table = doc.find_element("table").expect("table");
+        let style = styles.get(table).expect("a styled table");
+        let collapsed = collapse_borders(&doc, &styles, table, style);
+
+        assert_eq!(collapsed.grid.row_groups.len(), 2, "thead and tbody");
+        assert_eq!(collapsed.horizontal_widths[1], 7.0, "under the heading");
+        assert_eq!(
+            collapsed.horizontal_widths[2], 1.0,
+            "the group's border does not reach the rows inside it"
+        );
+    }
+
+    #[test]
+    fn a_column_offers_a_border_at_its_own_sides() {
+        let doc = dom::parse(
+            r#"<table><colgroup><col><col class="edge"></colgroup>
+               <tr><td>a</td><td>b</td></tr></table>"#,
+        );
+        let sheets = [css::Stylesheet::parse(
+            "table { border-collapse: collapse }
+             td { border: 1px solid black }
+             .edge { border-left: 9px solid black }",
+        )];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let table = doc.find_element("table").expect("table");
+        let style = styles.get(table).expect("a styled table");
+        let collapsed = collapse_borders(&doc, &styles, table, style);
+
+        assert_eq!(collapsed.grid.columns_declared.len(), 2);
+        assert_eq!(collapsed.grid.column_groups.len(), 1);
+        assert_eq!(
+            collapsed.vertical_widths[1], 9.0,
+            "the second column's left edge"
+        );
+    }
+
+    #[test]
+    fn a_spanning_cell_occupies_every_slot_it_covers() {
+        let grid = grid_of(
+            r#"<table><tr><td rowspan="2">tall</td><td>a</td></tr>
+               <tr><td>b</td></tr></table>"#,
+        );
+        let map = grid.occupancy();
+        assert_eq!(map[0][0], Some((0, 0)), "the tall cell, in its own row");
+        assert_eq!(map[1][0], Some((0, 0)), "and in the row it spans into");
+        assert_eq!(map[1][1], Some((1, 0)), "the row's own cell beside it");
     }
 
     #[test]
