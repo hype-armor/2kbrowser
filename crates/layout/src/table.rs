@@ -153,6 +153,32 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
     grid
 }
 
+/// A table's `caption` children, in document order, with their styles.
+///
+/// Found by tag name, as the rows and the column bands are: `display` is not
+/// consulted because `table-caption` is not a display value this engine has
+/// (see `Display::parse`), and the era's markup writes `<caption>` anyway.
+///
+/// Only direct children. A `caption` deeper in the subtree belongs to a nested
+/// table, and stealing it would move somebody else's heading.
+pub fn captions(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    table: NodeId,
+) -> Vec<(NodeId, ComputedStyle)> {
+    doc.children(table)
+        .iter()
+        .filter(|&&child| {
+            doc.element(child)
+                .is_some_and(|element| element.local_name() == "caption")
+        })
+        .filter_map(|&child| {
+            let style = styles.get(child)?;
+            (style.display != Display::None).then(|| (child, style.clone()))
+        })
+        .collect()
+}
+
 /// Reads `col` and `colgroup` elements into column bands.
 ///
 /// They contribute nothing to the separated model — this engine sizes columns

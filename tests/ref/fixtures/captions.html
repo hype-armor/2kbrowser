@@ -1,0 +1,73 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  table { margin-bottom: 10px; }
+  td, th { border: 1px solid #888888; padding: 4px; }
+
+  /* The caption is outside the table's border box, so this thick rule must
+     not enclose the heading. */
+  .bordered { border: 5px solid #333333; }
+  .bordered caption { background-color: #ffffcc; border: 3px solid #cc0000; padding: 3px; }
+
+  /* A caption on a collapsing table: the two features must not disturb each
+     other, since the caption is not one of the boxes a grid line resolves. */
+  .collapsed { border-collapse: collapse; border: 2px solid #333333; }
+  .collapsed caption { background-color: #ddeeff; }
+
+  /* Wider than the table it heads, which is what makes the minimum width
+     visible: the longest word must not be broken across lines. */
+  .narrow td { padding: 0; }
+  .narrow caption { background-color: #eeffee; }
+
+  .below { caption-side: bottom; }
+  .below caption { background-color: #ffeedd; }
+
+  .gone caption { display: none; }
+</style></head><body>
+
+<h3>A caption, which goes above by default</h3>
+<table>
+  <caption>Table 1: elements of the era</caption>
+  <tr><th>Element</th><th>Purpose</th></tr>
+  <tr><td>table</td><td>Tabular data, and most of the era's layout</td></tr>
+</table>
+
+<h3>caption-side: bottom</h3>
+<table class="below">
+  <caption>Table 2: and this one goes underneath</caption>
+  <tr><th>Element</th><th>Purpose</th></tr>
+  <tr><td>td</td><td>A cell</td></tr>
+</table>
+
+<h3>The table's border does not enclose its caption</h3>
+<table class="bordered">
+  <caption>Outside the border box</caption>
+  <tr><td>a</td><td>b</td></tr>
+  <tr><td>c</td><td>d</td></tr>
+</table>
+
+<h3>A caption on a collapsing table</h3>
+<table class="collapsed">
+  <caption>Collapsed borders, captioned</caption>
+  <tr><th>one</th><th>two</th></tr>
+  <tr><td>three</td><td>four</td></tr>
+</table>
+
+<h3>A caption wider than the table it heads</h3>
+<table class="narrow">
+  <caption>Extraordinarily long heading over a very narrow table</caption>
+  <tr><td>x</td></tr>
+</table>
+
+<h3>display: none on the caption removes it entirely</h3>
+<table class="gone">
+  <caption>This heading is not drawn</caption>
+  <tr><td>a</td><td>b</td></tr>
+</table>
+
+<h3>A table with no caption, which must be unchanged</h3>
+<table>
+  <tr><td>nothing</td><td>above or below</td></tr>
+</table>
+
+</body></html>

@@ -12,8 +12,8 @@ pub mod table;
 
 use css::cascade::StyleMap;
 use css::style::{
-    BorderCollapse, ComputedStyle, Display, Float, Overflow, Position, TextAlign, VerticalAlign,
-    WhiteSpace,
+    BorderCollapse, CaptionSide, ComputedStyle, Display, Float, Overflow, Position, TextAlign,
+    VerticalAlign, WhiteSpace,
 };
 use css::value::Length;
 use dom::{Document, NodeId};
@@ -1425,8 +1425,100 @@ fn layout_block(
             }
             box_.rect.x = x + left;
         }
+
+        // §17.4: a caption is *not* inside the table's border box. It is a
+        // sibling of it — as wide as the table, above or below it — which is
+        // why a bordered table does not draw its border around its own
+        // heading. Laid out here rather than by the child walk below, because
+        // this branch returns before that walk ever runs: that is exactly how
+        // captions came to be dropped altogether.
+        //
+        // Placed only once the table's width and x are settled, since both are
+        // what the caption is measured and positioned against, and a
+        // shrink-to-fit table does not know either until now.
+        let mut captions: Vec<LayoutBox> = Vec::new();
+        let mut above = 0.0;
+        let mut below = 0.0;
+        for top in [true, false] {
+            for (caption, caption_style) in table::captions(doc, styles, node) {
+                if (caption_style.caption_side == CaptionSide::Top) != top {
+                    continue;
+                }
+                // As wide as the table, but never narrower than the caption's
+                // longest word: a one-column table would otherwise wrap its
+                // heading to a letter a line. Browsers widen the wrapper box
+                // for this; with no wrapper here the caption simply overhangs,
+                // which is the same picture for everything but the table's own
+                // horizontal placement.
+                let (minimum, _) = subtree_widths(
+                    doc,
+                    styles,
+                    fonts,
+                    caption,
+                    &caption_style,
+                    intrinsic,
+                    box_.rect.width,
+                    0,
+                );
+                let width = box_.rect.width.max(minimum);
+                // Top captions stack down from the table's top edge; bottom
+                // ones from below it, by which point the table has already been
+                // moved down past the top ones.
+                let at = if top {
+                    box_.rect.y + above
+                } else {
+                    box_.rect.y + box_.rect.height + below
+                };
+                let mut holder = LayoutBox {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width,
+                        height: 0.0,
+                    },
+                    style: caption_style.clone(),
+                    text: None,
+                    content_origin: (0.0, 0.0),
+                    content_width: width,
+                    children: Vec::new(),
+                    replaced: None,
+                    node: None,
+                };
+                let taken = layout_block(
+                    doc,
+                    styles,
+                    fonts,
+                    caption,
+                    &caption_style,
+                    intrinsic,
+                    box_.rect.x,
+                    at,
+                    width,
+                    FloatContext::new(width),
+                    ContainingBlock::viewport(width, width),
+                    &mut holder,
+                );
+                if let Some(caption_box) = holder.children.pop() {
+                    if top {
+                        above += taken.outer();
+                    } else {
+                        below += taken.outer();
+                    }
+                    captions.push(caption_box);
+                }
+            }
+            // The table gives up the space its top captions took. Its children
+            // are positioned relative to it, so they come along.
+            if top {
+                box_.rect.y += above;
+            }
+        }
+
         let consumed = Consumed {
-            height: box_.rect.height,
+            // The captions are part of what this box occupies even though they
+            // sit outside its border box, or the content after the table would
+            // be laid out on top of a bottom caption.
+            height: above + box_.rect.height + below,
             margin_top,
             margin_bottom: style.margin.bottom.to_px(font_size, available_width),
             // A replaced box has content by definition, and a table is a
@@ -1435,6 +1527,7 @@ fn layout_block(
             collapses_through: false,
         };
         parent.children.push(box_);
+        parent.children.extend(captions);
         return consumed;
     }
 
@@ -2952,12 +3045,169 @@ mod tests {
         assert!((cells[0].rect.y - cells[1].rect.y).abs() < 0.01);
     }
 
+    /// The body's own children, which is the one coordinate space in which a
+    /// table and its caption can be compared: every other box in the tree is
+    /// positioned relative to its parent.
+    fn siblings(rendered: &Rendered) -> &[LayoutBox] {
+        &rendered
+            .layout
+            .root
+            .children
+            .first()
+            .expect("body box")
+            .children
+    }
+
+    /// The table box among the body's children.
+    fn table_of(rendered: &Rendered) -> &LayoutBox {
+        siblings(rendered)
+            .iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("a table box beside the caption")
+    }
+
     /// The table box of a rendered page.
     fn table_box(rendered: &Rendered) -> &LayoutBox {
         content_boxes(rendered)
             .into_iter()
             .find(|b| b.style.display == Display::Table)
             .expect("a table box")
+    }
+
+    #[test]
+    fn a_caption_is_laid_out_at_all() {
+        // It was not, for the whole life of the table code: the table branch of
+        // `layout_block` returns before the child walk that would have reached
+        // it, so a `<caption>` was parsed, cascaded, and then silently dropped.
+        // Wikitables and infoboxes use them constantly.
+        let rendered = run(
+            "<body><table><caption>The heading</caption>\
+             <tr><td>a</td><td>b</td></tr></table></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        // Three text-bearing boxes: the caption and the two cells.
+        let with_text = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .count();
+        assert_eq!(with_text, 3, "the caption was dropped again");
+    }
+
+    #[test]
+    fn a_caption_sits_outside_the_table_box_on_the_side_it_asks_for() {
+        // §17.4: the caption is a sibling of the table box, not a child of it —
+        // which is why a bordered table does not draw its border around its own
+        // heading. Asserted as "outside", not merely "above": a caption laid
+        // out inside the table would still be above its rows.
+        let markup = "<body><table><caption>Heading</caption>\
+                      <tr><td>a</td></tr></table></body>";
+        let top = run(markup, "body { margin: 0 }", 600.0);
+        let bottom = run(
+            markup,
+            "body { margin: 0 } table { caption-side: bottom }",
+            600.0,
+        );
+
+        // Among the *body's own children*, because that is the only place the
+        // question means anything: a box's rect is relative to its parent, so a
+        // cell's rect and the table's are not in the same space at all.
+        let caption_of = |rendered: &Rendered| -> Rect {
+            siblings(rendered)
+                .iter()
+                .find(|b| b.style.display != Display::Table)
+                .map(|b| b.rect)
+                .expect("a caption box beside the table")
+        };
+
+        let table = table_of(&top).rect;
+        let caption = caption_of(&top);
+        assert!(
+            caption.y + caption.height <= table.y + 0.01,
+            "top caption at {caption:?} is not clear of the table at {table:?}"
+        );
+
+        let table = table_of(&bottom).rect;
+        let caption = caption_of(&bottom);
+        assert!(
+            caption.y >= table.y + table.height - 0.01,
+            "bottom caption at {caption:?} is not below the table at {table:?}"
+        );
+    }
+
+    #[test]
+    fn a_caption_never_wraps_narrower_than_its_longest_word() {
+        // A one-column table of a single character would otherwise wrap its
+        // heading to a letter a line. Browsers widen the table's wrapper box to
+        // the caption's minimum; with no wrapper here the caption overhangs
+        // instead, which comes to the same picture except for where the table
+        // sits across it.
+        let rendered = run(
+            "<body><table><caption>Extraordinarily</caption>\
+             <tr><td>x</td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0 }",
+            600.0,
+        );
+        let table = table_of(&rendered).rect;
+        let caption = siblings(&rendered)
+            .iter()
+            .find(|b| b.style.display != Display::Table)
+            .expect("a caption")
+            .rect;
+        assert!(
+            caption.width > table.width,
+            "caption {caption:?} was squeezed to the table's {table:?}"
+        );
+    }
+
+    #[test]
+    fn content_after_a_table_clears_its_captions() {
+        // The caption sits outside the table's border box, so the height the
+        // table reports has to include it or the next paragraph is laid out on
+        // top of a bottom caption.
+        let without = run(
+            "<body><table><tr><td>a</td></tr></table><p>after</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let with = run(
+            "<body><table><caption>Heading</caption><tr><td>a</td></tr></table>\
+             <p>after</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        // The paragraph is a child of the body, as the table and its caption
+        // are, so all three are measured in one coordinate space.
+        let paragraph_y = |rendered: &Rendered| {
+            siblings(rendered)
+                .iter()
+                .filter(|b| b.text.is_some())
+                .map(|b| b.rect.y)
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            paragraph_y(&with) > paragraph_y(&without),
+            "the caption took no room: {} vs {}",
+            paragraph_y(&with),
+            paragraph_y(&without)
+        );
+    }
+
+    #[test]
+    fn a_caption_belongs_to_its_own_table_and_not_a_nested_one() {
+        // `captions` reads direct children only. Walking the subtree would let
+        // an outer table steal the heading of a table inside one of its cells,
+        // and the era's pages nest tables several deep.
+        let doc = dom::parse(
+            "<table><tr><td><table><caption>inner</caption>\
+             <tr><td>a</td></tr></table></td></tr></table>",
+        );
+        let styles = css::cascade::cascade(&doc, &[]);
+        let outer = doc.find_element("table").expect("a table");
+        assert!(
+            table::captions(&doc, &styles, outer).is_empty(),
+            "the outer table claimed the inner table's caption"
+        );
     }
 
     #[test]
