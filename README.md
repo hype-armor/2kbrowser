@@ -59,7 +59,10 @@ centred on the grid line between them, which is what a Wikipedia infobox or
 wikitable is built out of; table captions, which sit outside the table's
 border box on whichever side `caption-side` names; `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
-it can still ask to be visible and come back out; images,
+it can still ask to be visible and come back out; `text-transform`,
+`letter-spacing`, `text-indent` on a block's first line, `min-height`, and
+`z-index`, so that two overlapping positioned boxes land in the order their
+author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
@@ -132,14 +135,12 @@ saying plainly is that this makes some pages *look* broken rather than merely
 inert.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `text-indent`, `letter-spacing`, `word-spacing`,
-`text-transform`, `font-variant`, `outline`, `min-height`, `max-height`,
-`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
-`z-index` — so overlapping positioned boxes paint in document order rather than
-in the order asked for — `position: fixed`, which behaves as `absolute` and so
-scrolls with the page, the second value of `border-spacing`, `direction` and
-everything else about right-to-left text, and generated content in all its
-forms: `:before`, `:after`, `content`, counters and `quotes`.
+this file used to admit: `word-spacing`, `font-variant`, `outline`,
+`max-height`, `text-align: justify`, `list-style-position`, `list-style-image`,
+`clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
+page, the second value of `border-spacing`, `direction` and everything else
+about right-to-left text, and generated content in all its forms: `:before`,
+`:after`, `content`, counters and `quotes`.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have

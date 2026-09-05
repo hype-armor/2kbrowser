@@ -1804,6 +1804,22 @@ fn layout_block(
                 + border_bottom
         }
     };
+    // §10.7: the used height is then raised to `min-height`, whether it came
+    // from a declared height or from the content. Like `height` it bounds the
+    // *content* box, so the surround is added back on — the same shape as
+    // `max-width` above, and wrong in the same visible way if it is not.
+    //
+    // A percentage resolves against the containing block's *height*, which is
+    // not known here and is `auto` for most of the era's markup anyway; those
+    // are treated as no bound rather than guessed at.
+    if let Length::Px(_) | Length::Em(_) = style.min_height {
+        let floor = style.min_height.to_px(font_size, 0.0)
+            + padding_top
+            + padding_bottom
+            + border_top
+            + border_bottom;
+        box_.rect.height = box_.rect.height.max(floor);
+    }
 
     // Absolutely positioned children, now that this block's size is known.
     // A positioned box becomes the containing block for its own descendants;
@@ -2627,7 +2643,13 @@ fn gather_one(
     if let Some(text) = doc.text(child) {
         // Text belongs to the nearest element that wraps it, not to the text
         // node: `<a>go</a>` must hit the anchor, which is what has the href.
-        out.push(InlineRun::text(text, inherited.clone()).from_element(holder.0));
+        //
+        // §16.5's transform is applied here, before shaping, because it changes
+        // how wide the text is — uppercase is wider than what it replaces in
+        // every face bundled here, and a line measured lowercase would wrap in
+        // the wrong place and then be drawn in capitals over the top.
+        let transformed = inherited.text_transform.apply(text);
+        out.push(InlineRun::text(transformed, inherited.clone()).from_element(holder.0));
         return;
     }
     let Some(style) = styles.get(child) else {
@@ -3072,6 +3094,113 @@ mod tests {
             .into_iter()
             .find(|b| b.style.display == Display::Table)
             .expect("a table box")
+    }
+
+    #[test]
+    fn min_height_raises_a_box_that_would_be_shorter() {
+        // §10.7, and it bounds the content box like `height` does — so the
+        // padding and border are added back on rather than absorbed, which is
+        // the same shape as `max-width` and visibly wrong if it is not.
+        let rendered = run(
+            "<body><div>short</div></body>",
+            "body { margin: 0 } div { min-height: 120px; padding: 10px; border: 5px solid }",
+            600.0,
+        );
+        let box_ = siblings(&rendered).first().expect("the div");
+        assert!(
+            (box_.rect.height - (120.0 + 20.0 + 10.0)).abs() < 0.01,
+            "got {:?}",
+            box_.rect
+        );
+    }
+
+    #[test]
+    fn min_height_does_not_shrink_a_taller_box() {
+        // It is a floor, not a height. A box whose content already exceeds it
+        // must be left alone, or the property becomes `height` under a
+        // different name.
+        let sheet = "body { margin: 0 } div { min-height: 10px }";
+        let tall = run(
+            "<body><div>one<br>two<br>three<br>four<br>five</div></body>",
+            sheet,
+            600.0,
+        );
+        let plain = run(
+            "<body><div>one<br>two<br>three<br>four<br>five</div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert_eq!(
+            siblings(&tall).first().expect("div").rect.height,
+            siblings(&plain).first().expect("div").rect.height
+        );
+    }
+
+    #[test]
+    fn text_indent_moves_the_first_line_and_only_the_first() {
+        // §16.4. The indent comes out of the first line's own width rather than
+        // the block's, which is why it cannot be an offset applied at paint
+        // time: it changes where the text wraps.
+        let rendered = run(
+            "<body><p>the first line of this paragraph is indented and the rest              of it is not, which takes several lines to show</p></body>",
+            "body { margin: 0 } p { text-indent: 40px; width: 200px; margin: 0 }",
+            600.0,
+        );
+        let text = siblings(&rendered)
+            .iter()
+            .find_map(|b| b.text.as_ref())
+            .expect("the paragraph's text");
+        assert!(text.lines.len() > 1, "needs to wrap to prove anything");
+        // A line carries no offset of its own — `push_line` folds it into the
+        // glyph positions — so the leftmost glyph is where the line starts.
+        let starts_at = |line: &text::Line| {
+            line.glyphs
+                .iter()
+                .map(|glyph| glyph.x)
+                .fold(f32::MAX, f32::min)
+        };
+        let first = starts_at(&text.lines[0]);
+        assert!(
+            (first - 40.0).abs() < 1.0,
+            "first line starts at {first}, not at the 40px indent"
+        );
+        for line in &text.lines[1..] {
+            let at = starts_at(line);
+            assert!(
+                at < 1.0,
+                "a later line starts at {at}, so the indent was not the first line's alone"
+            );
+        }
+    }
+
+    #[test]
+    fn text_transform_changes_what_is_measured_not_only_what_is_drawn() {
+        // Applied before shaping, because uppercase is wider in every bundled
+        // face. A transform done at paint time would wrap the line at the
+        // lowercase width and then draw capitals past the edge.
+        let plain = run(
+            "<body><p>make me shout</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let shouted = run(
+            "<body><p>make me shout</p></body>",
+            "body { margin: 0 } p { margin: 0; text-transform: uppercase }",
+            600.0,
+        );
+        let width = |r: &Rendered| {
+            siblings(r)
+                .iter()
+                .find_map(|b| b.text.as_ref())
+                .expect("text")
+                .width
+        };
+        assert!(
+            width(&shouted) > width(&plain),
+            "uppercase measured {} against {}",
+            width(&shouted),
+            width(&plain)
+        );
     }
 
     #[test]

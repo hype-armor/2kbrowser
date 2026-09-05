@@ -1,0 +1,63 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  .measure { width: 240px; border: 1px solid #cccccc; }
+
+  .indent { text-indent: 40px; }
+  .hanging { text-indent: 0; }
+  .spaced { letter-spacing: 4px; }
+  .tight { letter-spacing: 0; }
+  .shout { text-transform: uppercase; }
+  .quiet { text-transform: lowercase; }
+  .title { text-transform: capitalize; }
+  .floor { min-height: 70px; background-color: #ddeeff; width: 160px;
+           padding: 6px; border: 2px solid #003366; }
+  .tall { min-height: 10px; background-color: #ddeeff; width: 160px; }
+
+  .stack { position: relative; height: 70px; }
+  .stack div { position: absolute; top: 0; width: 90px; height: 50px; }
+  #under { left: 0; background-color: #cc0000; z-index: 2; }
+  #over  { left: 40px; background-color: #0000cc; z-index: 1; }
+  /* Negative, so it must go *behind* the in-flow yellow box it overlaps,
+     which only proves anything if it does overlap it. */
+  #behind { left: 170px; background-color: #cc00cc; z-index: -1; }
+  /* A `p`, not a `div`, so `.stack div` above does not position it: the
+     point of this row is a negative `z-index` going behind content that is
+     genuinely in flow. */
+  .flow { height: 50px; background-color: #ffdd00; margin: 0 0 0 150px;
+          width: 90px; }
+</style></head><body>
+
+<h3>text-indent moves the first line, and only the first</h3>
+<p class="measure indent">The first line of this paragraph carries an indent of
+forty pixels, and every line after it must start hard against the left edge.</p>
+<p class="measure hanging">This one declares no indent at all, so all of its
+lines start in the same place and it is the control for the one above.</p>
+
+<h3>letter-spacing</h3>
+<p class="spaced">spaced out by four pixels</p>
+<p class="tight">the same words at no extra spacing</p>
+
+<h3>text-transform</h3>
+<p class="shout">make me shout</p>
+<p class="quiet">MAKE ME WHISPER</p>
+<p class="title">the HTML spec, o'clock</p>
+
+<h3>min-height raises a short box and leaves a tall one alone</h3>
+<div class="floor">short, but held open</div>
+<div class="tall">a box whose own content is already taller than its
+minimum, which must not be squeezed down to it: one line, two lines,
+three lines, four.</div>
+
+<h3>z-index decides which positioned box is on top</h3>
+<div class="stack">
+  <div id="under">z-index 2</div>
+  <div id="over">z-index 1</div>
+  <div id="behind">z-index -1</div>
+  <p class="flow">in flow</p>
+</div>
+
+<h3>None of it disturbs an ordinary paragraph</h3>
+<p>Plain text, a <b>bold</b> run, and an <i>italic</i> one, all unchanged.</p>
+
+</body></html>

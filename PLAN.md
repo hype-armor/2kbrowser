@@ -336,10 +336,10 @@ Known-wrong and recorded rather than hidden: fixed table
 layout, form controls — `<input>`, `<textarea>` and `<button>` draw no widget
 at all, `<fieldset>` no border, and a `<select>` shows its open option without a
 dropdown around it — the properties that parse and are then ignored
-(`text-indent`, `letter-spacing`, `word-spacing`, `text-transform`,
-`font-variant`, `outline`, `min-height`, `max-height`, `text-align: justify`,
-`list-style-position`, `list-style-image`, `clip`, `z-index`, `position: fixed`,
-`border-spacing`'s second value, `direction`, and generated content), a caption wider than its table — which overhangs rather than widening
+(`word-spacing`, `font-variant`, `outline`, `max-height`,
+`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
+`position: fixed`, `border-spacing`'s second value, `direction`, and generated
+content), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
 `empty-cells` — ignored in the separated model, where it applies, and

@@ -496,6 +496,23 @@ impl FontStore {
     /// Attributes for one inline span.
     fn attrs_for(style: &ComputedStyle) -> Attrs<'static> {
         Attrs::new()
+            // Part of the shaping key, which is what makes this safe to cache:
+            // the same words at two spacings are two different shapings and
+            // `AttrsOwned` already knows it.
+            //
+            // Divided by the font size, and that is not a detail. `cosmic-text`
+            // adds this to an advance it has *already* divided by the font
+            // scale, so the number it wants is in em rather than in pixels —
+            // handing it `5` for `letter-spacing: 5px` spaces the text by five
+            // ems, which at 16px is eighty pixels a letter and looks exactly as
+            // wrong as it sounds. Found by rendering it, not by reading it.
+            .letter_spacing(if style.font_size > 0.0 {
+                style.letter_spacing / style.font_size
+            } else {
+                // The fuzzer has already found `font-size: 0` once. Nothing to
+                // scale against, and no spacing worth adding to invisible text.
+                0.0
+            })
             .family(Self::family_for(style))
             .weight(Weight(style.font_weight))
             .stretch(Stretch::Normal)
@@ -653,10 +670,28 @@ impl FontStore {
         // started with — the alternative is re-flowing, which can oscillate.
         let mut available = constraints(y, line_height).1;
 
+        // §16.4: `text-indent` moves the first line only, and takes its room
+        // out of that line rather than out of the block — so the indent both
+        // shifts the line right and gives it that much less to fill, which is
+        // why it cannot be added at paint time. A percentage resolves against
+        // the containing block's width, which is what the constraint just
+        // reported for a full-height line.
+        //
+        // Tracked as a flag rather than by testing `y == 0.0`, because a first
+        // line that is also the last never advances `y` and the two cases would
+        // be indistinguishable.
+        let indent = default_style
+            .text_indent
+            .to_px(default_style.font_size, available);
+        let mut first_line = true;
+        available -= indent;
+
         for segment in segments {
             let fits = current.is_empty() || x + segment.shaped.width <= available;
             if !fits {
                 let (offset, _) = constraints(y, line_height);
+                let offset = offset + if first_line { indent } else { 0.0 };
+                first_line = false;
                 Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
@@ -678,6 +713,8 @@ impl FontStore {
             // line regardless of how much room is left.
             if forced {
                 let (offset, _) = constraints(y, line_height);
+                let offset = offset + if first_line { indent } else { 0.0 };
+                first_line = false;
                 Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
@@ -689,6 +726,7 @@ impl FontStore {
 
         if !current.is_empty() {
             let (offset, _) = constraints(y, line_height);
+            let offset = offset + if first_line { indent } else { 0.0 };
             Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
             y += line_height;
         }
