@@ -73,6 +73,41 @@ th, td { display: table-cell; padding: 1px; }
 th { text-align: center; }
 caption { display: block; text-align: center; }
 
+/* Form controls. Nothing here can be typed into or submitted — see
+   `layout::forms` — so this is what a control *looks* like, and looking right
+   is most of what a page needs from one. Without these rules a control is an
+   inline element with no content and draws nothing at all, which is how a
+   search box came to be invisible rather than merely inert.
+
+   `inset` and `outset` are the era's own borders, and the reason this browser
+   implements them: a field is a hole in the page and a button stands proud of
+   it, which is exactly what those two styles say. */
+input, textarea, select, button {
+  border: 2px inset #cccccc;
+  background-color: #ffffff;
+  padding: 1px 2px;
+  color: #000000;
+}
+input[type=submit], input[type=reset], input[type=button], button {
+  border: 2px outset #cccccc;
+  background-color: #dddddd;
+  text-align: center;
+}
+input[type=checkbox], input[type=radio] {
+  border: 1px inset #cccccc;
+  padding: 0;
+}
+/* A hidden input generates no box at all, which is why `layout::forms` has no
+   variant for it. */
+input[type=hidden] { display: none; }
+
+/* `fieldset` groups controls and has drawn a rule around them since it
+   existed. `legend` sits *in* that rule in a browser, which needs the border to
+   be broken where the text crosses it; that is not done here, so the legend is
+   drawn as an ordinary block above the group's contents. */
+fieldset { display: block; border: 2px groove #cccccc; padding: 6px; margin: 1em 2px; }
+legend { display: block; font-weight: bold; }
+
 big { font-size: 1.17em; }
 small, sub, sup { font-size: 0.83em; }
 "#;

@@ -124,15 +124,17 @@ so a page built on inline-blocks is re-rendered as a document and told so
 rather than coming out subtly wrong in silence (ADR-0009). It is a share and
 not a switch, so a navigation bar of them does not move an article.
 
-**Forms are not drawn.** `<input>` of every type, `<textarea>` and `<button>`
-have no widget here, so a search box is not a box — it is nothing at all, and a
-login form is a column of labels. `<fieldset>` draws no border and `<legend>` no
-notch in it. A `<select>` at least shows the one option it is open on rather
-than running every option together into the surrounding sentence, which is what
-it used to do, but it has no dropdown around it. Nothing can be typed into or
-submitted regardless, since forms were never on the M2 list; what is worth
-saying plainly is that this makes some pages *look* broken rather than merely
-inert.
+**Forms are drawn but do not work.** Every control has a box now — text and
+password fields, buttons, checkboxes, radios, `<textarea>`, `<select>` and the
+rule around a `<fieldset>` — sized in the era's own units, since `size`, `cols`
+and `rows` count characters and lines rather than pixels, and a field follows
+the font it is set in. A password field shows bullets and never its value.
+**Nothing can be typed into, clicked, or submitted**, and that is the stopping
+point rather than an oversight: a control that draws correctly makes the page
+read correctly, and interaction is separate work with a separate risk. Two
+things a browser draws and this does not: a radio button is square, because the
+rasteriser has rectangles and no rounded primitive, and a `<legend>` sits above
+its group rather than breaking the rule it is written into.
 
 And a list of properties that parse and are then ignored, which is longer than
 this file used to admit: `word-spacing`, `font-variant`, `outline`,
