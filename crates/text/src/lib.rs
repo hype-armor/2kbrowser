@@ -14,7 +14,7 @@ use cosmic_text::{
     Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache,
     Weight,
 };
-use css::style::{ComputedStyle, FontStyle, GenericFamily, TextDecoration, WhiteSpace};
+use css::style::{ComputedStyle, FontStyle, GenericFamily, TextDecoration, Visibility, WhiteSpace};
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
 const SANS: &[(&str, &[u8])] = &[
@@ -103,6 +103,15 @@ pub struct PositionedGlyph {
     /// single line can contain spans of different colours, and the paint stage
     /// has no way to recover which span a glyph belonged to.
     pub color: Option<(u8, u8, u8, u8)>,
+    /// Whether `visibility: hidden` applies to the span this glyph came from.
+    ///
+    /// Carried per glyph for exactly the reason the colour above is: the spans
+    /// on a line are merged into one layout, so by paint time there is no way
+    /// back to which span a glyph belonged to. Hidden glyphs are still shaped,
+    /// placed, and measured — they hold their advance open — and simply are not
+    /// drawn, which is what §11.2 asks for and the whole difference between
+    /// this and `display: none`.
+    pub hidden: bool,
     /// Byte range this glyph covers in its line's text.
     ///
     /// What lets a match in the text become a rectangle on the screen. Shaping
@@ -233,6 +242,9 @@ pub struct DecorationRun {
     pub thickness: f32,
     /// Colour of the span the rule belongs to, or `None` for the block's.
     pub color: Option<(u8, u8, u8, u8)>,
+    /// Whether the span the rule belongs to is hidden, in which case its
+    /// underline goes with it.
+    pub hidden: bool,
 }
 
 /// One laid-out line.
@@ -301,6 +313,8 @@ struct Segment {
     /// The segment's font size, which sets where its rules sit and how thick
     /// they are.
     font_size: f32,
+    /// Whether the span this segment came from is hidden.
+    hidden: bool,
     /// Colour of the span this segment came from, for its rules to match.
     color: Option<(u8, u8, u8, u8)>,
 }
@@ -569,6 +583,10 @@ impl FontStore {
                     y: 0.0,
                     font_size: glyph.font_size,
                     color: glyph.color_opt.map(|c| (c.r(), c.g(), c.b(), c.a())),
+                    // Stamped per segment when the line is assembled: keeping
+                    // it out of the shaping cache is what lets one cached
+                    // shaping serve a hidden span and a visible one.
+                    hidden: false,
                     start: glyph.start,
                     end: glyph.end,
                 })
@@ -702,6 +720,7 @@ impl FontStore {
             text.push_str(&segment.shaped.text);
             for glyph in &segment.shaped.glyphs {
                 glyphs.push(PositionedGlyph {
+                    hidden: segment.hidden,
                     x: glyph.x + segment.x + offset,
                     // Absolute baseline within the block: the line's own top
                     // plus the shared ascent. Using the ascent alone would
@@ -805,6 +824,7 @@ impl FontStore {
             decoration: TextDecoration,
             font_size: f32,
             color: Option<(u8, u8, u8, u8)>,
+            hidden: bool,
         }
 
         let mut out: Vec<DecorationRun> = Vec::new();
@@ -828,6 +848,7 @@ impl FontStore {
                     y,
                     thickness,
                     color: run.color,
+                    hidden: run.hidden,
                 });
             };
             if run.decoration.underline {
@@ -854,7 +875,8 @@ impl FontStore {
                 Some(run)
                     if run.decoration == segment.decoration
                         && run.color == segment.color
-                        && run.font_size == segment.font_size =>
+                        && run.font_size == segment.font_size
+                        && run.hidden == segment.hidden =>
                 {
                     run.right = right;
                 }
@@ -866,6 +888,7 @@ impl FontStore {
                         decoration: segment.decoration,
                         font_size: segment.font_size,
                         color: segment.color,
+                        hidden: segment.hidden,
                     });
                 }
             }
@@ -904,6 +927,7 @@ impl FontStore {
                     decoration: run.style.text_decoration,
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
+                    hidden: run.style.visibility == Visibility::Hidden,
                 });
                 continue;
             }
@@ -971,6 +995,7 @@ impl FontStore {
                             decoration: run.style.text_decoration,
                             font_size: run.style.font_size,
                             color: span_color(&run.style),
+                            hidden: run.style.visibility == Visibility::Hidden,
                         });
                     }
                     continue;
@@ -987,6 +1012,7 @@ impl FontStore {
                     decoration: run.style.text_decoration,
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
+                    hidden: run.style.visibility == Visibility::Hidden,
                 });
             }
         }

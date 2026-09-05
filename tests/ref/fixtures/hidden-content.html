@@ -1,0 +1,49 @@
+<!doctype html><html><head><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  .box { background: #ccddee; border: 2px solid #003366; padding: 4px; width: 220px; }
+  .hidden { visibility: hidden; }
+  .back { visibility: visible; }
+  /* `collapse` means `hidden` everywhere but a table row or column. */
+  .collapsed { visibility: collapse; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid #888888; padding: 3px; }
+</style></head><body>
+
+<h3>A hidden box draws nothing and keeps its room</h3>
+<div class="box">above</div>
+<div class="box hidden">this must not be seen</div>
+<div class="box">below, and must not have moved up</div>
+
+<h3>A hidden inline span holds its line open</h3>
+<p>before <span class="hidden">this span is hidden</span> after</p>
+<p>before <b class="hidden">bold and hidden</b> after</p>
+
+<h3>A visible child comes back out of a hidden parent</h3>
+<div class="box hidden">hidden text <span class="back">but this is visible</span></div>
+
+<h3>An underline goes with the span that carried it</h3>
+<p><a href="/x">a visible link</a> and <a href="/y" class="hidden">a hidden one</a></p>
+
+<h3>visibility: collapse reads as hidden</h3>
+<div class="box collapsed">collapsed, so not drawn</div>
+
+<h3>A hidden table cell keeps the grid's shape</h3>
+<table>
+  <tr><th>one</th><th>two</th><th>three</th></tr>
+  <tr><td>a</td><td class="hidden">hidden cell</td><td>c</td></tr>
+</table>
+
+<h3>A closed dropdown shows only the option it opens on</h3>
+<p>No selection: <select><option>United Kingdom</option><option>France</option></select></p>
+<p>Preselected: <select><option>One</option><option selected>Two</option><option>Three</option></select></p>
+<p>Through an optgroup: <select><optgroup label="G"><option>Nested one</option><option>Nested two</option></optgroup></select></p>
+
+<h3>A list box keeps every option, stacked</h3>
+<p><select multiple><option>Alpha</option><option>Beta</option><option>Gamma</option></select></p>
+<p><select size="3"><option>Red</option><option>Green</option></select></p>
+
+<h3>Neither property disturbs an ordinary page</h3>
+<p>Plain text, a <a href="/z">link</a>, and <b>bold</b>, all unchanged.</p>
+
+</body></html>
