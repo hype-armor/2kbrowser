@@ -296,7 +296,8 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    **both border models** — `border-collapse: collapse` with §17.6.2.1's
    conflict resolution in full, resolved per grid line *segment* so that one
    edge of a spanning cell can carry a different border against each neighbour
-   it faces. Missing: fixed layout
+   it faces. Captions, above or below per `caption-side`, outside the table's
+   border box. Missing: fixed layout
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
@@ -331,7 +332,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: fixed table
-layout, `empty-cells` — ignored in the separated model, where it applies, and
+layout, a caption wider than its table — which overhangs rather than widening
+the wrapper box CSS 2.1 puts around a table and its caption, since there is no
+such box here, so the table sits further left than a browser draws it —
+`empty-cells` — ignored in the separated model, where it applies, and
 correctly ignored in the collapsing one, where it does not — the corner where
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
 settled here by width rather than by a diagonal mitre, `inline-block` laid out as
@@ -1087,6 +1091,39 @@ regressing. That is a real but small number, and it is exactly the kind the
 README warns not to lean on: the reference fixture and its committed baseline
 are the evidence, and Chromium rendering the same fixture was what checked the
 baseline was worth blessing.
+
+Table captions were not on that list, because nobody had noticed they were
+missing. They were found while writing up what remained of the collapsing
+border model: a `<caption>` rendered as *nothing at all*, and had for as long as
+there has been table layout here. The cause is a single line of control flow —
+the table branch of `layout_block` returns as soon as the grid is placed, and
+the child walk that would have reached the caption is below that return — so
+the element was parsed, cascaded, given a UA rule of its own, and then dropped
+on the floor. It never showed up as a failing test because no fixture had a
+caption, and it never showed up in the suite because a reftest whose two sides
+both omit the caption still matches.
+
+That is the shape of bug this project should expect more of: not something
+rendering wrongly, but something rendering *nothing*, in a place no test was
+looking. The suite cannot find it, the reference baselines cannot find it, and
+the only reason this one surfaced is that somebody rendered a page with a
+caption on it and looked.
+
+§17.4 puts the caption outside the table's border box rather than inside it,
+which is the part worth getting right: a bordered table draws its rule around
+its rows and *not* around its own heading, and a caption laid out as another row
+would look almost correct and be wrong in exactly the way nobody checks. The
+caption is placed as a sibling of the table box, above or below it per
+`caption-side`, and the table gives up the space a top caption takes — its
+children come along, since they are positioned relative to it.
+
+CSS 2.1 wraps a table and its caption in an anonymous wrapper box, and there is
+no such box here. That costs one thing, stated in the README: a caption wider
+than its table overhangs it instead of widening a wrapper, so the table sits
+further left than a browser draws it. The caption is still never squeezed
+narrower than its own longest word, because a one-column table would otherwise
+wrap its heading to a letter a line, which is the case that would actually look
+broken.
 
 The three-dimensional border styles came off it as well — `double`, `groove`,
 `ridge`, `inset`, `outset` — and they are the most era-appropriate thing on the

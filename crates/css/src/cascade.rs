@@ -8,8 +8,8 @@ use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
     DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
-    parse_border_collapse, parse_border_style, parse_clear, parse_display, parse_float,
-    parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
+    parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_display,
+    parse_float, parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
     parse_vertical_align,
 };
 use crate::value::{
@@ -464,6 +464,13 @@ fn apply(
         "border-spacing" => {
             if let Some(length) = parse_length(first) {
                 style.border_spacing = length;
+            }
+        }
+        "caption-side" => {
+            if let Raw::Ident(name) = first
+                && let Some(side) = parse_caption_side(name)
+            {
+                style.caption_side = side;
             }
         }
         // Ahead of the `border-*` longhand fallback at the bottom of this
@@ -1058,7 +1065,8 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
 mod tests {
     use super::*;
     use crate::style::{
-        BackgroundPosition, BackgroundRepeat, BorderCollapse, Display, ListStyleType, VerticalAlign,
+        BackgroundPosition, BackgroundRepeat, BorderCollapse, CaptionSide, Display, ListStyleType,
+        VerticalAlign,
     };
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
@@ -1908,6 +1916,51 @@ mod tests {
                 .border_collapse,
             BorderCollapse::Separate
         );
+    }
+
+    #[test]
+    fn caption_side_parses_and_inherits_to_the_caption() {
+        // Written on the table, read on the caption, which is only possible
+        // because it inherits — the caption is where the value is consulted and
+        // nothing sets it there.
+        let doc = dom::parse("<table><caption>c</caption><tr><td>x</td></tr></table>");
+        let styles = cascade(&doc, &[Stylesheet::parse("table { caption-side: bottom }")]);
+        let of = |tag: &str| {
+            styles
+                .get(doc.find_element(tag).expect("an element"))
+                .expect("a styled element")
+                .caption_side
+        };
+        assert_eq!(of("table"), CaptionSide::Bottom);
+        assert_eq!(of("caption"), CaptionSide::Bottom, "did not inherit");
+
+        assert_eq!(
+            cascade(&doc, &[])
+                .get(doc.find_element("caption").expect("caption"))
+                .expect("a styled caption")
+                .caption_side,
+            CaptionSide::Top,
+            "the initial value"
+        );
+    }
+
+    #[test]
+    fn caption_side_refuses_the_values_css_21_dropped() {
+        // `left` and `right` are CSS 2.0 and no browser kept them. Refusing
+        // leaves the declaration invalid and the caption on top, which is what
+        // a browser does; guessing an axis would put it somewhere nobody asked.
+        for value in ["left", "right", "sideways"] {
+            let style = standards_style_of(
+                "<table><caption>c</caption><tr><td>x</td></tr></table>",
+                &format!("table {{ caption-side: {value} }}"),
+                "table",
+            );
+            assert_eq!(
+                style.caption_side,
+                CaptionSide::Top,
+                "`{value}` was accepted"
+            );
+        }
     }
 
     #[test]

@@ -56,7 +56,8 @@ Unicode line breaking; floats; tables with automatic column sizing, `colspan` an
 `cellspacing`, and **both border models** — including
 `border-collapse: collapse`, where adjoining borders resolve into one line
 centred on the grid line between them, which is what a Wikipedia infobox or
-wikitable is built out of; images,
+wikitable is built out of; table captions, which sit outside the table's
+border box on whichever side `caption-side` names; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
@@ -103,7 +104,9 @@ Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
 not clipped; an invalid selector does not invalidate its rule, so
 `[1digit], div { color: red }` styles the `div` where a browser would style
-nothing; `empty-cells`, which is parsed by nobody here and so is ignored in the
+nothing; a caption wider than its table, which overhangs it rather than
+widening a wrapper box this engine does not have, so the table sits a little
+left of where a browser puts it; `empty-cells`, which is parsed by nobody here and so is ignored in the
 separated model where it applies — it is correctly ignored in the collapsing
 one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to

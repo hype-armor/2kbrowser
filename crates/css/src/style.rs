@@ -715,6 +715,33 @@ pub fn parse_clear(name: &str) -> Option<Clear> {
     }
 }
 
+/// The `caption-side` property (CSS 2.1 §17.4.1).
+///
+/// Which side of the table its caption sits on. Inherited, because it is set on
+/// the table and read on the caption — the same shape as `border-collapse`, and
+/// for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptionSide {
+    /// Above the table. The initial value.
+    #[default]
+    Top,
+    /// Below it.
+    Bottom,
+}
+
+/// Parses a `caption-side` keyword.
+///
+/// `left` and `right` are CSS 2.0 values that CSS 2.1 dropped, and no browser
+/// kept them; they are refused rather than guessed at, which leaves the
+/// declaration invalid and the caption where the initial value puts it.
+pub fn parse_caption_side(name: &str) -> Option<CaptionSide> {
+    match name {
+        "top" => Some(CaptionSide::Top),
+        "bottom" => Some(CaptionSide::Bottom),
+        _ => None,
+    }
+}
+
 /// The `border-collapse` property (CSS 2.1 §17.6).
 ///
 /// Which of the two border models a table uses, and the two are not variations
@@ -919,6 +946,8 @@ pub struct ComputedStyle {
     pub border_spacing: Length,
     /// `border-collapse`, inherited, which model a table's borders use.
     pub border_collapse: BorderCollapse,
+    /// `caption-side`, inherited, which side of a table its caption sits on.
+    pub caption_side: CaptionSide,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -988,6 +1017,7 @@ impl Default for ComputedStyle {
             vertical_align: VerticalAlign::Middle,
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             border_collapse: BorderCollapse::Separate,
+            caption_side: CaptionSide::Top,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -1028,6 +1058,8 @@ impl ComputedStyle {
             // §17.6: inherited, so a rule on `table` reaches the cells that
             // have to agree with it about where their borders are.
             border_collapse: parent.border_collapse,
+            // §17.4.1: set on the table, read on the caption.
+            caption_side: parent.caption_side,
             ..Self::default()
         }
     }
