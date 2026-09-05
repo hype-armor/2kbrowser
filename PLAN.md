@@ -256,6 +256,41 @@ The CSS 2.1 test suite is the project's north-star metric — a frozen target wi
 a published pass rate. Track the number from the first milestone that can pass
 any of it, and the roadmap becomes measurable rather than vibes.
 
+### How a change reaches `main`
+
+Work branches off **`next-release`** and its pull requests target
+`next-release`. Changes collect there and ship to `main` about once a week, as
+one release that somebody read as a whole. `main` is what has shipped;
+`next-release` is what is going to.
+
+The reason to collect rather than merge each change straight through is that a
+release is a unit worth reviewing. A dozen changes that are each individually
+sound can still add up to a week that reads badly — three overlapping additions
+to the same gap list, or two of them undoing each other's wording. Nobody sees
+that on the commits; it is only visible on the pile.
+
+`.github/workflows/release.yml` opens the release pull request on Monday
+mornings, and `workflow_dispatch` cuts one that should not wait. It lives on
+`main` and cannot live anywhere else: GitHub only fires a `schedule` trigger
+from the default branch, so a copy on `next-release` would never run at all.
+A quiet week opens nothing rather than an empty pull request, and a release
+already open is left alone rather than rewritten under its review.
+
+`CHANGELOG.md` gets the release's section *before* it merges, written as prose
+in the same voice as the commits. The tag is made afterwards, by the same
+workflow, from the version in `Cargo.toml` — so what carries a tag is what
+actually shipped rather than what was proposed, and `git show v0.1.0` prints
+the changelog entry because that is where the tag message comes from.
+
+Two CI rules follow from this and are worth stating so they are not read as
+oversights. `next-release` joins `main` in being exempt from build
+cancellation, for `main`'s own reason: every commit on it is one that ships, so
+a cancelled build there is a commit nobody measured. The *matrix* is
+deliberately not widened to match — every change reaches `next-release` through
+a pull request, which already runs all four targets, and the release pull
+request runs them again over the collection, so nothing ships unmeasured and
+the 10x macOS minutes are not spent twice on the same commits.
+
 ---
 
 ## 6. Milestones
