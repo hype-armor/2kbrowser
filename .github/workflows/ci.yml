@@ -117,6 +117,15 @@ jobs:
       - name: Budgets
         run: cargo run --release -p budgets
 
+      # What the engine actually honours, against what README.md and PLAN.md
+      # say it does. Fails when the two disagree in *either* direction — a
+      # property that started working makes the gap list untrue just as surely
+      # as one that stopped. Neither of the other harnesses can see this: a
+      # reftest whose two sides both ignore a property still passes, and a
+      # reference baseline only covers what somebody wrote a fixture for.
+      - name: Gap inventory
+        run: cargo run --release -p gaps
+
       # The window is the one part with no automated coverage — CI has no
       # display, so event handling and blitting have always been exercised by
       # hand and by nothing else. Xvfb closes most of that gap. Linux only,
@@ -233,6 +242,9 @@ jobs:
 
       - name: Budgets
         run: cargo run --release -p budgets
+
+      - name: Gap inventory
+        run: cargo run --release -p gaps
 
       # What the allowlist was missing until now: the set of calls a renderer
       # makes on a second architecture, measured rather than inferred from the

@@ -146,7 +146,17 @@ and comparing, which is worth recording because nothing already here could have
 found them. The conformance suite cannot: a reftest passes when its two sides
 render alike, and content missing from both sides still matches. The reference
 baselines cannot either, since they only cover what somebody thought to write a
-fixture for. A gap list is only as good as the last time somebody looked.
+fixture for. Both are good at catching a rendering that *changed*; neither can
+find one that was never there.
+
+So the list above is now checked rather than remembered. `cargo run -p gaps`
+renders each property twice — once with the declaration and once without — and
+reports the ones that change nothing, alongside the elements that put nothing
+on the canvas. Every row carries the answer this file claims, and CI fails when
+they disagree in **either** direction: a property that starts working makes
+this list untrue just as surely as one that stops, and the point is that the
+list cannot go quietly stale again. It needs no browser, because "did this
+declaration change any pixel" is not a question that needs one.
 
 A document rendering also drops runs of line breaks, keeping one. Using
 `<br><br><br><br>` as a margin is how a great deal of the era's markup did its
