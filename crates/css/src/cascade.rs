@@ -10,7 +10,7 @@ use crate::style::{
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
     parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_display,
     parse_float, parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
-    parse_vertical_align,
+    parse_vertical_align, parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -466,6 +466,13 @@ fn apply(
                 style.border_spacing = length;
             }
         }
+        "visibility" => {
+            if let Raw::Ident(name) = first
+                && let Some(visibility) = parse_visibility(name)
+            {
+                style.visibility = visibility;
+            }
+        }
         "caption-side" => {
             if let Raw::Ident(name) = first
                 && let Some(side) = parse_caption_side(name)
@@ -823,6 +830,25 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
     {
         push("border", &format!("{width}px solid"));
     }
+    // A `<select>` has no widget here, so without this every one of its options
+    // is laid out as ordinary inline text and they run together: a country
+    // dropdown becomes two hundred country names in the middle of a sentence.
+    // That is worse than drawing nothing, because a reader cannot tell it is
+    // not part of the page.
+    //
+    // A closed dropdown shows exactly one option, so every other one is hidden.
+    // A list box — `multiple`, or `size` above one — shows all of them, and
+    // they are stacked rather than run together so the list still reads as a
+    // list.
+    if tag == "option"
+        && let Some(select) = enclosing_select(doc, node)
+    {
+        if is_list_box(doc.element(select)) {
+            push("display", "block");
+        } else if !is_shown_option(doc, select, node) {
+            push("display", "none");
+        }
+    }
     // `cellspacing` is `border-spacing` by another name, and the attribute is
     // what the era's markup used. `cellspacing="0"` in particular is how a
     // table used for page layout closed the gaps between its cells — leaving
@@ -851,6 +877,71 @@ fn enclosing_table(doc: &Document, node: NodeId) -> Option<&ElementData> {
         current = doc.node(id).parent;
     }
     None
+}
+
+/// The `select` enclosing an option, skipping any `optgroup`.
+fn enclosing_select(doc: &Document, node: NodeId) -> Option<NodeId> {
+    let mut current = doc.node(node).parent;
+    while let Some(id) = current {
+        if doc.element(id)?.local_name() == "select" {
+            return Some(id);
+        }
+        current = doc.node(id).parent;
+    }
+    None
+}
+
+/// Whether a `select` is drawn as a list rather than as a closed dropdown.
+///
+/// `size="1"` is a dropdown written the long way round, so the attribute is
+/// read rather than merely tested for.
+fn is_list_box(select: Option<&ElementData>) -> bool {
+    let Some(select) = select else {
+        return false;
+    };
+    if select.attr("multiple").is_some() {
+        return true;
+    }
+    select
+        .attr("size")
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|size| size > 1)
+}
+
+/// Whether this is the one option a closed dropdown displays.
+///
+/// The last option carrying `selected` wins, which is what browsers do with the
+/// malformed case of several; with none, the first option is shown, because
+/// that is what a dropdown opens on.
+fn is_shown_option(doc: &Document, select: NodeId, option: NodeId) -> bool {
+    let mut options = Vec::new();
+    collect_options(doc, select, &mut options);
+    let selected = options
+        .iter()
+        .rev()
+        .find(|&&id| {
+            doc.element(id)
+                .is_some_and(|element| element.attr("selected").is_some())
+        })
+        .copied();
+    match selected {
+        Some(id) => id == option,
+        None => options.first() == Some(&option),
+    }
+}
+
+/// Every `option` under a `select`, in document order, descending through
+/// `optgroup`.
+fn collect_options(doc: &Document, node: NodeId, out: &mut Vec<NodeId>) {
+    for &child in doc.children(node) {
+        let Some(element) = doc.element(child) else {
+            continue;
+        };
+        match element.local_name() {
+            "option" => out.push(child),
+            _ => collect_options(doc, child, out),
+        }
+    }
 }
 
 /// The width `<table border>` asks for, or `None` when it asks for no border.
@@ -1066,7 +1157,7 @@ mod tests {
     use super::*;
     use crate::style::{
         BackgroundPosition, BackgroundRepeat, BorderCollapse, CaptionSide, Display, ListStyleType,
-        VerticalAlign,
+        VerticalAlign, Visibility,
     };
 
     fn style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
@@ -1916,6 +2007,102 @@ mod tests {
                 .border_collapse,
             BorderCollapse::Separate
         );
+    }
+
+    #[test]
+    fn visibility_inherits_and_a_child_can_come_back_out() {
+        // §11.2's one genuine surprise, and it falls out of inheritance rather
+        // than needing a rule: a descendant of a hidden element can set
+        // `visible` and reappear. Without inheritance, hiding a container would
+        // not hide what is inside it, which is what the property is for.
+        let doc =
+            dom::parse(r#"<div id="outer">a<span id="inner">b</span><em id="deep">c</em></div>"#);
+        let styles = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "#outer { visibility: hidden } #inner { visibility: visible }",
+            )],
+        );
+        let of = |tag: &str| {
+            styles
+                .get(doc.find_element(tag).expect("an element"))
+                .expect("a styled element")
+                .visibility
+        };
+        assert_eq!(of("div"), Visibility::Hidden);
+        assert_eq!(of("span"), Visibility::Visible, "a child cannot come back");
+        assert_eq!(of("em"), Visibility::Hidden, "did not inherit");
+    }
+
+    #[test]
+    fn collapse_is_read_as_hidden() {
+        // §11.2 makes `collapse` mean `hidden` everywhere but on a table row or
+        // column. Treating it as an unknown value instead would leave the
+        // element *visible*, which is the opposite of what was asked for.
+        let style = standards_style_of("<p>x</p>", "p { visibility: collapse }", "p");
+        assert_eq!(style.visibility, Visibility::Hidden);
+
+        let nonsense = standards_style_of("<p>x</p>", "p { visibility: sideways }", "p");
+        assert_eq!(
+            nonsense.visibility,
+            Visibility::Visible,
+            "the initial value"
+        );
+    }
+
+    #[test]
+    fn a_closed_dropdown_shows_only_the_option_it_is_open_on() {
+        // Without this every option is inline text and they run together: a
+        // country dropdown becomes two hundred country names inside a sentence.
+        // Content that is wrong rather than missing, which a reader cannot tell
+        // is not part of the page.
+        let doc = dom::parse(
+            "<select><option>One</option><option selected>Two</option>\
+             <option>Three</option></select>",
+        );
+        let styles = cascade(&doc, &[]);
+        // The text of it, not merely the count: showing exactly one option and
+        // showing the *wrong* one are the same number.
+        let shown: Vec<String> = doc
+            .children(doc.find_element("select").expect("select"))
+            .iter()
+            .filter(|&&id| {
+                styles
+                    .get(id)
+                    .is_some_and(|style| style.display != Display::None)
+            })
+            .filter_map(|&id| doc.children(id).first().and_then(|&t| doc.text(t)))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["Two".to_owned()],
+            "a dropdown opens on `selected`"
+        );
+    }
+
+    #[test]
+    fn a_list_box_shows_every_option_and_stacks_them() {
+        // `multiple` and `size` above one are drawn as a list, so every option
+        // is kept — but as blocks, or they run together as one line of text,
+        // which is the bug in a different costume.
+        for markup in [
+            r#"<select multiple><option>A</option><option>B</option></select>"#,
+            r#"<select size="4"><option>A</option><option>B</option></select>"#,
+        ] {
+            let doc = dom::parse(markup);
+            let styles = cascade(&doc, &[]);
+            let displays: Vec<Display> = doc
+                .children(doc.find_element("select").expect("select"))
+                .iter()
+                .filter_map(|&id| Some(styles.get(id)?.display))
+                .collect();
+            assert_eq!(displays.len(), 2, "{markup} lost an option");
+            assert!(
+                displays.iter().all(|d| *d == Display::Block),
+                "{markup} gave {displays:?}"
+            );
+        }
     }
 
     #[test]

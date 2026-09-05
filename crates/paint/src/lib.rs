@@ -6,6 +6,7 @@
 
 pub mod images;
 
+use css::style::Visibility;
 use css::value::Color;
 use layout::{Layout, LayoutBox, Rect, line_offset};
 use text::FontStore;
@@ -136,7 +137,17 @@ fn paint_box(
     let y = offset_y + box_.rect.y;
     let is_canvas_background = box_.node.is_some() && box_.node == propagated;
 
-    if !box_.style.background_color.is_transparent() {
+    // §11.2: a hidden box draws nothing — no background, no border, no text,
+    // no image — but its *children are still walked*, because `visibility`
+    // inherits and a descendant may set `visible` to come back out of a hidden
+    // ancestor. Returning here instead would take that descendant with it.
+    //
+    // Layout is untouched on purpose: the box keeps every pixel of the space it
+    // would have taken, which is the whole difference between this and
+    // `display: none` and the reason an author reaches for it.
+    let drawn = box_.style.visibility == Visibility::Visible;
+
+    if drawn && !box_.style.background_color.is_transparent() {
         list.items.push(DisplayItem::Rect {
             rect: Rect {
                 x,
@@ -151,7 +162,8 @@ fn paint_box(
     // The background image goes over the background colour and under
     // everything else, which is the order CSS 2.1 §14.2 specifies and the
     // reason a tile with transparent pixels shows the colour through it.
-    if box_.style.background_image.is_some()
+    if drawn
+        && box_.style.background_image.is_some()
         && !is_canvas_background
         && let Some(node) = box_.node
     {
@@ -168,9 +180,11 @@ fn paint_box(
         });
     }
 
-    paint_borders(box_, x, y, list);
+    if drawn {
+        paint_borders(box_, x, y, list);
+    }
 
-    if let Some(node) = box_.replaced {
+    if drawn && let Some(node) = box_.replaced {
         list.items.push(DisplayItem::Image {
             node,
             rect: Rect {
@@ -182,6 +196,11 @@ fn paint_box(
         });
     }
 
+    // Not gated on `drawn`: the glyphs carry their own visibility, because a
+    // line merges spans that may disagree about it. A hidden block's own runs
+    // inherit `hidden` and drop out here individually, and a span that set
+    // `visible` inside one survives — which a gate on the box would take with
+    // it.
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
         let content_y = y + box_.content_origin.1;
@@ -190,7 +209,7 @@ fn paint_box(
             let dx = line_offset(box_.style.text_align, line.width, content_width);
             // Rules go under the glyphs so an underline sitting close to a
             // descender is crossed by it rather than cutting through it.
-            for rule in &line.decorations {
+            for rule in line.decorations.iter().filter(|rule| !rule.hidden) {
                 list.items.push(DisplayItem::Rect {
                     rect: Rect {
                         x: content_x + dx + rule.x,
@@ -204,7 +223,7 @@ fn paint_box(
                         .unwrap_or(box_.style.color),
                 });
             }
-            for glyph in &line.glyphs {
+            for glyph in line.glyphs.iter().filter(|glyph| !glyph.hidden) {
                 // A glyph's own colour wins: one line can hold spans of
                 // different colours, and the block's colour is only the
                 // default for text that did not come from a styled span.
@@ -962,6 +981,99 @@ mod tests {
         let height = layout.height.ceil().max(1.0) as u32;
         let images = ImageStore::new();
         rasterise(&list, &mut fonts, &images, width, height).expect("pixmap")
+    }
+
+    /// How many pixels of a render are not the blank canvas.
+    fn ink(pixmap: &Pixmap) -> usize {
+        pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px != &&[255, 255, 255, 255])
+            .count()
+    }
+
+    #[test]
+    fn a_hidden_box_draws_nothing_and_keeps_its_room() {
+        // Both halves matter and they pull in opposite directions. Drawing
+        // nothing is what separates this from being ignored; keeping the room
+        // is what separates it from `display: none`, and is the reason an
+        // author reaches for it.
+        let sheet =
+            "body { margin: 0 } div { height: 40px; background: #000; border: 2px solid #000 }";
+        let shown = render("<body><div></div></body>", sheet, 60);
+        let hidden = render(
+            "<body><div style=\"visibility: hidden\"></div></body>",
+            sheet,
+            60,
+        );
+        let gone = render(
+            "<body><div style=\"display: none\"></div></body>",
+            sheet,
+            60,
+        );
+
+        assert!(ink(&shown) > 0, "the control drew nothing");
+        assert_eq!(ink(&hidden), 0, "a hidden box was drawn");
+        assert_eq!(
+            hidden.height(),
+            shown.height(),
+            "a hidden box gave up its space, which is `display: none`"
+        );
+        assert!(
+            gone.height() < hidden.height(),
+            "`display: none` kept its space, so this proves nothing"
+        );
+    }
+
+    #[test]
+    fn hidden_inline_text_is_not_drawn_but_still_holds_its_line_open() {
+        // The case a box-level check cannot reach: spans are merged into one
+        // text layout, so hiding one has to travel with its glyphs. Before
+        // this, `visibility: hidden` on a span did nothing at all.
+        let sheet = "body { margin: 0 }";
+        let plain = render("<body><p>AAA BBB</p></body>", sheet, 200);
+        let hidden = render(
+            "<body><p>AAA <span style=\"visibility: hidden\">BBB</span></p></body>",
+            sheet,
+            200,
+        );
+        let dropped = render("<body><p>AAA </p></body>", sheet, 200);
+
+        assert!(
+            ink(&hidden) < ink(&plain),
+            "the hidden span was still drawn"
+        );
+        assert!(ink(&hidden) > 0, "it took the whole paragraph with it");
+        assert_eq!(
+            ink(&hidden),
+            ink(&dropped),
+            "what is left is not exactly the visible text"
+        );
+    }
+
+    #[test]
+    fn a_visible_span_inside_a_hidden_block_is_drawn() {
+        // §11.2's surprise, and the reason the glyphs carry their own
+        // visibility rather than the box carrying it for them: gating the whole
+        // text layout on the block would take this span with it.
+        let sheet = "body { margin: 0 }";
+        let hidden = render(
+            "<body><p style=\"visibility: hidden\">AAA</p></body>",
+            sheet,
+            200,
+        );
+        let with_child = render(
+            "<body><p style=\"visibility: hidden\">AAA              <span style=\"visibility: visible\">BBB</span></p></body>",
+            sheet,
+            200,
+        );
+        assert_eq!(ink(&hidden), 0, "the hidden paragraph drew something");
+        assert!(
+            ink(&with_child) > 0,
+            "a span that asked to be visible inside it was hidden anyway"
+        );
     }
 
     /// The display list, images, and height for a page, so a test can rasterise

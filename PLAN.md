@@ -332,7 +332,13 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: fixed table
-layout, a caption wider than its table — which overhangs rather than widening
+layout, form controls — `<input>`, `<textarea>` and `<button>` draw no widget
+at all, `<fieldset>` no border, and a `<select>` shows its open option without a
+dropdown around it — the properties that parse and are then ignored
+(`text-indent`, `letter-spacing`, `word-spacing`, `text-transform`,
+`font-variant`, `outline`, `min-height`, `max-height`, `text-align: justify`,
+`list-style-position`, `list-style-image`, `clip`, `z-index`, `position: fixed`,
+`border-spacing`'s second value, `direction`, and generated content), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
 `empty-cells` — ignored in the separated model, where it applies, and
@@ -1091,6 +1097,42 @@ regressing. That is a real but small number, and it is exactly the kind the
 README warns not to lean on: the reference fixture and its committed baseline
 are the evidence, and Chromium rendering the same fixture was what checked the
 baseline was worth blessing.
+
+Two things that put *wrong* content on the page came off the list next, and
+they are worth separating from everything else on it. Almost every gap here is
+an omission — something does not draw. These two were the other kind: the
+browser was displaying text that should not have been there, which a reader has
+no way to recognise as not part of the page.
+
+`visibility` did not exist. Not ignored on inline elements, not partly done —
+the property was absent from the cascade entirely, so anything an author had
+hidden was shown. It is implemented now, and the half worth recording is where
+it had to live. A hidden *box* is easy: paint skips it. But this engine merges a
+block's inline spans into one text layout, exactly as it merges their colours,
+so a hidden `<span>` has no box of its own to skip — before this, hiding one did
+nothing at all. The flag therefore travels per glyph, beside the colour that was
+already travelling there for the same reason, and the paint stage asks each
+glyph rather than the box. That also buys §11.2's genuine surprise for free: a
+span can set `visible` inside a hidden parent and come back out, which a check
+on the block would have taken with it.
+
+`<select>` was worse, because it was louder. With no widget to draw, every
+`<option>` was laid out as ordinary inline text and they ran together: a country
+dropdown put two hundred country names into the middle of a sentence. A closed
+dropdown now shows only the option it opens on, and a list box — `multiple`, or
+`size` above one — keeps them all but stacks them. There is still no control
+around either, which is its own gap and now said out loud.
+
+Both were found by rendering era-typical markup beside a real browser and
+comparing, which is now the third time that method has found something nothing
+else here could. It is worth being blunt about why. The conformance suite is
+blind to this class by construction: a reftest passes when its two sides render
+alike, and content missing from both sides matches. The reference baselines are
+blind to whatever nobody wrote a fixture for. Both are good at catching a
+rendering that *changed*; neither can catch a rendering that was never there.
+The same sweep turned up a longer list of properties that parse and are then
+ignored, and the README now names them rather than leaving the gap list to
+mean "the things we happened to notice".
 
 Table captions were not on that list, because nobody had noticed they were
 missing. They were found while writing up what remained of the collapsing

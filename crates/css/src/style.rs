@@ -715,6 +715,42 @@ pub fn parse_clear(name: &str) -> Option<Clear> {
     }
 }
 
+/// The `visibility` property (CSS 2.1 §11.2).
+///
+/// Not `display: none` with a different name, and the difference is the whole
+/// point: a hidden box still takes up exactly the room it would have taken, so
+/// the layout around it does not move. That is what an author reaches for it
+/// *for* — a menu that appears without shifting the page, a spacer that holds a
+/// column open.
+///
+/// Inherited, and that is what makes it useful rather than merely
+/// per-element: hiding a container hides everything inside it. A descendant can
+/// still set `visibility: visible` and reappear inside a hidden ancestor, which
+/// falls out of inheritance rather than needing a rule of its own — and is the
+/// one thing about this property that surprises people.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    /// Drawn. The initial value.
+    #[default]
+    Visible,
+    /// Not drawn, but still occupying its space.
+    Hidden,
+}
+
+/// Parses a `visibility` keyword.
+///
+/// `collapse` is treated as `hidden`, which is exactly what CSS 2.1 §11.2 says
+/// to do everywhere except on a table row or column — where it should remove
+/// the track and let the rest of the table close up. That part is not
+/// implemented, so a `collapse` row hides its contents and keeps its height.
+pub fn parse_visibility(name: &str) -> Option<Visibility> {
+    match name {
+        "visible" => Some(Visibility::Visible),
+        "hidden" | "collapse" => Some(Visibility::Hidden),
+        _ => None,
+    }
+}
+
 /// The `caption-side` property (CSS 2.1 §17.4.1).
 ///
 /// Which side of the table its caption sits on. Inherited, because it is set on
@@ -948,6 +984,8 @@ pub struct ComputedStyle {
     pub border_collapse: BorderCollapse,
     /// `caption-side`, inherited, which side of a table its caption sits on.
     pub caption_side: CaptionSide,
+    /// `visibility`, inherited. A hidden box keeps its space.
+    pub visibility: Visibility,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -1018,6 +1056,7 @@ impl Default for ComputedStyle {
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             border_collapse: BorderCollapse::Separate,
             caption_side: CaptionSide::Top,
+            visibility: Visibility::Visible,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -1060,6 +1099,9 @@ impl ComputedStyle {
             border_collapse: parent.border_collapse,
             // §17.4.1: set on the table, read on the caption.
             caption_side: parent.caption_side,
+            // §11.2: hiding a container hides what is inside it, and a
+            // descendant can set `visible` to come back out.
+            visibility: parent.visibility,
             ..Self::default()
         }
     }
