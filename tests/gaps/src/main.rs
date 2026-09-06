@@ -189,19 +189,21 @@ const PROPERTIES: &[Property] = &[
         expected: Verdict::Honoured,
     },
     // --- ignored: every one of these is named in README.md's gap list.
+    // A row moving out of this block is a change to that list as well, which
+    // is the whole reason the verdicts are recorded rather than printed.
     Property {
         name: "text-indent",
         scaffold: "#t { width: 240px }",
         declaration: "#t { text-indent: 60px }",
         body: "<p id=t>the first line of this paragraph should be indented</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "letter-spacing",
         scaffold: "",
         declaration: "#t { letter-spacing: 6px }",
         body: "<p id=t>spaced letters</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "word-spacing",
@@ -215,7 +217,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { text-transform: uppercase }",
         body: "<p id=t>make me shout</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "font-variant",
@@ -236,7 +238,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { background: #ccc }",
         declaration: "#t { min-height: 120px }",
         body: "<div id=t>x</div>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "max-height",
@@ -266,7 +268,7 @@ const PROPERTIES: &[Property] = &[
                    height: 80px } #a { background: red } #b { background: blue }",
         declaration: "#a { z-index: 2 } #b { z-index: 1 }",
         body: "<div id=a></div><div id=b></div>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "clip",
@@ -370,42 +372,43 @@ const ELEMENTS: &[Element] = &[
         body: "<select><option>shown</option><option>hidden</option></select>",
         expected: Ink::Some,
     },
-    // Form controls, none of which this engine draws. Each is an entry in the
-    // README's gap list, and each should flip to `Some` when it is drawn.
+    // Form controls. Each draws its chrome now — a border, a background, and
+    // its label — though none of them can be typed into or submitted, which is
+    // the line `layout::forms` draws and the README states.
     Element {
         name: "input[type=text]",
         body: "<input type=\"text\" value=\"x\">",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
     Element {
         name: "input[type=submit]",
         body: "<input type=\"submit\" value=\"Go\">",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
     Element {
         name: "input[type=checkbox]",
         body: "<input type=\"checkbox\" checked>",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
     Element {
         name: "input[type=radio]",
         body: "<input type=\"radio\" checked>",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
     Element {
         name: "textarea box",
         body: "<textarea></textarea>",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
     Element {
         name: "empty button",
         body: "<button></button>",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
     Element {
         name: "empty fieldset",
         body: "<fieldset></fieldset>",
-        expected: Ink::None,
+        expected: Ink::Some,
     },
 ];
 

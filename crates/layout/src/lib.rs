@@ -7,6 +7,7 @@
 
 pub mod classify;
 pub mod floats;
+pub mod forms;
 pub mod frameset;
 pub mod table;
 
@@ -622,6 +623,31 @@ pub fn layout(
 /// Gap between a list marker and the item's content edge.
 const MARKER_GAP: f32 = 0.4;
 
+/// A shaping width wide enough that no line ever breaks at it.
+///
+/// Used where the caller wants one line whatever its length, and will decide
+/// for itself what to do with the part that does not fit.
+const UNWRAPPED: f32 = 1.0e6;
+
+/// Cuts a form control's label off at the edge of its box.
+///
+/// A control clips, and nothing else in this engine does: an over-long value
+/// stops at the field's border instead of being drawn through it and across
+/// whatever sits beside it. Doing it here, on the shaped label, keeps paint
+/// free of a clip path it would need for this one case.
+///
+/// Glyphs go whole, so one straddling the edge is kept rather than cut through
+/// — at a text field's size that is a fraction of a character of overhang. The
+/// line's text is left intact so a search still matches what the field holds.
+fn clip_label(label: &mut text::TextLayout, width: f32) {
+    for line in &mut label.lines {
+        line.glyphs.retain(|glyph| glyph.x < width);
+        line.decorations.retain(|run| run.x < width);
+        line.width = line.width.min(width);
+    }
+    label.width = label.width.min(width);
+}
+
 /// The number this list item counts as.
 ///
 /// `<ol start>` moves where a list begins and `<li value>` restarts it
@@ -704,6 +730,17 @@ fn marker_box(
     })
 }
 
+/// Where a line's atomic boxes go.
+///
+/// The box being filled, together with the two numbers needed to place
+/// anything on a line inside it: where its content starts, and the width lines
+/// were broken at — which is what an aligned line measures its shift against.
+struct LineBoxes<'a> {
+    origin: (f32, f32),
+    content_width: f32,
+    parent: &'a mut LayoutBox,
+}
+
 /// Turns the line breaker's placements into real child boxes.
 ///
 /// An inline image is still a box: it can carry a border, padding, and a
@@ -711,13 +748,18 @@ fn marker_box(
 /// than painting the placements directly means all of that goes through the
 /// ordinary box-painting path instead of being special-cased.
 fn emit_replaced_boxes(
+    doc: &Document,
     styles: &StyleMap,
+    fonts: &mut FontStore,
     layout: &TextLayout,
     style: &ComputedStyle,
-    origin: (f32, f32),
-    content_width: f32,
-    parent: &mut LayoutBox,
+    into: LineBoxes<'_>,
 ) {
+    let LineBoxes {
+        origin,
+        content_width,
+        parent,
+    } = into;
     for line in &layout.lines {
         // The same shift paint applies to the line's glyphs, so a centred line
         // carries its images along with its text.
@@ -735,6 +777,69 @@ fn emit_replaced_boxes(
             let top = child_style.border.top.used_width(font_size)
                 + child_style.padding.top.to_px(font_size, content_width);
 
+            // A control is painted from its own border and background rather
+            // than from decoded bytes, so it carries no image — and its label,
+            // where it has one, is shaped into the box now that the box's
+            // width is finally known.
+            let control = forms::control_of(doc, node);
+            let inner = (placed.width - left - right).max(0.0);
+            let label = control
+                .and_then(|control| Some((control, forms::label_of(doc, node, control)?)))
+                .map(|(control, text)| {
+                    let single_line = forms::is_single_line(doc, node, control);
+                    // A list box and a textarea hold their lines apart with
+                    // newlines, so the label is shaped preformatted or they
+                    // would collapse into one run-on line — which is the bug
+                    // that made a `<select>` read as `United KingdomFrance`
+                    // before any of this existed.
+                    let mut label_style = child_style.clone();
+                    if !single_line {
+                        label_style.white_space = WhiteSpace::Pre;
+                    }
+                    let runs = [InlineRun::text(text, label_style.clone())];
+                    // A field that clips is shaped with nothing to break at,
+                    // so the value stays on one line and is cut at the border
+                    // rather than wrapping out of the box.
+                    let shaping_width = if single_line { UNWRAPPED } else { inner };
+                    let mut label = fonts.layout_runs(&runs, &label_style, shaping_width);
+                    clip_label(&mut label, inner);
+                    label
+                });
+
+            // A checked box needs a mark, and the rasteriser draws rectangles:
+            // a filled inner square reads as "checked" and is what a small
+            // checkbox mostly comes down to at this size anyway. The radio gets
+            // the same square, which is the divergence named in `forms`.
+            let checked = matches!(
+                control,
+                Some(forms::Control::Checkbox | forms::Control::Radio)
+            ) && doc
+                .element(node)
+                .is_some_and(|element| element.attr("checked").is_some());
+            let mut children = Vec::new();
+            if checked {
+                let inset = (placed.width * 0.25).max(1.0);
+                let mark = ComputedStyle {
+                    background_color: child_style.color,
+                    ..ComputedStyle::default()
+                };
+                children.push(LayoutBox {
+                    rect: Rect {
+                        x: inset,
+                        y: inset,
+                        width: (placed.width - inset * 2.0).max(1.0),
+                        height: (placed.height - inset * 2.0).max(1.0),
+                    },
+                    style: mark,
+                    text: None,
+                    content_origin: (0.0, 0.0),
+                    content_width: 0.0,
+                    children: Vec::new(),
+                    replaced: None,
+                    node: None,
+                });
+            }
+
             parent.children.push(LayoutBox {
                 rect: Rect {
                     x: origin.0 + dx + placed.x,
@@ -743,11 +848,11 @@ fn emit_replaced_boxes(
                     height: placed.height,
                 },
                 style: child_style.clone(),
-                text: None,
+                text: label,
                 content_origin: (left, top),
-                content_width: (placed.width - left - right).max(0.0),
-                children: Vec::new(),
-                replaced: Some(node),
+                content_width: inner,
+                children,
+                replaced: control.is_none().then_some(node),
                 node: Some(node),
             });
         }
@@ -787,6 +892,15 @@ fn contains_block(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize)
 ///
 /// An inline element wrapping a block one does not: see [`contains_block`].
 fn is_inline_child(doc: &Document, styles: &StyleMap, node: NodeId, style: &ComputedStyle) -> bool {
+    // A form control is atomic: its children are never laid out, so what they
+    // are cannot decide how it is laid out. Asking `contains_block` about them
+    // is not merely pointless but wrong — a `<select multiple>` gives its
+    // options `display: block` so they stack inside the control, and reading
+    // that as "this element contains a block" turned the whole control into a
+    // block box that filled the line.
+    if forms::control_of(doc, node).is_some() {
+        return style.display.is_inline();
+    }
     style.display.is_inline() && !contains_block(doc, styles, node, 0)
 }
 
@@ -1108,12 +1222,16 @@ fn flush_inline(
     if let Some(laid_out) = &anonymous.text {
         let laid_out = laid_out.clone();
         emit_replaced_boxes(
+            doc,
             styles,
+            fonts,
             &laid_out,
             style,
-            (0.0, 0.0),
-            content_width,
-            &mut anonymous,
+            LineBoxes {
+                origin: (0.0, 0.0),
+                content_width,
+                parent: &mut anonymous,
+            },
         );
     }
     parent.children.push(anonymous);
@@ -1374,12 +1492,16 @@ fn layout_block(
         };
         content_height = layout.height;
         emit_replaced_boxes(
+            doc,
             styles,
+            fonts,
             &layout,
             style,
-            (padding_left + border_left, padding_top + border_top),
-            content_width,
-            &mut box_,
+            LineBoxes {
+                origin: (padding_left + border_left, padding_top + border_top),
+                content_width,
+                parent: &mut box_,
+            },
         );
         box_.text = Some(layout);
     }
@@ -1804,6 +1926,22 @@ fn layout_block(
                 + border_bottom
         }
     };
+    // §10.7: the used height is then raised to `min-height`, whether it came
+    // from a declared height or from the content. Like `height` it bounds the
+    // *content* box, so the surround is added back on — the same shape as
+    // `max-width` above, and wrong in the same visible way if it is not.
+    //
+    // A percentage resolves against the containing block's *height*, which is
+    // not known here and is `auto` for most of the era's markup anyway; those
+    // are treated as no bound rather than guessed at.
+    if let Length::Px(_) | Length::Em(_) = style.min_height {
+        let floor = style.min_height.to_px(font_size, 0.0)
+            + padding_top
+            + padding_bottom
+            + border_top
+            + border_bottom;
+        box_.rect.height = box_.rect.height.max(floor);
+    }
 
     // Absolutely positioned children, now that this block's size is known.
     // A positioned box becomes the containing block for its own descendants;
@@ -2627,7 +2765,13 @@ fn gather_one(
     if let Some(text) = doc.text(child) {
         // Text belongs to the nearest element that wraps it, not to the text
         // node: `<a>go</a>` must hit the anchor, which is what has the href.
-        out.push(InlineRun::text(text, inherited.clone()).from_element(holder.0));
+        //
+        // §16.5's transform is applied here, before shaping, because it changes
+        // how wide the text is — uppercase is wider than what it replaces in
+        // every face bundled here, and a line measured lowercase would wrap in
+        // the wrong place and then be drawn in capitals over the top.
+        let transformed = inherited.text_transform.apply(text);
+        out.push(InlineRun::text(transformed, inherited.clone()).from_element(holder.0));
         return;
     }
     let Some(style) = styles.get(child) else {
@@ -2661,14 +2805,36 @@ fn gather_one(
     // it: an icon beside a link, a spacer between words. It becomes an atomic
     // box the line breaker can place, keyed by node so paint can find the
     // decoded image again.
-    if is_replaced(doc, child) {
-        let (width, height) = replaced_size(
-            style,
-            intrinsic.get(&child).copied(),
-            size_attr(doc, child, "width"),
-            size_attr(doc, child, "height"),
-            available_width,
-        );
+    // A form control is the same shape of thing: a box on the line with no
+    // inline content to look inside. It differs only in where its picture comes
+    // from — its own border and background rather than decoded bytes — which is
+    // settled when the box is emitted, not here.
+    let control = forms::control_of(doc, child);
+    if is_replaced(doc, child) || control.is_some() {
+        let (width, height) = match control {
+            Some(control) => {
+                let label = forms::label_of(doc, child, control);
+                let (w, h) = forms::intrinsic_size(doc, child, style, control, label.as_deref());
+                // A declared width or height still wins, as it does for an
+                // image: `<input style="width: 300px">` is a wide field.
+                match (style.width, style.height) {
+                    (Length::Auto, Length::Auto) => (w, h),
+                    (Length::Auto, height) => (w, height.to_px(style.font_size, h)),
+                    (width, Length::Auto) => (width.to_px(style.font_size, available_width), h),
+                    (width, height) => (
+                        width.to_px(style.font_size, available_width),
+                        height.to_px(style.font_size, h),
+                    ),
+                }
+            }
+            None => replaced_size(
+                style,
+                intrinsic.get(&child).copied(),
+                size_attr(doc, child, "width"),
+                size_attr(doc, child, "height"),
+                available_width,
+            ),
+        };
         // CSS `width` is the content width, so the box the line has to make
         // room for is that plus the border and padding around it. Leaving them
         // out lets a bordered image overlap the text beside it.
@@ -3072,6 +3238,113 @@ mod tests {
             .into_iter()
             .find(|b| b.style.display == Display::Table)
             .expect("a table box")
+    }
+
+    #[test]
+    fn min_height_raises_a_box_that_would_be_shorter() {
+        // §10.7, and it bounds the content box like `height` does — so the
+        // padding and border are added back on rather than absorbed, which is
+        // the same shape as `max-width` and visibly wrong if it is not.
+        let rendered = run(
+            "<body><div>short</div></body>",
+            "body { margin: 0 } div { min-height: 120px; padding: 10px; border: 5px solid }",
+            600.0,
+        );
+        let box_ = siblings(&rendered).first().expect("the div");
+        assert!(
+            (box_.rect.height - (120.0 + 20.0 + 10.0)).abs() < 0.01,
+            "got {:?}",
+            box_.rect
+        );
+    }
+
+    #[test]
+    fn min_height_does_not_shrink_a_taller_box() {
+        // It is a floor, not a height. A box whose content already exceeds it
+        // must be left alone, or the property becomes `height` under a
+        // different name.
+        let sheet = "body { margin: 0 } div { min-height: 10px }";
+        let tall = run(
+            "<body><div>one<br>two<br>three<br>four<br>five</div></body>",
+            sheet,
+            600.0,
+        );
+        let plain = run(
+            "<body><div>one<br>two<br>three<br>four<br>five</div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert_eq!(
+            siblings(&tall).first().expect("div").rect.height,
+            siblings(&plain).first().expect("div").rect.height
+        );
+    }
+
+    #[test]
+    fn text_indent_moves_the_first_line_and_only_the_first() {
+        // §16.4. The indent comes out of the first line's own width rather than
+        // the block's, which is why it cannot be an offset applied at paint
+        // time: it changes where the text wraps.
+        let rendered = run(
+            "<body><p>the first line of this paragraph is indented and the rest              of it is not, which takes several lines to show</p></body>",
+            "body { margin: 0 } p { text-indent: 40px; width: 200px; margin: 0 }",
+            600.0,
+        );
+        let text = siblings(&rendered)
+            .iter()
+            .find_map(|b| b.text.as_ref())
+            .expect("the paragraph's text");
+        assert!(text.lines.len() > 1, "needs to wrap to prove anything");
+        // A line carries no offset of its own — `push_line` folds it into the
+        // glyph positions — so the leftmost glyph is where the line starts.
+        let starts_at = |line: &text::Line| {
+            line.glyphs
+                .iter()
+                .map(|glyph| glyph.x)
+                .fold(f32::MAX, f32::min)
+        };
+        let first = starts_at(&text.lines[0]);
+        assert!(
+            (first - 40.0).abs() < 1.0,
+            "first line starts at {first}, not at the 40px indent"
+        );
+        for line in &text.lines[1..] {
+            let at = starts_at(line);
+            assert!(
+                at < 1.0,
+                "a later line starts at {at}, so the indent was not the first line's alone"
+            );
+        }
+    }
+
+    #[test]
+    fn text_transform_changes_what_is_measured_not_only_what_is_drawn() {
+        // Applied before shaping, because uppercase is wider in every bundled
+        // face. A transform done at paint time would wrap the line at the
+        // lowercase width and then draw capitals past the edge.
+        let plain = run(
+            "<body><p>make me shout</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let shouted = run(
+            "<body><p>make me shout</p></body>",
+            "body { margin: 0 } p { margin: 0; text-transform: uppercase }",
+            600.0,
+        );
+        let width = |r: &Rendered| {
+            siblings(r)
+                .iter()
+                .find_map(|b| b.text.as_ref())
+                .expect("text")
+                .width
+        };
+        assert!(
+            width(&shouted) > width(&plain),
+            "uppercase measured {} against {}",
+            width(&shouted),
+            width(&plain)
+        );
     }
 
     #[test]
@@ -4882,6 +5155,168 @@ mod tests {
         assert_eq!(line_offset(TextAlign::Right, 100.0, 500.0), 400.0);
         // A line wider than its box never produces a negative offset.
         assert_eq!(line_offset(TextAlign::Center, 700.0, 500.0), 0.0);
+    }
+
+    /// The box drawn for the first control on the page.
+    fn control_box(rendered: &Rendered) -> &LayoutBox {
+        content_boxes(rendered)
+            .into_iter()
+            .find(|b| b.style.border.left.used_width(b.style.font_size) > 0.0)
+            .expect("a control box")
+    }
+
+    #[test]
+    fn a_control_is_a_box_on_the_line_and_not_a_block() {
+        // The bug this pins: a `<select multiple>` gives its options
+        // `display: block`, and reading that as "contains a block" laid the
+        // control out as a block box filling the whole line.
+        let rendered = run(
+            r#"<body><p>Pick: <select multiple size="3"><option>Alpha</option>
+               <option>Beta</option></select></p></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let control = control_box(&rendered);
+        assert!(
+            control.rect.width < 200.0,
+            "a list box filled the line: {:?}",
+            control.rect
+        );
+        assert!(
+            control.rect.x > 0.0,
+            "a list box was not placed after the text beside it: {:?}",
+            control.rect
+        );
+    }
+
+    #[test]
+    fn a_value_too_long_for_its_field_is_cut_at_the_border() {
+        let rendered = run(
+            r#"<body><input type="text" size="8" value="far more text than eight characters"></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let control = control_box(&rendered);
+        let label = control.text.as_ref().expect("a shaped value");
+        assert_eq!(label.lines.len(), 1, "the value wrapped out of the field");
+        assert!(
+            label.width <= control.content_width,
+            "the value ran past the field: {} in {}",
+            label.width,
+            control.content_width
+        );
+        // Cut, not merely measured short: the glyphs beyond the edge are gone.
+        let last = label.lines[0]
+            .glyphs
+            .last()
+            .expect("some of the value is shown");
+        assert!(
+            last.x < control.content_width,
+            "a glyph was left outside the field at x={}",
+            last.x
+        );
+    }
+
+    #[test]
+    fn a_textarea_keeps_the_lines_it_was_given() {
+        let rendered = run(
+            "<body><textarea rows=\"3\" cols=\"20\">one\ntwo\nthree</textarea></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let control = control_box(&rendered);
+        let label = control.text.as_ref().expect("a shaped value");
+        assert_eq!(
+            label.lines.len(),
+            3,
+            "a textarea collapsed its lines into one"
+        );
+    }
+
+    #[test]
+    fn a_textarea_shows_the_spacing_it_was_typed_with() {
+        // A textarea is preformatted: the spaces between two words are as many
+        // as were typed. Shaping its value like ordinary flow text collapses
+        // them to one, and columns lined up with spaces — which is how the
+        // era's forms held their shape — fall apart.
+        let width = |value: &str| {
+            let html = format!("<body><textarea cols=\"40\">{value}</textarea></body>");
+            let rendered = run(&html, "body { margin: 0 }", 600.0);
+            control_box(&rendered)
+                .text
+                .as_ref()
+                .expect("a shaped value")
+                .lines[0]
+                .width
+        };
+        assert!(
+            width("a    b") > width("a b") + 2.0,
+            "a textarea collapsed the spacing inside its value: {} vs {}",
+            width("a    b"),
+            width("a b")
+        );
+    }
+
+    #[test]
+    fn a_checked_box_draws_a_mark_and_an_unchecked_one_does_not() {
+        let checked = run(
+            r#"<body><input type="checkbox" checked></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let empty = run(
+            r#"<body><input type="checkbox"></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert_eq!(control_box(&checked).children.len(), 1, "no tick was drawn");
+        assert!(
+            control_box(&empty).children.is_empty(),
+            "an unchecked box was ticked"
+        );
+    }
+
+    #[test]
+    fn a_hidden_input_takes_no_room() {
+        let rendered = run(
+            r#"<body><p>before<input type="hidden" value="x">after</p></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            content_boxes(&rendered).into_iter().all(|b| b
+                .style
+                .border
+                .left
+                .used_width(b.style.font_size)
+                == 0.0),
+            "a hidden input was drawn"
+        );
+    }
+
+    #[test]
+    fn clipping_a_label_leaves_what_fits() {
+        let mut label = text::TextLayout {
+            lines: vec![text::Line {
+                glyphs: Vec::new(),
+                replaced: Vec::new(),
+                spans: Vec::new(),
+                decorations: Vec::new(),
+                text: String::new(),
+                width: 200.0,
+                baseline: 10.0,
+            }],
+            height: 12.0,
+            width: 200.0,
+        };
+        clip_label(&mut label, 50.0);
+        assert_eq!(label.width, 50.0);
+        assert_eq!(label.lines[0].width, 50.0);
+
+        // A label already inside its box is left exactly as it was.
+        let mut narrow = label.clone();
+        clip_label(&mut narrow, 500.0);
+        assert_eq!(narrow.width, 50.0, "clipping widened a label");
     }
 }
 
