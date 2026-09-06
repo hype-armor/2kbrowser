@@ -1,0 +1,55 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  p { margin: 4px 0; }
+  fieldset { margin: 6px 0; }
+</style></head><body>
+
+<h3>Text-like fields draw a sunken box</h3>
+<p><input type="text" value="a text field"></p>
+<p><input value="no type, so text"></p>
+<p><input type="password" value="secret"></p>
+<p><input type="search" value="unknown types fall back to text"></p>
+<p><input type="text" size="8" value="size=8"></p>
+
+<h3>Buttons draw a raised box around their label</h3>
+<p><input type="submit"> <input type="reset"> <input type="button" value="Press me"></p>
+<p><button>A button element</button></p>
+
+<h3>Checkboxes and radios draw a small box, ticked when checked</h3>
+<p><input type="checkbox"> off
+   <input type="checkbox" checked> on</p>
+<p><input type="radio" name="r"> one
+   <input type="radio" name="r" checked> two</p>
+
+<h3>A textarea draws its content</h3>
+<p><textarea rows="3" cols="24">Some text that was
+typed into the box.</textarea></p>
+
+<h3>A closed select shows the option it opens on</h3>
+<p><select>
+  <option>First</option>
+  <option selected>Second, preselected</option>
+  <option>Third</option>
+</select></p>
+
+<h3>An open list box shows every option</h3>
+<p><select multiple size="3">
+  <option>Alpha</option>
+  <option>Beta</option>
+  <option>Gamma</option>
+</select></p>
+
+<h3>Hidden and file inputs draw nothing</h3>
+<p>before<input type="hidden" value="x">after</p>
+
+<h3>A fieldset draws a grooved border</h3>
+<fieldset>
+  <legend>A legend</legend>
+  <p><input type="text" value="inside the group"></p>
+</fieldset>
+
+<h3>Controls sit on the line with their labels</h3>
+<p>Name: <input type="text" size="10"> Age: <input type="text" size="3"> <input type="submit"></p>
+
+</body></html>
