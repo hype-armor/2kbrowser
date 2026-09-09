@@ -15,9 +15,22 @@ on:
 # runs group under `refs/pull/N/merge`, which is a different ref from the branch
 # — a push run and its pull-request run never cancel each other, so a check the
 # PR is waiting on cannot be taken out by a race.
+#
+# `next-release` is exempt for exactly the same reason and not a weaker one:
+# changes collect there and ship from it, so every commit on it is one that
+# goes out at the next release. A branch that decides what ships is not a
+# work-in-progress branch, whatever its name.
+#
+# The *matrix* below is deliberately not widened to match. Every change reaches
+# `next-release` through a pull request, which already gets all four targets,
+# and the release pull request gets them again over the collection as a whole —
+# so nothing ships unmeasured, and the 10x macOS minutes are not spent twice on
+# the same commits.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: >-
+    ${{ github.ref != 'refs/heads/main'
+        && github.ref != 'refs/heads/next-release' }}
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,0 +1,141 @@
+name: Release
+
+# Changes collect on `next-release` and ship to `main` about once a week, so
+# that a release is a thing somebody reviewed as a whole rather than a running
+# total of whatever merged.
+#
+# This file has to live on `main`, and that is not a preference: GitHub only
+# ever fires a `schedule` trigger from the repository's default branch. A copy
+# on `next-release` would never run.
+#
+# No third-party actions, as everywhere else here. `actions/checkout` is
+# first-party and `gh` is not an action at all — it is pre-installed on the
+# runners and authenticated from `GH_TOKEN`.
+on:
+  schedule:
+    # Monday morning UTC, so the week's work is proposed before anyone needs it
+    # and there is a working week left to review it in.
+    #
+    # GitHub disables a scheduled workflow after 60 days without repository
+    # activity, silently. `workflow_dispatch` is the way back, and is also how
+    # to cut a release that should not wait for Monday.
+    - cron: "0 9 * * MON"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  propose:
+    name: Propose the week's release
+    # The schedule and the manual button, never the push: a push to `main` *is*
+    # a release landing, and proposing another one from the same commits would
+    # open an empty pull request every time.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history, because this compares two branches and counts
+          # what is between them.
+          fetch-depth: 0
+
+      - name: Open the release pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main next-release
+
+          # Nothing to ship is the ordinary case for a quiet week, and it is a
+          # success rather than a failure: a release nobody needed is not an
+          # error, and failing here would cry wolf every Monday.
+          behind=$(git rev-list --count origin/main..origin/next-release)
+          if [ "$behind" -eq 0 ]; then
+            echo "next-release holds nothing main does not. No release to propose."
+            exit 0
+          fi
+
+          # An open release pull request is left exactly as it is. Reopening or
+          # rewriting it would throw away the review it has already had.
+          open=$(gh pr list --base main --head next-release --state open \
+                   --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            echo "Release pull request #$open is already open. Leaving it alone."
+            exit 0
+          fi
+
+          {
+            echo "\`next-release\` carries $behind commit(s) that \`main\` does not."
+            echo
+            echo "This pull request was opened by the release schedule. What it"
+            echo "ships still needs reading: the summary below is the commit"
+            echo "subjects, and the release notes belong in \`CHANGELOG.md\` as"
+            echo "prose that says *why*, in the same voice as the commits."
+            echo
+            echo "Before merging:"
+            echo
+            echo "- [ ] \`CHANGELOG.md\` has a section for this release"
+            echo "- [ ] the workspace version in \`Cargo.toml\` matches it"
+            echo "- [ ] CI is green on all four targets"
+            echo
+            echo "The tag is not made here. It is made when this merges, from"
+            echo "the version in \`Cargo.toml\`, so that what gets tagged is what"
+            echo "actually shipped."
+            echo
+            echo "## What is in it"
+            echo
+            git log --no-merges --format='- %s' origin/main..origin/next-release
+          } > release-body.md
+
+          gh pr create \
+            --base main \
+            --head next-release \
+            --title "Release $(date -u +%Y-%m-%d)" \
+            --body-file release-body.md
+
+  tag:
+    name: Tag what merged
+    # Only when something lands on `main`. Every guard below makes this a no-op
+    # for an ordinary merge, so it is safe on every push rather than only on a
+    # release: a workflow that has to be remembered is one that gets forgotten.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag the workspace version, if it is new
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+
+          # `0.0.0` is the placeholder this repository carried before it made
+          # releases. Nothing to tag until somebody sets a real one.
+          if [ -z "$version" ] || [ "$version" = "0.0.0" ]; then
+            echo "Workspace version is '$version'. Nothing to tag."
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already tagged. Nothing to do."
+            exit 0
+          fi
+
+          # The tag message is the changelog's own entry, so `git show v0.1.0`
+          # says what the release was for without anybody retyping it.
+          notes=$(awk -v v="## $version" '
+            $0 == v { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf 'Release %s\n%s\n' "$version" "$notes" | git tag -a "v$version" -F -
+          git push origin "v$version"
+          echo "Tagged v$version."
