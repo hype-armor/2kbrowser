@@ -10,7 +10,7 @@ use crate::style::{
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
     parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_display,
     parse_float, parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
-    parse_vertical_align, parse_visibility,
+    parse_text_transform, parse_vertical_align, parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -465,6 +465,49 @@ fn apply(
             if let Some(length) = parse_length(first) {
                 style.border_spacing = length;
             }
+        }
+        "text-transform" => {
+            if let Raw::Ident(name) = first
+                && let Some(transform) = parse_text_transform(name)
+            {
+                style.text_transform = transform;
+            }
+        }
+        // `normal` is zero rather than a value of its own: CSS 2.1 gives it no
+        // meaning beyond "no extra space", and a separate variant would be a
+        // second way to spell the same number.
+        //
+        // `word-spacing` is deliberately *not* handled alongside it. The two
+        // look like a pair and are not implemented as one, and naming it here
+        // to do nothing with it would make the gap invisible to the next
+        // reader — it stays in the README's list until it is really done.
+        "letter-spacing" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("normal")) {
+                style.letter_spacing = 0.0;
+            } else if let Some(length) = parse_length(first) {
+                // Resolved here because it is a used length by the time text is
+                // shaped, and shaping is where it has to arrive.
+                style.letter_spacing = length.to_px(style.font_size, 0.0);
+            }
+        }
+        "text-indent" => {
+            if let Some(length) = parse_length(first) {
+                style.text_indent = length;
+            }
+        }
+        "min-height" => {
+            if let Some(length) = parse_length(first) {
+                style.min_height = length;
+            }
+        }
+        // §9.9. `auto` is the initial value and means "no new stacking context
+        // and paint in tree order", which is what `None` stands for.
+        "z-index" => {
+            style.z_index = match first {
+                Raw::Number(n) => Some(*n as i32),
+                Raw::Ident(name) if name.eq_ignore_ascii_case("auto") => None,
+                _ => style.z_index,
+            };
         }
         "visibility" => {
             if let Raw::Ident(name) = first
@@ -2007,6 +2050,46 @@ mod tests {
                 .border_collapse,
             BorderCollapse::Separate
         );
+    }
+
+    #[test]
+    fn letter_spacing_is_resolved_to_pixels_against_the_element_own_size() {
+        // Stored in pixels rather than as a length, because shaping is where it
+        // has to arrive and shaping has no containing block to ask.
+        let style = standards_style_of(
+            "<p>x</p>",
+            "p { font-size: 20px; letter-spacing: 0.5em }",
+            "p",
+        );
+        assert!(
+            (style.letter_spacing - 10.0).abs() < 0.01,
+            "got {}",
+            style.letter_spacing
+        );
+
+        let normal = standards_style_of("<p>x</p>", "p { letter-spacing: normal }", "p");
+        assert_eq!(normal.letter_spacing, 0.0, "`normal` is no extra space");
+    }
+
+    #[test]
+    fn word_spacing_is_still_not_implemented() {
+        // It sits beside `letter-spacing` in every stylesheet and is *not*
+        // implemented, and this asserts the gap rather than leaving somebody to
+        // assume the pair came together. Delete this test when it does.
+        let style = standards_style_of("<p>x</p>", "p { word-spacing: 20px }", "p");
+        assert_eq!(
+            style.letter_spacing, 0.0,
+            "word-spacing leaked into letter-spacing"
+        );
+    }
+
+    #[test]
+    fn z_index_is_an_integer_or_auto() {
+        let of = |css: &str| standards_style_of("<p>x</p>", css, "p").z_index;
+        assert_eq!(of("p { z-index: 3 }"), Some(3));
+        assert_eq!(of("p { z-index: -2 }"), Some(-2));
+        assert_eq!(of("p { z-index: auto }"), None, "auto is not a number");
+        assert_eq!(of(""), None, "the initial value");
     }
 
     #[test]

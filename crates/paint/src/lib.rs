@@ -241,7 +241,34 @@ fn paint_box(
         }
     }
 
-    for child in &box_.children {
+    // §9.9's painting order, as far as this engine models stacking. Children
+    // are drawn by `(z-index, positioned)` rather than in tree order, which is
+    // the difference between two overlapping absolute boxes landing the way
+    // their author asked and landing in the order they happen to be written.
+    //
+    // The pair, and not the number alone, is what gets the middle of §9.9's
+    // list right: a negative `z-index` paints *before* the in-flow content, an
+    // `auto` or `0` positioned box paints *after* it, and an unpositioned box
+    // sits between the two. Comparing only the number would put a positioned
+    // `z-index: 0` and its unpositioned sibling in tree order, which is the one
+    // pairing §9.9 actually reverses.
+    //
+    // A stable sort, so boxes that tie keep document order — which is both what
+    // §9.9 says and what keeps a rendering reproducible (ADR-0005).
+    let mut order: Vec<&LayoutBox> = box_.children.iter().collect();
+    order.sort_by_key(|child| {
+        let positioned = child.style.position.is_positioned();
+        // `z-index` means nothing on an unpositioned box, so it is not read
+        // from one: honouring it there would invent a stacking order the spec
+        // does not give.
+        let z = if positioned {
+            child.style.z_index.unwrap_or(0)
+        } else {
+            0
+        };
+        (z, positioned)
+    });
+    for child in order {
         paint_box(child, x, y, propagated, list);
     }
 }
@@ -992,6 +1019,121 @@ mod tests {
             .iter()
             .filter(|px| px != &&[255, 255, 255, 255])
             .count()
+    }
+
+    /// An in-flow box that draws nothing, so a page of out-of-flow content
+    /// still has a height to rasterise.
+    const SPACER: &str = "<div style=\"height: 50px\"></div>";
+
+    /// The colour at a point, as `(r, g, b)`.
+    fn at(pixmap: &Pixmap, x: u32, y: u32) -> (u8, u8, u8) {
+        // Checked rather than indexed blind: a page of only out-of-flow boxes
+        // lays out to no height, and the one-row canvas that results is far
+        // easier to recognise from this than from a bounds panic.
+        assert!(
+            x < pixmap.width() && y < pixmap.height(),
+            "({x}, {y}) lies outside a {}x{} canvas - the page laid out to \
+             nothing, so no colour assertion below could mean anything",
+            pixmap.width(),
+            pixmap.height()
+        );
+        let i = ((y * pixmap.width() + x) * 4) as usize;
+        let d = pixmap.data();
+        (d[i], d[i + 1], d[i + 2])
+    }
+
+    #[test]
+    fn z_index_decides_which_of_two_positioned_boxes_is_on_top() {
+        // Written blue-last, so tree order would put blue on top. `z-index`
+        // says otherwise and must win, in both directions — the second half is
+        // what catches a sort that runs the wrong way and still "does
+        // something".
+        // `#r, #b` rather than `div`, so the spacer that gives the page a
+        // height is not itself positioned — two out-of-flow boxes alone lay out
+        // to no height at all and rasterise to a single row.
+        let sheet = "body { margin: 0 } #r, #b { position: absolute; top: 0; left: 0; \
+                     width: 40px; height: 40px } #r { background: #ff0000 } \
+                     #b { background: #0000ff }";
+        let red_on_top = render(
+            &format!(
+                "<body>{SPACER}<div id=r style=\"z-index: 2\"></div>\
+                 <div id=b style=\"z-index: 1\"></div></body>"
+            ),
+            sheet,
+            60,
+        );
+        assert_eq!(at(&red_on_top, 20, 20), (255, 0, 0), "z-index was ignored");
+
+        let blue_on_top = render(
+            &format!(
+                "<body>{SPACER}<div id=r style=\"z-index: 1\"></div>\
+                 <div id=b style=\"z-index: 2\"></div></body>"
+            ),
+            sheet,
+            60,
+        );
+        assert_eq!(
+            at(&blue_on_top, 20, 20),
+            (0, 0, 255),
+            "the order did not follow z-index, it only changed"
+        );
+    }
+
+    #[test]
+    fn a_negative_z_index_goes_behind_the_in_flow_content() {
+        // §9.9's middle: a negative `z-index` paints before unpositioned
+        // content, an `auto` or `0` positioned box after it. Comparing the
+        // numbers alone would put a positioned `0` and its unpositioned sibling
+        // in tree order, which is the one pairing §9.9 reverses.
+        let sheet = "body { margin: 0 } #flow { background: #00ff00; height: 40px }                      #pos { position: absolute; top: 0; left: 0; width: 40px;                      height: 40px; background: #ff0000 }";
+        let behind = render(
+            "<body><div id=pos style=\"z-index: -1\"></div><div id=flow></div></body>",
+            sheet,
+            60,
+        );
+        assert_eq!(
+            at(&behind, 20, 20),
+            (0, 255, 0),
+            "a negative z-index did not go behind the in-flow box"
+        );
+
+        // A *relatively* positioned box for the second half, and that is the
+        // whole point of it. An absolutely positioned one is laid out after the
+        // in-flow children and appended to the box tree last, so tree order
+        // alone already puts it in front and the test would pass without the
+        // rule it claims to check — it did, until this was noticed. A relative
+        // box keeps its place among its siblings, so only §9.9 can move it.
+        let overlapping = "body { margin: 0 } div { height: 40px }                            #rel { position: relative; background: #ff0000 }                            #flow { background: #00ff00; margin-top: -40px }";
+        let front = render(
+            "<body><div id=rel></div><div id=flow></div></body>",
+            overlapping,
+            60,
+        );
+        assert_eq!(
+            at(&front, 20, 20),
+            (255, 0, 0),
+            "a positioned box with auto z-index did not come out in front of \
+             the in-flow box written after it"
+        );
+    }
+
+    #[test]
+    fn z_index_is_not_read_from_an_unpositioned_box() {
+        // §9.9 gives it meaning only on a positioned box. Honouring it
+        // elsewhere would invent a stacking order the spec does not describe,
+        // and pages do set it on static elements by accident.
+        let sheet = "body { margin: 0 } div { height: 40px }                      #a { background: #ff0000 } #b { background: #0000ff; margin-top: -40px }";
+        let plain = render("<body><div id=a></div><div id=b></div></body>", sheet, 60);
+        let with_z = render(
+            "<body><div id=a style=\"z-index: 9\"></div><div id=b></div></body>",
+            sheet,
+            60,
+        );
+        assert_eq!(
+            plain.data(),
+            with_z.data(),
+            "z-index moved an unpositioned box"
+        );
     }
 
     #[test]

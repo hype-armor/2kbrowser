@@ -245,6 +245,7 @@ tests/
   ref/      reference tests: render → PNG → compare against expected
   css21/    the official CSS 2.1 test suite, tracked as a pass-rate metric
   budgets/  size, memory, and startup budget enforcement
+  gaps/     what the engine honours, checked against what the docs claim
 docs/adr/   architecture decision records
 ```
 
@@ -332,13 +333,14 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: fixed table
-layout, form controls — `<input>`, `<textarea>` and `<button>` draw no widget
-at all, `<fieldset>` no border, and a `<select>` shows its open option without a
-dropdown around it — the properties that parse and are then ignored
-(`text-indent`, `letter-spacing`, `word-spacing`, `text-transform`,
-`font-variant`, `outline`, `min-height`, `max-height`, `text-align: justify`,
-`list-style-position`, `list-style-image`, `clip`, `z-index`, `position: fixed`,
-`border-spacing`'s second value, `direction`, and generated content), a caption wider than its table — which overhangs rather than widening
+layout, forms that draw but do not work — no control can be typed into, clicked
+or submitted, a radio button is square for want of a rounded primitive, and a
+`<legend>` sits above its group rather than breaking the rule around it — the
+properties that parse and are then ignored
+(`word-spacing`, `font-variant`, `outline`, `max-height`,
+`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
+`position: fixed`, `border-spacing`'s second value, `direction`, and generated
+content), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
 `empty-cells` — ignored in the separated model, where it applies, and
@@ -1133,6 +1135,22 @@ rendering that *changed*; neither can catch a rendering that was never there.
 The same sweep turned up a longer list of properties that parse and are then
 ignored, and the README now names them rather than leaving the gap list to
 mean "the things we happened to notice".
+
+That sweep is now `tests/gaps`, and making it a standing check rather than a
+one-off is the part that matters. It renders each property twice, differing by
+one declaration, and calls it ignored when no pixel moves — which needs no
+browser, since a declaration that changes nothing changed nothing. Each row
+carries the answer the documentation claims and CI fails on a disagreement in
+either direction, so implementing a property *makes* somebody update the gap
+list rather than leaving it to be noticed. The expectations were set against
+headless Chromium once, by hand; repeating that in CI would buy nothing and
+cost a browser as a build dependency.
+
+It is the third harness here and it earns its place by finding what the other
+two cannot. A reftest passes when its two sides render alike, so a property
+both sides ignore passes; a reference baseline only covers what somebody wrote
+a fixture for. Both catch a rendering that changed. Neither catches one that
+was never there, and everything in this section was of that kind.
 
 Table captions were not on that list, because nobody had noticed they were
 missing. They were found while writing up what remained of the collapsing

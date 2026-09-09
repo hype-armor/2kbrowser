@@ -59,7 +59,10 @@ centred on the grid line between them, which is what a Wikipedia infobox or
 wikitable is built out of; table captions, which sit outside the table's
 border box on whichever side `caption-side` names; `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
-it can still ask to be visible and come back out; images,
+it can still ask to be visible and come back out; `text-transform`,
+`letter-spacing`, `text-indent` on a block's first line, `min-height`, and
+`z-index`, so that two overlapping positioned boxes land in the order their
+author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
@@ -121,32 +124,42 @@ so a page built on inline-blocks is re-rendered as a document and told so
 rather than coming out subtly wrong in silence (ADR-0009). It is a share and
 not a switch, so a navigation bar of them does not move an article.
 
-**Forms are not drawn.** `<input>` of every type, `<textarea>` and `<button>`
-have no widget here, so a search box is not a box — it is nothing at all, and a
-login form is a column of labels. `<fieldset>` draws no border and `<legend>` no
-notch in it. A `<select>` at least shows the one option it is open on rather
-than running every option together into the surrounding sentence, which is what
-it used to do, but it has no dropdown around it. Nothing can be typed into or
-submitted regardless, since forms were never on the M2 list; what is worth
-saying plainly is that this makes some pages *look* broken rather than merely
-inert.
+**Forms are drawn but do not work.** Every control has a box now — text and
+password fields, buttons, checkboxes, radios, `<textarea>`, `<select>` and the
+rule around a `<fieldset>` — sized in the era's own units, since `size`, `cols`
+and `rows` count characters and lines rather than pixels, and a field follows
+the font it is set in. A password field shows bullets and never its value.
+**Nothing can be typed into, clicked, or submitted**, and that is the stopping
+point rather than an oversight: a control that draws correctly makes the page
+read correctly, and interaction is separate work with a separate risk. Two
+things a browser draws and this does not: a radio button is square, because the
+rasteriser has rectangles and no rounded primitive, and a `<legend>` sits above
+its group rather than breaking the rule it is written into.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `text-indent`, `letter-spacing`, `word-spacing`,
-`text-transform`, `font-variant`, `outline`, `min-height`, `max-height`,
-`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
-`z-index` — so overlapping positioned boxes paint in document order rather than
-in the order asked for — `position: fixed`, which behaves as `absolute` and so
-scrolls with the page, the second value of `border-spacing`, `direction` and
-everything else about right-to-left text, and generated content in all its
-forms: `:before`, `:after`, `content`, counters and `quotes`.
+this file used to admit: `word-spacing`, `font-variant`, `outline`,
+`max-height`, `text-align: justify`, `list-style-position`, `list-style-image`,
+`clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
+page, the second value of `border-spacing`, `direction` and everything else
+about right-to-left text, and generated content in all its forms: `:before`,
+`:after`, `content`, counters and `quotes`.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have
 found them. The conformance suite cannot: a reftest passes when its two sides
 render alike, and content missing from both sides still matches. The reference
 baselines cannot either, since they only cover what somebody thought to write a
-fixture for. A gap list is only as good as the last time somebody looked.
+fixture for. Both are good at catching a rendering that *changed*; neither can
+find one that was never there.
+
+So the list above is now checked rather than remembered. `cargo run -p gaps`
+renders each property twice — once with the declaration and once without — and
+reports the ones that change nothing, alongside the elements that put nothing
+on the canvas. Every row carries the answer this file claims, and CI fails when
+they disagree in **either** direction: a property that starts working makes
+this list untrue just as surely as one that stops, and the point is that the
+list cannot go quietly stale again. It needs no browser, because "did this
+declaration change any pixel" is not a question that needs one.
 
 A document rendering also drops runs of line breaks, keeping one. Using
 `<br><br><br><br>` as a margin is how a great deal of the era's markup did its

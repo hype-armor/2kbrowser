@@ -715,6 +715,67 @@ pub fn parse_clear(name: &str) -> Option<Clear> {
     }
 }
 
+/// The `text-transform` property (CSS 2.1 §16.5).
+///
+/// Applied to the text before it is shaped rather than at paint time, because
+/// it changes how wide the text is: `uppercase` is wider than what it replaced
+/// in every face here, so a line that was measured lowercase would wrap in the
+/// wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextTransform {
+    /// Left as written. The initial value.
+    #[default]
+    None,
+    /// Every character uppercased.
+    Uppercase,
+    /// Every character lowercased.
+    Lowercase,
+    /// The first letter of each word uppercased, the rest left alone.
+    Capitalize,
+}
+
+impl TextTransform {
+    /// Applies the transform to a run of text.
+    ///
+    /// `capitalize` uppercases the first letter of each *word* and leaves the
+    /// rest as the author wrote it — not lowercasing the remainder, which is
+    /// what §16.5 says and what stops `HTML` becoming `Html`.
+    pub fn apply(self, text: &str) -> String {
+        match self {
+            TextTransform::None => text.to_owned(),
+            TextTransform::Uppercase => text.to_uppercase(),
+            TextTransform::Lowercase => text.to_lowercase(),
+            TextTransform::Capitalize => {
+                let mut out = String::with_capacity(text.len());
+                let mut at_start = true;
+                for ch in text.chars() {
+                    if at_start && ch.is_alphanumeric() {
+                        out.extend(ch.to_uppercase());
+                        at_start = false;
+                    } else {
+                        out.push(ch);
+                        // A word boundary is whitespace here. Punctuation does
+                        // not start a new word, so `o'clock` is not `O'Clock`.
+                        at_start = ch.is_whitespace();
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Parses a `text-transform` keyword.
+pub fn parse_text_transform(name: &str) -> Option<TextTransform> {
+    match name {
+        "none" => Some(TextTransform::None),
+        "uppercase" => Some(TextTransform::Uppercase),
+        "lowercase" => Some(TextTransform::Lowercase),
+        "capitalize" => Some(TextTransform::Capitalize),
+        _ => None,
+    }
+}
+
 /// The `visibility` property (CSS 2.1 §11.2).
 ///
 /// Not `display: none` with a different name, and the difference is the whole
@@ -986,6 +1047,24 @@ pub struct ComputedStyle {
     pub caption_side: CaptionSide,
     /// `visibility`, inherited. A hidden box keeps its space.
     pub visibility: Visibility,
+    /// `text-transform`, inherited.
+    pub text_transform: TextTransform,
+    /// `letter-spacing` in pixels, inherited. Zero is `normal`.
+    pub letter_spacing: f32,
+    /// `text-indent`, inherited, applied to a block's first line.
+    ///
+    /// Kept as a length because it may be a percentage, which resolves against
+    /// the containing block's width and so cannot be settled in the cascade.
+    pub text_indent: Length,
+    /// A lower bound on the used height, which `height` is clamped to.
+    ///
+    /// `Auto` means no bound, as it does for `max_width`.
+    pub min_height: Length,
+    /// `z-index`, and `None` for `auto`.
+    ///
+    /// Only consulted on a positioned box, which is the only place §9.9 gives
+    /// it any meaning.
+    pub z_index: Option<i32>,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -1057,6 +1136,11 @@ impl Default for ComputedStyle {
             border_collapse: BorderCollapse::Separate,
             caption_side: CaptionSide::Top,
             visibility: Visibility::Visible,
+            text_transform: TextTransform::None,
+            letter_spacing: 0.0,
+            text_indent: Length::Px(0.0),
+            min_height: Length::Auto,
+            z_index: None,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -1102,6 +1186,9 @@ impl ComputedStyle {
             // §11.2: hiding a container hides what is inside it, and a
             // descendant can set `visible` to come back out.
             visibility: parent.visibility,
+            text_transform: parent.text_transform,
+            letter_spacing: parent.letter_spacing,
+            text_indent: parent.text_indent,
             ..Self::default()
         }
     }
@@ -1120,6 +1207,27 @@ pub fn parse_display(name: &str) -> Option<Display> {
 #[cfg(test)]
 mod marker_tests {
     use super::*;
+
+    #[test]
+    fn capitalize_uppercases_word_starts_and_leaves_the_rest_alone() {
+        // §16.5 capitalises the first letter of each word and says nothing
+        // about the others, so `HTML` stays `HTML`. Lowercasing the remainder
+        // is the obvious-looking mistake and it mangles every acronym on the
+        // page.
+        let cap = |s: &str| TextTransform::Capitalize.apply(s);
+        assert_eq!(cap("hello world"), "Hello World");
+        assert_eq!(cap("the HTML spec"), "The HTML Spec");
+        // Punctuation does not start a word, or `o'clock` becomes `O'Clock`.
+        assert_eq!(cap("o'clock"), "O'clock");
+        assert_eq!(cap("  leading space"), "  Leading Space");
+    }
+
+    #[test]
+    fn the_other_transforms_are_wholesale() {
+        assert_eq!(TextTransform::Uppercase.apply("MiXeD"), "MIXED");
+        assert_eq!(TextTransform::Lowercase.apply("MiXeD"), "mixed");
+        assert_eq!(TextTransform::None.apply("MiXeD"), "MiXeD");
+    }
 
     #[test]
     fn unordered_markers_are_a_fixed_glyph() {
