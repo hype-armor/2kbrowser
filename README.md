@@ -278,10 +278,16 @@ M3 is complete, and M4 has started with fuzzing. `cargo test` runs a short pass
 that mutates the reference fixtures into the HTML parser, the CSS parser, image
 decoding, URL parsing, the process-boundary protocol, and the whole render
 pipeline; `cargo run -p fuzz` soaks for as long as you leave it, and
-`.github/workflows/fuzz.yml` leaves it for twenty minutes a target every night.
-That last part is newer than the rest: for a while the only thing that ever ran
-was the short fixed-seed pass, which re-runs inputs already seen and by
-construction finds nothing new. A fuzzer nobody schedules is a regression test.
+`.github/workflows/fuzz.yml` will do the same on six runners at once, twenty
+minutes a target, when somebody starts it.
+
+Somebody has to start it. The workflow is dispatch-only by choice, so the long
+soak happens when a person asks and not otherwise — worth knowing, because the
+short pass in `cargo test` re-runs inputs already seen and by construction finds
+nothing new. The habit that makes this worth having is running it after touching
+a parser, and running it again after fixing whatever it found: the one panic
+below that was not ours turned up in four minutes, and its second shape turned
+up only on the soak *after* the first fix.
 
 The first soak found three panics reachable from an ordinary stylesheet —
 `font-size: 0`, `font-size: 99999px`, and `margin: 1e40px` — each of which
