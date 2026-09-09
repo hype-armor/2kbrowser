@@ -45,6 +45,13 @@ shot "https://news.ycombinator.com/" "$images/hacker-news.png" 900 700 12
 shot "http://info.cern.ch/hypertext/WWW/TheProject.html" "$images/first-website.png" 820 520 10
 shot "https://www.rust-lang.org/" "$images/document-fallback.png" 900 560 14
 
+# An October 2000 capture, served by the Wayback Machine in `id_` mode so the
+# bytes are the page's own rather than the archive's viewer wrapped around them.
+# This is the one screenshot that is not a demonstration of coping with the
+# modern web: it is the web this engine was built for, rendered as it was.
+shot "https://web.archive.org/web/20001018204910id_/http://www.google.com/" \
+    "$images/era-google.png" 820 520 12
+
 # The chrome bar needs no window: the example draws every state of it.
 (cd "$here" && cargo run --quiet -p shell --example chrome-strip >/dev/null)
 mv "$here/chrome-strip.png" "$images/chrome.png"

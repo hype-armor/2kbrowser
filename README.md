@@ -19,6 +19,18 @@ See [PLAN.md](PLAN.md) for the full rationale and roadmap, and
 Real pages, screenshotted from the running browser. Regenerate them with
 `scripts/screenshots.sh`.
 
+![google.com in October 2000, rendered by 2kbrowser](docs/images/era-google.png)
+
+google.com as it stood in October 2000, served by the Wayback Machine in `id_`
+mode so these are the page's own bytes rather than the archive's viewer wrapped
+around them. Centred layout from a table, the logo as a GIF, underlined links,
+and an index of 1,060,000,000 pages.
+
+Every other screenshot here shows the browser coping with a web it was not built
+for. This one is the web it *was* built for, and there is nothing to cope with:
+no fallback, no notice in the bar, nothing the engine had to decline. A page
+from the year the scope boundary is named after renders as its author wrote it.
+
 ![Hacker News in 2kbrowser](docs/images/hacker-news.png)
 
 Hacker News, today, with no JavaScript. Most of the web that is worth reading
