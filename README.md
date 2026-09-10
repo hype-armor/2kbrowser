@@ -88,8 +88,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **1916 of 4821 reference tests pass,
-39.7%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **1991 of 4821 reference tests pass,
+41.3%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -121,7 +121,9 @@ figure every time.
 
 Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
-not clipped; an invalid selector does not invalidate its rule, so
+not clipped — it is drawn, and the canvas is now grown to hold it, which it was
+not until a `height: 0` box turned out to be losing its text off the bottom
+edge; an invalid selector does not invalidate its rule, so
 `[1digit], div { color: red }` styles the `div` where a browser would style
 nothing; a caption wider than its table, which overhangs it rather than
 widening a wrapper box this engine does not have, so the table sits a little
