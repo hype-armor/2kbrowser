@@ -612,12 +612,43 @@ pub fn layout(
         _ => None,
     };
 
+    // Not `height.outer()` alone. That is the root box's own height, and
+    // content is allowed to be taller than the box holding it — `overflow`
+    // defaults to `visible` and CSS 2.1 §11.1.1 says such content is still
+    // painted. Sizing the canvas by the root box cuts it off, and being cut
+    // off is indistinguishable from never having been drawn: a page whose last
+    // element overflowed simply lost it, silently.
+    let height = height.outer().max(ink_bottom(&root, 0.0));
+
     Layout {
         root,
-        height: height.outer(),
+        height,
         canvas_background,
         canvas_image,
     }
+}
+
+/// The lowest point on the page anything actually reaches.
+///
+/// A box's own height is not that point. A block with `height: 0` and text in
+/// it, a float taller than its container, a positioned box placed past the
+/// bottom — each draws below the edge of what holds it, and `overflow:
+/// visible` says each must still be drawn. Rectangles here are relative to the
+/// parent, so the offset is carried down rather than read off the box.
+///
+/// Text is measured separately from the box, and that is the case that matters:
+/// a box's rectangle can be shorter than the lines inside it, which is exactly
+/// what `height: 0` produces.
+fn ink_bottom(box_: &LayoutBox, offset_y: f32) -> f32 {
+    let top = offset_y + box_.rect.y;
+    let mut bottom = top + box_.rect.height;
+    if let Some(text) = &box_.text {
+        bottom = bottom.max(top + box_.content_origin.1 + text.height);
+    }
+    for child in &box_.children {
+        bottom = bottom.max(ink_bottom(child, top));
+    }
+    bottom
 }
 
 /// Gap between a list marker and the item's content edge.
@@ -5291,6 +5322,54 @@ mod tests {
                 .used_width(b.style.font_size)
                 == 0.0),
             "a hidden input was drawn"
+        );
+    }
+
+    #[test]
+    fn a_page_is_tall_enough_for_content_that_overflows_its_box() {
+        // `height: 0` with text in it is not an empty box: `overflow`
+        // defaults to `visible`, so the text is still drawn — below the box.
+        // Sizing the canvas by the box alone cuts it off, and being cut off
+        // looks exactly like never having been drawn.
+        let rendered = run(
+            "<body><div style=\"height: 0\">text below the box</div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            rendered.layout.height > 5.0,
+            "the page ended at the box's own edge: {}",
+            rendered.layout.height
+        );
+    }
+
+    #[test]
+    fn a_page_with_nothing_overflowing_is_not_made_taller() {
+        // The floor is the root box. Growing past it without cause would pad
+        // every page with blank canvas and move every committed baseline.
+        let rendered = run("<body><p>one line</p></body>", "body { margin: 0 }", 600.0);
+        assert_eq!(
+            rendered.layout.height, rendered.layout.root.rect.height,
+            "the page grew past the root box with nothing overflowing it"
+        );
+    }
+
+    #[test]
+    fn a_child_reaching_below_its_parent_extends_the_page() {
+        // The spacer above matters: rectangles are relative to the parent, so
+        // an overflow measured without carrying the offset down reports 60
+        // here rather than 160, and is right only when the overflow happens
+        // to begin at the very top of the page.
+        let rendered = run(
+            "<body><div style=\"height: 100px\"></div>\
+             <div style=\"height: 4px\"><div style=\"height: 60px\"></div></div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            rendered.layout.height >= 160.0,
+            "an overflowing child was cut off: {}",
+            rendered.layout.height
         );
     }
 
