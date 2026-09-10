@@ -88,22 +88,36 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **1451 of 4821 reference tests pass,
-30.1%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **1916 of 4821 reference tests pass,
+39.7%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
-an engine that ignores a property draws both sides the same way — but the
-failures are largely real: on a random sample of 150 of them, headless Chromium
-renders 140 identically. `cargo run --profile conformance -p conformance` does
-it; the suite is not vendored.
+an engine that ignores a property draws both sides the same way.
+`cargo run --profile conformance -p conformance` does it; the suite is not
+vendored.
 
-The figure moves in small amounts and is worth reading that way. Collapsed
-borders were worth **eight** tests, seven of them named for the thing they
-test — and a rise of eight is the weakest evidence in this file, which is why
-the reference tests below carry committed baselines instead.
+The figure usually moves in small amounts and is worth reading that way.
+Collapsed borders were worth **eight** tests, seven of them named for the thing
+they test — and a rise of eight is the weakest evidence in this file, which is
+why the reference tests below carry committed baselines instead.
 
-The first run of that reported 20.6%, and the number was wrong three times over
-before it was worth anything — see PLAN.md, because the harness's own bugs are
-more instructive than the figure.
+It has twice moved by a lot, and both times the cause was the harness rather
+than the engine. The first run reported 20.6% and was wrong three times over
+before it was worth anything. Then 30.4% became 35.5% when the suite's
+stylesheets started reaching the engine at all: almost every test here is
+XHTML, wrapping its CSS in `<![CDATA[ … ]]>`, and read as HTML — which is how
+this browser reads everything, and how every browser read XHTML served as
+`text/html` — that wrapper makes CSS error recovery swallow the whole
+stylesheet. Chromium does the same with the same bytes; it differs only because
+a `.xht` file off disk sends it down its XML parser.
+
+The half of that worth dwelling on is not the 590 tests that started passing.
+It is the **342 that started failing** — pairs with the wrapper on *both* sides,
+where two lost stylesheets left two pages of unstyled prose matching each other
+perfectly. They had been counted green from the beginning. A reftest cannot
+tell "identical" from "identically blank", so nothing here would ever have
+found them; they turned up only because a fix aimed at something else made them
+move. See PLAN.md — the harness's own bugs have been more instructive than the
+figure every time.
 
 Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
