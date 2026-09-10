@@ -32,6 +32,10 @@ pub enum Raw {
     Url(String),
     /// A comma separator, kept because some properties are comma-delimited.
     Comma,
+    /// A `/` separator. Modelled because the `font` shorthand puts one between
+    /// the size and the line height, and without it that value arrives as an
+    /// unmodelled token and the whole declaration is dropped.
+    Slash,
     /// Any token we do not model. Its presence usually invalidates a value.
     Other,
 }
@@ -72,6 +76,7 @@ pub fn read_components(input: &mut Parser<'_, '_>) -> Vec<Raw> {
             Token::Hash(h) | Token::IDHash(h) => Raw::Hash(h.as_ref().to_owned()),
             Token::UnquotedUrl(url) => Raw::Url(url.as_ref().to_owned()),
             Token::Comma => Raw::Comma,
+            Token::Delim('/') => Raw::Slash,
             Token::Function(name) => {
                 let name = name.as_ref().to_ascii_lowercase();
                 let args = input

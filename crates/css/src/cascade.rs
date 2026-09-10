@@ -373,6 +373,25 @@ fn apply(
                 style.background_position = parsed;
             }
         }
+        // §15.8. Era stylesheets are full of this — `font: bold 12px Arial`
+        // was how a page set its type — and until now it parsed as nothing at
+        // all, so both the size and the line height silently stayed at their
+        // defaults. That is why a table cell with `font: 20px/1 Ahem` came out
+        // a few pixels short and let the row's background show through.
+        //
+        // A shorthand resets every property it covers, including the ones it
+        // does not mention: `font: 12px serif` after `font-weight: bold` is
+        // not bold. Assigning only the parts that were written is the usual
+        // way to get this wrong.
+        "font" => {
+            if let Some(font) = parse_font_shorthand(values, parent) {
+                style.font_style = font.style;
+                style.font_weight = font.weight;
+                style.font_size = font.size;
+                style.line_height = font.line_height.unwrap_or(font.size * NORMAL_LINE_HEIGHT);
+                style.font_family = font.family;
+            }
+        }
         // font-size resolves em and % against the *parent's* size, not its own.
         "font-size" => {
             if let Some(size) = parse_font_size(first, parent.font_size) {
@@ -668,6 +687,91 @@ fn parse_font_size(raw: &Raw, parent_size: f32) -> Option<f32> {
         Length::Auto => None,
         length => Some(length.to_px(parent_size, parent_size)),
     }
+}
+
+/// Everything a `font` shorthand sets.
+struct FontShorthand {
+    style: FontStyle,
+    weight: u16,
+    size: f32,
+    /// `None` where the shorthand wrote no `/ line-height`, which means
+    /// `normal` rather than "leave the old one".
+    line_height: Option<f32>,
+    family: FontStack,
+}
+
+/// Parses `font: [ style || variant || weight ]? size [ / line-height ]? family`.
+///
+/// The size and the family are required; anything before the size is optional
+/// and may come in any order. A shorthand missing either is invalid and must
+/// change nothing at all, which is why this returns an `Option` rather than
+/// filling in defaults.
+///
+/// `small-caps` is accepted and then discarded. `font-variant` is not
+/// implemented here, and rejecting the whole declaration over it would throw
+/// away the size and family too — the page would lose styling it should have,
+/// to no one's benefit.
+///
+/// The system font keywords — `font: menu`, `caption`, `status-bar` — need no
+/// case of their own, though it is tempting to write one. CSS 2.1 §15.8 says
+/// they take a platform widget's font, which cannot be asked for here; and
+/// none of them is a valid font size, so each fails the required-size check
+/// and leaves the page's own styling exactly where it was. A special case for
+/// them was written first and deleted: it read as load-bearing and changed
+/// nothing, which is worse than its absence.
+fn parse_font_shorthand(values: &[Raw], parent: &ComputedStyle) -> Option<FontShorthand> {
+    let mut style = FontStyle::Normal;
+    let mut weight = 400;
+    let mut index = 0;
+
+    // The optional prefix. `normal` is legal for all three of style, variant
+    // and weight, so it is consumed without deciding which one it meant —
+    // correct, because each already sits at the value `normal` names.
+    while let Some(value) = values.get(index) {
+        match value {
+            Raw::Ident(name) => match name.as_str() {
+                "normal" | "small-caps" => {}
+                "italic" | "oblique" => style = FontStyle::Italic,
+                "bold" => weight = 700,
+                "bolder" => weight = (parent.font_weight + 300).min(900),
+                "lighter" => weight = parent.font_weight.saturating_sub(300),
+                _ => break,
+            },
+            Raw::Number(number) if (100.0..=900.0).contains(number) => {
+                weight = (*number as u16).clamp(100, 900);
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+
+    let size = parse_font_size(values.get(index)?, parent.font_size)?;
+    index += 1;
+
+    let mut line_height = None;
+    if matches!(values.get(index), Some(Raw::Slash)) {
+        index += 1;
+        line_height = Some(match values.get(index)? {
+            // Resolved against this shorthand's own size, not the parent's:
+            // `font: 20px/1.5 serif` is a 30px line whatever the parent is.
+            Raw::Number(number) => size * number,
+            Raw::Ident(name) if name == "normal" => size * NORMAL_LINE_HEIGHT,
+            other => parse_length(other)?.to_px(size, size),
+        });
+        index += 1;
+    }
+
+    let rest = values.get(index..).unwrap_or_default();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(FontShorthand {
+        style,
+        weight,
+        size,
+        line_height,
+        family: parse_font_family(rest),
+    })
 }
 
 fn parse_font_family(values: &[Raw]) -> FontStack {
@@ -1209,6 +1313,110 @@ mod tests {
         let map = cascade(&doc, &sheets);
         let node = doc.find_element(tag).expect("element present");
         map.get(node).expect("element styled").clone()
+    }
+
+    /// The declaration era stylesheets are full of, which parsed as nothing
+    /// at all until it was noticed making table rows a few pixels short.
+    #[test]
+    fn the_font_shorthand_sets_size_line_height_and_family() {
+        let style = style_of("<p>x</p>", "p { font: 20px/1.5 Georgia, serif }", "p");
+        assert_eq!(style.font_size, 20.0);
+        assert_eq!(style.line_height, 30.0);
+        assert_eq!(style.font_family.families, vec!["georgia".to_owned()]);
+        assert_eq!(style.font_family.generic, GenericFamily::Serif);
+    }
+
+    #[test]
+    fn the_font_shorthand_takes_style_and_weight_in_any_order() {
+        for css in [
+            "p { font: italic bold 20px serif }",
+            "p { font: bold italic 20px serif }",
+            "p { font: italic small-caps bold 20px serif }",
+        ] {
+            let style = style_of("<p>x</p>", css, "p");
+            assert_eq!(style.font_style, FontStyle::Italic, "{css}");
+            assert_eq!(style.font_weight, 700, "{css}");
+            assert_eq!(style.font_size, 20.0, "{css}");
+        }
+    }
+
+    #[test]
+    fn the_font_shorthand_resets_what_it_does_not_mention() {
+        // The usual way to get a shorthand wrong is to assign only the parts
+        // that were written. `font` covers weight, style and line height, so
+        // all three go back to their initial values here.
+        let style = style_of(
+            "<p>x</p>",
+            "p { font-weight: bold; font-style: italic; line-height: 40px; font: 20px serif }",
+            "p",
+        );
+        assert_eq!(style.font_weight, 400, "weight survived the shorthand");
+        assert_eq!(style.font_style, FontStyle::Normal, "style survived it");
+        assert_eq!(
+            style.line_height,
+            20.0 * NORMAL_LINE_HEIGHT,
+            "line-height survived it"
+        );
+    }
+
+    #[test]
+    fn a_font_shorthand_without_a_size_or_family_changes_nothing() {
+        // Both are required. An invalid shorthand must leave the earlier
+        // declaration standing rather than half-applying itself.
+        // `font: nonsense serif` matters more than the others: a family does
+        // follow, so only the required-size check stands between an invalid
+        // shorthand and it half-applying itself at a made-up size.
+        for bad in [
+            "font: serif",
+            "font: 20px",
+            "font: bold",
+            "font: 20px/1.5",
+            "font: nonsense serif",
+        ] {
+            let css = format!("p {{ font-size: 11px; font-family: monospace; {bad} }}");
+            let style = style_of("<p>x</p>", &css, "p");
+            assert_eq!(style.font_size, 11.0, "{bad} changed the size");
+            assert_eq!(
+                style.font_family.generic,
+                GenericFamily::Monospace,
+                "{bad} changed the family"
+            );
+        }
+    }
+
+    #[test]
+    fn a_system_font_keyword_leaves_the_page_alone() {
+        // There is no way to ask this platform for its menu font, and a guess
+        // dressed up as the system's answer is worse than doing nothing.
+        let style = style_of(
+            "<p>x</p>",
+            "p { font-size: 11px; font-family: monospace; font: menu }",
+            "p",
+        );
+        assert_eq!(style.font_size, 11.0);
+        assert_eq!(style.font_family.generic, GenericFamily::Monospace);
+    }
+
+    #[test]
+    fn the_font_shorthands_line_height_resolves_against_its_own_size() {
+        // `20px/1.5` is a 30px line whatever the parent's size is — the
+        // shorthand's own size is the one in force by the time the slash is
+        // read.
+        let style = style_of(
+            "<div><p>x</p></div>",
+            "div { font-size: 40px } p { font: 20px/1.5 serif }",
+            "p",
+        );
+        assert_eq!(style.font_size, 20.0);
+        assert_eq!(style.line_height, 30.0);
+    }
+
+    #[test]
+    fn a_slash_is_not_swallowed_as_an_unknown_token() {
+        // Before `Raw::Slash` existed the separator arrived as an unmodelled
+        // token, which is how the whole declaration came to be dropped.
+        let style = style_of("<p>x</p>", "p { font: 20px/10px serif }", "p");
+        assert_eq!(style.line_height, 10.0);
     }
 
     #[test]

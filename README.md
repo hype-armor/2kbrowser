@@ -72,7 +72,10 @@ text decorations; tiled background images; every CSS 2.1 border style —
 dotted and dashed runs stretched to start and end flush with the corners rather
 than leaving half a dash there, and `double`, `groove`, `ridge`, `inset` and
 `outset` lit from above and to the left, which is what made the era's grey
-buttons look like buttons; external stylesheets, including
+buttons look like buttons; the `font` shorthand, which is how the era's
+stylesheets actually set type — `font: bold 12px Arial` — and which until
+recently parsed as nothing at all, taking the line height down with it;
+external stylesheets, including
 `@import` chains and `@media` blocks; and legacy
 character encodings, which most of the surviving old web needs — a page in
 windows-1252 read as UTF-8 is replacement characters where every accented
@@ -88,8 +91,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **1991 of 4821 reference tests pass,
-41.3%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2024 of 4821 reference tests pass,
+42.0%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -156,7 +159,9 @@ And a list of properties that parse and are then ignored, which is longer than
 this file used to admit: `word-spacing`, `font-variant`, `outline`,
 `max-height`, `text-align: justify`, `list-style-position`, `list-style-image`,
 `clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
-page, the second value of `border-spacing`, `direction` and everything else
+page, the system font keywords (`font: menu` and its siblings), which name a
+font of the host platform's that this engine has no way to ask for and so
+leave the page's own styling standing, the second value of `border-spacing`, `direction` and everything else
 about right-to-left text, and generated content in all its forms: `:before`,
 `:after`, `content`, counters and `quotes`.
 
