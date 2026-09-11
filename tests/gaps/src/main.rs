@@ -263,7 +263,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { background: #ccc; overflow: hidden }",
         declaration: "#t { max-height: 10px }",
         body: "<div id=t>one<br>two<br>three<br>four</div>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "text-align: justify",

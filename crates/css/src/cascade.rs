@@ -337,6 +337,10 @@ fn apply(
     // through, rather than at each of the forty that use them. Shadowing was
     // already the trick for quirks mode, and the same shadow carries this.
     let parse_length = |raw: &Raw| parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom));
+    // For the properties CSS 2.1 forbids a negative value on. A negative one
+    // there is invalid, and an invalid declaration is dropped rather than
+    // clamped — the property keeps whatever it already had.
+    let parse_size = |raw: &Raw| parse_length(raw).filter(|length| !length.is_negative());
     let parse_color = |raw: &Raw| parse_color_quirky(raw, quirks);
 
     match declaration.name.as_str() {
@@ -525,7 +529,7 @@ fn apply(
             }
         }
         "border-spacing" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.border_spacing = length;
             }
         }
@@ -559,8 +563,19 @@ fn apply(
             }
         }
         "min-height" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.min_height = length;
+            }
+        }
+        "max-height" => {
+            // `none` is the initial value and the way an author takes a cap
+            // back off, which a page does by overriding an earlier rule. It
+            // is a keyword rather than a length, so it has to be matched
+            // before parsing one — the same shape as `max-width` above.
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("none")) {
+                style.max_height = Length::Auto;
+            } else if let Some(length) = parse_size(first) {
+                style.max_height = length;
             }
         }
         // §9.9. `auto` is the initial value and means "no new stacking context
@@ -636,10 +651,10 @@ fn apply(
                 style.clear = clear;
             }
         }
-        "margin" => style.margin = parse_edges(values, quirks, zoom),
-        "padding" => style.padding = parse_edges(values, quirks, zoom),
+        "margin" => style.margin = parse_edges(values, quirks, zoom, false),
+        "padding" => style.padding = parse_edges(values, quirks, zoom, true),
         "width" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.width = length;
             }
         }
@@ -648,12 +663,12 @@ fn apply(
         "max-width" => {
             if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("none")) {
                 style.max_width = Length::Auto;
-            } else if let Some(length) = parse_length(first) {
+            } else if let Some(length) = parse_size(first) {
                 style.max_width = length;
             }
         }
         "height" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.height = length;
             }
         }
@@ -700,9 +715,9 @@ fn apply(
         }
         name => {
             if let Some(side) = name.strip_prefix("margin-") {
-                set_edge(&mut style.margin, side, first, quirks, zoom);
+                set_edge(&mut style.margin, side, first, quirks, zoom, false);
             } else if let Some(side) = name.strip_prefix("padding-") {
-                set_edge(&mut style.padding, side, first, quirks, zoom);
+                set_edge(&mut style.padding, side, first, quirks, zoom, true);
             } else if let Some(rest) = name.strip_prefix("border-") {
                 apply_border_longhand(&mut style.border, rest, values, zoom);
             }
@@ -847,10 +862,16 @@ fn parse_font_family(values: &[Raw]) -> FontStack {
 }
 
 /// Parses the one-to-four value `margin`/`padding` shorthand.
-fn parse_edges(values: &[Raw], quirks: bool, zoom: f32) -> Edges {
+///
+/// `non_negative` is set for padding and clear for margin, which is the one
+/// place the two differ: a negative margin is legal and useful — it is how the
+/// era pulled a box back over its neighbour — and a negative padding is
+/// invalid, so the declaration is dropped rather than clamped.
+fn parse_edges(values: &[Raw], quirks: bool, zoom: f32, non_negative: bool) -> Edges {
     let lengths: Vec<Length> = values
         .iter()
         .filter_map(|raw| parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom)))
+        .filter(|length| !(non_negative && length.is_negative()))
         .collect();
     match lengths.len() {
         1 => Edges::all(lengths[0]),
@@ -1334,10 +1355,13 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw], zoom
     }
 }
 
-fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool, zoom: f32) {
+fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool, zoom: f32, non_negative: bool) {
     let Some(length) = parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom)) else {
         return;
     };
+    if non_negative && length.is_negative() {
+        return;
+    }
     match side {
         "top" => edges.top = length,
         "right" => edges.right = length,
