@@ -226,6 +226,25 @@ impl Document {
         out
     }
 
+    /// The element a fragment names, by `id` or by an anchor's `name`.
+    ///
+    /// Both spellings, because the era's pages use both — `<a name="top">` is
+    /// how a page written before `id` was universal marks its own sections,
+    /// and plenty of pages still carry them side by side. Document order
+    /// decides when two elements claim the same name, which is malformed but
+    /// common.
+    pub fn fragment_target(&self, name: &str) -> Option<NodeId> {
+        if name.is_empty() {
+            return None;
+        }
+        self.descendants(self.root).into_iter().find(|&id| {
+            self.element(id).is_some_and(|element| {
+                element.id() == Some(name)
+                    || (element.local_name() == "a" && element.attr("name") == Some(name))
+            })
+        })
+    }
+
     /// First element in document order whose local name matches.
     pub fn find_element(&self, local_name: &str) -> Option<NodeId> {
         self.descendants(self.root).into_iter().find(|&id| {
@@ -601,5 +620,33 @@ mod tests {
         let element = doc.element(div).expect("element");
         assert_eq!(element.id(), Some("main"));
         assert_eq!(element.classes().collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_fragment_finds_an_id_or_an_old_pages_named_anchor() {
+        let doc = parse(r#"<body><h2 id="here">A</h2><a name="there">B</a></body>"#);
+
+        assert_eq!(
+            doc.element(doc.fragment_target("here").expect("by id"))
+                .map(ElementData::local_name),
+            Some("h2")
+        );
+        assert_eq!(
+            doc.element(doc.fragment_target("there").expect("by name"))
+                .map(ElementData::local_name),
+            Some("a")
+        );
+        assert_eq!(doc.fragment_target("elsewhere"), None);
+    }
+
+    #[test]
+    fn an_empty_fragment_names_nothing() {
+        // Not even an element that carries an empty one. `href="#"` means the
+        // top of the page, which is the caller's business to know — an
+        // element is the wrong answer to give it, and a page with `id=""` on
+        // it is malformed rather than an invitation.
+        let doc = parse(r#"<body><p id="">x</p><a name="">y</a></body>"#);
+
+        assert_eq!(doc.fragment_target(""), None);
     }
 }

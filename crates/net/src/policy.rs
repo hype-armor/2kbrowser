@@ -354,6 +354,15 @@ pub fn resolve(base: &Origin, base_path: &str, relative: &str) -> String {
         return format!("{scheme}://{authority}/{rest}");
     }
 
+    // A reference that is only a fragment names a place in the document it is
+    // written in (RFC 3986 §5.3), so the base's path is kept whole. Treating
+    // it as a relative path instead resolved it against the document's
+    // *directory* — `#cite_note-1` on `/wiki/Cat` came out as `/wiki/#cite_
+    // note-1`, a URL that is not the page the reader is looking at.
+    if let Some(fragment) = relative.strip_prefix('#') {
+        return format!("{scheme}://{authority}{base_path}#{fragment}");
+    }
+
     // Relative to the document's directory, which is everything up to and
     // including the last slash.
     let directory = match base_path.rfind('/') {
@@ -386,6 +395,33 @@ mod tests {
     fn resolve_from(base_url: &str, relative: &str) -> String {
         let (origin, path) = parse_url(base_url).expect("parses");
         resolve(&origin, &path, relative)
+    }
+
+    #[test]
+    fn a_fragment_names_a_place_in_the_page_it_is_written_in() {
+        // RFC 3986 §5.3: a reference that is only a fragment keeps the base's
+        // path whole. Resolving it against the document's *directory* instead
+        // turned every footnote marker on a Wikipedia article into a link to
+        // `/wiki/#cite_note-1` — not the page the reader is looking at.
+        assert_eq!(
+            resolve_from("https://example.com/wiki/Cat", "#cite_note-1"),
+            "https://example.com/wiki/Cat#cite_note-1"
+        );
+        assert_eq!(
+            resolve_from("file:///home/reader/page.html", "#top"),
+            "file:///home/reader/page.html#top"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_carrying_a_fragment_is_still_a_relative_path() {
+        // The rule is about references that are *only* a fragment. One with a
+        // path in front of it resolves the path as usual and takes the
+        // fragment along.
+        assert_eq!(
+            resolve_from("https://example.com/wiki/Cat", "Dog#Breeds"),
+            "https://example.com/wiki/Dog#Breeds"
+        );
     }
 
     #[test]

@@ -121,11 +121,6 @@ impl Page {
             }
             let hit = frame.layout.hit_test(x - frame.rect.x, y - frame.rect.y)?;
             let (_, href) = frame.doc.enclosing_link(hit)?;
-            // A fragment alone is a destination within this document, not a
-            // navigation; there is nothing to fetch.
-            if href.starts_with('#') {
-                return None;
-            }
             return Some(net::resolve(&frame.origin, &frame.path, href));
         }
         None
@@ -178,13 +173,26 @@ impl Page {
                 let Some((link, href)) = frame.doc.enclosing_link(node) else {
                     continue;
                 };
-                if link != node || href.starts_with('#') {
+                if link != node {
                     continue;
                 }
+                // The whole subtree, not the `<a>` alone. An inline link
+                // generates no box of its own and is found through the text
+                // spans that name it — and a span names the element the text
+                // is *directly* in. Wikipedia writes
+                // `<a href="#cite_note-1"><span class="mw-reflink-text">[1]</span></a>`,
+                // so asking only about the anchor came back with nothing at
+                // all: no rectangle, so no entry in the link list, so no
+                // cursor, no keyboard focus, and nothing under the pointer for
+                // a click to land on (#52). The window hit-tests against this
+                // list, not against the box tree — the box tree is in another
+                // process — so a link missing from it is a link that does not
+                // work.
                 let rects: Vec<layout::Rect> = frame
-                    .layout
-                    .rects_for(node)
+                    .doc
+                    .descendants(node)
                     .into_iter()
+                    .flat_map(|inside| frame.layout.rects_for(inside))
                     .map(|mut rect| {
                         rect.x += frame.rect.x;
                         rect.y += frame.rect.y;
@@ -197,6 +205,7 @@ impl Page {
                 out.push(Link {
                     rects,
                     url: net::resolve(&frame.origin, &frame.path, href),
+                    jump_to: jump_to(frame, href),
                 });
             }
         }
@@ -211,6 +220,55 @@ pub struct Link {
     pub rects: Vec<layout::Rect>,
     /// The absolute URL it leads to.
     pub url: String,
+    /// Where on this page it goes, for a link that does not leave it.
+    ///
+    /// `href="#Etymology"` is not a page to fetch; it is a place on the page
+    /// already open. These were being dropped on the floor — left out of the
+    /// link list entirely, so they took no cursor, took no keyboard focus, and
+    /// did nothing at all when clicked. On Wikipedia that is "Jump to
+    /// content", every entry in the contents, and every footnote marker in the
+    /// article (#52).
+    ///
+    /// Carried on the link rather than looked up when it is followed, because
+    /// the answer is in the box tree and by then the box tree is in another
+    /// process. It costs one optional float per link and saves a round trip
+    /// per click.
+    ///
+    /// `None` for a link that leaves the page, and also for a fragment naming
+    /// something this page does not have — a stale anchor is a link to
+    /// nowhere, and the honest thing is to do nothing rather than to guess.
+    pub jump_to: Option<f32>,
+}
+
+/// Where a fragment link lands on the canvas, if it is one and it lands.
+fn jump_to(frame: &Frame, href: &str) -> Option<f32> {
+    let name = href.strip_prefix('#')?;
+    // `href="#"` names the document itself — HTML calls the top of the page
+    // the indicated part when the fragment is empty. It is a common enough
+    // spelling of "back to the top" that treating it as a link to nowhere
+    // would leave a visibly dead link on the page.
+    if name.is_empty() {
+        return Some(frame.rect.y);
+    }
+    let target = frame.doc.fragment_target(name)?;
+    // The topmost edge of everything under the target, for the same reason the
+    // link's own rectangles are gathered that way: an inline element generates
+    // no box, and its text belongs to whatever is directly around it. A
+    // Wikipedia footnote's back-link points at
+    // `<sup id="cite_ref-1"><a>…</a></sup>`, and asking the `<sup>` alone
+    // about its geometry comes back with none.
+    //
+    // The minimum rather than the first: an anchor that wrapped across lines
+    // has a rectangle per line, and landing on its last one would put the
+    // start of it above the window.
+    let top = frame
+        .doc
+        .descendants(target)
+        .into_iter()
+        .flat_map(|inside| frame.layout.rects_for(inside))
+        .map(|rect| rect.y)
+        .reduce(f32::min)?;
+    Some(frame.rect.y + top)
 }
 
 impl Link {
@@ -1678,29 +1736,159 @@ mod link_geometry_tests {
     }
 
     #[test]
-    fn a_fragment_link_is_not_a_navigation() {
-        // It names a destination inside this document. There is nothing to
-        // fetch, and treating it as a fetch reloads the page for no reason.
+    fn a_link_whose_text_is_wrapped_in_a_span_is_still_somewhere_to_click() {
+        // The window hit-tests against this list and not against the box tree,
+        // because the box tree is in another process — so a link with no
+        // rectangle in it is a link that does not work: no cursor, no keyboard
+        // focus, nothing under the pointer for a click to land on (#52).
+        //
+        // An inline link generates no box of its own and is found through the
+        // text spans naming it, and a span names the element its text is
+        // *directly* in. Wikipedia writes every footnote marker as
+        // `<a href="…"><span>[1]</span></a>`, and there are 951 of them on one
+        // article.
         let (page, _) = page_at(
-            "frag.html",
-            r##"<body><p><a href="#section">jump</a></p></body>"##,
+            "nested.html",
+            r#"<body><p><a href="b.html"><span><b>there</b></span></a></p></body>"#,
         );
-        assert!(
-            page.links().is_empty(),
-            "a fragment is not a link to follow"
+        let link = page.link_groups().pop().expect("the link is on the page");
+
+        assert!(!link.rects.is_empty(), "the link has no geometry");
+        let bounds = link.bounds();
+        assert_eq!(
+            page.link_at(
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0
+            ),
+            Some(link.url.clone()),
+            "the rectangle is not where the link actually is"
+        );
+    }
+
+    #[test]
+    fn a_fragment_can_name_something_whose_text_is_wrapped_up_too() {
+        // The other end of the same problem. A Wikipedia footnote's back-link
+        // points at `<sup id="cite_ref-1"><a>…</a></sup>`, and asking the
+        // `<sup>` alone where it is comes back with nothing.
+        let (page, _) = page_at(
+            "wrapped-target.html",
+            r##"<body><p><a href="#marker">back</a></p>
+                <p style="height: 300px">spacer</p>
+                <sup id="marker"><span>[1]</span></sup></body>"##,
         );
 
-        let rects = page.frames[0].layout.rects_for(
-            page.frames[0]
-                .doc
-                .find_element("a")
-                .expect("the anchor exists"),
+        assert!(
+            page.link_groups()[0].jump_to.is_some_and(|top| top > 100.0),
+            "the wrapped target was not found: {:?}",
+            page.link_groups()[0].jump_to
         );
-        let rect = rects.first().expect("it still has geometry");
-        assert_eq!(
-            page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
-            None
+    }
+
+    #[test]
+    fn a_fragment_link_goes_to_a_place_on_the_page_rather_than_nowhere() {
+        // It names a destination inside this document, so there is nothing to
+        // fetch — and for want of anywhere else to put that, these were being
+        // left out of the link list altogether. They took no cursor, took no
+        // keyboard focus, and did nothing at all when clicked. The Wikipedia
+        // article I was testing against has 690 of them: "Jump to content",
+        // every line of the contents, and every footnote marker (#52).
+        let (page, _) = page_at(
+            "frag.html",
+            r##"<body><p><a href="#section">jump</a></p>
+                <p style="height: 400px">spacer</p>
+                <h2 id="section">Section</h2></body>"##,
         );
+        let link = page.link_groups().pop().expect("the fragment is a link");
+        let heading = page.frames[0]
+            .doc
+            .find_element("h2")
+            .expect("the heading exists");
+        let top = page.frames[0].layout.rects_for(heading)[0].y;
+
+        assert_eq!(link.jump_to, Some(top));
+        assert!(top > 100.0, "the spacer did not push the heading down");
+    }
+
+    #[test]
+    fn a_bare_hash_goes_back_to_the_top() {
+        // HTML calls the top of the page the indicated part when the fragment
+        // is empty, and `href="#"` is a common enough spelling of "back to the
+        // top" that treating it as a link to nowhere leaves a visibly dead
+        // link on the page.
+        let (page, _) = page_at(
+            "top.html",
+            r##"<body><p style="height: 400px">spacer</p>
+                <p><a href="#">back to the top</a></p></body>"##,
+        );
+
+        assert_eq!(page.link_groups()[0].jump_to, Some(0.0));
+    }
+
+    #[test]
+    fn a_target_that_wraps_is_scrolled_to_its_first_line_and_not_its_last() {
+        // Landing on the last line of the destination puts the start of it
+        // above the window, which is the one place the reader was told to
+        // look.
+        let (page, _) = page_at(
+            "wrapping-target.html",
+            &format!(
+                r##"<body><p><a href="#long">down</a></p>
+                    <p style="height: 200px">spacer</p>
+                    <p><span id="long">{}</span></p></body>"##,
+                "a destination long enough to take several lines ".repeat(8)
+            ),
+        );
+        let target = page.frames[0]
+            .doc
+            .find_element("span")
+            .expect("the target exists");
+        let rects = page.frames[0].layout.rects_for(target);
+        let (first, last) = (rects[0].y, rects[rects.len() - 1].y);
+
+        assert!(last > first, "the target did not wrap: {rects:?}");
+        assert_eq!(page.link_groups()[0].jump_to, Some(first));
+    }
+
+    #[test]
+    fn a_fragment_naming_nothing_on_the_page_goes_nowhere() {
+        // A stale anchor is a link to nowhere. Doing nothing is the honest
+        // answer; scrolling to the top instead would look like the page had
+        // jumped for no reason.
+        let (page, _) = page_at(
+            "stale.html",
+            r##"<body><p><a href="#gone">jump</a></p></body>"##,
+        );
+
+        assert_eq!(page.link_groups()[0].jump_to, None);
+    }
+
+    #[test]
+    fn an_old_pages_named_anchor_is_a_destination_too() {
+        // `<a name="top">` is how a page written before `id` was universal
+        // marks its own sections, and the era this browser is for is full of
+        // them.
+        let (page, _) = page_at(
+            "named.html",
+            r##"<body><p><a href="#top">up</a></p>
+                <p style="height: 300px">spacer</p>
+                <a name="top">here</a></body>"##,
+        );
+
+        assert!(
+            page.link_groups()[0].jump_to.is_some_and(|top| top > 100.0),
+            "the named anchor was not found: {:?}",
+            page.link_groups()[0].jump_to
+        );
+    }
+
+    #[test]
+    fn a_link_that_leaves_the_page_has_nowhere_on_it_to_go() {
+        let (page, _) = page_at(
+            "away.html",
+            r#"<body><p><a href="b.html">there</a></p></body>"#,
+        );
+
+        assert_eq!(page.link_groups()[0].jump_to, None);
     }
 
     #[test]
