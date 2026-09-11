@@ -507,19 +507,37 @@ pub fn render_as_authored_with(
 }
 
 /// How to render, beyond the document itself.
-#[derive(Debug, Clone, Copy, Default)]
-struct Settings {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Settings {
     /// Fill the canvas to the height given rather than shrinking to content.
-    fill_height: bool,
+    pub(crate) fill_height: bool,
     /// Use the author's layout whatever classification decided.
-    force_authored: bool,
+    pub(crate) force_authored: bool,
     /// Use the document fallback whatever classification decided.
     ///
     /// The other direction of `force_authored`, and not reachable by inverting
     /// it: a page that classifies as `Authored` has no fallback to return to,
     /// so asking for one is a different request rather than the absence of
     /// this one.
-    force_document: bool,
+    pub(crate) force_document: bool,
+    /// How much bigger than its own pixels the page is drawn.
+    ///
+    /// 1.0 is the page as written. It is applied in the cascade, where every
+    /// pixel length is computed — so the text is *shaped* at the zoomed size
+    /// rather than a finished rendering being blown up, and the viewport keeps
+    /// its real width so the text reflows to the window (#55).
+    pub(crate) zoom: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            fill_height: false,
+            force_authored: false,
+            force_document: false,
+            zoom: 1.0,
+        }
+    }
 }
 
 #[expect(
@@ -527,7 +545,7 @@ struct Settings {
     reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
               nothing else would use"
 )]
-fn render_sized(
+pub(crate) fn render_sized(
     html: &str,
     width: u32,
     band_top: u32,
@@ -559,7 +577,7 @@ fn render_sized(
     }
 
     let author_sheets = collect_stylesheets(&doc, loader, base);
-    let styles = css::cascade::cascade(&doc, &author_sheets);
+    let styles = css::cascade::cascade_at(&doc, &author_sheets, settings.zoom);
 
     // Classify before laying out: if the page needs layout we do not implement,
     // producing the wrong layout first and discarding it would be wasted work.
@@ -590,7 +608,7 @@ fn render_sized(
         // the reader sheet is applied over the UA defaults instead.
         RenderMode::Document { .. } | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
-            let mut styles = css::cascade::cascade(&doc, &[reader]);
+            let mut styles = css::cascade::cascade_at(&doc, &[reader], settings.zoom);
             // The author's furniture goes with the author's layout. Without
             // this the navigation, the sidebar and the footer no longer sit
             // beside the article — they stack above and below it, so a reading

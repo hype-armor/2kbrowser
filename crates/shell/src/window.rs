@@ -50,6 +50,38 @@ const SCROLL_STEP: f32 = 60.0;
 /// Multiplier applied to line-based mouse wheel deltas.
 const WHEEL_LINE_HEIGHT: f32 = 40.0;
 
+/// The zoom levels, in order.
+///
+/// A fixed table rather than a multiplier applied to wherever the reader
+/// happens to be. Two reasons, and both are about being able to get back: a
+/// multiplier leaves 100% unreachable — in and out again lands on 99.99% —
+/// and it puts every reader on a different set of sizes depending on how they
+/// arrived. These are the steps browsers have settled on.
+const ZOOM_STEPS: &[f32] = &[
+    0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
+/// Where 100% sits in that table.
+const ZOOM_DEFAULT: usize = 4;
+
+/// The zoom `steps` notches from `now` along [`ZOOM_STEPS`].
+///
+/// Clamped at both ends rather than wrapping: a reader holding Ctrl and
+/// scrolling wants the biggest text there is, not the smallest.
+///
+/// A zoom that is not in the table — which nothing can produce today, since
+/// every value comes from here — is treated as 100%, so the next press lands
+/// somewhere the reader recognises instead of somewhere arbitrary.
+fn stepped_zoom(now: f32, steps: i32) -> f32 {
+    let at = ZOOM_STEPS
+        .iter()
+        .position(|step| (step - now).abs() < f32::EPSILON)
+        .unwrap_or(ZOOM_DEFAULT);
+    let to = at
+        .saturating_add_signed(steps as isize)
+        .min(ZOOM_STEPS.len() - 1);
+    ZOOM_STEPS[to]
+}
+
 /// Turns what someone typed into a URL.
 ///
 /// A bare host is the overwhelmingly common case and has to work: typing
@@ -201,6 +233,12 @@ struct Tab {
     /// classification did not give one to (ADR-0009). Reset on navigation for
     /// the same reason, and never true at the same time as `forcing_authored`.
     forcing_document: bool,
+    /// How much bigger than its own pixels this page is drawn (#55).
+    ///
+    /// Per tab and *not* reset on navigation, unlike the layout overrides: a
+    /// reader who zooms in has made a decision about their eyes, not about the
+    /// page, and the next page needs it just as much.
+    zoom: f32,
     /// Whether this page is in a layout decision the reader can change.
     can_toggle_layout: bool,
     /// Whether this page's certificate verified only against a local root.
@@ -238,6 +276,7 @@ impl Tab {
             error: None,
             forcing_authored: false,
             forcing_document: false,
+            zoom: 1.0,
             can_toggle_layout: false,
             local_root: false,
             finding: None,
@@ -507,7 +546,13 @@ impl App {
             // anything at all: `resize` renders with whatever the viewport was
             // last told, so a press that updated only the tab moved the word on
             // the button and nothing else.
-            Some(page) => page.set_forcing(tab.forcing_authored, tab.forcing_document, width, band),
+            Some(page) => page.set_view(
+                tab.forcing_authored,
+                tab.forcing_document,
+                tab.zoom,
+                width,
+                band,
+            ),
             None => match crate::viewport::Viewport::open(
                 renderer,
                 tab.loaded.clone(),
@@ -515,6 +560,7 @@ impl App {
                 band,
                 tab.forcing_authored,
                 tab.forcing_document,
+                tab.zoom,
             ) {
                 Ok(page) => {
                     // How a band painted on another thread reaches a window
@@ -901,6 +947,32 @@ impl App {
             self.tab_mut().focused_link = None;
         }
         self.tab_mut().focused_rects = rects;
+    }
+
+    /// Moves the zoom `steps` notches along [`ZOOM_STEPS`].
+    ///
+    /// Steps rather than a multiplier, so that zooming in and back out returns
+    /// to exactly 100% rather than to 99.99%, and so that every reader lands
+    /// on the same set of sizes rather than on wherever the wheel left them.
+    fn zoom_by(&mut self, steps: i32) {
+        self.set_zoom(stepped_zoom(self.tab().zoom, steps));
+    }
+
+    /// Draws this tab's page again at `zoom`.
+    ///
+    /// A re-render and not a redraw, which is the whole point: the text is
+    /// shaped at the new size rather than a finished rendering being
+    /// stretched, so it stays sharp and reflows to the window.
+    fn set_zoom(&mut self, zoom: f32) {
+        if (self.tab().zoom - zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.tab_mut().zoom = zoom;
+        // The page reflows, so the row that was on screen is not the row that
+        // will be. Back to the top, which is what a resize does and for the
+        // same reason.
+        self.tab_mut().scroll = 0.0;
+        self.rerender();
     }
 
     /// Scrolls `bounds` into view, if it is not already.
@@ -1693,7 +1765,16 @@ impl ApplicationHandler<BandReady> for App {
                     MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE_HEIGHT,
                     MouseScrollDelta::PixelDelta(position) => -position.y as f32,
                 };
-                self.scroll_by(pixels);
+                // Ctrl and the wheel is zoom everywhere else, and a reader
+                // who tries it and gets a scroll has been told the browser
+                // cannot do it (#55).
+                if self.modifiers.state().control_key() {
+                    // Up the page is in, which is what every other browser and
+                    // every trackpad has agreed on.
+                    self.zoom_by(if pixels < 0.0 { 1 } else { -1 });
+                } else {
+                    self.scroll_by(pixels);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
@@ -1853,6 +1934,22 @@ impl ApplicationHandler<BandReady> for App {
                         }
                         Key::Character(c) if c == "w" => {
                             self.close_tab(self.tabs.active_index());
+                            return;
+                        }
+                        // The keyboard half of zoom. `+` is shifted on most
+                        // layouts and unshifted on some, so both spellings are
+                        // taken rather than asking the reader which keyboard
+                        // they own.
+                        Key::Character(c) if c == "+" || c == "=" => {
+                            self.zoom_by(1);
+                            return;
+                        }
+                        Key::Character(c) if c == "-" || c == "_" => {
+                            self.zoom_by(-1);
+                            return;
+                        }
+                        Key::Character(c) if c == "0" => {
+                            self.set_zoom(ZOOM_STEPS[ZOOM_DEFAULT]);
                             return;
                         }
                         // Ctrl+D saves and Ctrl+B shows the list, which is
@@ -2206,6 +2303,43 @@ mod tests {
         }
     }
     use super::*;
+
+    use super::{ZOOM_DEFAULT, ZOOM_STEPS, stepped_zoom};
+
+    #[test]
+    fn zooming_in_and_back_out_lands_on_a_hundred_percent_exactly() {
+        // The reason the levels are a table and not a multiplier. In and out
+        // again with a multiplier lands on 99.99%, which is a page laid out
+        // very slightly wrong for ever afterwards and no way to say so.
+        let one = ZOOM_STEPS[ZOOM_DEFAULT];
+        assert_eq!(stepped_zoom(stepped_zoom(one, 1), -1), one);
+        assert_eq!(stepped_zoom(stepped_zoom(one, 3), -3), one);
+    }
+
+    #[test]
+    fn zoom_stops_at_both_ends_rather_than_wrapping() {
+        // A reader holding Ctrl and scrolling wants the biggest text there is,
+        // not the smallest.
+        let (smallest, biggest) = (ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
+        assert_eq!(stepped_zoom(biggest, 1), biggest);
+        assert_eq!(stepped_zoom(biggest, 50), biggest);
+        assert_eq!(stepped_zoom(smallest, -1), smallest);
+        assert_eq!(stepped_zoom(smallest, -50), smallest);
+    }
+
+    #[test]
+    fn a_step_goes_one_level_and_not_two() {
+        assert_eq!(stepped_zoom(1.0, 1), ZOOM_STEPS[ZOOM_DEFAULT + 1]);
+        assert_eq!(stepped_zoom(1.0, -1), ZOOM_STEPS[ZOOM_DEFAULT - 1]);
+    }
+
+    #[test]
+    fn a_zoom_off_the_table_is_treated_as_a_hundred_percent() {
+        // Nothing can produce one today; if something ever does, the next
+        // press should land somewhere the reader recognises rather than
+        // somewhere arbitrary.
+        assert_eq!(stepped_zoom(1.234, 1), ZOOM_STEPS[ZOOM_DEFAULT + 1]);
+    }
 
     #[test]
     fn scroll_is_clamped_to_the_document() {

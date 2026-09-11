@@ -106,35 +106,67 @@ struct Precedence {
 ///
 /// Sheets are applied in the order given, after the user-agent sheet.
 pub fn cascade(doc: &Document, author_sheets: &[Stylesheet]) -> StyleMap {
+    cascade_at(doc, author_sheets, 1.0)
+}
+
+/// The same, at a zoom factor.
+///
+/// Zoom multiplies every pixel length as it is computed — the font sizes, the
+/// margins, the borders — and then nothing downstream knows about it. A glyph
+/// shaped at twice the size is twice as sharp, where a rendering scaled up
+/// afterwards is twice as blurry; and because the viewport keeps its real
+/// width, text reflows to the window instead of running off the side of it.
+/// That is what a browser means by zoom, as against a magnifying glass.
+pub fn cascade_at(doc: &Document, author_sheets: &[Stylesheet], zoom: f32) -> StyleMap {
     let ua = Stylesheet::parse(crate::ua::UA_STYLESHEET);
     let mut map = StyleMap::default();
-    let root_style = ComputedStyle::default();
-    // Quirks mode is a property of the document, decided by its doctype, and
-    // changes how values parse (ADR-0004).
-    let quirks = doc.is_quirks();
-    style_subtree(
-        doc,
-        doc.root(),
-        &root_style,
-        &ua,
-        author_sheets,
-        quirks,
-        &mut map,
-    );
+    // The root carries the zoomed default, so an element that says nothing
+    // about its font size inherits one that has already been scaled — and with
+    // it every `em` measured against it. Most text on most pages is this case:
+    // without it, zoom would move the headings and leave the prose alone.
+    //
+    // The line height is not set here, and deliberately: the UA sheet gives
+    // `body` a unitless `line-height: 1.2`, which resolves against each
+    // element's own font size — already zoomed — so everything inside the body
+    // is covered, and there is nothing outside it. A second scaling here was
+    // dead code, and mutation testing said so.
+    let root_style = ComputedStyle {
+        font_size: DEFAULT_FONT_SIZE * zoom,
+        ..ComputedStyle::default()
+    };
+    let rules = Rules {
+        ua: &ua,
+        sheets: author_sheets,
+        // Quirks mode is a property of the document, decided by its doctype,
+        // and changes how values parse (ADR-0004).
+        quirks: doc.is_quirks(),
+        zoom,
+    };
+    style_subtree(doc, doc.root(), &root_style, &rules, &mut map);
     map
+}
+
+/// What the cascade works from, fixed for the whole of one document.
+struct Rules<'a> {
+    /// The user-agent sheet.
+    ua: &'a Stylesheet,
+    /// The sheets handed in, in the order they apply.
+    sheets: &'a [Stylesheet],
+    /// Whether the document is in quirks mode.
+    quirks: bool,
+    /// How much bigger than its own pixels the page is drawn.
+    zoom: f32,
 }
 
 fn style_subtree(
     doc: &Document,
     node: NodeId,
     parent_style: &ComputedStyle,
-    ua: &Stylesheet,
-    author: &[Stylesheet],
-    quirks: bool,
+    rules: &Rules,
     out: &mut StyleMap,
 ) {
     let style = if doc.element(node).is_some() {
-        let computed = compute(doc, node, parent_style, ua, author, quirks);
+        let computed = compute(doc, node, parent_style, rules);
         out.styles.insert(node, computed.clone());
         computed
     } else {
@@ -142,23 +174,17 @@ fn style_subtree(
     };
 
     for &child in doc.children(node) {
-        style_subtree(doc, child, &style, ua, author, quirks, out);
+        style_subtree(doc, child, &style, rules, out);
     }
 }
 
-fn compute(
-    doc: &Document,
-    node: NodeId,
-    parent: &ComputedStyle,
-    ua: &Stylesheet,
-    author: &[Stylesheet],
-    quirks: bool,
-) -> ComputedStyle {
+fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) -> ComputedStyle {
+    let (quirks, zoom) = (rules.quirks, rules.zoom);
     let mut matched: Vec<(Precedence, &Declaration)> = Vec::new();
     let mut order = 0usize;
 
-    for (sheet, origin) in
-        std::iter::once((ua, Origin::UserAgent)).chain(author.iter().map(|s| (s, Origin::Author)))
+    for (sheet, origin) in std::iter::once((rules.ua, Origin::UserAgent))
+        .chain(rules.sheets.iter().map(|s| (s, Origin::Author)))
     {
         for rule in &sheet.rules {
             let best = rule
@@ -226,7 +252,7 @@ fn compute(
     // The UA sheet gives `display: block` to block-level elements; everything
     // else starts inline, which is the CSS initial value.
     for (_, declaration) in matched {
-        apply(&mut style, declaration, parent, quirks);
+        apply(&mut style, declaration, parent, quirks, zoom);
     }
 
     // §16.3: an ancestor's decoration is drawn across this element's text too,
@@ -301,12 +327,16 @@ fn apply(
     declaration: &Declaration,
     parent: &ComputedStyle,
     quirks: bool,
+    zoom: f32,
 ) {
     let values = &declaration.value;
     let Some(first) = values.first() else { return };
     // Shadow the strict parsers so every property below picks up the
     // quirks-mode forms without each having to remember to ask.
-    let parse_length = |raw: &Raw| parse_length_quirky(raw, quirks);
+    // Zoom is applied here, at the one place every property's lengths come
+    // through, rather than at each of the forty that use them. Shadowing was
+    // already the trick for quirks mode, and the same shadow carries this.
+    let parse_length = |raw: &Raw| parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom));
     let parse_color = |raw: &Raw| parse_color_quirky(raw, quirks);
 
     match declaration.name.as_str() {
@@ -398,7 +428,7 @@ fn apply(
         // not bold. Assigning only the parts that were written is the usual
         // way to get this wrong.
         "font" => {
-            if let Some(font) = parse_font_shorthand(values, parent) {
+            if let Some(font) = parse_font_shorthand(values, parent, zoom) {
                 style.font_style = font.style;
                 style.font_weight = font.weight;
                 style.font_size = font.size;
@@ -408,7 +438,7 @@ fn apply(
         }
         // font-size resolves em and % against the *parent's* size, not its own.
         "font-size" => {
-            if let Some(size) = parse_font_size(first, parent.font_size) {
+            if let Some(size) = parse_font_size(first, parent.font_size, zoom) {
                 style.font_size = size;
                 if style.line_height == parent.line_height {
                     style.line_height = size * NORMAL_LINE_HEIGHT;
@@ -606,8 +636,8 @@ fn apply(
                 style.clear = clear;
             }
         }
-        "margin" => style.margin = parse_edges(values, quirks),
-        "padding" => style.padding = parse_edges(values, quirks),
+        "margin" => style.margin = parse_edges(values, quirks, zoom),
+        "padding" => style.padding = parse_edges(values, quirks, zoom),
         "width" => {
             if let Some(length) = parse_length(first) {
                 style.width = length;
@@ -630,9 +660,9 @@ fn apply(
         // `border: 1px solid red` sets width, style, and colour on all four
         // sides from whichever components are present.
         "border" => {
-            let parsed = parse_border_shorthand(values);
+            let parsed = parse_border_shorthand(values, zoom);
             for side in border_sides(&mut style.border) {
-                apply_border_shorthand(side, &parsed);
+                apply_border_shorthand(side, &parsed, zoom);
             }
         }
         "border-width" => {
@@ -670,17 +700,17 @@ fn apply(
         }
         name => {
             if let Some(side) = name.strip_prefix("margin-") {
-                set_edge(&mut style.margin, side, first, quirks);
+                set_edge(&mut style.margin, side, first, quirks, zoom);
             } else if let Some(side) = name.strip_prefix("padding-") {
-                set_edge(&mut style.padding, side, first, quirks);
+                set_edge(&mut style.padding, side, first, quirks, zoom);
             } else if let Some(rest) = name.strip_prefix("border-") {
-                apply_border_longhand(&mut style.border, rest, values);
+                apply_border_longhand(&mut style.border, rest, values, zoom);
             }
         }
     }
 }
 
-fn parse_font_size(raw: &Raw, parent_size: f32) -> Option<f32> {
+fn parse_font_size(raw: &Raw, parent_size: f32, zoom: f32) -> Option<f32> {
     if let Raw::Ident(name) = raw {
         // The CSS 2.1 absolute-size keywords, as scale factors from medium.
         let factor = match name.as_str() {
@@ -695,9 +725,9 @@ fn parse_font_size(raw: &Raw, parent_size: f32) -> Option<f32> {
             "larger" => return Some(parent_size * 1.2),
             _ => return None,
         };
-        return Some(DEFAULT_FONT_SIZE * factor);
+        return Some(DEFAULT_FONT_SIZE * zoom * factor);
     }
-    match parse_length(raw)? {
+    match parse_length(raw)?.scaled(zoom) {
         Length::Auto => None,
         length => Some(length.to_px(parent_size, parent_size)),
     }
@@ -733,7 +763,11 @@ struct FontShorthand {
 /// and leaves the page's own styling exactly where it was. A special case for
 /// them was written first and deleted: it read as load-bearing and changed
 /// nothing, which is worse than its absence.
-fn parse_font_shorthand(values: &[Raw], parent: &ComputedStyle) -> Option<FontShorthand> {
+fn parse_font_shorthand(
+    values: &[Raw],
+    parent: &ComputedStyle,
+    zoom: f32,
+) -> Option<FontShorthand> {
     let mut style = FontStyle::Normal;
     let mut weight = 400;
     let mut index = 0;
@@ -759,7 +793,7 @@ fn parse_font_shorthand(values: &[Raw], parent: &ComputedStyle) -> Option<FontSh
         index += 1;
     }
 
-    let size = parse_font_size(values.get(index)?, parent.font_size)?;
+    let size = parse_font_size(values.get(index)?, parent.font_size, zoom)?;
     index += 1;
 
     let mut line_height = None;
@@ -770,7 +804,7 @@ fn parse_font_shorthand(values: &[Raw], parent: &ComputedStyle) -> Option<FontSh
             // `font: 20px/1.5 serif` is a 30px line whatever the parent is.
             Raw::Number(number) => size * number,
             Raw::Ident(name) if name == "normal" => size * NORMAL_LINE_HEIGHT,
-            other => parse_length(other)?.to_px(size, size),
+            other => parse_length(other)?.scaled(zoom).to_px(size, size),
         });
         index += 1;
     }
@@ -813,10 +847,10 @@ fn parse_font_family(values: &[Raw]) -> FontStack {
 }
 
 /// Parses the one-to-four value `margin`/`padding` shorthand.
-fn parse_edges(values: &[Raw], quirks: bool) -> Edges {
+fn parse_edges(values: &[Raw], quirks: bool, zoom: f32) -> Edges {
     let lengths: Vec<Length> = values
         .iter()
-        .filter_map(|raw| parse_length_quirky(raw, quirks))
+        .filter_map(|raw| parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom)))
         .collect();
     match lengths.len() {
         1 => Edges::all(lengths[0]),
@@ -1217,7 +1251,7 @@ struct BorderShorthand {
 }
 
 /// Reads `1px solid red` in any order, since CSS does not fix one.
-fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
+fn parse_border_shorthand(values: &[Raw], zoom: f32) -> BorderShorthand {
     let mut out = BorderShorthand::default();
     for raw in values {
         if let Raw::Ident(name) = raw {
@@ -1229,15 +1263,15 @@ fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
             }
             match name.as_str() {
                 "thin" => {
-                    out.width = Some(Length::Px(1.0));
+                    out.width = Some(Length::Px(1.0 * zoom));
                     continue;
                 }
                 "medium" => {
-                    out.width = Some(Length::Px(MEDIUM_BORDER));
+                    out.width = Some(Length::Px(MEDIUM_BORDER * zoom));
                     continue;
                 }
                 "thick" => {
-                    out.width = Some(Length::Px(5.0));
+                    out.width = Some(Length::Px(5.0 * zoom));
                     continue;
                 }
                 _ => {}
@@ -1246,23 +1280,23 @@ fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
         if let Some(color) = parse_color(raw) {
             out.color = Some(color);
         } else if let Some(length) = parse_length(raw) {
-            out.width = Some(length);
+            out.width = Some(length.scaled(zoom));
         }
     }
     out
 }
 
-fn apply_border_shorthand(side: &mut BorderSide, parsed: &BorderShorthand) {
+fn apply_border_shorthand(side: &mut BorderSide, parsed: &BorderShorthand, zoom: f32) {
     // The shorthand resets omitted components to their initial values, which is
     // why `border: solid` produces a medium border rather than keeping whatever
     // width an earlier rule set.
-    side.width = parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER));
+    side.width = parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER * zoom));
     side.style = parsed.style.unwrap_or_default();
     side.color = parsed.color;
 }
 
 /// Handles `border-top`, `border-left-width`, and friends.
-fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
+fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw], zoom: f32) {
     let (side_name, property) = match rest.split_once('-') {
         Some((side, property)) => (side, Some(property)),
         None => (rest, None),
@@ -1278,10 +1312,10 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
 
     match property {
         // `border-top: 1px solid red`
-        None => apply_border_shorthand(side, &parse_border_shorthand(values)),
+        None => apply_border_shorthand(side, &parse_border_shorthand(values, zoom), zoom),
         Some("width") => {
             if let Some(width) = parse_length(first) {
-                side.width = width;
+                side.width = width.scaled(zoom);
             }
         }
         Some("style") => {
@@ -1300,8 +1334,8 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
     }
 }
 
-fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
-    let Some(length) = parse_length_quirky(raw, quirks) else {
+fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool, zoom: f32) {
+    let Some(length) = parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom)) else {
         return;
     };
     match side {
@@ -1327,6 +1361,83 @@ mod tests {
         let map = cascade(&doc, &sheets);
         let node = doc.find_element(tag).expect("element present");
         map.get(node).expect("element styled").clone()
+    }
+
+    fn zoomed_style_of(html: &str, css: &str, tag: &str, zoom: f32) -> ComputedStyle {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css)];
+        let map = cascade_at(&doc, &sheets, zoom);
+        let node = doc.find_element(tag).expect("element present");
+        map.get(node).expect("element styled").clone()
+    }
+
+    #[test]
+    fn zoom_multiplies_every_pixel_the_page_asked_for() {
+        let css = "p { font-size: 20px; margin: 10px; padding-left: 4px; \
+                   border: 2px solid red; width: 300px }";
+        let plain = zoomed_style_of("<p>x</p>", css, "p", 1.0);
+        let doubled = zoomed_style_of("<p>x</p>", css, "p", 2.0);
+
+        assert_eq!(doubled.font_size, plain.font_size * 2.0);
+        assert_eq!(doubled.margin.top, Length::Px(20.0));
+        assert_eq!(doubled.padding.left, Length::Px(8.0));
+        assert_eq!(doubled.border.top.width, Length::Px(4.0));
+        assert_eq!(doubled.width, Length::Px(600.0));
+    }
+
+    #[test]
+    fn a_percentage_is_left_alone_because_its_basis_is_already_zoomed() {
+        // Scaling it too would apply the zoom twice: a column half the width
+        // of the window is half the width of the window at any zoom, which is
+        // what page zoom means as against a magnifying glass.
+        let doubled = zoomed_style_of("<p>x</p>", "p { width: 50% }", "p", 2.0);
+
+        assert_eq!(doubled.width, Length::Percent(50.0));
+    }
+
+    #[test]
+    fn an_em_is_left_alone_because_the_font_size_is_already_zoomed() {
+        let doubled = zoomed_style_of("<p>x</p>", "p { margin: 2em }", "p", 2.0);
+
+        assert_eq!(doubled.margin.top, Length::Em(2.0));
+        assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0);
+    }
+
+    #[test]
+    fn a_page_that_names_no_size_is_zoomed_by_what_it_inherits() {
+        // Most text on most pages sets no font size at all. If the root's
+        // default were not scaled, zoom would move the headings and leave the
+        // prose exactly where it was.
+        let doubled = zoomed_style_of("<body><p>x</p></body>", "", "p", 2.0);
+
+        assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0);
+        assert_eq!(
+            doubled.line_height,
+            DEFAULT_FONT_SIZE * 2.0 * NORMAL_LINE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn the_named_border_widths_and_font_sizes_are_zoomed_too() {
+        // `medium` and `x-large` are pixel lengths spelled as words, and a
+        // word is exactly as easy to forget as a number.
+        let doubled = zoomed_style_of(
+            "<p>x</p>",
+            "p { border: medium solid red; font-size: x-large }",
+            "p",
+            2.0,
+        );
+
+        assert_eq!(doubled.border.top.width, Length::Px(MEDIUM_BORDER * 2.0));
+        assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0 * 1.5);
+    }
+
+    #[test]
+    fn zooming_out_is_the_same_rule_the_other_way() {
+        let halved = zoomed_style_of("<p>x</p>", "p { font-size: 20px; margin: 10px }", "p", 0.5);
+
+        assert_eq!(halved.font_size, 10.0);
+        assert_eq!(halved.margin.top, Length::Px(5.0));
     }
 
     /// The declaration era stylesheets are full of, which parsed as nothing

@@ -69,6 +69,7 @@ pub struct Viewport {
     page: Rendered,
     force_authored: bool,
     force_document: bool,
+    zoom: f32,
 }
 
 impl Viewport {
@@ -80,6 +81,7 @@ impl Viewport {
         band_height: u32,
         force_authored: bool,
         force_document: bool,
+        zoom: f32,
     ) -> Result<Self, Error> {
         let (session, page) = renderer.open(
             document.body.clone(),
@@ -91,6 +93,7 @@ impl Viewport {
             document.path.clone(),
             force_authored,
             force_document,
+            zoom,
         )?;
         Ok(Self {
             session,
@@ -98,6 +101,7 @@ impl Viewport {
             page,
             force_authored,
             force_document,
+            zoom,
         })
     }
 
@@ -316,6 +320,7 @@ impl Viewport {
             self.document.path.clone(),
             self.force_authored,
             self.force_document,
+            self.zoom,
         )?;
         Ok(())
     }
@@ -355,9 +360,32 @@ impl Viewport {
         width: u32,
         max_height: u32,
     ) -> Result<(), Error> {
+        self.set_view(authored, document, self.zoom, width, max_height)
+    }
+
+    /// Everything the reader has chosen about how this page is shown, pushed
+    /// across together.
+    ///
+    /// One call because each of them costs a re-render, and setting two in a
+    /// row would pay for it twice — with the page visibly laid out the wrong
+    /// way in between.
+    pub fn set_view(
+        &mut self,
+        authored: bool,
+        document: bool,
+        zoom: f32,
+        width: u32,
+        max_height: u32,
+    ) -> Result<(), Error> {
         self.force_authored = authored;
         self.force_document = document;
+        self.zoom = zoom;
         self.resize(width, max_height)
+    }
+
+    /// The zoom this page is being drawn at. 1.0 is the page as written.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
     }
 }
 

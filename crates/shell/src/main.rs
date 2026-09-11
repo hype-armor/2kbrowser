@@ -37,7 +37,11 @@ goes back, Escape drops the focus. Alt+Left and Alt+Right, or Backspace,
 go back and forward. Ctrl+L focuses the URL bar and Ctrl+F searches the page;
 Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
 switches. Ctrl+D saves the page and Ctrl+B shows the saved list. Arrows and
-PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
+PageUp/PageDown scroll, Home/End jump, Esc or q quits.
+
+Ctrl and the wheel zooms, as do Ctrl+plus and Ctrl+minus; Ctrl+0 goes back to
+100%. The page is laid out again at the new size rather than magnified, so the
+text stays sharp and rewraps to the window.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -297,9 +301,11 @@ fn render_in_child(input: &str, width: u32, height: u32) -> Result<Viewport, Str
         width,
         height.min(sandbox::max_canvas_height(width)),
         // Neither layout override: the command line has no chrome to press,
-        // so it gets whatever classification decided (ADR-0009).
+        // so it gets whatever classification decided (ADR-0009). Nor any zoom,
+        // for the same reason.
         false,
         false,
+        1.0,
     )
     .map_err(|error| error.to_string())
 }

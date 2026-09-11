@@ -274,6 +274,7 @@ mod tests {
             path: String::new(),
             force_authored: false,
             force_document: false,
+            zoom: 1.0,
         }
         .encode()
     }
