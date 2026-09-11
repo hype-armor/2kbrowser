@@ -420,6 +420,8 @@ struct App {
     /// pointer the moment it is pressed, which would move the page before the
     /// drag had begun.
     dragging: Option<f32>,
+    /// The context menu, while one is open (#54).
+    menu: Option<crate::menu::Menu>,
     /// The system clipboard, opened on the first copy and then kept.
     ///
     /// `None` until something is copied, and still `None` where there is no
@@ -1051,6 +1053,25 @@ impl App {
         }
     }
 
+    /// Opens the context menu under the pointer.
+    ///
+    /// What goes in it is what the pointer is on: a link brings its own two
+    /// entries, and the page's own three are always there. Nothing is greyed
+    /// out — an entry that cannot do anything is left out, which is shorter to
+    /// read and cannot be clicked in hope.
+    fn open_menu(&mut self) {
+        let items = crate::menu::items_for(
+            self.link_under_pointer(),
+            !self.tab().selected.is_empty(),
+            self.tab().history.can_go_back(),
+            self.tab().history.can_go_forward(),
+        );
+        self.menu = crate::menu::Menu::open(self.pointer, items, self.size);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Drops the selection, which is what pressing anywhere does.
     fn clear_selection(&mut self) {
         if self.tab().selection.is_empty() && self.tab().selected.is_empty() {
@@ -1065,31 +1086,65 @@ impl App {
 
     /// Puts the selected text on the system clipboard.
     ///
-    /// Silent when there is nothing selected, and silent when the clipboard
-    /// cannot be had — a headless session, a compositor that offers none. The
-    /// alternative is an error box for a keystroke the reader may have pressed
-    /// by accident, about a thing they can see did not happen.
+    /// Silent when there is nothing selected: the alternative is an error box
+    /// for a keystroke the reader may have pressed by accident, about a thing
+    /// they can see did not happen.
     fn copy_selection(&mut self) {
         let text = self.tab().selected.clone();
-        if text.is_empty() {
-            return;
+        if !text.is_empty() {
+            self.copy(text);
         }
-        // Kept rather than opened per copy. On X11 the clipboard is *owned* by
-        // a running process — there is no store to put bytes in — so a handle
-        // opened, written and dropped takes the text with it, and a paste a
-        // moment later gets whatever was there before.
+    }
+
+    /// Acts on whatever the pointer is over, and closes the menu.
+    fn choose_from_menu(&mut self) {
+        let Some(menu) = self.menu.take() else { return };
+        let chosen = menu
+            .item_at(self.pointer.0, self.pointer.1)
+            .and_then(|index| menu.items.get(index).cloned());
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        match chosen {
+            Some(crate::menu::Item::Back) => self.go_back(),
+            Some(crate::menu::Item::Forward) => self.go_forward(),
+            Some(crate::menu::Item::Reload) => self.reload(),
+            Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
+            Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
+            Some(crate::menu::Item::CopySelection) => self.copy_selection(),
+            // A click outside the menu dismisses it and does nothing else.
+            None => {}
+        }
+    }
+
+    /// Puts `text` on the system clipboard.
+    ///
+    /// The handle is opened once and then kept, which is not an optimisation:
+    /// on X11 the clipboard is *owned* by a running process rather than stored
+    /// anywhere, so a handle opened, written and dropped takes the text with
+    /// it and a paste a moment later gets whatever was there before.
+    ///
+    /// Silent when there is no clipboard to be had — a headless session, a
+    /// compositor that offers none. The alternative is an error box about a
+    /// thing the reader can see did not happen.
+    fn copy(&mut self, text: String) {
         let clipboard = match &mut self.clipboard {
             Some(clipboard) => clipboard,
             None => match arboard::Clipboard::new() {
                 Ok(clipboard) => self.clipboard.insert(clipboard),
-                // A headless session, or a compositor that offers none. Silent:
-                // the alternative is an error box for a keystroke the reader
-                // may have pressed by accident, about a thing they can see did
-                // not happen.
                 Err(_) => return,
             },
         };
         let _ = clipboard.set_text(text);
+    }
+
+    /// Closes the menu if one is open. Whether there was one to close.
+    fn close_menu(&mut self) -> bool {
+        let had = self.menu.take().is_some();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
     }
 
     /// Scrolls `bounds` into view, if it is not already.
@@ -1450,6 +1505,9 @@ impl App {
             strip,
             size,
             loading,
+            menu,
+            fonts,
+            theme,
             ..
         } = self;
         let tab = tabs.active();
@@ -1557,6 +1615,32 @@ impl App {
             (width.get(), height.get()),
             bar_height,
         );
+        // Over everything else, including the bar: a menu is in front of the
+        // window by definition, and one opened near the top would otherwise
+        // disappear under the chrome it overlaps.
+        if let Some(menu) = menu {
+            let pixmap = menu.render(fonts, *theme);
+            let rect = menu.rect();
+            for row in 0..pixmap.height() {
+                let y = rect.y as u32 + row;
+                if y >= height.get() {
+                    break;
+                }
+                for column in 0..pixmap.width() {
+                    let x = rect.x as u32 + column;
+                    if x >= width.get() {
+                        break;
+                    }
+                    let Some(pixel) = pixmap
+                        .pixels()
+                        .get((row * pixmap.width() + column) as usize)
+                    else {
+                        continue;
+                    };
+                    buffer[(y * width.get() + x) as usize] = pack(pixel);
+                }
+            }
+        }
         // Over everything, because it is about the window rather than about
         // the page under it, and a page can be any colour at all.
         draw_loading(
@@ -1958,6 +2042,19 @@ impl ApplicationHandler<BandReady> for App {
                     self.drag_thumb_to(top);
                     return;
                 }
+                // A menu takes the pointer while it is open: the row under it
+                // lights up, and nothing behind it is asked about — including
+                // a selection the press before it started.
+                if let Some(menu) = &mut self.menu {
+                    let hovered = menu.item_at(self.pointer.0, self.pointer.1);
+                    if hovered != menu.hovered {
+                        menu.hovered = hovered;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 if self.selecting.is_some() {
                     self.extend_selection();
                     return;
@@ -2020,6 +2117,13 @@ impl ApplicationHandler<BandReady> for App {
                 ..
             } => match button {
                 MouseButton::Left => {
+                    // An open menu owns the next click, wherever it lands: on
+                    // an entry it chooses, anywhere else it dismisses. Either
+                    // way the click does not also reach the page under it.
+                    if self.menu.is_some() {
+                        self.choose_from_menu();
+                        return;
+                    }
                     // Letting go of the thumb is not a click on whatever the
                     // pointer happens to be over by then.
                     if self.dragging.take().is_some() {
@@ -2090,6 +2194,11 @@ impl ApplicationHandler<BandReady> for App {
                         self.open_tab(&url);
                     }
                 }
+                // The right-hand button opens the menu, and does it on
+                // release rather than on press so that it can be opened and
+                // chosen from with one press-move-release, the way a menu has
+                // always worked.
+                MouseButton::Right => self.open_menu(),
                 // The mouse's own back and forward buttons, which people who
                 // have them use constantly.
                 MouseButton::Back => self.go_back(),
@@ -2251,7 +2360,9 @@ impl ApplicationHandler<BandReady> for App {
                     // up the window: quitting out from under someone who only
                     // meant to drop a focus ring would be unforgivable.
                     Key::Named(NamedKey::Escape) => {
-                        if !self.clear_focused_link() {
+                        // An open menu is the innermost thing in progress, so
+                        // it is the first thing Escape gives up.
+                        if !self.close_menu() && !self.clear_focused_link() {
                             event_loop.exit();
                         }
                     }
@@ -2339,6 +2450,7 @@ pub fn open(
         loading: None,
         dragging: None,
         selecting: None,
+        menu: None,
         clipboard: None,
         theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),

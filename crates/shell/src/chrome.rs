@@ -49,7 +49,7 @@ const BUTTON: f32 = 40.0;
 /// these were hard to see at all.
 const ARROW: f32 = 18.0;
 /// Gap between the buttons and the URL.
-const PADDING: f32 = 8.0;
+pub(crate) const PADDING: f32 = 8.0;
 
 /// Every colour the chrome draws with, so that the two schemes are one
 /// substitution rather than a branch at each use site.
@@ -990,7 +990,7 @@ fn baseline() -> f32 {
 }
 
 /// The chrome's own font: sans-serif, because this is not the page.
-fn ui_style(size: f32) -> ComputedStyle {
+pub(crate) fn ui_style(size: f32) -> ComputedStyle {
     ComputedStyle {
         font_size: size,
         line_height: size * 1.2,
@@ -1132,7 +1132,7 @@ fn elided(fonts: &mut FontStore, text: &str, style: &ComputedStyle, max_width: f
     clippy::too_many_arguments,
     reason = "a drawing call; every argument is a distinct visual property"
 )]
-fn draw_text(
+pub(crate) fn draw_text(
     list: &mut DisplayList,
     fonts: &mut FontStore,
     text: &str,
