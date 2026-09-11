@@ -93,8 +93,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2048 of 4821 reference tests pass,
-42.5%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2106 of 4821 reference tests pass,
+43.7%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -132,7 +132,10 @@ edge; an invalid selector does not invalidate its rule, so
 `[1digit], div { color: red }` styles the `div` where a browser would style
 nothing; a caption wider than its table, which overhangs it rather than
 widening a wrapper box this engine does not have, so the table sits a little
-left of where a browser puts it; `empty-cells`, which is parsed by nobody here and so is ignored in the
+left of where a browser puts it; a float, which grows the block
+that contains it instead of hanging out below its bottom edge as §10.6.3 says
+(issue #41), so a container wraps its float where a browser lets it overhang;
+`empty-cells`, which is parsed by nobody here and so is ignored in the
 separated model where it applies — it is correctly ignored in the collapsing
 one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to

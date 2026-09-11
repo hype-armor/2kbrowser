@@ -1923,6 +1923,34 @@ fn layout_block(
         trailing_bottom = Some(consumed.margin_bottom);
     }
 
+    // Floats declared after the last block child. Nothing further comes along
+    // to trigger the drain inside the loop, so without this they are laid out
+    // nowhere and never appear — a float at the end of a container simply
+    // vanished, which is most of what `float: left` is used for on a page that
+    // ends with one.
+    //
+    // Placed before the trailing inline flush so that text after them wraps
+    // around them, which is the ordinary case. A float written *after* some
+    // trailing text is placed a little too high by this, since the drain
+    // inside the loop only ever compares against block children; that is the
+    // same granularity the rest of this function works at, and it is a far
+    // smaller error than not drawing the float at all.
+    for (float_node, float_style) in std::mem::take(&mut late) {
+        place_float(
+            doc,
+            styles,
+            fonts,
+            float_node,
+            &float_style,
+            intrinsic,
+            content_width,
+            cursor_y - padding_top - border_top,
+            (padding_left + border_left, padding_top + border_top),
+            &mut context,
+            &mut box_,
+        );
+    }
+
     // Trailing inline content, after the last block child.
     let trailing = flush_inline(
         doc,
@@ -4532,6 +4560,68 @@ mod tests {
             "expected a right-hand position, got {}",
             float_box.rect.x
         );
+    }
+
+    #[test]
+    fn a_float_after_the_last_block_is_still_placed() {
+        // Floats declared after the first in-flow block are held back and
+        // placed when the next block arrives. A float with no block after it
+        // was never placed at all — it vanished, which is most of what
+        // `float: left` is for on a page that ends with one.
+        let rendered = run(
+            r#"<body><p>text</p><div id="f"></div></body>"#,
+            "body { margin: 0 } div { float: left; width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let floated: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .collect();
+        assert_eq!(floated.len(), 1, "the trailing float was dropped");
+        assert!(
+            floated[0].rect.y > 0.0,
+            "it must sit below the paragraph, not at the top: {:?}",
+            floated[0].rect
+        );
+        assert!(
+            rendered.layout.height >= 60.0,
+            "the page is too short to hold it: {}",
+            rendered.layout.height
+        );
+    }
+
+    #[test]
+    fn a_trailing_float_is_placed_once_and_not_twice() {
+        // The drain inside the loop and the drain after it must not both fire
+        // for the same float.
+        let rendered = run(
+            r#"<body><p>one</p><div id="f"></div><p>two</p></body>"#,
+            "body { margin: 0 } div { float: left; width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let floated = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .count();
+        assert_eq!(floated, 1, "the float was placed twice");
+    }
+
+    #[test]
+    fn an_absolutely_positioned_box_is_not_also_a_float() {
+        // §9.7: `position: absolute` makes `float` compute to `none`. Both
+        // take the box out of flow and each has its own way of placing it, so
+        // a box claiming both was placed twice and drawn twice.
+        let rendered = run(
+            r#"<body><p>one</p><div id="f"></div></body>"#,
+            "body { margin: 0 } div { float: right; position: absolute; top: 0; \
+             width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let boxes: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.rect.width == 40.0 && b.rect.height == 60.0)
+            .collect();
+        assert_eq!(boxes.len(), 1, "the box was drawn twice: {boxes:?}");
     }
 
     #[test]

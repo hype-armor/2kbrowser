@@ -6,7 +6,7 @@ use dom::{Document, ElementData, NodeId};
 
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
+    DEFAULT_FONT_SIZE, Edges, Float, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
     parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_display,
     parse_float, parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
@@ -236,6 +236,20 @@ fn compute(
     style.text_decoration.underline |= parent.text_decoration.underline;
     style.text_decoration.line_through |= parent.text_decoration.line_through;
     style.text_decoration.overline |= parent.text_decoration.overline;
+
+    // §9.7: an absolutely positioned box is not a float, whatever `float`
+    // says. Both properties take the box out of normal flow and each has its
+    // own machinery for placing it, so a box that claims both gets placed
+    // twice and drawn twice — which is exactly what
+    // `position-absolute-008.xht` does, with `float: right` and
+    // `position: absolute` on one div.
+    //
+    // Applied here rather than in layout because it is a rule about the
+    // *computed value*, and because layout asks about `float` from several
+    // places that would each have to remember to ask about `position` first.
+    if style.position.is_out_of_flow() {
+        style.float = Float::None;
+    }
 
     style
 }
