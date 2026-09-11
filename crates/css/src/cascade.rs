@@ -102,11 +102,37 @@ struct Precedence {
     order: usize,
 }
 
+/// Whose colours a rendering uses where the author has named one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Colours {
+    /// The author's, wherever they wrote them.
+    Authors,
+    /// The sheets': a colour written into the markup is ignored, and the
+    /// stylesheets decide.
+    ///
+    /// For the document fallback, where this is not a preference but a
+    /// correctness problem. That rendering drops the author's sheet and
+    /// applies the reader's, which paints a dark page — and dropping a sheet
+    /// does not drop the colours in the markup. Wikipedia's taxobox carries
+    /// its bands as `<tr style="background-color: rgb(235,235,210)">` on
+    /// every row, so the reading view came out as pale strips of near-white
+    /// text on near-white: less legible than the page it was rescuing.
+    ///
+    /// Both properties and not only the background, because they are legible
+    /// only as a pair: an author's dark `color` left standing over the
+    /// reader's dark page is the same bug upside down.
+    ///
+    /// Only `style` and presentational attributes are ignored — the sheets
+    /// handed in still apply in full. On this path the author has none, and
+    /// the one sheet there is belongs to the reader.
+    Readers,
+}
+
 /// Resolves computed styles for the whole document.
 ///
 /// Sheets are applied in the order given, after the user-agent sheet.
 pub fn cascade(doc: &Document, author_sheets: &[Stylesheet]) -> StyleMap {
-    cascade_at(doc, author_sheets, 1.0)
+    cascade_as(doc, author_sheets, 1.0, Colours::Authors)
 }
 
 /// The same, at a zoom factor.
@@ -118,6 +144,19 @@ pub fn cascade(doc: &Document, author_sheets: &[Stylesheet]) -> StyleMap {
 /// width, text reflows to the window instead of running off the side of it.
 /// That is what a browser means by zoom, as against a magnifying glass.
 pub fn cascade_at(doc: &Document, author_sheets: &[Stylesheet], zoom: f32) -> StyleMap {
+    cascade_as(doc, author_sheets, zoom, Colours::Authors)
+}
+
+/// The whole of it: at a zoom, and saying whose colours win.
+///
+/// The document fallback wants both at once — a reader who has zoomed in is
+/// still reading on the reader's page.
+pub fn cascade_as(
+    doc: &Document,
+    author_sheets: &[Stylesheet],
+    zoom: f32,
+    colours: Colours,
+) -> StyleMap {
     let ua = Stylesheet::parse(crate::ua::UA_STYLESHEET);
     let mut map = StyleMap::default();
     // The root carries the zoomed default, so an element that says nothing
@@ -141,6 +180,7 @@ pub fn cascade_at(doc: &Document, author_sheets: &[Stylesheet], zoom: f32) -> St
         // and changes how values parse (ADR-0004).
         quirks: doc.is_quirks(),
         zoom,
+        colours,
     };
     style_subtree(doc, doc.root(), &root_style, &rules, &mut map);
     map
@@ -150,12 +190,28 @@ pub fn cascade_at(doc: &Document, author_sheets: &[Stylesheet], zoom: f32) -> St
 struct Rules<'a> {
     /// The user-agent sheet.
     ua: &'a Stylesheet,
-    /// The sheets handed in, in the order they apply.
+    /// The sheets handed in: the author's, or the reader's on a document
+    /// rendering.
     sheets: &'a [Stylesheet],
     /// Whether the document is in quirks mode.
     quirks: bool,
     /// How much bigger than its own pixels the page is drawn.
     zoom: f32,
+    /// Whose colours win where the markup names one.
+    colours: Colours,
+}
+
+/// Whether a property names a colour the reader's sheet should be choosing.
+///
+/// Backgrounds and foregrounds together, because they are only legible as a
+/// pair. Not borders: a border the reader cannot see against the page is a
+/// line missing, not a line of text lost, and leaving them alone keeps a
+/// table's rules visible where the author drew them.
+fn names_a_colour(name: &str) -> bool {
+    matches!(
+        name,
+        "color" | "background" | "background-color" | "background-image"
+    )
 }
 
 fn style_subtree(
@@ -244,6 +300,13 @@ fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) 
             },
             declaration,
         ));
+    }
+
+    if rules.colours == Colours::Readers {
+        matched.retain(|(precedence, declaration)| {
+            !matches!(precedence.origin, Origin::Presentational | Origin::Inline)
+                || !names_a_colour(&declaration.name)
+        });
     }
 
     matched.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1388,9 +1451,17 @@ mod tests {
     }
 
     fn zoomed_style_of(html: &str, css: &str, tag: &str, zoom: f32) -> ComputedStyle {
+        style_from(html, css, tag, zoom, Colours::Authors)
+    }
+
+    fn reader_style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
+        style_from(html, css, tag, 1.0, Colours::Readers)
+    }
+
+    fn style_from(html: &str, css: &str, tag: &str, zoom: f32, colours: Colours) -> ComputedStyle {
         let doc = dom::parse(html);
         let sheets = [Stylesheet::parse(css)];
-        let map = cascade_at(&doc, &sheets, zoom);
+        let map = cascade_as(&doc, &sheets, zoom, colours);
         let node = doc.find_element(tag).expect("element present");
         map.get(node).expect("element styled").clone()
     }
@@ -1462,6 +1533,101 @@ mod tests {
 
         assert_eq!(halved.font_size, 10.0);
         assert_eq!(halved.margin.top, Length::Px(5.0));
+    }
+
+    #[test]
+    fn a_reading_view_ignores_the_colours_written_into_the_markup() {
+        // Dropping the author's sheet does not drop the colours in their
+        // markup, and on a dark reader page what is left is a pale band with
+        // near-white text on it. Wikipedia's taxobox writes exactly this, on
+        // every row.
+        let html = r##"<body><table><tr style="background-color: rgb(235,235,210)">
+            <td bgcolor="#e9e9c8"><font color="#333">Conservation status</font></td>
+            </tr></table></body>"##;
+        let sheet = "body { color: #eee; background-color: #1c1b22 }";
+
+        for tag in ["tr", "td", "font"] {
+            let reading = reader_style_of(html, sheet, tag);
+            assert_eq!(
+                reading.background_color,
+                Color::TRANSPARENT,
+                "<{tag}> kept a background from the markup"
+            );
+            assert_eq!(
+                reading.color,
+                Color::rgb(0xee, 0xee, 0xee),
+                "<{tag}> kept a foreground from the markup"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authored_rendering_keeps_them() {
+        // The other half, and the one that keeps this a fallback behaviour
+        // rather than a policy: a page rendered as its author wrote it is
+        // rendered as its author wrote it.
+        let html = r#"<body><table><tr style="background-color: rgb(235,235,210)">
+            <td>x</td></tr></table></body>"#;
+        let authored = style_of(html, "body { color: #eee }", "tr");
+
+        assert_eq!(authored.background_color, Color::rgb(235, 235, 210));
+    }
+
+    #[test]
+    fn the_sheets_colours_still_apply_in_a_reading_view() {
+        // What is ignored is the markup, not the cascade. The reader sheet is
+        // handed in through the same slot the author's would use, and the
+        // whole point of the reading view is that its colours win.
+        let style = reader_style_of(
+            "<body><p>x</p></body>",
+            "body { background-color: #1c1b22 } p { color: #eee }",
+            "p",
+        );
+
+        assert_eq!(style.color, Color::rgb(0xee, 0xee, 0xee));
+    }
+
+    #[test]
+    fn a_reading_view_keeps_everything_in_the_markup_that_is_not_a_colour() {
+        // Narrow on purpose. A `style` attribute is not all colour, and an
+        // element hidden inline has to stay hidden — dropping that would
+        // *reveal* content the page had put away, which is a worse failure
+        // than an ugly one.
+        let style = reader_style_of(
+            r#"<body><p style="background-color: red; display: none; text-align: right">x</p></body>"#,
+            "body { color: #eee }",
+            "p",
+        );
+
+        assert_eq!(style.display, Display::None);
+        assert_eq!(style.text_align, TextAlign::Right);
+        assert_eq!(style.background_color, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn a_reading_view_leaves_the_borders_where_the_author_drew_them() {
+        // A border the reader cannot make out is a line missing; a paragraph
+        // the reader cannot make out is the article missing. Only the second
+        // is worth overriding an author for, so the rule stops at the two
+        // properties that cause it.
+        for declaration in [
+            "border: 1px solid rgb(200,200,160)",
+            "border-style: solid; border-color: rgb(200,200,160)",
+        ] {
+            let style = reader_style_of(
+                &format!(
+                    r#"<body><table><tr><td style="{declaration}">x</td></tr></table></body>"#
+                ),
+                "body { color: #eee }",
+                "td",
+            );
+
+            assert_eq!(
+                style.border.top.color,
+                Some(Color::rgb(200, 200, 160)),
+                "{declaration}"
+            );
+        }
     }
 
     /// The declaration era stylesheets are full of, which parsed as nothing

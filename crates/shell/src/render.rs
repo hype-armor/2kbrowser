@@ -692,11 +692,23 @@ pub(crate) fn render_sized(
         // Re-render as a document. The author's sheets are dropped entirely —
         // keeping them would reintroduce exactly the layout that failed — and
         // the reader sheet is applied over the UA defaults instead.
+        //
+        // Their colours go too, and that needs saying separately: a sheet is
+        // not the only place an author writes one. Wikipedia's taxobox carries
+        // its pale bands in a `style` attribute on each row, which survived
+        // the sheet being dropped and left near-white text on near-white
+        // backgrounds — a reading view less legible than the page it was
+        // rescuing.
         RenderMode::Document { .. }
         | RenderMode::DocumentFrame { .. }
         | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
-            let mut styles = css::cascade::cascade_at(&doc, &[reader], settings.zoom);
+            let mut styles = css::cascade::cascade_as(
+                &doc,
+                &[reader],
+                settings.zoom,
+                css::cascade::Colours::Readers,
+            );
             // The author's furniture goes with the author's layout. Without
             // this the navigation, the sidebar and the footer no longer sit
             // beside the article — they stack above and below it, so a reading
@@ -1427,6 +1439,37 @@ mod tests {
             .iter()
             .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
             .count()
+    }
+
+    #[test]
+    fn the_document_fallback_paints_none_of_the_colours_in_the_markup() {
+        // Dropping the author's sheet does not drop the colours in their
+        // markup. Wikipedia's taxobox carries its bands inline, on every row,
+        // and they came through onto the dark reader page as pale strips with
+        // near-white text on them — a reading view less legible than the page
+        // it was rescuing.
+        let html = "<body><p style=\"background-color: rgb(0,255,0)\">A paragraph.</p></body>";
+        let mut fonts = FontStore::new();
+        let as_document = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        let as_authored = render_as_authored(html, 900, 4000, &mut fonts, None);
+
+        assert_eq!(
+            green_pixels(&as_document),
+            0,
+            "the reading view painted the author's background"
+        );
+        assert!(
+            green_pixels(&as_authored) > 0,
+            "the authored rendering lost it"
+        );
     }
 
     #[test]
