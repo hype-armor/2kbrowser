@@ -39,6 +39,33 @@ Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
 switches. Ctrl+D saves the page and Ctrl+B shows the saved list. Arrows and
 PageUp/PageDown scroll, Home/End jump, Esc or q quits.";
 
+/// Prints a line of output, treating a closed pipe as the end of the job.
+///
+/// `2kbrowser links page.html | head` is an ordinary thing to type, and `head`
+/// closes the pipe the moment it has its lines. Rust's `println!` panics
+/// there — the process aborts with a backtrace and exit 134, which reads as
+/// the browser crashing rather than as a pipeline ending normally (#51).
+///
+/// The usual answer is to restore the default `SIGPIPE` handler at startup.
+/// That is a call into libc and this workspace forbids `unsafe`, so the error
+/// is handled where it arrives instead. It also says more: every write is
+/// checked, rather than one signal disposition set once and hoped over.
+fn say(text: &str) -> ExitCode {
+    say_to(&mut std::io::stdout().lock(), text)
+}
+
+/// The half of [`say`] that does not need the real stdout to be tested.
+fn say_to(out: &mut impl std::io::Write, text: &str) -> ExitCode {
+    match writeln!(out, "{text}").and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -49,16 +76,12 @@ fn main() -> ExitCode {
         // stray line would be read as a frame header.
         // Applies the sandbox and reports what it could and could not do. The
         // only honest way to test a sandbox is from inside one.
-        Some(sandbox::confine::SELFTEST_ARGUMENT) => {
-            println!("{}", sandbox::confine::selftest());
-            ExitCode::SUCCESS
-        }
+        Some(sandbox::confine::SELFTEST_ARGUMENT) => say(&sandbox::confine::selftest()),
         // The far half of the self-test, for platforms where the confinement is
         // applied from outside and so cannot be applied by the process running
         // the probes. Not in the usage text: the self-test runs this on itself.
         Some(sandbox::confine::SELFTEST_PROBE_ARGUMENT) => {
-            println!("{}", sandbox::confine::selftest_probe(&args[1..]));
-            ExitCode::SUCCESS
+            say(&sandbox::confine::selftest_probe(&args[1..]))
         }
         Some(sandbox::CHILD_ARGUMENT) => match shell::isolated::run_child() {
             Ok(()) => ExitCode::SUCCESS,
@@ -71,10 +94,7 @@ fn main() -> ExitCode {
         Some("links") => report(run_links(&args[1..])),
         Some("open") => report(run_open(&args[1..])),
         Some("bookmarks") => report(run_bookmarks()),
-        Some("--help" | "-h" | "help") | None => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+        Some("--help" | "-h" | "help") | None => say(USAGE),
         Some(other) => {
             eprintln!("error: unknown command `{other}`\n\n{USAGE}");
             ExitCode::FAILURE
@@ -85,12 +105,8 @@ fn main() -> ExitCode {
 /// Prints a command's outcome and turns it into an exit code.
 fn report(outcome: Result<String, String>) -> ExitCode {
     match outcome {
-        Ok(message) => {
-            if !message.is_empty() {
-                println!("{message}");
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(message) if message.is_empty() => ExitCode::SUCCESS,
+        Ok(message) => say(&message),
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -373,4 +389,69 @@ fn take(args: &[String], index: &mut usize, flag: &str) -> Result<String, String
     args.get(*index)
         .cloned()
         .ok_or_else(|| format!("{flag} needs a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::say_to;
+    use std::io::Write;
+    use std::process::ExitCode;
+
+    /// A pipe with nobody on the other end of it — `| head`, once `head` has
+    /// the lines it asked for.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pipe that refuses for a reason of its own.
+    struct DeadPipe;
+
+    impl Write for DeadPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `ExitCode` has no `PartialEq`, so it is compared the way the shell
+    /// would see it.
+    fn code(exit: ExitCode) -> String {
+        format!("{exit:?}")
+    }
+
+    #[test]
+    fn output_lands_with_a_line_ending_on_it() {
+        let mut out = Vec::new();
+        say_to(&mut out, "two links");
+
+        assert_eq!(out, b"two links\n");
+    }
+
+    #[test]
+    fn a_reader_that_stopped_reading_is_not_an_error() {
+        // `2kbrowser links page.html | head` is an ordinary thing to type, and
+        // `head` closes the pipe the moment it has its lines. `println!`
+        // panics there: the process aborted with a backtrace and exit 134,
+        // which reads as the browser crashing rather than as a pipeline
+        // ending normally (#51).
+        assert_eq!(code(say_to(&mut ClosedPipe, "x")), code(ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn a_pipe_that_fails_for_any_other_reason_still_fails() {
+        // The narrowness is the point: output that cannot be written for some
+        // other reason is a real failure, and exiting 0 would hide it.
+        assert_eq!(code(say_to(&mut DeadPipe, "x")), code(ExitCode::FAILURE));
+    }
 }
