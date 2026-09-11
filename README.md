@@ -67,7 +67,9 @@ including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
-markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
+markup actually used (`bgcolor`, `align`, `<font>`, `border`, and `width` on an
+image — including `width="100%"`, which is how a page drew a rule across a
+column or held a layout open with a spacer GIF); list markers;
 text decorations; tiled background images; every CSS 2.1 border style —
 dotted and dashed runs stretched to start and end flush with the corners rather
 than leaving half a dash there, and `double`, `groove`, `ridge`, `inset` and
@@ -91,8 +93,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2024 of 4821 reference tests pass,
-42.0%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2048 of 4821 reference tests pass,
+42.5%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
