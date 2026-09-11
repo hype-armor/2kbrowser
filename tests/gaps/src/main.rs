@@ -252,6 +252,22 @@ const PROPERTIES: &[Property] = &[
         expected: Verdict::Ignored,
     },
     Property {
+        name: "content on ::before",
+        scaffold: "",
+        declaration: "#t::before { content: \"GENERATED\" }",
+        body: "<p id=t>own text</p>",
+        expected: Verdict::Honoured,
+    },
+    Property {
+        name: "content: counter()",
+        scaffold: "",
+        // Out of scope: there is no counter state. The whole declaration is
+        // dropped rather than half-applied, so this must change nothing.
+        declaration: "#t::before { content: counter(c) }",
+        body: "<p id=t>own text</p>",
+        expected: Verdict::Ignored,
+    },
+    Property {
         name: "min-height",
         scaffold: "#t { background: #ccc }",
         declaration: "#t { min-height: 120px }",
@@ -335,7 +351,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t:before { content: 'PREFIX ' }",
         body: "<p id=t>body text</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "display: inline-block",

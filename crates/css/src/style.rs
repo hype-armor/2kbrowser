@@ -32,6 +32,17 @@ pub enum Display {
     TableRowGroup,
     /// A table cell. A block container in its own right.
     TableCell,
+    /// `table-column` and `table-column-group`.
+    ///
+    /// A column box sizes a column and paints its own background; §17.2 gives
+    /// it no content of its own, and anything inside it is not rendered. This
+    /// engine does not lay out column boxes at all — a table's widths come
+    /// from its cells — so the variant exists to say "generates no content
+    /// box", which is the part that is observable. Mapping these to `Block`,
+    /// as the catch-all below used to, made a `::before` with
+    /// `display: table-column` draw its content, and the suite puts the word
+    /// FAIL in exactly that place.
+    TableColumn,
     /// Generates no box at all.
     None,
     /// `flex` or `inline-flex` — recognised, not implemented (ADR-0004).
@@ -74,7 +85,7 @@ impl Display {
     pub fn is_table_internal(self) -> bool {
         matches!(
             self,
-            Display::TableRow | Display::TableRowGroup | Display::TableCell
+            Display::TableRow | Display::TableRowGroup | Display::TableCell | Display::TableColumn
         )
     }
 
@@ -93,6 +104,7 @@ impl Display {
                 Display::TableRowGroup
             }
             "table-cell" => Display::TableCell,
+            "table-column" | "table-column-group" => Display::TableColumn,
             // Column and caption boxes are not implemented; treating them as
             // blocks keeps their content visible rather than dropping it.
             name if name.starts_with("table") => Display::Block,
@@ -1066,6 +1078,16 @@ pub struct ComputedStyle {
     /// applies the maximum first and the minimum second, so a box asked to be
     /// at most 10px and at least 20px is 20px.
     pub max_height: Length,
+    /// Generated content, already resolved to the text it stands for.
+    ///
+    /// Only ever set on a `::before` or `::after` style. Resolved in the
+    /// cascade rather than carried as a value list because every form in
+    /// scope here — a string, `attr()` — is known there, and the originating
+    /// element is in hand for `attr()`, which it is not by layout time.
+    ///
+    /// `None` is `content: none` and `content: normal`, both of which mean the
+    /// pseudo-element generates no box at all.
+    pub content: Option<String>,
     /// `z-index`, and `None` for `auto`.
     ///
     /// Only consulted on a positioned box, which is the only place §9.9 gives
@@ -1147,6 +1169,7 @@ impl Default for ComputedStyle {
             text_indent: Length::Px(0.0),
             min_height: Length::Auto,
             max_height: Length::Auto,
+            content: None,
             z_index: None,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,

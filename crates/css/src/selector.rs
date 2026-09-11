@@ -2,9 +2,11 @@
 //!
 //! Scope is the CSS 2.1 subset: type, class, id, universal, and attribute
 //! selectors, combined into compounds and joined by descendant, child, or
-//! adjacent sibling combinators. Pseudo-classes and pseudo-elements are not
-//! here; a selector using one is dropped whole rather than matched partially,
-//! since matching too broadly is the worse failure.
+//! adjacent sibling combinators, optionally addressing the `::before` or
+//! `::after` pseudo-element. Pseudo-classes are not here, nor are the
+//! pseudo-elements that restyle existing text (`::first-line`,
+//! `::first-letter`); a selector using one is dropped whole rather than
+//! matched partially, since matching too broadly is the worse failure.
 //!
 //! The general sibling combinator `~` is deliberately absent: it is CSS 3, and
 //! the scope boundary is what gives this project a finish line (PLAN.md §2).
@@ -15,6 +17,21 @@
 //! than by mis-matching it.
 
 use dom::{Document, NodeId};
+
+/// A pseudo-element: a box the stylesheet asks for that the document does not
+/// contain.
+///
+/// Only the two CSS 2.1 defines that generate content. `::first-line` and
+/// `::first-letter` are pseudo-elements too and are not here: they restyle
+/// text that already exists rather than inventing any, which is a different
+/// piece of machinery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PseudoElement {
+    /// `::before` — generated content at the start of the element.
+    Before,
+    /// `::after` — generated content at its end.
+    After,
+}
 
 /// How two compounds in a selector relate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +144,13 @@ pub struct Selector {
     /// `(combinator to previous compound, compound)`. The first entry's
     /// combinator is unused.
     pub parts: Vec<(Combinator, Compound)>,
+    /// The pseudo-element this selector addresses, if any.
+    ///
+    /// `matches` answers for the *originating* element either way — the
+    /// pseudo-element has no node of its own to match against. It is the
+    /// cascade that keeps the two apart, by only letting a rule with a
+    /// pseudo-element style that pseudo-element.
+    pub pseudo: Option<PseudoElement>,
 }
 
 /// CSS specificity, compared lexicographically.
@@ -307,7 +331,34 @@ pub fn parse_selector_list(input: &str) -> Vec<Selector> {
         .collect()
 }
 
+/// Splits a trailing `::before`/`::after` off a selector.
+///
+/// Both spellings are accepted. CSS 2.1 writes one colon and CSS 2.2 onwards
+/// writes two, and the era's pages use the single-colon form, so refusing it
+/// would miss the markup this engine exists for.
+fn split_pseudo(input: &str) -> (&str, Option<PseudoElement>) {
+    let lowered = input.trim_end().to_ascii_lowercase();
+    for (suffix, pseudo) in [
+        ("::before", PseudoElement::Before),
+        ("::after", PseudoElement::After),
+        (":before", PseudoElement::Before),
+        (":after", PseudoElement::After),
+    ] {
+        if let Some(rest) = lowered.strip_suffix(suffix) {
+            // A bare `::before` with nothing in front of it is `*::before`.
+            let head = if rest.trim().is_empty() {
+                "*"
+            } else {
+                &input[..rest.len()]
+            };
+            return (head, Some(pseudo));
+        }
+    }
+    (input, None)
+}
+
 fn parse_selector(input: &str) -> Option<Selector> {
+    let (input, pseudo) = split_pseudo(input);
     let spaced = space_combinators(input);
     let mut parts: Vec<(Combinator, Compound)> = Vec::new();
     let mut combinator = Combinator::Descendant;
@@ -340,7 +391,7 @@ fn parse_selector(input: &str) -> Option<Selector> {
     if explicit {
         return None;
     }
-    (!parts.is_empty()).then_some(Selector { parts })
+    (!parts.is_empty()).then_some(Selector { parts, pseudo })
 }
 
 fn parse_compound(input: &str) -> Option<Compound> {
