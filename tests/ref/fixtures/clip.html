@@ -1,0 +1,22 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body { margin: 8px; font: 14px/18px serif; }
+.wrap { position: relative; height: 90px; }
+.box { position: absolute; top: 0; left: 0; width: 120px; height: 60px; background: #cc0000; }
+.clipped { clip: rect(0, 60px, 30px, 0); }
+.commas { clip: rect(0px 60px 30px 0px); }
+.autos  { clip: rect(10px, auto, auto, 10px); }
+.off    { clip: rect(0,0,0,0); clip: auto; }
+.notpos { position: static; clip: rect(0, 10px, 10px, 0); }
+</style></head><body>
+<p>Clipped to the top-left quarter: every side is an offset from the top-left,
+so `rect(0, 60px, 30px, 0)` keeps 60 wide by 30 tall.</p>
+<div class="wrap"><div class="box clipped"></div></div>
+<p>The same, written with spaces instead of commas.</p>
+<div class="wrap"><div class="box commas"></div></div>
+<p>An `auto` side is the border edge, so this trims ten pixels off two sides.</p>
+<div class="wrap"><div class="box autos"></div></div>
+<p>`clip: auto` takes an earlier clip back off.</p>
+<div class="wrap"><div class="box off"></div></div>
+<p>`clip` applies to absolutely positioned boxes only, so this one is whole.</p>
+<div class="wrap"><div class="box notpos"></div></div>
+</body></html>

@@ -508,6 +508,61 @@ impl ListStyleType {
     }
 }
 
+/// The four offsets of a `clip: rect(…)`.
+///
+/// Every one is measured from the *top-left* of the border box, including
+/// `right` and `bottom` — they are not insets from the far edges, which is
+/// the trap in this property and the reason it is worth a type of its own.
+/// CSS 2.1 §11.1.2 is explicit about it, and later specifications kept the
+/// shape for compatibility rather than because anyone liked it.
+///
+/// `None` on a side is `auto`: that edge of the clip is the border edge, so
+/// the side does not clip.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipRect {
+    /// Distance down from the border box's top edge.
+    pub top: Option<Length>,
+    /// Distance right from the border box's *left* edge.
+    pub right: Option<Length>,
+    /// Distance down from the border box's *top* edge.
+    pub bottom: Option<Length>,
+    /// Distance right from the border box's left edge.
+    pub left: Option<Length>,
+}
+
+/// Parses `clip: rect(t, r, b, l)`, or `auto`.
+///
+/// Both separators are accepted. CSS 2.1 specifies commas and notes that
+/// implementations also took spaces, which the era's pages duly used.
+pub fn parse_clip(values: &[Raw]) -> Option<Option<ClipRect>> {
+    if let [Raw::Ident(name)] = values {
+        return (name == "auto").then_some(None);
+    }
+    let [Raw::Function(name, args)] = values else {
+        return None;
+    };
+    if name != "rect" {
+        return None;
+    }
+    let sides: Vec<Option<Length>> = args
+        .iter()
+        .filter(|arg| !matches!(arg, Raw::Comma))
+        .map(|arg| match arg {
+            Raw::Ident(name) if name == "auto" => Some(None),
+            other => crate::value::parse_length(other).map(Some),
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [top, right, bottom, left] = sides.as_slice() else {
+        return None;
+    };
+    Some(Some(ClipRect {
+        top: *top,
+        right: *right,
+        bottom: *bottom,
+        left: *left,
+    }))
+}
+
 /// Parses a `list-style-type` keyword.
 pub fn parse_list_style_type(name: &str) -> Option<ListStyleType> {
     let value = match name {
@@ -1088,6 +1143,11 @@ pub struct ComputedStyle {
     /// `None` is `content: none` and `content: normal`, both of which mean the
     /// pseudo-element generates no box at all.
     pub content: Option<String>,
+    /// `clip`, and `None` for `auto` — no clipping at all.
+    ///
+    /// Only consulted on an absolutely positioned box, which is the only
+    /// place CSS 2.1 §11.1.2 gives it any meaning.
+    pub clip: Option<ClipRect>,
     /// `z-index`, and `None` for `auto`.
     ///
     /// Only consulted on a positioned box, which is the only place §9.9 gives
@@ -1170,6 +1230,7 @@ impl Default for ComputedStyle {
             min_height: Length::Auto,
             max_height: Length::Auto,
             content: None,
+            clip: None,
             z_index: None,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,

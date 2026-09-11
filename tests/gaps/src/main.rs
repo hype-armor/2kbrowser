@@ -309,7 +309,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { position: absolute; background: red; width: 100px; height: 100px }",
         declaration: "#t { clip: rect(0,20px,20px,0) }",
         body: "<div id=t></div>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "position: fixed",
