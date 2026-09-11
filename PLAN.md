@@ -955,11 +955,11 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**1385 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
+**1991 of 4821 reference tests pass — 41.3%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
-Three things about that number, in the order they matter.
+Four things about that number, in the order they matter.
 
 **It is an upper bound, not a score.** A reftest passes when a test and its
 reference render the same, and an engine that ignores a property draws both
@@ -968,9 +968,24 @@ sides the same way. Reftests find inconsistency, not absence.
 **Most of the failures are real.** That was not obvious and had to be checked:
 a reftest can also fail because the pair was loosely matched during the suite's
 import into wpt, which is nothing to do with us. Running the same pairs through
-headless Chromium on a random sample of 150 failures: **140 render identically
-there**. So roughly 93% of the ~3,500 failures are this engine's, not the
-suite's.
+headless Chromium on a random sample of 150 failures: **139 render identically
+there**. So roughly 93% of the failures are this engine's, not the suite's.
+That sample was taken again from scratch after the harness fixes below, rather
+than carried forward — the population it describes had changed, and a
+re-used measurement is a stale one wearing a current number's clothes.
+
+**A test can pass because neither side rendered.** Almost every test here is
+XHTML and writes its stylesheet inside `<![CDATA[ … ]]>`. Read as HTML — which
+is how this browser reads everything, and how every browser read the XHTML the
+real web actually served — that wrapper makes CSS error recovery swallow the
+entire stylesheet. Unwrapping it in the harness moved the figure from 30.4% to
+35.5%, but the direction that matters is the other one: **342 tests stopped
+passing**, every one of them a pair with the wrapper on both sides, two lost
+stylesheets and two pages of unstyled prose matching each other exactly. A
+reftest cannot tell "identical" from "identically blank". Nothing here could
+have found those; they surfaced only because a fix aimed elsewhere made them
+move, and the lesson is that a suite of this shape has a *floor* of false
+green that has to be hunted deliberately.
 
 **The harness was wrong three times before the number meant anything.** The
 first published figure, 20.6%, was an artefact of my own tooling, and the errors
@@ -1064,8 +1079,12 @@ error anywhere in its selector is ignored entirely, so
 `[1digit], div { color: red }` must style nothing — the malformed attribute name
 takes the valid `div` with it. This engine keeps the `div` and applies the red.
 The suite catches it the way it catches everything: a page whose whole assertion
-is "no red". `selectors` is the worst-scoring chapter with content — 59 of 463 —
-and this looks like a large share of it.
+is "no red". `selectors` is the worst-scoring chapter with content — 62 of 463 —
+though most of that is one absence rather than many: **339 of its 401 failures
+are `first-letter-punctuation`**, the suite's per-character sweep of which
+punctuation `::first-letter` draws along with the letter. One pseudo-element
+accounts for 7% of the entire suite, which is worth knowing before reading the
+chapter's score as a verdict on selector matching.
 
 Being strict is not the fix, which is the interesting part. Two different
 failures reach the parser as the same "did not parse": syntax that is *invalid*,
