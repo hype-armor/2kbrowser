@@ -234,6 +234,24 @@ const PROPERTIES: &[Property] = &[
         expected: Verdict::Ignored,
     },
     Property {
+        name: "font (shorthand)",
+        scaffold: "#t { background: #ccc }",
+        // The line height, because that is the half that went unnoticed: the
+        // shorthand parsed as nothing at all, and a row set with
+        // `font: 20px/1` came out short enough to show the background under
+        // its own cells.
+        declaration: "#t { font: 20px/3 serif }",
+        body: "<div id=t>x</div>",
+        expected: Verdict::Honoured,
+    },
+    Property {
+        name: "font-variant",
+        scaffold: "#t { background: #ccc; font-size: 20px }",
+        declaration: "#t { font-variant: small-caps }",
+        body: "<div id=t>small caps</div>",
+        expected: Verdict::Ignored,
+    },
+    Property {
         name: "min-height",
         scaffold: "#t { background: #ccc }",
         declaration: "#t { min-height: 120px }",

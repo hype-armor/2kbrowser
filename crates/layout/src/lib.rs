@@ -128,18 +128,27 @@ fn relative_shift(style: &ComputedStyle, containing: (f32, f32)) -> (f32, f32) {
 pub fn replaced_size(
     style: &ComputedStyle,
     intrinsic: Option<(f32, f32)>,
-    attr_width: Option<f32>,
-    attr_height: Option<f32>,
+    attr_width: Option<Length>,
+    attr_height: Option<Length>,
     available_width: f32,
 ) -> (f32, f32) {
     let font_size = style.font_size;
     // CSS wins over the presentational attribute, which is only a fallback.
     let width = match style.width {
-        Length::Auto => attr_width,
+        Length::Auto => attr_width.map(|length| length.to_px(font_size, available_width)),
         length => Some(length.to_px(font_size, available_width)),
     };
     let height = match style.height {
-        Length::Auto => attr_height,
+        // A percentage *height* is a different matter from a percentage width.
+        // It resolves against the containing block's height, which is `auto`
+        // for nearly every box on a page of this era, and CSS 2.1 §10.5 says
+        // such a percentage computes to `auto` in turn. Reading it against the
+        // width instead — the only basis to hand — would stretch an image to a
+        // fraction of the page's *width*, which is not a small error.
+        Length::Auto => attr_height.and_then(|length| match length {
+            Length::Percent(_) => None,
+            length => Some(length.to_px(font_size, available_width)),
+        }),
         length => Some(length.to_px(font_size, available_width)),
     };
 
@@ -185,14 +194,31 @@ fn is_replaced(doc: &Document, node: NodeId) -> bool {
 
 /// Reads a presentational width/height attribute, which the era's markup used
 /// far more than CSS.
-fn size_attr(doc: &Document, node: NodeId, name: &str) -> Option<f32> {
+/// A `width` or `height` presentational attribute, as a length.
+///
+/// A percentage is not a curiosity here. `<img width="100%">` is how the era
+/// drew a rule across a column, how a spacer GIF held a layout open, and how
+/// a banner filled the page — and this used to return `None` for one, on the
+/// grounds that percentages "were rare and ambiguous". They were neither.
+/// HTML's rendering rules map `width="N%"` onto `width: N%`, and the CSS 2.1
+/// suite's own references lean on it: `<img src="1x1-green.png" width="100%"
+/// height="50">` is how several of them draw the green bar a test must match,
+/// so the *reference* came out a 50px square and the test failed for having
+/// been right.
+fn size_attr(doc: &Document, node: NodeId, name: &str) -> Option<Length> {
     let value = doc.element(node)?.attr(name)?.trim();
-    // Percentages in these attributes are not supported; they were rare and
-    // ambiguous, and treating them as pixels would be worse than ignoring them.
-    if value.ends_with('%') {
-        return None;
+    if let Some(number) = value.strip_suffix('%') {
+        let percent = number.trim().parse::<f32>().ok().filter(|v| *v >= 0.0)?;
+        return Some(Length::Percent(percent));
     }
-    value.parse::<f32>().ok().filter(|v| *v >= 0.0)
+    // A bare number is pixels, and a trailing `px` is not legal in the
+    // attribute — `width="100px"` is what an author writes when they mean the
+    // CSS property, and browsers read it as no width at all.
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| *v >= 0.0)
+        .map(Length::Px)
 }
 
 /// A rectangle in CSS pixels, with the origin at the top left of the canvas.
@@ -1895,6 +1921,34 @@ fn layout_block(
         }
         previous_bottom = Some(child_margins.1);
         trailing_bottom = Some(consumed.margin_bottom);
+    }
+
+    // Floats declared after the last block child. Nothing further comes along
+    // to trigger the drain inside the loop, so without this they are laid out
+    // nowhere and never appear — a float at the end of a container simply
+    // vanished, which is most of what `float: left` is used for on a page that
+    // ends with one.
+    //
+    // Placed before the trailing inline flush so that text after them wraps
+    // around them, which is the ordinary case. A float written *after* some
+    // trailing text is placed a little too high by this, since the drain
+    // inside the loop only ever compares against block children; that is the
+    // same granularity the rest of this function works at, and it is a far
+    // smaller error than not drawing the float at all.
+    for (float_node, float_style) in std::mem::take(&mut late) {
+        place_float(
+            doc,
+            styles,
+            fonts,
+            float_node,
+            &float_style,
+            intrinsic,
+            content_width,
+            cursor_y - padding_top - border_top,
+            (padding_left + border_left, padding_top + border_top),
+            &mut context,
+            &mut box_,
+        );
     }
 
     // Trailing inline content, after the last block child.
@@ -4509,6 +4563,68 @@ mod tests {
     }
 
     #[test]
+    fn a_float_after_the_last_block_is_still_placed() {
+        // Floats declared after the first in-flow block are held back and
+        // placed when the next block arrives. A float with no block after it
+        // was never placed at all — it vanished, which is most of what
+        // `float: left` is for on a page that ends with one.
+        let rendered = run(
+            r#"<body><p>text</p><div id="f"></div></body>"#,
+            "body { margin: 0 } div { float: left; width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let floated: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .collect();
+        assert_eq!(floated.len(), 1, "the trailing float was dropped");
+        assert!(
+            floated[0].rect.y > 0.0,
+            "it must sit below the paragraph, not at the top: {:?}",
+            floated[0].rect
+        );
+        assert!(
+            rendered.layout.height >= 60.0,
+            "the page is too short to hold it: {}",
+            rendered.layout.height
+        );
+    }
+
+    #[test]
+    fn a_trailing_float_is_placed_once_and_not_twice() {
+        // The drain inside the loop and the drain after it must not both fire
+        // for the same float.
+        let rendered = run(
+            r#"<body><p>one</p><div id="f"></div><p>two</p></body>"#,
+            "body { margin: 0 } div { float: left; width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let floated = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .count();
+        assert_eq!(floated, 1, "the float was placed twice");
+    }
+
+    #[test]
+    fn an_absolutely_positioned_box_is_not_also_a_float() {
+        // §9.7: `position: absolute` makes `float` compute to `none`. Both
+        // take the box out of flow and each has its own way of placing it, so
+        // a box claiming both was placed twice and drawn twice.
+        let rendered = run(
+            r#"<body><p>one</p><div id="f"></div></body>"#,
+            "body { margin: 0 } div { float: right; position: absolute; top: 0; \
+             width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let boxes: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.rect.width == 40.0 && b.rect.height == 60.0)
+            .collect();
+        assert_eq!(boxes.len(), 1, "the box was drawn twice: {boxes:?}");
+    }
+
+    #[test]
     fn clear_pushes_a_block_below_the_float() {
         let cleared = run(
             "<body><div class=\"f\">side</div><p class=\"c\">after</p></body>",
@@ -4889,11 +5005,23 @@ mod tests {
         // `<img width="200">` on a 2:1 image must not squash it.
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((100.0, 50.0)), Some(200.0), None, 500.0),
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                Some(Length::Px(200.0)),
+                None,
+                500.0
+            ),
             (200.0, 100.0)
         );
         assert_eq!(
-            replaced_size(&style, Some((100.0, 50.0)), None, Some(25.0), 500.0),
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                None,
+                Some(Length::Px(25.0)),
+                500.0
+            ),
             (50.0, 25.0)
         );
     }
@@ -4902,7 +5030,13 @@ mod tests {
     fn both_declared_dimensions_win_over_the_ratio() {
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((100.0, 50.0)), Some(30.0), Some(300.0), 500.0),
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                Some(Length::Px(30.0)),
+                Some(Length::Px(300.0)),
+                500.0
+            ),
             (30.0, 300.0)
         );
     }
@@ -4913,7 +5047,13 @@ mod tests {
             width: Length::Px(64.0),
             ..ComputedStyle::default()
         };
-        let (width, _) = replaced_size(&style, Some((100.0, 100.0)), Some(999.0), None, 500.0);
+        let (width, _) = replaced_size(
+            &style,
+            Some((100.0, 100.0)),
+            Some(Length::Px(999.0)),
+            None,
+            500.0,
+        );
         assert_eq!(width, 64.0);
     }
 
@@ -4922,7 +5062,13 @@ mod tests {
         // A broken image must not collapse the layout around it.
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, None, Some(120.0), Some(60.0), 500.0),
+            replaced_size(
+                &style,
+                None,
+                Some(Length::Px(120.0)),
+                Some(Length::Px(60.0)),
+                500.0
+            ),
             (120.0, 60.0)
         );
         assert_eq!(
@@ -4950,12 +5096,63 @@ mod tests {
     }
 
     #[test]
-    fn a_percentage_size_attribute_is_ignored_rather_than_read_as_pixels() {
+    fn a_percentage_size_attribute_is_a_percentage_and_not_pixels() {
         let doc = dom::parse(r#"<body><img src="x.png" width="50%"></body>"#);
         assert_eq!(
             size_attr(&doc, doc.find_element("img").expect("img"), "width"),
-            None,
-            "50% must not be read as 50px"
+            Some(Length::Percent(50.0)),
+            "50% must be half the containing block, and never 50px"
+        );
+    }
+
+    #[test]
+    fn a_percentage_width_attribute_fills_that_share_of_the_line() {
+        // `<img width="100%">` is how the era drew a rule across a column and
+        // how the CSS 2.1 suite's own references draw a green bar. Ignoring it
+        // left a 1x1 image at its intrinsic size — a single pixel where the
+        // page wanted a band.
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(
+                &style,
+                Some((1.0, 1.0)),
+                Some(Length::Percent(100.0)),
+                Some(Length::Px(50.0)),
+                500.0
+            ),
+            (500.0, 50.0)
+        );
+        assert_eq!(
+            replaced_size(
+                &style,
+                Some((1.0, 1.0)),
+                Some(Length::Percent(50.0)),
+                None,
+                500.0
+            ),
+            (250.0, 250.0),
+            "with no height, a square image keeps its ratio"
+        );
+    }
+
+    #[test]
+    fn a_percentage_height_attribute_is_auto() {
+        // It resolves against the containing block's *height*, which is `auto`
+        // for nearly every box on a page of this era — §10.5 makes such a
+        // percentage `auto` in turn. The only basis to hand is the width, and
+        // using it would size an image to a fraction of the page's width in
+        // the vertical direction, which is not a small error.
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                None,
+                Some(Length::Percent(50.0)),
+                500.0
+            ),
+            (100.0, 50.0),
+            "the image keeps its intrinsic size"
         );
     }
 
