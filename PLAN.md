@@ -955,7 +955,7 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**2048 of 4821 reference tests pass — 42.5%.** Zero panics across roughly ten
+**2106 of 4821 reference tests pass — 43.7%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 

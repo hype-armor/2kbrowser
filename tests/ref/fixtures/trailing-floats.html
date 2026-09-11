@@ -1,0 +1,43 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; clear: both; }
+  .box { float: left; width: 60px; height: 40px; background: #ccddee;
+         border: 1px solid #003366; margin-right: 6px; }
+  .right { float: right; background: #eeddcc; }
+  .after { clear: both; }
+  section { border: 1px solid #999999; padding: 6px; margin-bottom: 6px; }
+</style></head><body>
+
+<h3>A float after the last block still appears</h3>
+<section>
+  <p>A paragraph, and then a float with nothing after it.</p>
+  <div class="box"></div>
+</section>
+
+<h3>And so does one after trailing text</h3>
+<section>
+  <p>A paragraph.</p>
+  <div class="box"></div>
+  <div class="box right"></div>
+</section>
+
+<h3>A float between two blocks is placed where it is written</h3>
+<section>
+  <p>Before.</p>
+  <div class="box"></div>
+  <p class="after">After, cleared.</p>
+</section>
+
+<h3>A float before any block still starts at the top</h3>
+<section>
+  <div class="box"></div>
+  <p>Text beside the float rather than below it.</p>
+</section>
+
+<h3>Absolutely positioned and floated at once is positioned, not floated</h3>
+<section style="position: relative; height: 60px">
+  <p>One box, not two.</p>
+  <div class="box" style="position: absolute; float: right; top: 4px; right: 4px"></div>
+</section>
+
+</body></html>
