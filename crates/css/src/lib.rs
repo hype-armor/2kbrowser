@@ -59,9 +59,21 @@ impl Stylesheet {
     /// parse and carry on", which is exactly what a browser must do with two
     /// decades of accumulated authoring mistakes.
     pub fn parse(source: &str) -> Self {
+        Self::parse_at(source, ASSUMED_VIEWPORT_WIDTH)
+    }
+
+    /// Parses a stylesheet for a viewport `width` pixels across.
+    ///
+    /// The width is needed at parse time and not later because `@media`
+    /// decides which rules exist at all: a block whose query does not apply
+    /// contributes nothing, so there is no rule left to ask about afterwards.
+    pub fn parse_at(source: &str, width: f32) -> Self {
         let mut input = ParserInput::new(source);
         let mut parser = Parser::new(&mut input);
-        let mut rule_parser = TopLevel::default();
+        let mut rule_parser = TopLevel {
+            viewport_width: width,
+            ..TopLevel::default()
+        };
         // `flatten` discards the Err arm, which is the specified recovery: a
         // rule that fails to parse is dropped and the sheet continues.
         let rules: Vec<Rule> = StyleSheetParser::new(&mut parser, &mut rule_parser)
@@ -91,23 +103,106 @@ pub fn parse_style_attribute(source: &str) -> Vec<Declaration> {
     body.flatten().collect()
 }
 
-/// Whether a media query list applies to this browser.
+/// The viewport width assumed where none is supplied.
 ///
-/// CSS 2.1 has media *types*, not media features: `screen`, `print`, `all`,
-/// and a handful of others. A query carrying features — `screen and
-/// (min-width: 600px)` — is CSS 3, and is treated as not applying rather than
-/// as applying: a rule written for one viewport size, applied unconditionally,
-/// misrenders the page more badly than not applying it at all. Pages that
-/// depend on such rules are re-rendered as documents anyway (ADR-0009).
+/// Only reached by callers that parse a stylesheet without a page to render
+/// it into — tests, mostly. A real render passes its own width.
+pub const ASSUMED_VIEWPORT_WIDTH: f32 = 1000.0;
+
+/// Whether a media query list applies, at an assumed viewport width.
 pub fn media_applies(query: &str) -> bool {
+    media_applies_at(query, ASSUMED_VIEWPORT_WIDTH)
+}
+
+/// Whether a media query list applies to a viewport `width` pixels across.
+///
+/// CSS 2.1 has media *types* and no features, and this used to answer `false`
+/// to any query carrying one, on the grounds that a rule written for one
+/// viewport size is worse applied unconditionally than not applied at all.
+/// That reasoning was right about the danger and wrong about the remedy:
+/// answering `false` to `(min-width: 640px)` is not declining to guess, it is
+/// guessing *no* — and on a page whose desktop layout lives behind exactly
+/// that query, it throws the desktop layout away.
+///
+/// Wikipedia is the case in point. Its infobox is floated right by a rule
+/// inside `@media all and (min-width: 640px)`, and without it the article's
+/// whole two-column shape collapses. The width is a number this browser
+/// knows, so the query gets a real answer.
+///
+/// Width features only. `orientation`, `resolution`, `color` and the rest are
+/// still answered `false`, because a wrong answer there is a guess rather than
+/// a measurement — and `print` still does not apply, because this is a screen.
+pub fn media_applies_at(query: &str, width: f32) -> bool {
     // An empty query list is `all`, which is why `@media { … }` works.
     if query.trim().is_empty() {
         return true;
     }
-    query.split(',').any(|entry| {
-        let entry = entry.trim().to_ascii_lowercase();
-        matches!(entry.as_str(), "all" | "screen")
-    })
+    query
+        .split(',')
+        .any(|entry| query_applies(entry.trim(), width))
+}
+
+/// Whether one comma-separated query in a list applies.
+fn query_applies(query: &str, width: f32) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    let (negated, query) = match query.strip_prefix("not ") {
+        Some(rest) => (true, rest.trim()),
+        // `only` exists to hide a query from parsers too old to know the
+        // syntax. This one is not, so it reads through it.
+        None => (false, query.strip_prefix("only ").unwrap_or(&query).trim()),
+    };
+    let mut parts = query
+        .split(" and ")
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let matched = parts.clone().next().is_some()
+        && parts.all(|part| {
+            if part.starts_with('(') {
+                feature_applies(part.trim_matches(['(', ')']).trim(), width)
+            } else {
+                matches!(part, "all" | "screen")
+            }
+        });
+    matched != negated
+}
+
+/// Whether one `(feature: value)` term holds.
+fn feature_applies(term: &str, width: f32) -> bool {
+    let Some((name, value)) = term.split_once(':') else {
+        // A bare `(feature)` asks whether it exists and is non-zero. Only the
+        // width ones can be answered, and a viewport always has a width.
+        return matches!(term.trim(), "width" | "device-width");
+    };
+    let name = name.trim();
+    let Some(pixels) = length_in_pixels(value.trim()) else {
+        return false;
+    };
+    match name {
+        "min-width" | "min-device-width" => width >= pixels,
+        "max-width" | "max-device-width" => width <= pixels,
+        "width" | "device-width" => (width - pixels).abs() < f32::EPSILON,
+        // Answering anything else would be a guess rather than a measurement.
+        _ => false,
+    }
+}
+
+/// A media feature's length value, in pixels.
+///
+/// `em` is relative to the *initial* font size in a media query — the page's
+/// own font size cannot apply, since the query decides which rules make it.
+fn length_in_pixels(value: &str) -> Option<f32> {
+    let value = value.trim();
+    for (unit, scale) in [
+        ("px", 1.0),
+        ("em", style::DEFAULT_FONT_SIZE),
+        ("rem", style::DEFAULT_FONT_SIZE),
+    ] {
+        if let Some(number) = value.strip_suffix(unit) {
+            return number.trim().parse::<f32>().ok().map(|n| n * scale);
+        }
+    }
+    // A bare `0` is legal and needs no unit.
+    value.parse::<f32>().ok().filter(|n| *n == 0.0)
 }
 
 /// What an at-rule turned out to be.
@@ -121,9 +216,19 @@ enum AtRule {
 }
 
 /// Parses top-level rules, including the two at-rules that matter.
-#[derive(Default)]
 struct TopLevel {
     imports: Vec<String>,
+    /// The viewport the sheet is being parsed for, which `@media` needs.
+    viewport_width: f32,
+}
+
+impl Default for TopLevel {
+    fn default() -> Self {
+        Self {
+            imports: Vec::new(),
+            viewport_width: ASSUMED_VIEWPORT_WIDTH,
+        }
+    }
 }
 
 impl<'i> QualifiedRuleParser<'i> for TopLevel {
@@ -174,7 +279,10 @@ impl<'i> AtRuleParser<'i> for TopLevel {
             "media" => {
                 let start = input.position();
                 while input.next().is_ok() {}
-                Ok(AtRule::Media(media_applies(input.slice_from(start))))
+                Ok(AtRule::Media(media_applies_at(
+                    input.slice_from(start),
+                    self.viewport_width,
+                )))
             }
             "import" => {
                 // `@import url(x.css)` and `@import "x.css"` are both ordinary,
@@ -194,7 +302,8 @@ impl<'i> AtRuleParser<'i> for TopLevel {
                 };
                 let start = input.position();
                 while input.next().is_ok() {}
-                if url.is_empty() || !media_applies(input.slice_from(start)) {
+                if url.is_empty() || !media_applies_at(input.slice_from(start), self.viewport_width)
+                {
                     return Ok(AtRule::Unhandled);
                 }
                 Ok(AtRule::Import(url))
@@ -469,13 +578,87 @@ mod at_rule_tests {
     }
 
     #[test]
-    fn a_feature_query_does_not_apply() {
-        // CSS 3, and applying a rule written for one viewport size to every
-        // size misrenders the page worse than dropping it.
-        assert!(!media_applies("screen and (min-width: 600px)"));
-        assert!(!media_applies("(max-width: 400px)"));
-        let sheet = Stylesheet::parse("@media screen and (min-width: 9px) { p { color: lime } }");
-        assert!(colors(&sheet).is_empty());
+    fn a_width_query_is_answered_against_the_viewport() {
+        // This used to answer `false` to every feature query. Answering
+        // `false` to `(min-width: 640px)` at 1000px is not declining to
+        // guess — it is guessing wrong, and it threw away the desktop half
+        // of every responsive stylesheet.
+        assert!(media_applies_at("screen and (min-width: 640px)", 1000.0));
+        assert!(!media_applies_at("screen and (min-width: 640px)", 320.0));
+        assert!(media_applies_at("(max-width: 400px)", 320.0));
+        assert!(!media_applies_at("(max-width: 400px)", 1000.0));
+        assert!(media_applies_at("all and (min-width: 0)", 1000.0));
+    }
+
+    #[test]
+    fn every_term_of_a_query_has_to_hold() {
+        assert!(media_applies_at(
+            "screen and (min-width: 500px) and (max-width: 1200px)",
+            1000.0
+        ));
+        assert!(!media_applies_at(
+            "screen and (min-width: 500px) and (max-width: 800px)",
+            1000.0
+        ));
+        // The type still has to match, whatever the width says.
+        assert!(!media_applies_at("print and (min-width: 100px)", 1000.0));
+    }
+
+    #[test]
+    fn a_feature_that_cannot_be_measured_still_does_not_apply() {
+        // A wrong answer here would be a guess rather than a measurement,
+        // which is the distinction the width features cross and these do not.
+        for query in [
+            "screen and (orientation: landscape)",
+            "screen and (min-resolution: 2dppx)",
+            "screen and (color)",
+            "screen and (min-width: 40banana)",
+            // The one that matters most: a perfectly good length under a
+            // name this browser cannot answer. The others fail while
+            // parsing the value and never reach the question.
+            "screen and (min-height: 100px)",
+            "screen and (max-height: 100px)",
+        ] {
+            assert!(!media_applies_at(query, 1000.0), "{query}");
+        }
+    }
+
+    #[test]
+    fn not_and_only_are_read() {
+        assert!(!media_applies_at("not screen", 1000.0));
+        assert!(media_applies_at("not print", 1000.0));
+        assert!(!media_applies_at(
+            "not screen and (min-width: 640px)",
+            1000.0
+        ));
+        // `only` exists to hide a query from parsers too old to know the
+        // syntax; this one is not one of those.
+        assert!(media_applies_at(
+            "only screen and (min-width: 640px)",
+            1000.0
+        ));
+    }
+
+    #[test]
+    fn em_in_a_query_is_the_initial_font_size() {
+        // The page's own font size cannot apply: the query decides which
+        // rules exist, so it is answered before any of them are.
+        assert!(media_applies_at("(min-width: 40em)", 1000.0));
+        assert!(!media_applies_at("(min-width: 40em)", 320.0));
+    }
+
+    #[test]
+    fn a_media_block_contributes_its_rules_when_the_width_matches() {
+        let sheet = Stylesheet::parse_at(
+            "@media screen and (min-width: 9px) { p { color: lime } }",
+            100.0,
+        );
+        assert_eq!(colors(&sheet), vec!["lime"]);
+        let narrow = Stylesheet::parse_at(
+            "@media screen and (min-width: 900px) { p { color: lime } }",
+            100.0,
+        );
+        assert!(colors(&narrow).is_empty());
     }
 
     #[test]

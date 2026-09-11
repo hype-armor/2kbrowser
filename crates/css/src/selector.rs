@@ -287,6 +287,14 @@ fn space_combinators(input: &str) -> String {
                 in_brackets = false;
                 out.push(c);
             }
+            (None, '(') => {
+                in_brackets = true;
+                out.push(c);
+            }
+            (None, ')') => {
+                in_brackets = false;
+                out.push(c);
+            }
             (None, '>' | '+') if !in_brackets => {
                 out.push(' ');
                 out.push(c);
@@ -325,10 +333,47 @@ fn space_combinators(input: &str) -> String {
 /// both the suite and the reference baselines, because it can move rendering
 /// on real pages in either direction.
 pub fn parse_selector_list(input: &str) -> Vec<Selector> {
-    input
-        .split(',')
+    split_top_level(input)
+        .into_iter()
         .filter_map(|s| parse_selector(s.trim()))
         .collect()
+}
+
+/// Splits a selector list on its *top-level* commas.
+///
+/// Not `split(',')`, which is what this used to be, because a comma inside
+/// `:is(…)`, `:not(…)` or an attribute value is not a separator. Splitting on
+/// it tears one selector into fragments, and a fragment can be a perfectly
+/// valid selector that matches far more than the original ever did.
+///
+/// That is not hypothetical. Wikipedia ships
+/// `… .mw-collapsible:not(.mw-made-collapsible) > :is(p,table,thead + tbody)
+/// { display: none }`, and splitting it on every comma leaves a bare `table`
+/// — which matched **every table on the page** and hid all of them, the
+/// infobox included. The pseudo-classes themselves were already handled
+/// correctly: a compound containing one is rejected and its selector dropped.
+/// The list simply never reached that check in one piece.
+fn split_top_level(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (index, c) in input.char_indices() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                out.push(&input[start..index]);
+                start = index + c.len_utf8();
+            }
+            (None, _) => {}
+        }
+    }
+    out.push(&input[start..]);
+    out
 }
 
 /// Splits a trailing `::before`/`::after` off a selector.
@@ -535,6 +580,50 @@ mod tests {
             .into_iter()
             .filter(|&n| selectors.iter().any(|s| s.matches(doc, n)))
             .count()
+    }
+
+    #[test]
+    fn a_comma_inside_a_pseudo_class_is_not_a_separator() {
+        // The bug this pins cost Wikipedia every table on the page.
+        // `… :is(p,table,thead + tbody) { display: none }` split on every
+        // comma leaves a bare `table`, which is a valid selector matching far
+        // more than the original ever did — and the rule hid the lot.
+        let list = ".x:not(.y) > :is(p,table,thead + tbody)";
+        assert!(
+            parse_selector_list(list).is_empty(),
+            "a fragment escaped: {:?}",
+            parse_selector_list(list)
+        );
+    }
+
+    #[test]
+    fn a_comma_inside_an_attribute_value_is_not_a_separator() {
+        let doc = dom::parse(r#"<body><p title="a,b">x</p><p>y</p></body>"#);
+        assert_eq!(matching(&doc, "[title=\"a,b\"]"), 1);
+    }
+
+    #[test]
+    fn a_selector_list_still_splits_on_its_own_commas() {
+        let doc = dom::parse("<body><p>x</p><div>y</div><span>z</span></body>");
+        assert_eq!(matching(&doc, "p, div"), 2);
+        assert_eq!(matching(&doc, "p,div,span"), 3);
+    }
+
+    #[test]
+    fn an_unsupported_selector_in_a_list_drops_only_itself() {
+        // The valid ones beside it still apply: dropping the whole list would
+        // lose styling a browser shows.
+        let doc = dom::parse("<body><p>x</p><div>y</div></body>");
+        assert_eq!(matching(&doc, "p:hover, div"), 1);
+    }
+
+    #[test]
+    fn a_combinator_inside_a_pseudo_class_is_not_one() {
+        // `>` and `+` inside `:is(…)` belong to the pseudo-class, and the
+        // whole selector is dropped for containing one — not torn apart.
+        for list in [":is(a > b)", ":is(a + b)", ".x:not(a > b)"] {
+            assert!(parse_selector_list(list).is_empty(), "{list}");
+        }
     }
 
     #[test]
