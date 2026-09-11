@@ -247,6 +247,9 @@ impl Viewport {
             sandbox::Mode::Document { unsupported_share } => RenderMode::Document {
                 unsupported_share: *unsupported_share,
             },
+            sandbox::Mode::DocumentFrame { containers } => RenderMode::DocumentFrame {
+                containers: *containers as usize,
+            },
             sandbox::Mode::RequiresScripting => RenderMode::RequiresScripting,
         }
     }

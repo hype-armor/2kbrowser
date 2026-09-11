@@ -169,7 +169,9 @@ fn title_for(source: &str, mode: &RenderMode, error: Option<&str>) -> String {
     }
     match mode {
         RenderMode::Authored => format!("{source} — 2kbrowser"),
-        RenderMode::Document { .. } => format!("{source} — rendered as document — 2kbrowser"),
+        RenderMode::Document { .. } | RenderMode::DocumentFrame { .. } => {
+            format!("{source} — rendered as document — 2kbrowser")
+        }
         RenderMode::RequiresScripting => format!("{source} — needs JavaScript — 2kbrowser"),
     }
 }

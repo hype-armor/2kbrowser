@@ -588,7 +588,9 @@ fn render_sized(
         // Re-render as a document. The author's sheets are dropped entirely —
         // keeping them would reintroduce exactly the layout that failed — and
         // the reader sheet is applied over the UA defaults instead.
-        RenderMode::Document { .. } | RenderMode::RequiresScripting => {
+        RenderMode::Document { .. }
+        | RenderMode::DocumentFrame { .. }
+        | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
             let mut styles = css::cascade::cascade(&doc, &[reader]);
             // The author's furniture goes with the author's layout. Without
