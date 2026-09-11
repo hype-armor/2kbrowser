@@ -274,6 +274,16 @@ impl Render for PageRenderer {
             None => Vec::new(),
         }
     }
+
+    fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<layout::Rect>, String) {
+        match &self.page {
+            Some(page) => {
+                let selection = page.select(from, to);
+                (selection.rects, selection.text)
+            }
+            None => (Vec::new(), String::new()),
+        }
+    }
 }
 
 /// Runs this process as a renderer child, reading from stdin and writing to

@@ -56,6 +56,12 @@ pub trait Render {
     /// can answer is the process holding them.
     fn find(&mut self, query: &str) -> Vec<layout::Rect>;
 
+    /// What lies between two points of the page already held, and where it is.
+    ///
+    /// Same reason as `find`: the text and its geometry are in the box tree,
+    /// which never crosses the boundary.
+    fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<layout::Rect>, String);
+
     /// Paints a different band of the page most recently rendered.
     ///
     /// Never fetches: the document is already parsed and laid out, and a band
@@ -113,6 +119,10 @@ fn answer_until_the_parent_goes(
         let request = ToChild::decode(&frame)?;
         match &request {
             ToChild::Render { .. } => serve_render(input, output, renderer, request)?,
+            ToChild::Select { from, to } => {
+                let (rects, text) = renderer.select(*from, *to);
+                write_frame(output, &ToParent::Selected { rects, text }.encode())?;
+            }
             ToChild::Find { query } => {
                 let rects = renderer.find(query);
                 write_frame(output, &ToParent::Matches { rects }.encode())?;
@@ -271,6 +281,18 @@ mod tests {
 
         fn band(&mut self, _top: u32, _height: u32) -> Result<Rendered, String> {
             Err("the stub renderer paints no bands".to_owned())
+        }
+
+        fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<layout::Rect>, String) {
+            (
+                vec![layout::Rect {
+                    x: from.0,
+                    y: from.1,
+                    width: to.0 - from.0,
+                    height: to.1 - from.1,
+                }],
+                "selected".to_owned(),
+            )
         }
 
         fn find(&mut self, query: &str) -> Vec<layout::Rect> {
