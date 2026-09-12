@@ -25,6 +25,13 @@ pub struct Link {
     pub rects: Vec<Rect>,
     /// Where it leads, already absolute.
     pub url: String,
+    /// Where on this page it goes, for a link that does not leave it.
+    ///
+    /// A fragment link — `href="#Etymology"` — names a place on the page
+    /// already open rather than a page to fetch. `None` for a link that goes
+    /// somewhere else, and for a fragment naming something the page does not
+    /// have.
+    pub jump_to: Option<f32>,
 }
 
 impl Link {
@@ -267,6 +274,7 @@ impl Viewport {
                     out.push(Link {
                         rects: vec![link.rect],
                         url: link.url.clone(),
+                        jump_to: link.jump_to,
                     });
                 }
             }
@@ -281,16 +289,22 @@ impl Viewport {
     /// be absurd — but it is also all the parent *can* do, since the box tree it
     /// would hit-test against is on the other side.
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.wire_link_at(x, y).map(|link| link.url.as_str())
+    }
+
+    /// The same, with where on this page the link goes if it does not leave
+    /// it — so a caller can tell a page to fetch from a place to scroll to.
+    pub fn target_at(&self, x: f32, y: f32) -> Option<(&str, Option<f32>)> {
+        self.wire_link_at(x, y)
+            .map(|link| (link.url.as_str(), link.jump_to))
+    }
+
+    fn wire_link_at(&self, x: f32, y: f32) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
-        self.page
-            .links
-            .iter()
-            .rev()
-            .find(|link| {
-                let rect = link.rect;
-                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-            })
-            .map(|link| link.url.as_str())
+        self.page.links.iter().rev().find(|link| {
+            let rect = link.rect;
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        })
     }
 
     /// Where `query` appears, asked of the child holding the page.
@@ -416,6 +430,7 @@ mod tests {
                     out.push(Link {
                         rects: vec![link.rect],
                         url: link.url.clone(),
+                        jump_to: link.jump_to,
                     });
                 }
             }
@@ -428,6 +443,7 @@ mod tests {
             rect: rect(at, at, 10.0, 5.0),
             url: url.to_owned(),
             group,
+            jump_to: None,
         }
     }
 
@@ -473,6 +489,7 @@ mod tests {
         let link = Link {
             rects: vec![rect(10.0, 0.0, 20.0, 5.0), rect(0.0, 10.0, 15.0, 5.0)],
             url: "https://example.com/".to_owned(),
+            jump_to: None,
         };
         let bounds = link.bounds();
         assert_eq!((bounds.x, bounds.y), (0.0, 0.0));

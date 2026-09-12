@@ -919,10 +919,38 @@ impl App {
 
     /// Follows the focused link, if there is one.
     fn follow_focused_link(&mut self) {
-        let Some(url) = self.focused().map(|link| link.url) else {
+        let Some(link) = self.focused() else {
             return;
         };
-        self.navigate(url);
+        self.follow(link.url, link.jump_to);
+    }
+
+    /// Follows a link: another page to fetch, or a place on this one.
+    fn follow(&mut self, url: String, jump_to: Option<f32>) {
+        match jump_to {
+            Some(top) => self.jump_to(top),
+            None => self.navigate(url),
+        }
+    }
+
+    /// Scrolls so `top` is the first row of the page area.
+    ///
+    /// What following a fragment link does. Unlike [`Self::scroll_into_view`]
+    /// it moves even when the destination is already on screen: `#Etymology`
+    /// means put me at the etymology, and leaving the page where it was
+    /// because the heading happens to be visible reads as the link not
+    /// working at all.
+    fn jump_to(&mut self, top: f32) {
+        let Some(page) = &self.tab().page else { return };
+        let height = page.scrollable_height();
+        let viewport = self.viewport_height();
+        self.tab_mut().scroll = clamp_scroll(top, height, viewport);
+        // A fragment can name anything on the page, so this is the case most
+        // likely to land outside the band that is painted.
+        self.refresh_band();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// The focused link, looked up afresh.
@@ -1247,6 +1275,12 @@ impl App {
     /// The pointer is in window coordinates; the page starts below the bar and
     /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
+        self.target_under_pointer().map(|(url, _)| url)
+    }
+
+    /// The same, with where on this page the link goes if it does not leave
+    /// it.
+    fn target_under_pointer(&self) -> Option<(String, Option<f32>)> {
         // The scrollbar is on top of the page, so a link beneath it is not
         // under the pointer — it is under the bar. Answered here rather than at
         // each caller so that the cursor, a click and a middle-click cannot
@@ -1256,7 +1290,8 @@ impl App {
         }
         let page = self.tab().page.as_ref()?;
         let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
-        page.link_at(x, y).map(str::to_owned)
+        page.target_at(x, y)
+            .map(|(url, jump_to)| (url.to_owned(), jump_to))
     }
 
     /// Where the pointer falls on the scrollbar, if it falls on one at all.
@@ -1890,8 +1925,8 @@ impl ApplicationHandler<BandReady> for App {
                         // A click on the page is a click on the page, even if
                         // it is not on a link: the URL bar loses focus.
                         self.cancel_editing();
-                        if let Some(url) = self.link_under_pointer() {
-                            self.navigate(url);
+                        if let Some((url, jump_to)) = self.target_under_pointer() {
+                            self.follow(url, jump_to);
                         }
                     }
                 }

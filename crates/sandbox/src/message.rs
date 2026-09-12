@@ -73,6 +73,13 @@ pub struct Link {
     /// URL would be wrong: two different links on a page may lead to the same
     /// place.
     pub group: u32,
+    /// Where on this page it goes, for a link that does not leave it.
+    ///
+    /// A fragment link is a place on the page already open rather than a page
+    /// to fetch, and the answer is in the box tree — which lives on this side
+    /// of the boundary. Sent with the link so that following one costs no
+    /// round trip.
+    pub jump_to: Option<f32>,
 }
 
 fn write_rect(writer: &mut Writer, rect: &Rect) {
@@ -445,6 +452,10 @@ impl ToParent {
                     write_rect(&mut writer, &link.rect);
                     writer.str(&link.url);
                     writer.u32(link.group);
+                    writer.some(link.jump_to.is_some());
+                    if let Some(top) = link.jump_to {
+                        writer.f32(top);
+                    }
                 }
                 writer.some(page.can_toggle_layout);
                 writer.u32(page.images_loaded);
@@ -508,6 +519,7 @@ impl ToParent {
                         rect: read_rect(&mut reader)?,
                         url: reader.str()?,
                         group: reader.u32()?,
+                        jump_to: reader.some()?.then(|| reader.f32()).transpose()?,
                     });
                 }
                 let can_toggle_layout = reader.some()?;
@@ -585,6 +597,7 @@ mod tests {
                 },
                 url: "https://example.com/".to_owned(),
                 group: 0,
+                jump_to: Some(920.0),
             }],
             can_toggle_layout: true,
             images_loaded: 3,
