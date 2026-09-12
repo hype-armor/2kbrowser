@@ -1433,11 +1433,19 @@ fn compose_row(
     let source_start = source_row as usize * page_width as usize * 4;
     for (column, slot) in out.iter_mut().enumerate() {
         // Premultiplied RGBA as it crossed the pipe, packed to the 0RGB
-        // softbuffer wants. Bounds-checked per pixel because the row may be
-        // narrower than the window after a resize the child has not caught up
-        // with.
+        // softbuffer wants.
+        //
+        // Stopping at the row's own end is the whole of it. A band narrower
+        // than the window — a resize the child has not caught up with — has no
+        // pixel for the columns past it, and a flat array does not run out
+        // there: it runs into the *next row*. Widening a window drew the page
+        // twice, the second copy sheared one row up, because every row was
+        // finished off with the beginning of the row below it.
         let at = source_start + column * 4;
-        *slot = match pixels.get(at..at + 3) {
+        *slot = match pixels
+            .get(at..at + 3)
+            .filter(|_| column < page_width as usize)
+        {
             Some(rgb) => (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]),
             None => blank,
         };
@@ -2561,6 +2569,15 @@ mod focus_outline_tests {
         vec![r, g, b, 0xff, r, g, b, 0xff]
     }
 
+    /// A two-pixel-wide page of several rows, each a different colour.
+    ///
+    /// One row is not enough to test a row against: reading past the end of
+    /// the only row is the one case where it also runs off the end of the
+    /// array, so the bug that mattered could not show itself.
+    fn page(rows: &[(u8, u8, u8)]) -> Vec<u8> {
+        rows.iter().flat_map(|rgb| page_row(*rgb)).collect()
+    }
+
     const DARK: u32 = 0x001c_1b22;
 
     #[test]
@@ -2586,6 +2603,18 @@ mod focus_outline_tests {
         // is still the old width, and the columns past it have no pixel.
         let mut out = [0u32; 4];
         compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
+    }
+
+    #[test]
+    fn the_columns_past_a_narrow_row_are_not_filled_from_the_next_one() {
+        // Widening the window drew the page a second time down the right-hand
+        // side, one row out of step. Each row ran past its own end into the
+        // start of the row below, which is only a hole in the array when there
+        // is no row below.
+        let page = page(&[(0x11, 0x22, 0x33), (0x44, 0x55, 0x66)]);
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &page, Some(0), 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
     }
 }
