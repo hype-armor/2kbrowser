@@ -16,6 +16,37 @@ record for everything earlier.
 
 ## Unreleased
 
+**A table is what `display` says it is, not what the tag says.** The grid was
+built by looking for `tr`, `td` and `th` elements, so a table written the way
+CSS defines one — `display: table` on a div, `table-row` on its children —
+produced an empty grid and rendered as nothing. That is not an edge case in the
+suite: it is how most of its table tests are written, and how a page that is not
+from the era builds a table. The structure now comes from the UA stylesheet,
+which is what gives `<tr>` its `display: table-row`, so era markup reaches the
+same place by a different road and both work.
+
+`table-caption` and `table-column-group` became real display values with it,
+and §9.7's blockification grew the rest of its table: a floated or absolutely
+positioned `table-row` is a block, because a row taken out of the flow is no
+longer part of any table and a box that kept the display would be looked for in
+a grid that no longer holds it.
+
+**`border-spacing`'s initial value was wrong, and it was wrong invisibly.** It
+was two pixels. §17.6.1 says zero; the two pixels are the HTML user-agent
+sheet's rule for the `table` *element*. With every table in the era's markup
+being a `<table>`, the difference never showed — and it showed on every table
+built from `display` values, as a 2px gap nobody asked for, on exactly the
+tests that were about to start running. Moving it to the UA sheet is most of
+the 328.
+
+**2736 of 4821 reference tests to 3064**, 56.8% to 63.6%, with 331 newly
+passing and 3 newly failing. The three are all the same missing thing —
+anonymous table boxes (§17.2.1), including a `::before` with `display:
+table-cell`, which needs pseudo-elements to be able to join a grid. An orphan
+table-internal box with no table above it is laid out as an ordinary block
+rather than dropped, which is the cheap half of §17.2.1 and keeps such a box
+visible.
+
 **`::first-letter`.** The single largest absence the conformance suite was
 measuring: 339 of its 4821 tests — 7% of the whole — are one family,
 `first-letter-punctuation`, sweeping character by character through which
