@@ -332,6 +332,7 @@ impl Renderer {
         path: String,
         force_authored: bool,
         force_document: bool,
+        zoom: f32,
     ) -> Result<(Session, Rendered), Error> {
         let mut session = Session::new(self.spawn()?, self.fetcher.clone(), self.timeout)?;
         let page = session.render(
@@ -344,6 +345,7 @@ impl Renderer {
             path,
             force_authored,
             force_document,
+            zoom,
         );
         match page {
             Ok(page) => Ok((session, page)),
@@ -369,6 +371,7 @@ impl Renderer {
         path: String,
         force_authored: bool,
         force_document: bool,
+        zoom: f32,
     ) -> Result<Rendered, Error> {
         self.open(
             body,
@@ -380,6 +383,7 @@ impl Renderer {
             path,
             force_authored,
             force_document,
+            zoom,
         )
         .map(|(_, page)| page)
     }
@@ -403,6 +407,7 @@ struct RenderJob {
     path: String,
     force_authored: bool,
     force_document: bool,
+    zoom: f32,
 }
 
 /// Which request an answer belongs to.
@@ -529,6 +534,7 @@ impl Session {
         path: String,
         force_authored: bool,
         force_document: bool,
+        zoom: f32,
     ) -> Result<Rendered, Error> {
         self.submit(
             Job::Render(Box::new(RenderJob {
@@ -541,6 +547,7 @@ impl Session {
                 path,
                 force_authored,
                 force_document,
+                zoom,
             })),
             Kind::Page,
         )?;
@@ -755,6 +762,7 @@ impl Conversation {
                     path: request.path,
                     force_authored: request.force_authored,
                     force_document: request.force_document,
+                    zoom: request.zoom,
                 })
                 .map(|page| Answer::Rendered(Box::new(page)))
             }
@@ -1052,6 +1060,7 @@ mod tests {
             String::new(),
             false,
             false,
+            1.0,
         );
         assert!(matches!(outcome, Err(Error::Spawn(_))), "{outcome:?}");
     }
@@ -1077,6 +1086,7 @@ mod tests {
             String::new(),
             false,
             false,
+            1.0,
         );
         assert!(
             matches!(outcome, Err(Error::Died) | Err(Error::Io(_))),

@@ -190,6 +190,7 @@ fn resident_memory() -> Check {
         // Neither layout override: what is being measured is an ordinary page.
         false,
         false,
+        1.0,
     );
     let page = match page {
         Ok(page) => page,

@@ -170,6 +170,9 @@ pub enum ToChild {
         /// reads whatever arrives, and `render` gives `force_authored`
         /// precedence rather than trusting a stranger to have kept the rule.
         force_document: bool,
+        /// How much bigger than its own pixels to draw the page. 1.0 is the
+        /// page as written.
+        zoom: f32,
     },
     /// Paint a different band of the page already held.
     ///
@@ -220,6 +223,7 @@ impl ToChild {
                 path,
                 force_authored,
                 force_document,
+                zoom,
             } => {
                 writer.tag(0);
                 writer.bytes(body);
@@ -237,6 +241,7 @@ impl ToChild {
                 writer.str(path);
                 writer.some(*force_authored);
                 writer.some(*force_document);
+                writer.f32(*zoom);
             }
             ToChild::Find { query } => {
                 writer.tag(2);
@@ -292,6 +297,7 @@ impl ToChild {
                     path: reader.str()?,
                     force_authored: reader.some()?,
                     force_document: reader.some()?,
+                    zoom: reader.f32()?,
                 }
             }
             1 => {
@@ -602,6 +608,7 @@ mod tests {
             path: "/a.html".to_owned(),
             force_authored: true,
             force_document: false,
+            zoom: 1.0,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
     }
@@ -630,6 +637,7 @@ mod tests {
                 path: "/a.html".to_owned(),
                 force_authored,
                 force_document,
+                zoom: 1.0,
             };
             let decoded = ToChild::decode(&message.encode());
             assert_eq!(decoded, Ok(message), "{force_authored} {force_document}");
@@ -648,6 +656,7 @@ mod tests {
             path: String::new(),
             force_authored: false,
             force_document: false,
+            zoom: 1.0,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
     }
@@ -670,6 +679,7 @@ mod tests {
                 path,
                 force_authored: false,
                 force_document: false,
+                zoom: 1.0,
             };
             assert_eq!(ToChild::decode(&message.encode()), Ok(message), "{url}");
         }
@@ -752,6 +762,7 @@ mod tests {
                 path: "/".to_owned(),
                 force_authored: false,
                 force_document: true,
+                zoom: 1.0,
             }
             .encode(),
             ToParent::Rendered(Box::new(rendered(3, 2))).encode(),

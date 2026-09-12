@@ -36,6 +36,7 @@ fn request(html: &str, width: u32) -> ToChild {
         path: String::new(),
         force_authored: false,
         force_document: false,
+        zoom: 1.0,
     }
 }
 
@@ -176,6 +177,7 @@ fn session(html: &str, width: u32) -> (sandbox::Session, sandbox::Rendered) {
             at,
             false,
             false,
+            1.0,
         )
         .expect("the renderer opens the page")
 }
@@ -228,6 +230,7 @@ fn the_same_child_re_renders_at_a_new_width() {
             at,
             false,
             false,
+            1.0,
         )
         .expect("re-renders");
 
@@ -337,6 +340,7 @@ fn viewport(html: &str, width: u32) -> shell::viewport::Viewport {
         2000,
         false,
         false,
+        1.0,
     )
     .expect("the page opens")
 }
@@ -499,6 +503,7 @@ fn over_http(port: u16, html: &str) -> shell::viewport::Viewport {
         200,
         false,
         false,
+        1.0,
     )
     .expect("the page opens")
 }
@@ -547,6 +552,7 @@ fn a_subresource_remembered_for_one_page_is_not_served_to_another() {
             at,
             false,
             false,
+            1.0,
         )
         .expect("the renderer opens the page");
 
@@ -575,6 +581,7 @@ fn a_subresource_remembered_for_one_page_is_not_served_to_another() {
             other_at,
             false,
             false,
+            1.0,
         )
         .expect("renders");
 
@@ -744,6 +751,7 @@ fn a_page_asking_for_more_resources_than_the_ceiling_is_refused() {
         200,
         false,
         false,
+        1.0,
     );
 
     match outcome {
@@ -942,6 +950,7 @@ fn a_subresource_keeps_the_charset_its_own_header_declared() {
         200,
         false,
         false,
+        1.0,
     )
     .expect("the page opens");
 
@@ -1174,6 +1183,7 @@ fn a_renderer_child_renders_a_page_with_subresources_over_the_pipe() {
         4000,
         false,
         false,
+        1.0,
     )
     .expect("the confined renderer opens the page");
 
@@ -1219,7 +1229,7 @@ fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
     };
 
     let mut page =
-        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false, false)
+        shell::viewport::Viewport::open(&renderer, document.clone(), 400, 300, false, false, 1.0)
             .expect("the page opens");
     assert!(
         page.content_height() > page.height() as f32,
@@ -1339,6 +1349,7 @@ fn renderers_built_at_the_same_time_all_start() {
                         String::new(),
                         false,
                         false,
+                        1.0,
                     )
                     .map(|page| page.width)
                     .map_err(|error| format!("thread {index}: {error}"))
@@ -1395,6 +1406,7 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
             at,
             false,
             false,
+            1.0,
         )
         .expect("the renderer opens the page");
     assert!(
@@ -1469,6 +1481,7 @@ fn tall_session(lines: usize, width: u32) -> (sandbox::Session, sandbox::Rendere
             at,
             false,
             false,
+            1.0,
         )
         .expect("the renderer opens the page")
 }
@@ -1568,6 +1581,7 @@ fn a_charset_that_only_the_header_knows_still_reaches_the_renderer() {
                 String::new(),
                 false,
                 false,
+                1.0,
             )
             .expect("renders")
             .title

@@ -280,6 +280,25 @@ pub enum Length {
 }
 
 impl Length {
+    /// The same length with every pixel in it made `factor` times bigger.
+    ///
+    /// What page zoom is. Applied here, as the declaration is computed, rather
+    /// than to the finished layout: a glyph shaped at twice the size is twice
+    /// as sharp, and a glyph *scaled* to twice the size is twice as blurry.
+    /// Doing it to the computed value gets the first for free, and gets
+    /// reflow with it — text at 200% wraps to the window rather than running
+    /// off the side of it.
+    ///
+    /// Only the pixels. `em` follows the font size, which is scaled with
+    /// everything else, and a percentage resolves against a basis that has
+    /// already been scaled — so scaling those too would apply the zoom twice.
+    pub fn scaled(self, factor: f32) -> Self {
+        match self {
+            Length::Px(value) => Length::Px(value * factor),
+            other => other,
+        }
+    }
+
     /// Resolves to pixels. `auto` and percentages need context the caller has.
     pub fn to_px(self, font_size: f32, percent_basis: f32) -> f32 {
         match self {
