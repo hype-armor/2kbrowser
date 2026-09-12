@@ -522,11 +522,29 @@ impl ListStyleType {
             ListStyleType::Circle => "\u{25e6}".to_owned(),
             ListStyleType::Square => "\u{25aa}".to_owned(),
             ListStyleType::None => String::new(),
-            ListStyleType::Decimal => format!("{ordinal}."),
-            ListStyleType::LowerAlpha => format!("{}.", alphabetic(ordinal, 'a')),
-            ListStyleType::UpperAlpha => format!("{}.", alphabetic(ordinal, 'A')),
-            ListStyleType::LowerRoman => format!("{}.", roman(ordinal).to_lowercase()),
-            ListStyleType::UpperRoman => format!("{}.", roman(ordinal)),
+            _ => format!("{}.", self.counter(ordinal)),
+        }
+    }
+
+    /// The same ordinal as a bare counter value, with no trailing stop.
+    ///
+    /// §12.4.3's `counter()` prints the number and nothing else: the full stop
+    /// in a list marker is the marker's, not the number's, and
+    /// `content: counter(chapter) ". "` writes its own.
+    ///
+    /// A bullet type has no number to print, so it prints nothing — which is
+    /// what §12.4.3 says `counter(n, disc)` does.
+    pub fn counter(self, ordinal: usize) -> String {
+        match self {
+            ListStyleType::Disc
+            | ListStyleType::Circle
+            | ListStyleType::Square
+            | ListStyleType::None => String::new(),
+            ListStyleType::Decimal => format!("{ordinal}"),
+            ListStyleType::LowerAlpha => alphabetic(ordinal, 'a'),
+            ListStyleType::UpperAlpha => alphabetic(ordinal, 'A'),
+            ListStyleType::LowerRoman => roman(ordinal).to_lowercase(),
+            ListStyleType::UpperRoman => roman(ordinal),
         }
     }
 }
@@ -1223,6 +1241,13 @@ pub struct ComputedStyle {
     pub min_width: Length,
     /// `height`.
     pub height: Length,
+    /// `counter-reset`, as `(name, value)` pairs in source order (§12.4).
+    ///
+    /// A list because one declaration can reset several counters, and their
+    /// order matters when two of them share a name.
+    pub counter_reset: Vec<(String, i32)>,
+    /// `counter-increment`, as `(name, delta)` pairs in source order.
+    pub counter_increment: Vec<(String, i32)>,
 }
 
 /// What a `<table>` element gets for `border-spacing` when nothing says
@@ -1288,6 +1313,8 @@ impl Default for ComputedStyle {
             width: Length::Auto,
             max_width: Length::Auto,
             height: Length::Auto,
+            counter_reset: Vec::new(),
+            counter_increment: Vec::new(),
         }
     }
 }

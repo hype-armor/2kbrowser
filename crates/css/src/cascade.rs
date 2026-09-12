@@ -7,11 +7,12 @@ use dom::{Document, ElementData, NodeId};
 use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
-    NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
-    parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_clip,
-    parse_display, parse_float, parse_list_style_type, parse_overflow, parse_position,
-    parse_text_decoration, parse_text_transform, parse_vertical_align, parse_visibility,
+    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, ListStyleType,
+    MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position,
+    parse_background_repeat, parse_border_collapse, parse_border_style, parse_caption_side,
+    parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type, parse_overflow,
+    parse_position, parse_text_decoration, parse_text_transform, parse_vertical_align,
+    parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -197,7 +198,16 @@ pub fn cascade_as(
         zoom,
         colours,
     };
-    style_subtree(doc, doc.root(), &root_style, &rules, &mut map);
+    let mut counters = Counters::default();
+    style_subtree(
+        doc,
+        doc.root(),
+        &root_style,
+        &rules,
+        &mut counters,
+        0,
+        &mut map,
+    );
     resolve_first_letters(doc, &mut map);
     map
 }
@@ -309,17 +319,23 @@ fn style_subtree(
     node: NodeId,
     parent_style: &ComputedStyle,
     rules: &Rules,
+    counters: &mut Counters,
+    depth: usize,
     out: &mut StyleMap,
 ) {
     let style = if doc.element(node).is_some() {
-        let computed = compute(doc, node, parent_style, rules, None);
+        let computed = compute(doc, node, parent_style, rules, counters, None);
         out.styles.insert(node, computed.clone());
+        // §12.4: the element's own counter operations happen before anything
+        // reads a counter, so a `::before` on the element numbering itself
+        // sees the value this element just set.
+        step_counters(&computed, counters, depth);
         // §12.1: a pseudo-element generates a box only when `content` gives it
         // one. Computing the style and then throwing it away when there is no
         // content keeps that decision in one place, and lets every later stage
         // read "a style exists here" as "this box exists".
         for which in [PseudoElement::Before, PseudoElement::After] {
-            let generated = compute(doc, node, &computed, rules, Some(which));
+            let generated = compute(doc, node, &computed, rules, counters, Some(which));
             if generated.content.is_some() {
                 out.pseudos.insert((node, which), generated);
             }
@@ -337,6 +353,7 @@ fn style_subtree(
                 node,
                 &computed,
                 rules,
+                counters,
                 Some(PseudoElement::FirstLetter),
             );
             out.pseudos
@@ -348,8 +365,12 @@ fn style_subtree(
     };
 
     for &child in doc.children(node) {
-        style_subtree(doc, child, &style, rules, out);
+        style_subtree(doc, child, &style, rules, counters, depth + 1, out);
     }
+    // Every counter this element's children created goes out of scope here:
+    // §12.4.1 ends a reset's scope with the element it was written on, and
+    // with it the following siblings that shared it.
+    counters.leave(depth);
 }
 
 /// Whether any rule in scope addresses `which` on this node.
@@ -371,6 +392,7 @@ fn compute(
     node: NodeId,
     parent: &ComputedStyle,
     rules: &Rules,
+    counters: &Counters,
     pseudo: Option<PseudoElement>,
 ) -> ComputedStyle {
     let (quirks, zoom) = (rules.quirks, rules.zoom);
@@ -473,6 +495,7 @@ fn compute(
             quirks,
             zoom,
             doc.element(node),
+            counters,
         );
     }
 
@@ -577,6 +600,8 @@ fn apply(
     // The originating element, for the one property that reads the document
     // rather than only its own value: `content: attr(href)`.
     element: Option<&ElementData>,
+    // The counters in scope here, for `content: counter(n)`.
+    counters: &Counters,
 ) {
     let values = &declaration.value;
     let Some(first) = values.first() else { return };
@@ -812,10 +837,21 @@ fn apply(
             }
         }
         // §12.2. Resolved to text here rather than carried as a value list:
-        // every form in scope is known at this point, and `attr()` needs the
-        // originating element, which layout does not have.
+        // every form in scope is known at this point — `attr()` needs the
+        // originating element and `counter()` needs the counters in scope, and
+        // layout has neither.
         "content" => {
-            style.content = parse_content(element, values);
+            style.content = parse_content(element, counters, values);
+        }
+        "counter-reset" => {
+            if let Some(list) = parse_counters(values, 0) {
+                style.counter_reset = list;
+            }
+        }
+        "counter-increment" => {
+            if let Some(list) = parse_counters(values, 1) {
+                style.counter_increment = list;
+            }
         }
         // §11.1.2. `parse_clip` answers with a nested option: the outer one
         // is "did this parse", the inner is "is it `auto`" — and `auto` has
@@ -1127,7 +1163,146 @@ fn parse_font_shorthand(
 /// the rejection below and drop the declaration, which is exactly what they
 /// mean. A branch for them was written first and deleted when a mutation
 /// showed it changed nothing.
-fn parse_content(element: Option<&ElementData>, values: &[Raw]) -> Option<String> {
+/// The counters in scope at one point of a document-order walk (§12.4.1).
+///
+/// A counter is *self-nesting*: `counter-reset` on an element creates an
+/// instance whose scope is that element, its following siblings, and all of
+/// their descendants. Several instances of one name can therefore be live at
+/// once — that is what `counters()` prints, and what makes a nested ordered
+/// list read `2.1.3` rather than `3`.
+///
+/// Each instance remembers the depth it was created at, which is the whole
+/// bookkeeping: an instance created at depth *d* dies when the walk leaves the
+/// element at depth *d - 1*, because that is where its scope ends.
+#[derive(Debug, Default)]
+pub struct Counters {
+    instances: Vec<Instance>,
+}
+
+#[derive(Debug)]
+struct Instance {
+    name: String,
+    value: i32,
+    depth: usize,
+}
+
+impl Counters {
+    /// Applies an element's `counter-reset` at `depth`.
+    fn reset(&mut self, name: &str, value: i32, depth: usize) {
+        // A sibling's instance at this same depth is *replaced*, not nested
+        // inside: two `<li>`s that each reset a counter are one counter that
+        // keeps being set back, not two counters.
+        if let Some(existing) = self
+            .instances
+            .iter_mut()
+            .rev()
+            .find(|instance| instance.name == name)
+            && existing.depth == depth
+        {
+            existing.value = value;
+            return;
+        }
+        self.instances.push(Instance {
+            name: name.to_owned(),
+            value,
+            depth,
+        });
+    }
+
+    /// Applies an element's `counter-increment`.
+    ///
+    /// §12.4.1: incrementing a counter that was never reset acts as though the
+    /// root had reset it to zero, which is what makes `counter-increment`
+    /// usable on its own.
+    fn increment(&mut self, name: &str, delta: i32, depth: usize) {
+        match self
+            .instances
+            .iter_mut()
+            .rev()
+            .find(|instance| instance.name == name)
+        {
+            Some(instance) => instance.value = instance.value.saturating_add(delta),
+            None => self.instances.push(Instance {
+                name: name.to_owned(),
+                value: delta,
+                depth,
+            }),
+        }
+    }
+
+    /// Drops every instance whose scope ended when the walk left `depth`.
+    fn leave(&mut self, depth: usize) {
+        self.instances.retain(|instance| instance.depth <= depth);
+    }
+
+    /// The innermost instance's value, for `counter()`.
+    fn value(&self, name: &str) -> i32 {
+        self.instances
+            .iter()
+            .rev()
+            .find(|instance| instance.name == name)
+            .map_or(0, |instance| instance.value)
+    }
+
+    /// Every instance's value, outermost first, for `counters()`.
+    fn nested(&self, name: &str) -> Vec<i32> {
+        self.instances
+            .iter()
+            .filter(|instance| instance.name == name)
+            .map(|instance| instance.value)
+            .collect()
+    }
+}
+
+/// Applies an element's own `counter-reset` and `counter-increment`.
+///
+/// Reset before increment, which is the order §12.4 gives and is visible
+/// whenever one element does both.
+fn step_counters(style: &ComputedStyle, counters: &mut Counters, depth: usize) {
+    for (name, value) in &style.counter_reset {
+        counters.reset(name, *value, depth);
+    }
+    for (name, delta) in &style.counter_increment {
+        counters.increment(name, *delta, depth);
+    }
+}
+
+/// Parses `counter-reset` / `counter-increment`: names, each optionally
+/// followed by an integer.
+///
+/// `none` is the initial value and clears the list. An unreadable value drops
+/// the declaration rather than half of it, since a counter list that is partly
+/// applied numbers a document in a way nobody wrote.
+fn parse_counters(values: &[Raw], default: i32) -> Option<Vec<(String, i32)>> {
+    if let [Raw::Ident(single)] = values
+        && single.eq_ignore_ascii_case("none")
+    {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<(String, i32)> = Vec::new();
+    for value in values {
+        match value {
+            Raw::Ident(name) => {
+                if name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("inherit") {
+                    return None;
+                }
+                out.push((name.clone(), default));
+            }
+            Raw::Number(number) => {
+                let last = out.last_mut()?;
+                last.1 = *number as i32;
+            }
+            _ => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn parse_content(
+    element: Option<&ElementData>,
+    counters: &Counters,
+    values: &[Raw],
+) -> Option<String> {
     if values.is_empty() {
         return None;
     }
@@ -1135,6 +1310,45 @@ fn parse_content(element: Option<&ElementData>, values: &[Raw]) -> Option<String
     for value in values {
         match value {
             Raw::Str(text) => out.push_str(text),
+            // §12.4.3. `counter(n)` prints the innermost instance;
+            // `counters(n, sep)` prints every one in scope, outermost first,
+            // which is how a nested list numbers itself `2.1.3`.
+            Raw::Function(name, args) if name == "counter" || name == "counters" => {
+                // Split on the commas the tokeniser keeps, so an argument is
+                // an argument rather than whatever happens to be at an index.
+                let arguments: Vec<&[Raw]> = args.split(|raw| matches!(raw, Raw::Comma)).collect();
+                let nested = name == "counters";
+                let [Raw::Ident(counter)] = arguments.first()? else {
+                    return None;
+                };
+                // `counters()` takes a separator and `counter()` does not; both
+                // then take an optional list-style saying how to spell the
+                // number. Anything else is not this function.
+                let (separator, style) = match (nested, arguments.as_slice()) {
+                    (false, [_]) => (String::new(), ListStyleType::Decimal),
+                    (false, [_, [Raw::Ident(style)]]) => {
+                        (String::new(), crate::style::parse_list_style_type(style)?)
+                    }
+                    (true, [_, [Raw::Str(separator)]]) => {
+                        (separator.clone(), ListStyleType::Decimal)
+                    }
+                    (true, [_, [Raw::Str(separator)], [Raw::Ident(style)]]) => (
+                        separator.clone(),
+                        crate::style::parse_list_style_type(style)?,
+                    ),
+                    _ => return None,
+                };
+                let values = if nested {
+                    counters.nested(counter)
+                } else {
+                    vec![counters.value(counter)]
+                };
+                let printed: Vec<String> = values
+                    .into_iter()
+                    .map(|value| style.counter(value.max(0) as usize))
+                    .collect();
+                out.push_str(&printed.join(&separator));
+            }
             Raw::Function(name, args) if name == "attr" => {
                 // A missing attribute is the empty string, not a failure:
                 // §12.2 says so, and it is what makes `content: attr(title)`
@@ -2082,14 +2296,173 @@ mod tests {
         );
     }
 
+    /// The generated content of every `::before` in the document, in order.
+    fn all_before(html: &str, css: &str) -> Vec<String> {
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[Stylesheet::parse(css)]);
+        doc.descendants(doc.root())
+            .into_iter()
+            .filter_map(|node| map.pseudo(node, PseudoElement::Before))
+            .filter_map(|style| style.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_counter_counts() {
+        assert_eq!(
+            all_before(
+                "<body><ol><li>a</li><li>b</li><li>c</li></ol></body>",
+                "ol { counter-reset: c } li { counter-increment: c } \
+                 li::before { content: counter(c) }",
+            ),
+            ["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn a_counter_nobody_reset_still_counts_from_zero() {
+        // §12.4.1: incrementing a counter with no reset acts as though the root
+        // had reset it, which is what makes `counter-increment` usable alone.
+        assert_eq!(
+            all_before(
+                "<body><p>a</p><p>b</p></body>",
+                "p { counter-increment: c } p::before { content: counter(c) }",
+            ),
+            ["1", "2"]
+        );
+    }
+
+    #[test]
+    fn counters_prints_every_instance_in_scope() {
+        // The self-nesting rule, and the reason `counters()` exists: a nested
+        // list numbers itself `1`, `1.1`, `1.2`, `2` rather than `1 1 2 2`.
+        assert_eq!(
+            all_before(
+                "<body><ol><li>one<ol><li>a</li><li>b</li></ol></li><li>two</li></ol></body>",
+                "ol { counter-reset: s } li { counter-increment: s } \
+                 li::before { content: counters(s, \".\") }",
+            ),
+            ["1", "1.1", "1.2", "2"]
+        );
+    }
+
+    #[test]
+    fn a_counters_scope_is_the_element_its_siblings_after_it_and_their_descendants() {
+        // §12.4.1, which is easy to read as "the element and its descendants"
+        // and is not that. The reset is on the first paragraph, so the second
+        // paragraph — its following sibling — shares the counter, and the
+        // paragraph in the next div does not: it is neither a descendant of
+        // the first nor a sibling of it, so it starts again from zero.
+        assert_eq!(
+            all_before(
+                "<body><div><p class=one>a</p><p>b</p></div><div><p>c</p></div></body>",
+                ".one { counter-reset: c 10 } p { counter-increment: c } \
+                 p::before { content: counter(c) }",
+            ),
+            ["11", "12", "1"]
+        );
+        // And with the reset a level up, the *second div* is a following
+        // sibling of the first, so its paragraph is inside the scope after
+        // all. This is the pair that makes the rule unambiguous.
+        assert_eq!(
+            all_before(
+                "<body><div class=one><p>a</p></div><div><p>b</p></div></body>",
+                ".one { counter-reset: c 10 } p { counter-increment: c } \
+                 p::before { content: counter(c) }",
+            ),
+            ["11", "12"]
+        );
+    }
+
+    #[test]
+    fn a_following_sibling_shares_the_scope_rather_than_nesting_in_it() {
+        // A reset's scope covers the element *and its following siblings*, so
+        // two paragraphs that each reset the same counter are one counter set
+        // back twice, not two counters.
+        assert_eq!(
+            all_before(
+                "<body><p>a</p><p>b</p></body>",
+                "p { counter-reset: c 5; counter-increment: c } \
+                 p::before { content: counters(c, \".\") }",
+            ),
+            ["6", "6"]
+        );
+    }
+
+    #[test]
+    fn counter_prints_the_innermost_instance_and_counters_prints_them_all() {
+        // The pair that tells the two functions apart. With a nested list live
+        // at two depths, `counter()` is the inner number alone.
+        let markup = "<body><ol><li>one<ol><li>a</li><li>b</li></ol></li><li>two</li></ol></body>";
+        let sheet = "ol { counter-reset: s } li { counter-increment: s }";
+        assert_eq!(
+            all_before(
+                markup,
+                &format!("{sheet} li::before {{ content: counter(s) }}")
+            ),
+            ["1", "1", "2", "2"],
+            "counter() did not take the innermost instance"
+        );
+        assert_eq!(
+            all_before(
+                markup,
+                &format!("{sheet} li::before {{ content: counters(s, \".\") }}")
+            ),
+            ["1", "1.1", "1.2", "2"]
+        );
+    }
+
+    #[test]
+    fn a_counter_can_be_spelled_in_another_list_style() {
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 7 } p::before { content: counter(c, upper-roman) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("VII")
+        );
+        // And the number carries no full stop of its own: that belongs to a
+        // list marker, and `content` writes its own punctuation.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 3 } p::before { content: counter(c) \". \" }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("3. ")
+        );
+    }
+
+    #[test]
+    fn reset_happens_before_increment_on_one_element() {
+        // §12.4's order, and visible only when one element does both.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 10; counter-increment: c 5 } \
+                 p::before { content: counter(c) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("15")
+        );
+    }
+
     #[test]
     fn a_content_form_out_of_scope_drops_the_whole_declaration() {
         // A pseudo-element showing *part* of what the author asked for is
         // worse than one showing nothing: it looks deliberate.
         for css in [
-            "p::before { content: counter(x) }",
             "p::before { content: open-quote }",
-            "p::before { content: \"a\" counter(x) }",
+            "p::before { content: \"a\" url(x.png) }",
+            // `counters()` without a separator is not `counters()`.
+            "p::before { content: counters(x) }",
         ] {
             assert_eq!(
                 content_of("<p>y</p>", css, "p", PseudoElement::Before),
