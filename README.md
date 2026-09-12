@@ -62,7 +62,10 @@ hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
 `letter-spacing`, `text-indent` on a block's first line, `min-height` and
 `max-height` — applied in the order §10.7 gives them, so a box asked for both
-at once takes the minimum — and `z-index`, so that two overlapping positioned boxes land in the order their
+at once takes the minimum — `clip`, where every side of the `rect()` is an
+offset from the box's top-left corner rather than an inset from the far edges,
+the one thing about that property which is easy to get backwards — and
+`z-index`, so that two overlapping positioned boxes land in the order their
 author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
@@ -97,8 +100,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2232 of 4821 reference tests pass,
-46.3%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2265 of 4821 reference tests pass,
+47.0%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not

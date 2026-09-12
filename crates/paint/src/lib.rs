@@ -137,6 +137,24 @@ fn paint_box(
     let y = offset_y + box_.rect.y;
     let is_canvas_background = box_.node.is_some() && box_.node == propagated;
 
+    // §11.1.2: `clip` applies to an absolutely positioned box, and clips that
+    // box together with everything inside it. Applied to the *range of items
+    // this subtree emits* rather than threaded through every push below —
+    // there are four kinds of item and two more places that emit them, and a
+    // parameter on each is four chances to forget one.
+    //
+    // Nesting falls out of that: an inner clip has already narrowed its own
+    // items by the time the outer box's range is clipped, so the two
+    // intersect without either knowing about the other.
+    let clip = box_
+        .style
+        .position
+        .is_out_of_flow()
+        .then_some(box_.style.clip)
+        .flatten()
+        .map(|clip| resolve_clip(clip, x, y, box_.rect, box_.style.font_size));
+    let clip_from = list.items.len();
+
     // §11.2: a hidden box draws nothing — no background, no border, no text,
     // no image — but its *children are still walked*, because `visibility`
     // inherits and a descendant may set `visible` to come back out of a hidden
@@ -271,6 +289,82 @@ fn paint_box(
     for child in order {
         paint_box(child, x, y, propagated, list);
     }
+
+    if let Some(clip) = clip {
+        clip_items(&mut list.items, clip_from, clip);
+    }
+}
+
+/// Turns a `clip` into a rectangle on the canvas.
+///
+/// Every side is measured from the border box's top-left corner, `right` and
+/// `bottom` included — they are offsets, not insets from the far edges, which
+/// is the one thing about this property that is easy to get backwards. `auto`
+/// on a side leaves that border edge alone.
+fn resolve_clip(clip: css::style::ClipRect, x: f32, y: f32, rect: Rect, font_size: f32) -> Rect {
+    let offset = |length: Option<css::Length>, fallback: f32| {
+        length.map_or(fallback, |length| length.to_px(font_size, 0.0))
+    };
+    let top = y + offset(clip.top, 0.0);
+    let left = x + offset(clip.left, 0.0);
+    let bottom = y + offset(clip.bottom, rect.height);
+    let right = x + offset(clip.right, rect.width);
+    Rect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
+}
+
+/// Narrows every item in `items` to `clip`, dropping what falls outside.
+///
+/// Rectangles are intersected. Glyphs go whole: one straddling the edge is
+/// kept rather than cut through, which is the same trade the form controls
+/// make when they clip an over-long value, and which keeps this from needing
+/// a clip path in the rasteriser.
+fn clip_items(items: &mut Vec<DisplayItem>, from: usize, clip: Rect) {
+    let mut tail = items.split_off(from);
+    tail.retain_mut(|item| match item {
+        // A tile's `rect` is the area it repeats within, so narrowing it
+        // clips the tiling without moving where the tiles start — the anchor
+        // that decides the phase is carried separately, for exactly this
+        // reason.
+        DisplayItem::Rect { rect, .. }
+        | DisplayItem::Image { rect, .. }
+        | DisplayItem::Tile { rect, .. } => match intersect(*rect, clip) {
+            Some(narrowed) => {
+                *rect = narrowed;
+                true
+            }
+            None => false,
+        },
+        DisplayItem::Glyph {
+            glyph,
+            origin_x,
+            origin_y,
+            ..
+        } => {
+            let gx = *origin_x + glyph.x;
+            let gy = *origin_y + glyph.y;
+            gx >= clip.x && gx < clip.x + clip.width && gy >= clip.y && gy <= clip.y + clip.height
+        }
+    });
+    items.append(&mut tail);
+}
+
+/// The overlap of two rectangles, or `None` where they do not overlap.
+fn intersect(rect: Rect, clip: Rect) -> Option<Rect> {
+    let x = rect.x.max(clip.x);
+    let y = rect.y.max(clip.y);
+    let right = (rect.x + rect.width).min(clip.x + clip.width);
+    let bottom = (rect.y + rect.height).min(clip.y + clip.height);
+    (right > x && bottom > y).then_some(Rect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
 }
 
 /// Emits the four border edges of a box.
@@ -990,6 +1084,103 @@ fn draw_glyph(
         Transform::identity(),
         None,
     );
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+    use css::style::ClipRect;
+    use css::value::Length;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn every_side_is_measured_from_the_top_left() {
+        // The trap in this property: `right` and `bottom` are offsets from
+        // the top-left, not insets from the far edges. Read as insets, a
+        // `rect(0, 60px, 30px, 0)` on a 120x60 box clips to the wrong half.
+        let clip = ClipRect {
+            top: Some(Length::Px(0.0)),
+            right: Some(Length::Px(60.0)),
+            bottom: Some(Length::Px(30.0)),
+            left: Some(Length::Px(0.0)),
+        };
+        assert_eq!(
+            resolve_clip(clip, 10.0, 20.0, rect(0.0, 0.0, 120.0, 60.0), 16.0),
+            rect(10.0, 20.0, 60.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn an_auto_side_is_the_border_edge() {
+        let clip = ClipRect {
+            top: Some(Length::Px(10.0)),
+            right: None,
+            bottom: None,
+            left: Some(Length::Px(10.0)),
+        };
+        assert_eq!(
+            resolve_clip(clip, 0.0, 0.0, rect(0.0, 0.0, 120.0, 60.0), 16.0),
+            rect(10.0, 10.0, 110.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn a_backwards_clip_is_empty_rather_than_negative() {
+        let clip = ClipRect {
+            top: Some(Length::Px(40.0)),
+            right: Some(Length::Px(10.0)),
+            bottom: Some(Length::Px(10.0)),
+            left: Some(Length::Px(40.0)),
+        };
+        let resolved = resolve_clip(clip, 0.0, 0.0, rect(0.0, 0.0, 120.0, 60.0), 16.0);
+        assert_eq!((resolved.width, resolved.height), (0.0, 0.0));
+    }
+
+    #[test]
+    fn clipping_narrows_a_rectangle_and_drops_one_outside() {
+        let mut items = vec![
+            DisplayItem::Rect {
+                rect: rect(0.0, 0.0, 100.0, 100.0),
+                color: Color::rgb(1, 2, 3),
+            },
+            DisplayItem::Rect {
+                rect: rect(200.0, 200.0, 10.0, 10.0),
+                color: Color::rgb(1, 2, 3),
+            },
+        ];
+        clip_items(&mut items, 0, rect(0.0, 0.0, 50.0, 50.0));
+        assert_eq!(items.len(), 1, "the outside rectangle survived");
+        let DisplayItem::Rect { rect: narrowed, .. } = items[0] else {
+            panic!("wrong item kind");
+        };
+        assert_eq!(narrowed, rect(0.0, 0.0, 50.0, 50.0));
+    }
+
+    #[test]
+    fn clipping_leaves_items_emitted_before_the_box_alone() {
+        // The clip applies to the range this subtree emitted, and an earlier
+        // sibling's items sit in front of it in the same list.
+        let mut items = vec![
+            DisplayItem::Rect {
+                rect: rect(200.0, 200.0, 10.0, 10.0),
+                color: Color::rgb(1, 2, 3),
+            },
+            DisplayItem::Rect {
+                rect: rect(200.0, 200.0, 10.0, 10.0),
+                color: Color::rgb(1, 2, 3),
+            },
+        ];
+        clip_items(&mut items, 1, rect(0.0, 0.0, 50.0, 50.0));
+        assert_eq!(items.len(), 1, "an earlier item was clipped too");
+    }
 }
 
 #[cfg(test)]

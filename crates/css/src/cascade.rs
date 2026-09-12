@@ -9,9 +9,9 @@ use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
     DEFAULT_FONT_SIZE, Edges, Float, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
-    parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_display,
-    parse_float, parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
-    parse_text_transform, parse_vertical_align, parse_visibility,
+    parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_clip,
+    parse_display, parse_float, parse_list_style_type, parse_overflow, parse_position,
+    parse_text_decoration, parse_text_transform, parse_vertical_align, parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -684,6 +684,14 @@ fn apply(
         // originating element, which layout does not have.
         "content" => {
             style.content = parse_content(element, values);
+        }
+        // §11.1.2. `parse_clip` answers with a nested option: the outer one
+        // is "did this parse", the inner is "is it `auto`" — and `auto` has
+        // to be able to switch off a clip an earlier rule set.
+        "clip" => {
+            if let Some(clip) = parse_clip(values) {
+                style.clip = clip;
+            }
         }
         "min-height" => {
             if let Some(length) = parse_size(first) {
