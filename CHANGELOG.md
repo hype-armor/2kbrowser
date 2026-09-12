@@ -16,6 +16,28 @@ record for everything earlier.
 
 ## Unreleased
 
+**Two table-structure bugs, both found by drawing a picture rather than by the
+suite.** Making a demo page of the newly supported CSS turned up a table that
+rendered as one table where two were written, and then a strip of cells that
+rendered as nothing.
+
+The grid walk descends through plain wrappers on purpose, so that a row inside
+a `<div>` inside a table is still that table's row. It had no stop at a *nested
+table*, so an outer grid swallowed an inner one whole. Markup hides this: a
+nested `<table>` lives inside a `<td>`, and cells are read by the row loop,
+which never recurses. It appears the moment either table is built out of
+`display` values.
+
+And §17.2.1's anonymous row: a `display: table-cell` whose parent is not a row
+gets one generated around it, together with the cells beside it. Without that
+the grid finds no rows at all and the cells are drawn by nobody — a strip of
+navigation built this way was simply absent. This is the first piece of
+§17.2.1 the engine has; the rest of the anonymous-box rules are still missing.
+
+Neither moves the conformance number: 3188 of 4821 before and after, with
+nothing newly passing and nothing newly failing. The suite's table tests do not
+write either shape.
+
 **An `<iframe>` is a box.** It was not a replaced element here at all, so one
 laid out as nothing and left a hole in a page built around it. It is 300x150
 now — §10.3.2 and §10.4's size for a replaced element with no intrinsic
