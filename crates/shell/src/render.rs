@@ -145,6 +145,32 @@ impl Page {
         out
     }
 
+    /// What lies between two points on the canvas, and where it is.
+    ///
+    /// Only within one frame — the one the drag started in. A selection that
+    /// ran from a frameset's sidebar into its article would be two documents'
+    /// text with nothing to say where one ended, which is not what anyone
+    /// means by dragging across a page.
+    pub fn select(&self, from: (f32, f32), to: (f32, f32)) -> layout::Selection {
+        for frame in self.frames.iter().rev() {
+            let inside = from.0 >= frame.rect.x
+                && from.0 < frame.rect.x + frame.rect.width
+                && from.1 >= frame.rect.y
+                && from.1 < frame.rect.y + frame.rect.height;
+            if !inside {
+                continue;
+            }
+            let local = |(x, y): (f32, f32)| (x - frame.rect.x, y - frame.rect.y);
+            let mut selection = frame.layout.select(local(from), local(to));
+            for rect in &mut selection.rects {
+                rect.x += frame.rect.x;
+                rect.y += frame.rect.y;
+            }
+            return selection;
+        }
+        layout::Selection::default()
+    }
+
     /// Every link rectangle on the canvas, with the URL it leads to.
     ///
     /// What a keyboard-first browser needs: something to number, highlight, and

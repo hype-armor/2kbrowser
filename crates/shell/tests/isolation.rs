@@ -370,6 +370,38 @@ fn a_viewport_answers_everything_the_window_asks_of_a_page() {
 }
 
 #[test]
+fn a_drag_across_the_page_comes_back_as_text_from_the_other_side() {
+    // Selection is answered by the child for the same reason find is: the
+    // text and where it sits are in the box tree, which never crosses the
+    // boundary. Only the two points do, and the words come back (#53).
+    let mut page = viewport(
+        "<body><p>first line here</p><p>second line here</p></body>",
+        400,
+    );
+
+    let (rects, text) = page.select((0.0, 0.0), (400.0, 10_000.0));
+    assert_eq!(text, "first line here\nsecond line here");
+    assert_eq!(rects.len(), 2, "one rectangle per line: {rects:?}");
+    assert!(
+        rects
+            .iter()
+            .all(|rect| rect.width > 0.0 && rect.height > 0.0)
+    );
+}
+
+#[test]
+fn a_drag_that_went_nowhere_selects_nothing() {
+    // A click is a press and a release at the same point, and it must not
+    // leave a selection behind — the release is where a link is followed, and
+    // a selection there would swallow it.
+    let mut page = viewport("<body><p>some words</p></body>", 400);
+
+    let (rects, text) = page.select((20.0, 20.0), (20.0, 20.0));
+    assert!(text.is_empty(), "{text:?}");
+    assert!(rects.is_empty(), "{rects:?}");
+}
+
+#[test]
 fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
     // Hit testing is answered from the rectangles the child sent, because the
     // box tree it would otherwise test against is on the far side — and because

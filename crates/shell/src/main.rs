@@ -41,7 +41,9 @@ PageUp/PageDown scroll, Home/End jump, Esc or q quits.
 
 Ctrl and the wheel zooms, as do Ctrl+plus and Ctrl+minus; Ctrl+0 goes back to
 100%. The page is laid out again at the new size rather than magnified, so the
-text stays sharp and rewraps to the window.";
+text stays sharp and rewraps to the window.
+
+Drag across the page to select text, and Ctrl+C to copy it.";
 
 /// Prints a line of output, treating a closed pipe as the end of the job.
 ///

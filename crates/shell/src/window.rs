@@ -253,6 +253,10 @@ struct Tab {
     finding: Option<crate::field::Field>,
     /// Where the current query matches, in canvas coordinates.
     matches: Vec<layout::Rect>,
+    /// Where the reader's selection is, one rectangle per line (#53).
+    selection: Vec<layout::Rect>,
+    /// The selected text itself, for the clipboard.
+    selected: String,
     /// Which match the reader is on.
     current_match: usize,
     /// Which link has keyboard focus, as an index into `link_groups()`.
@@ -283,6 +287,8 @@ impl Tab {
             local_root: false,
             finding: None,
             matches: Vec::new(),
+            selection: Vec::new(),
+            selected: String::new(),
             current_match: 0,
             focused_link: None,
             focused_rects: Vec::new(),
@@ -414,6 +420,17 @@ struct App {
     /// pointer the moment it is pressed, which would move the page before the
     /// drag had begun.
     dragging: Option<f32>,
+    /// The system clipboard, opened on the first copy and then kept.
+    ///
+    /// `None` until something is copied, and still `None` where there is no
+    /// clipboard to be had.
+    clipboard: Option<arboard::Clipboard>,
+    /// Where a text selection drag started, in document coordinates.
+    ///
+    /// `None` when the pointer is not selecting. Set on press rather than on
+    /// the first move, because the anchor is where the press was and by the
+    /// time a move arrives the pointer is somewhere else.
+    selecting: Option<(f32, f32)>,
     /// Which colour scheme the chrome draws in.
     theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
@@ -589,6 +606,13 @@ impl App {
             tab.can_toggle_layout = page.can_toggle_layout();
             tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
         }
+
+        // The old selection pointed at the old layout, and unlike a query there
+        // is nothing to re-run it from: the two points it was dragged between
+        // are where the pointer was on a page that has reflowed. Dropped rather
+        // than moved, which is what every browser does on a resize.
+        tab.selection.clear();
+        tab.selected.clear();
 
         // The old matches pointed at the old layout.
         if let Some(query) = tab.finding.as_ref().map(|field| field.text().to_owned()) {
@@ -1003,6 +1027,69 @@ impl App {
         // same reason.
         self.tab_mut().scroll = 0.0;
         self.rerender();
+    }
+
+    /// Extends the selection to wherever the pointer is now.
+    ///
+    /// The answer comes from the child, because the text and its geometry are
+    /// in the box tree and the box tree is over there. One round trip per
+    /// pointer move sounds extravagant and is what find already does per
+    /// keystroke: the message is two points and the answer is a few rectangles.
+    fn extend_selection(&mut self) {
+        let Some(from) = self.selecting else { return };
+        let Some(to) = document_point(self.pointer, self.chrome_height(), self.tab().scroll) else {
+            return;
+        };
+        let Some(page) = self.tabs.active_mut().page.as_mut() else {
+            return;
+        };
+        let (rects, text) = page.select(from, to);
+        self.tab_mut().selection = rects;
+        self.tab_mut().selected = text;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Drops the selection, which is what pressing anywhere does.
+    fn clear_selection(&mut self) {
+        if self.tab().selection.is_empty() && self.tab().selected.is_empty() {
+            return;
+        }
+        self.tab_mut().selection.clear();
+        self.tab_mut().selected.clear();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Puts the selected text on the system clipboard.
+    ///
+    /// Silent when there is nothing selected, and silent when the clipboard
+    /// cannot be had — a headless session, a compositor that offers none. The
+    /// alternative is an error box for a keystroke the reader may have pressed
+    /// by accident, about a thing they can see did not happen.
+    fn copy_selection(&mut self) {
+        let text = self.tab().selected.clone();
+        if text.is_empty() {
+            return;
+        }
+        // Kept rather than opened per copy. On X11 the clipboard is *owned* by
+        // a running process — there is no store to put bytes in — so a handle
+        // opened, written and dropped takes the text with it, and a paste a
+        // moment later gets whatever was there before.
+        let clipboard = match &mut self.clipboard {
+            Some(clipboard) => clipboard,
+            None => match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard.insert(clipboard),
+                // A headless session, or a compositor that offers none. Silent:
+                // the alternative is an error box for a keystroke the reader
+                // may have pressed by accident, about a thing they can see did
+                // not happen.
+                Err(_) => return,
+            },
+        };
+        let _ = clipboard.set_text(text);
     }
 
     /// Scrolls `bounds` into view, if it is not already.
@@ -1445,6 +1532,16 @@ impl App {
                 buffer[start..].fill(0x00ff_ffff);
             }
         }
+        // Under the find highlights, so a search inside a selection still
+        // stands out. Both are tints rather than fills, so the text reads
+        // through either.
+        highlight_selection(
+            &mut buffer,
+            &tab.selection,
+            tab.scroll,
+            (width.get(), height.get()),
+            bar_height,
+        );
         highlight_matches(
             &mut buffer,
             &tab.matches,
@@ -1676,7 +1773,6 @@ fn highlight_matches(
     size: (u32, u32),
     bar_height: u32,
 ) {
-    let (width, height) = size;
     for (index, rect) in matches.iter().enumerate() {
         // The current match is stronger, because "which one am I on" is the
         // question the reader is actually asking.
@@ -1685,29 +1781,63 @@ fn highlight_matches(
         } else {
             (255, 240, 150)
         };
-        let top = rect.y - scroll + bar_height as f32;
-        let (x0, x1) = (
-            rect.x.max(0.0) as u32,
-            (rect.x + rect.width).max(0.0) as u32,
-        );
-        let (y0, y1) = (
-            top.max(bar_height as f32) as u32,
-            (top + rect.height).max(0.0) as u32,
-        );
+        tint_rect(buffer, *rect, tint, scroll, size, bar_height);
+    }
+}
 
-        for y in y0..y1.min(height) {
-            for x in x0..x1.min(width) {
-                let Some(pixel) = buffer.get_mut((y * width + x) as usize) else {
-                    continue;
-                };
-                // Multiplied rather than replaced, so the text stays legible
-                // through the highlight instead of being painted over.
-                let blend = |shift: u32, tint: u32| {
-                    let channel = (*pixel >> shift) & 0xff;
-                    ((channel * tint) / 255) << shift
-                };
-                *pixel = blend(16, tint.0) | blend(8, tint.1) | blend(0, tint.2);
-            }
+/// Tints what the reader has selected (#53).
+///
+/// A blue wash, which is what selection has looked like for thirty years, and
+/// a tint rather than a fill for the same reason a match is one: the words
+/// have to stay readable underneath it. That also means it needs no separate
+/// text colour, which a fill would — and a fill over a dark document rendering
+/// would have needed a different one again.
+fn highlight_selection(
+    buffer: &mut [u32],
+    selection: &[layout::Rect],
+    scroll: f32,
+    size: (u32, u32),
+    bar_height: u32,
+) {
+    for rect in selection {
+        tint_rect(buffer, *rect, (120, 170, 255), scroll, size, bar_height);
+    }
+}
+
+/// Multiplies a rectangle of the window by a colour.
+///
+/// Multiplied rather than replaced, so the text stays legible through the
+/// tint instead of being painted over. Shared by the find highlights and the
+/// selection, which differ only in colour.
+fn tint_rect(
+    buffer: &mut [u32],
+    rect: layout::Rect,
+    tint: (u32, u32, u32),
+    scroll: f32,
+    size: (u32, u32),
+    bar_height: u32,
+) {
+    let (width, height) = size;
+    let top = rect.y - scroll + bar_height as f32;
+    let (x0, x1) = (
+        rect.x.max(0.0) as u32,
+        (rect.x + rect.width).max(0.0) as u32,
+    );
+    let (y0, y1) = (
+        top.max(bar_height as f32) as u32,
+        (top + rect.height).max(0.0) as u32,
+    );
+
+    for y in y0..y1.min(height) {
+        for x in x0..x1.min(width) {
+            let Some(pixel) = buffer.get_mut((y * width + x) as usize) else {
+                continue;
+            };
+            let blend = |shift: u32, tint: u32| {
+                let channel = (*pixel >> shift) & 0xff;
+                ((channel * tint) / 255) << shift
+            };
+            *pixel = blend(16, tint.0) | blend(8, tint.1) | blend(0, tint.2);
         }
     }
 }
@@ -1828,6 +1958,10 @@ impl ApplicationHandler<BandReady> for App {
                     self.drag_thumb_to(top);
                     return;
                 }
+                if self.selecting.is_some() {
+                    self.extend_selection();
+                    return;
+                }
                 // The cursor says whether there is a link here, which is how a
                 // pointer-driven browser has always answered that question.
                 let over = self.link_under_pointer().is_some();
@@ -1869,7 +2003,16 @@ impl ApplicationHandler<BandReady> for App {
                     self.dragging = Some(height / 2.0);
                     self.drag_thumb_to(y - height / 2.0);
                 }
-                None => {}
+                // Not on the bar: a press on the page is where a selection
+                // starts. Whether it turns out to be one is decided on release
+                // — a press that never moved is a click.
+                None => {
+                    self.selecting =
+                        document_point(self.pointer, self.chrome_height(), self.tab().scroll);
+                    if self.selecting.is_some() {
+                        self.clear_selection();
+                    }
+                }
             },
             WindowEvent::MouseInput {
                 state: ElementState::Released,
@@ -1880,6 +2023,14 @@ impl ApplicationHandler<BandReady> for App {
                     // Letting go of the thumb is not a click on whatever the
                     // pointer happens to be over by then.
                     if self.dragging.take().is_some() {
+                        return;
+                    }
+                    // Nor is letting go of a selection. A press that moved was
+                    // a drag across the text and not a click on whatever is
+                    // under the pointer at the end of it — which on a page of
+                    // prose is very often a link.
+                    self.selecting = None;
+                    if !self.tab().selected.is_empty() {
                         return;
                     }
                     // The bar owns the top of the window, so it gets first
@@ -1995,6 +2146,12 @@ impl ApplicationHandler<BandReady> for App {
                         }
                         Key::Character(c) if c == "0" => {
                             self.set_zoom(ZOOM_STEPS[ZOOM_DEFAULT]);
+                            return;
+                        }
+                        // Copy what is selected. Where every program has put
+                        // it, and the reason selection is worth having.
+                        Key::Character(c) if c == "c" => {
+                            self.copy_selection();
                             return;
                         }
                         // Ctrl+D saves and Ctrl+B shows the list, which is
@@ -2181,6 +2338,8 @@ pub fn open(
         over_link: false,
         loading: None,
         dragging: None,
+        selecting: None,
+        clipboard: None,
         theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
@@ -2495,7 +2654,7 @@ mod entered_url_tests {
 
 #[cfg(test)]
 mod highlight_tests {
-    use super::highlight_matches;
+    use super::{highlight_matches, highlight_selection};
     use layout::Rect;
 
     /// A 4x4 white buffer with no chrome, for arithmetic that is easier to
@@ -2610,6 +2769,63 @@ mod highlight_tests {
     fn no_matches_leaves_the_buffer_alone() {
         let mut buffer = buffer();
         highlight_matches(&mut buffer, &[], 0, 0.0, (4, 4), 0);
+        assert_eq!(tinted(&buffer), 0);
+    }
+
+    #[test]
+    fn a_selection_tints_its_lines_and_nothing_else() {
+        let mut buffer = buffer();
+        highlight_selection(
+            &mut buffer,
+            &[
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4.0,
+                    height: 1.0,
+                },
+                Rect {
+                    x: 0.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 1.0,
+                },
+            ],
+            0.0,
+            (4, 4),
+            0,
+        );
+
+        assert_eq!(tinted(&buffer), 6, "a full line and a partial one");
+    }
+
+    #[test]
+    fn a_selection_tints_rather_than_paints_over() {
+        // The words have to stay readable underneath it, which is also why it
+        // needs no text colour of its own — and why it works over the dark
+        // document rendering as well as over a white page.
+        let mut buffer = vec![0x0080_8080; 16];
+        highlight_selection(
+            &mut buffer,
+            &[Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }],
+            0.0,
+            (4, 4),
+            0,
+        );
+
+        assert_ne!(buffer[0], 0x0080_8080, "nothing was tinted");
+        assert_ne!(buffer[0], 0x0000_0000, "the pixel was painted over");
+    }
+
+    #[test]
+    fn nothing_selected_leaves_the_buffer_alone() {
+        let mut buffer = buffer();
+        highlight_selection(&mut buffer, &[], 0.0, (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
     }
 }

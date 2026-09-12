@@ -394,6 +394,7 @@ enum Job {
     Render(Box<RenderJob>),
     Band { top: u32, height: u32 },
     Find(String),
+    Select { from: (f32, f32), to: (f32, f32) },
 }
 
 /// A render request, boxed because it carries the whole document.
@@ -420,12 +421,14 @@ enum Kind {
     Page,
     Band,
     Find,
+    Select,
 }
 
 /// What came back.
 enum Answer {
     Rendered(Box<Rendered>),
     Matches(Vec<layout::Rect>),
+    Selected(Vec<layout::Rect>, String),
     Failed(Error),
 }
 
@@ -554,7 +557,7 @@ impl Session {
         match self.wait_for(Kind::Page)? {
             Answer::Rendered(page) => Ok(*page),
             Answer::Failed(error) => Err(error),
-            Answer::Matches(_) => Err(Error::Wire(crate::WireError::Unknown)),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
         }
     }
 
@@ -581,7 +584,7 @@ impl Session {
         match self.wait_for(Kind::Band)? {
             Answer::Rendered(page) => Ok(*page),
             Answer::Failed(error) => Err(error),
-            Answer::Matches(_) => Err(Error::Wire(crate::WireError::Unknown)),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
         }
     }
 
@@ -618,7 +621,24 @@ impl Session {
         match self.wait_for(Kind::Find)? {
             Answer::Matches(rects) => Ok(rects),
             Answer::Failed(error) => Err(error),
-            Answer::Rendered(_) => Err(Error::Wire(crate::WireError::Unknown)),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
+    /// What lies between two points of the page, and where it is.
+    ///
+    /// Asked of the child because the text is in the box tree, which is on
+    /// that side. The two points are all that crosses.
+    pub fn select(
+        &mut self,
+        from: (f32, f32),
+        to: (f32, f32),
+    ) -> Result<(Vec<layout::Rect>, String), Error> {
+        self.submit(Job::Select { from, to }, Kind::Select)?;
+        match self.wait_for(Kind::Select)? {
+            Answer::Selected(rects, text) => Ok((rects, text)),
+            Answer::Failed(error) => Err(error),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
         }
     }
 
@@ -638,7 +658,7 @@ impl Session {
                 self.band = Some(match answer {
                     Answer::Rendered(page) => Ok(*page),
                     Answer::Failed(error) => Err(error),
-                    Answer::Matches(_) => Err(Error::Wire(crate::WireError::Unknown)),
+                    _ => Err(Error::Wire(crate::WireError::Unknown)),
                 });
             }
             _ => drop(answer),
@@ -770,6 +790,7 @@ impl Conversation {
                 .converse(ToChild::Band { top, height })
                 .map(|page| Answer::Rendered(Box::new(page))),
             Job::Find(query) => self.ask(&ToChild::Find { query }),
+            Job::Select { from, to } => self.ask(&ToChild::Select { from, to }),
         };
         outcome.unwrap_or_else(Answer::Failed)
     }
@@ -790,6 +811,7 @@ impl Conversation {
         let frame = self.read()?;
         match ToParent::decode(&frame)? {
             ToParent::Matches { rects } => Ok(Answer::Matches(rects)),
+            ToParent::Selected { rects, text } => Ok(Answer::Selected(rects, text)),
             ToParent::Rendered(page) => Ok(Answer::Rendered(page)),
             ToParent::Failed { message } => Err(Error::Render(message)),
             ToParent::Fetch { .. } => Err(Error::Wire(crate::WireError::Unknown)),
@@ -819,7 +841,7 @@ impl Conversation {
             match ToParent::decode(&frame)? {
                 ToParent::Rendered(page) => return Ok(*page),
                 ToParent::Failed { message } => return Err(Error::Render(message)),
-                ToParent::Matches { .. } => {
+                ToParent::Matches { .. } | ToParent::Selected { .. } => {
                     // Nothing asked a question. Either the child is confused or
                     // it is not ours.
                     return Err(Error::Wire(crate::WireError::Unknown));

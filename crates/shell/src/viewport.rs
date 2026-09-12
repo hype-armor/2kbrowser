@@ -310,6 +310,18 @@ impl Viewport {
         })
     }
 
+    /// What lies between two points, asked of the child holding the page.
+    ///
+    /// Empty when the child cannot answer, which is the same answer as "there
+    /// is nothing there" and is what the caller would do with an error anyway:
+    /// a selection is a thing on the screen, and the honest way to say it
+    /// failed is not to draw one.
+    pub fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<Rect>, String) {
+        self.session
+            .select(from, to)
+            .unwrap_or_else(|_| (Vec::new(), String::new()))
+    }
+
     /// Where `query` appears, asked of the child holding the page.
     pub fn find(&mut self, query: &str) -> Vec<Rect> {
         // Every match, wherever it is. These used to be filtered to the painted

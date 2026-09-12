@@ -403,6 +403,64 @@ impl Layout {
         out
     }
 
+    /// What lies between two points on the page.
+    ///
+    /// The points are where a drag started and where it is now, in either
+    /// order — a reader selecting upwards is selecting, not doing nothing. The
+    /// range runs in reading order between them and covers whole lines in
+    /// between, which is what selection means everywhere and is not what a
+    /// rectangle between the two points would give.
+    pub fn select(&self, from: (f32, f32), to: (f32, f32)) -> Selection {
+        let mut lines = Vec::new();
+        placed_lines(&self.root, 0.0, 0.0, &mut lines);
+        // Reading order: down the page, then across. Tree order is nearly this
+        // and not exactly — a float is laid out before the text beside it.
+        lines.sort_by(|a, b| {
+            a.top
+                .partial_cmp(&b.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    a.origin_x
+                        .partial_cmp(&b.origin_x)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        if lines.is_empty() {
+            return Selection::default();
+        }
+
+        let (start, end) = {
+            let (a, b) = (caret_at(&lines, from), caret_at(&lines, to));
+            if a <= b { (a, b) } else { (b, a) }
+        };
+
+        let mut out = Selection::default();
+        for (index, placed) in lines.iter().enumerate().take(end.line + 1).skip(start.line) {
+            let text = &placed.line.text;
+            let from = if index == start.line { start.offset } else { 0 };
+            let to = if index == end.line {
+                end.offset
+            } else {
+                text.len()
+            };
+            if from >= to {
+                continue;
+            }
+            if let Some(rect) = span_rect(placed.line, from, to, placed.origin_x, placed.origin_y) {
+                out.rects.push(rect);
+            }
+            if !out.text.is_empty() {
+                // Where the page broke the line. The source's own newlines are
+                // already gone — whitespace collapsed on the way in — so this
+                // is the only place one can come from, and text copied out of
+                // a paragraph reads as it looked.
+                out.text.push('\n');
+            }
+            out.text.push_str(&text[from..to]);
+        }
+        out
+    }
+
     /// Every rectangle belonging to `node`, in canvas coordinates.
     ///
     /// A link wrapping onto three lines has three, which is what drawing a
@@ -447,6 +505,100 @@ fn hit_test_box(box_: &LayoutBox, x: f32, y: f32, offset_x: f32, offset_y: f32) 
     // specific answer and has already had its chance.
     let inside = x >= left && x < left + box_.rect.width && y >= top && y < top + box_.rect.height;
     if inside { box_.node } else { None }
+}
+
+/// Text on the page between two points, and where it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Selection {
+    /// One rectangle per line the selection touches, to draw the highlight.
+    pub rects: Vec<Rect>,
+    /// What is selected, with a newline where the page broke the line.
+    ///
+    /// Copied as it reads rather than as it was written: the whitespace is
+    /// already collapsed, so what comes out is what is on the screen.
+    pub text: String,
+}
+
+/// One line of text on the page, with where it sits.
+struct PlacedLine<'a> {
+    line: &'a text::Line,
+    /// Left edge of the line's own text, alignment already applied.
+    origin_x: f32,
+    origin_y: f32,
+    top: f32,
+    bottom: f32,
+}
+
+/// Where a point falls in the page's text: which line, and how far into it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Caret {
+    line: usize,
+    offset: usize,
+}
+
+/// Every line of text on the page, in reading order.
+fn placed_lines<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<PlacedLine<'a>>) {
+    let left = x + box_.rect.x;
+    let top = y + box_.rect.y;
+    if let Some(text) = &box_.text {
+        let content_x = left + box_.content_origin.0;
+        let content_y = top + box_.content_origin.1;
+        for line in &text.lines {
+            let Some(first) = line.glyphs.first() else {
+                continue;
+            };
+            let line_top = content_y + first.y - line.baseline;
+            out.push(PlacedLine {
+                line,
+                origin_x: content_x
+                    + line_offset(box_.style.text_align, line.width, box_.content_width),
+                origin_y: content_y,
+                top: line_top,
+                bottom: line_top + line.baseline * 1.25,
+            });
+        }
+    }
+    for child in &box_.children {
+        placed_lines(child, left, top, out);
+    }
+}
+
+/// Which byte of a line a point is nearest, measured to the middle of each
+/// glyph so that clicking the left half of a letter puts the caret before it.
+fn offset_at(placed: &PlacedLine, x: f32) -> usize {
+    let line = placed.line;
+    for (index, glyph) in line.glyphs.iter().enumerate() {
+        let right = line.glyphs.get(index + 1).map_or(line.width, |next| next.x);
+        if x < placed.origin_x + (glyph.x + right) / 2.0 {
+            return glyph.start;
+        }
+    }
+    line.text.len()
+}
+
+/// Where a point falls among `lines`, which are in reading order.
+///
+/// A point off the end of a line belongs to that line, and a point in the gap
+/// between two lines belongs to the one above — which is what makes dragging
+/// down the left-hand margin select whole lines rather than nothing.
+fn caret_at(lines: &[PlacedLine], (x, y): (f32, f32)) -> Caret {
+    let mut last = Caret { line: 0, offset: 0 };
+    for (index, placed) in lines.iter().enumerate() {
+        if y < placed.top {
+            return last;
+        }
+        if y < placed.bottom {
+            return Caret {
+                line: index,
+                offset: offset_at(placed, x),
+            };
+        }
+        last = Caret {
+            line: index,
+            offset: placed.line.text.len(),
+        };
+    }
+    last
 }
 
 fn collect_matches(
@@ -3020,6 +3172,132 @@ pub fn line_offset(align: TextAlign, line_width: f32, content_width: f32) -> f32
 
 #[cfg(test)]
 mod tests {
+
+    /// A page, its layout, and a way to select across it.
+    fn page_for(html: &str, width: f32) -> (Document, StyleMap, Layout) {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css::ua::UA_STYLESHEET)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        let layout = layout(&doc, &styles, &mut fonts, &Default::default(), width);
+        (doc, styles, layout)
+    }
+
+    #[test]
+    fn a_drag_across_a_line_selects_what_it_crossed() {
+        let (_, _, out) = page_for("<body><p>hello there world</p></body>", 800.0);
+        let all = out.select((0.0, 0.0), (800.0, 10_000.0));
+        assert_eq!(all.text, "hello there world");
+
+        // Halfway across the line it actually drew, which must be some of it
+        // and not all of it.
+        let line = all.rects[0];
+        let half = out.select(
+            (0.0, 0.0),
+            (line.x + line.width / 2.0, line.y + line.height / 2.0),
+        );
+        assert!(
+            all.text.starts_with(&half.text) && half.text.len() < all.text.len(),
+            "{:?} is not a prefix of {:?}",
+            half.text,
+            all.text
+        );
+        assert!(!half.text.is_empty(), "nothing was selected");
+    }
+
+    #[test]
+    fn dragging_backwards_selects_the_same_thing() {
+        // A reader selecting upwards is selecting, not doing nothing.
+        let (_, _, out) = page_for("<body><p>hello there world</p></body>", 800.0);
+        let forwards = out.select((0.0, 0.0), (800.0, 10_000.0));
+        let backwards = out.select((800.0, 10_000.0), (0.0, 0.0));
+
+        assert_eq!(forwards.text, backwards.text);
+        assert_eq!(forwards.rects.len(), backwards.rects.len());
+    }
+
+    #[test]
+    fn a_selection_across_lines_covers_the_ones_in_between_whole() {
+        // Not the rectangle between the two points: selection means everything
+        // in reading order, which is what makes dragging down the left margin
+        // take whole lines.
+        let (_, _, out) = page_for(
+            "<body><p>first line here</p><p>second line here</p><p>third line here</p></body>",
+            800.0,
+        );
+        let all = out.select((0.0, 0.0), (800.0, 10_000.0));
+        assert_eq!(
+            all.text,
+            "first line here\nsecond line here\nthird line here"
+        );
+        assert_eq!(all.rects.len(), 3, "one rectangle per line");
+    }
+
+    #[test]
+    fn a_line_break_on_the_page_is_a_line_break_in_what_is_copied() {
+        // The source's own newlines are gone by now — whitespace collapsed on
+        // the way in — so a wrapped paragraph copied out reads as it looked.
+        let (_, _, out) = page_for(
+            &format!("<body><p>{}</p></body>", "a word ".repeat(40)),
+            200.0,
+        );
+        let all = out.select((0.0, 0.0), (800.0, 10_000.0));
+
+        assert!(all.text.contains('\n'), "a wrapped paragraph came out flat");
+        assert!(all.rects.len() > 1, "one rectangle for several lines");
+    }
+
+    #[test]
+    fn a_click_past_the_middle_of_a_letter_takes_the_letter() {
+        // Where the caret goes decides which letter a drag includes, and
+        // measuring to the *start* of each glyph rather than its middle loses
+        // the one the pointer is plainly on top of.
+        let (_, _, out) = page_for("<body><p>abcdef</p></body>", 800.0);
+        let line = out.select((0.0, 0.0), (800.0, 10_000.0)).rects[0];
+        let letter = line.width / 6.0;
+        let middle = line.y + line.height / 2.0;
+
+        // Just past the middle of the first letter: that letter is in.
+        let over = out.select((line.x, middle), (line.x + letter * 0.6, middle));
+        assert_eq!(over.text, "a");
+        // Just short of it: nothing yet.
+        let under = out.select((line.x, middle), (line.x + letter * 0.4, middle));
+        assert_eq!(under.text, "");
+    }
+
+    #[test]
+    fn dragging_down_the_margin_takes_whole_lines() {
+        // A point in the gap between two lines belongs to the one above, which
+        // is what makes a drag down the left-hand margin select the lines it
+        // passes rather than nothing at all.
+        let (_, _, out) = page_for(
+            "<body><p>first line here</p><p>second line here</p><p>third line here</p></body>",
+            800.0,
+        );
+        let rects = out.select((0.0, 0.0), (800.0, 10_000.0)).rects;
+        // Down the far-left edge, stopping between the second line and the
+        // third.
+        let gap = rects[1].y + rects[1].height + 1.0;
+        let down = out.select((0.0, 0.0), (0.0, gap));
+
+        assert_eq!(down.text, "first line here\nsecond line here");
+    }
+
+    #[test]
+    fn selecting_nothing_selects_nothing() {
+        let (_, _, out) = page_for("<body><p>hello</p></body>", 800.0);
+        let empty = out.select((0.0, 0.0), (0.0, 0.0));
+
+        assert_eq!(empty.text, "");
+        assert!(empty.rects.is_empty());
+    }
+
+    #[test]
+    fn a_page_with_no_text_has_nothing_to_select() {
+        let (_, _, out) = page_for("<body><hr></body>", 800.0);
+
+        assert_eq!(out.select((0.0, 0.0), (800.0, 800.0)), Selection::default());
+    }
     use super::*;
     use css::Stylesheet;
 

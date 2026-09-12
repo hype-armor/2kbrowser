@@ -205,6 +205,17 @@ pub enum ToChild {
         /// How many rows to paint.
         height: u32,
     },
+    /// What lies between two points of the page already held.
+    ///
+    /// Asked of the child rather than worked out by the parent for the same
+    /// reason find is: the text and where it sits are in the box tree, which
+    /// never crosses the boundary. Only the two points do.
+    Select {
+        /// Where the drag started, in canvas coordinates.
+        from: (f32, f32),
+        /// Where it is now.
+        to: (f32, f32),
+    },
     /// The answers to a [`ToParent::Fetch`], one per URL and in the same order.
     ///
     /// Order is the whole matching rule: the parent answers a batch with
@@ -266,6 +277,13 @@ impl ToChild {
             ToChild::Find { query } => {
                 writer.tag(2);
                 writer.str(query);
+            }
+            ToChild::Select { from, to } => {
+                writer.tag(4);
+                writer.f32(from.0);
+                writer.f32(from.1);
+                writer.f32(to.0);
+                writer.f32(to.1);
             }
             ToChild::Band { top, height } => {
                 writer.tag(3);
@@ -348,6 +366,10 @@ impl ToChild {
                 top: reader.u32()?,
                 height: reader.u32()?,
             },
+            4 => ToChild::Select {
+                from: (reader.f32()?, reader.f32()?),
+                to: (reader.f32()?, reader.f32()?),
+            },
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;
@@ -389,6 +411,13 @@ pub enum ToParent {
     Matches {
         /// One rectangle per match, in document order.
         rects: Vec<Rect>,
+    },
+    /// What a [`ToChild::Select`] drag covers.
+    Selected {
+        /// One rectangle per line it touches, to draw the highlight with.
+        rects: Vec<Rect>,
+        /// The text itself, for the clipboard.
+        text: String,
     },
 }
 
@@ -485,6 +514,14 @@ impl ToParent {
                     write_rect(&mut writer, rect);
                 }
             }
+            ToParent::Selected { rects, text } => {
+                writer.tag(4);
+                writer.u32(rects.len() as u32);
+                for rect in rects {
+                    write_rect(&mut writer, rect);
+                }
+                writer.str(text);
+            }
         }
         writer.finish()
     }
@@ -578,6 +615,20 @@ impl ToParent {
                     rects.push(read_rect(&mut reader)?);
                 }
                 ToParent::Matches { rects }
+            }
+            4 => {
+                // A count, not a plain `u32`: bounded by the bytes left, so a
+                // claim of four billion lines cannot reserve for four billion
+                // lines.
+                let count = reader.count()?;
+                let mut rects = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    rects.push(read_rect(&mut reader)?);
+                }
+                ToParent::Selected {
+                    rects,
+                    text: reader.str()?,
+                }
             }
             _ => return Err(WireError::Unknown),
         };
