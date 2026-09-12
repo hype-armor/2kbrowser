@@ -198,7 +198,82 @@ pub fn cascade_as(
         colours,
     };
     style_subtree(doc, doc.root(), &root_style, &rules, &mut map);
+    resolve_first_letters(doc, &mut map);
     map
+}
+
+/// Moves each `::first-letter` style onto the element whose line the first
+/// letter is actually on.
+///
+/// §5.12.2 puts the box on the block's first *formatted line*, and with
+/// `<div><p>First</p>…` that line belongs to the paragraph, not to the div. A
+/// drop cap on an article whose first child is a paragraph would otherwise
+/// land on whatever text happened to follow the paragraph, or on nothing.
+///
+/// A post-pass rather than part of the cascade because the walk needs the
+/// children's computed styles to know which of them is a block, and the
+/// cascade computes a parent before its children by construction.
+fn resolve_first_letters(doc: &Document, out: &mut StyleMap) {
+    let originators: Vec<NodeId> = out
+        .pseudos
+        .keys()
+        .filter(|(_, which)| *which == PseudoElement::FirstLetter)
+        .map(|&(node, _)| node)
+        .collect();
+    for node in originators {
+        let holder = first_line_holder(doc, out, node, 0);
+        // An element that has its own `::first-letter` keeps it: with a rule on
+        // both a div and the paragraph inside it, the paragraph's is the one
+        // written about the text it lands on.
+        if holder == node
+            || out
+                .pseudos
+                .contains_key(&(holder, PseudoElement::FirstLetter))
+        {
+            continue;
+        }
+        if let Some(style) = out.pseudos.remove(&(node, PseudoElement::FirstLetter)) {
+            out.pseudos
+                .insert((holder, PseudoElement::FirstLetter), style);
+        }
+    }
+}
+
+/// The element holding the first formatted line of `node`'s content.
+///
+/// Descends through first children that are blocks and stops at the first one
+/// with inline content of its own. Stops early at a box that starts a
+/// formatting context of its own — §5.12.2: "the first letter of a table-cell
+/// or inline-block cannot be the first letter of an ancestor element" — and
+/// skips anything out of flow, which is not on the line at all.
+fn first_line_holder(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize) -> NodeId {
+    /// Deep enough for any real document; a bound rather than a judgement.
+    const MAX_DEPTH: usize = 24;
+    if depth >= MAX_DEPTH {
+        return node;
+    }
+    for &child in doc.children(node) {
+        if let Some(text) = doc.text(child) {
+            if text.trim().is_empty() {
+                continue;
+            }
+            return node;
+        }
+        let Some(style) = styles.get(child) else {
+            continue;
+        };
+        if style.display == Display::None
+            || style.position.is_out_of_flow()
+            || style.float != Float::None
+        {
+            continue;
+        }
+        if style.display.is_inline() || style.display != Display::Block {
+            return node;
+        }
+        return first_line_holder(doc, styles, child, depth + 1);
+    }
+    node
 }
 
 /// What the cascade works from, fixed for the whole of one document.
@@ -249,6 +324,24 @@ fn style_subtree(
                 out.pseudos.insert((node, which), generated);
             }
         }
+        // §5.12.2's box is gated differently, because it invents nothing:
+        // `::first-letter` restyles text that is already on the page, so
+        // `content` cannot say whether it exists. What says so is whether a
+        // stylesheet addressed it at all. Comparing the computed style against
+        // the element's own would be the other way to ask, and it would answer
+        // "yes" for a rule that changes nothing — a box laid out, and a run
+        // split, for no visible reason.
+        if addresses(doc, node, rules, PseudoElement::FirstLetter) {
+            let first = compute(
+                doc,
+                node,
+                &computed,
+                rules,
+                Some(PseudoElement::FirstLetter),
+            );
+            out.pseudos
+                .insert((node, PseudoElement::FirstLetter), first);
+        }
         computed
     } else {
         parent_style.clone()
@@ -257,6 +350,20 @@ fn style_subtree(
     for &child in doc.children(node) {
         style_subtree(doc, child, &style, rules, out);
     }
+}
+
+/// Whether any rule in scope addresses `which` on this node.
+///
+/// Only asked for the pseudo-elements that have no `content` to gate them.
+fn addresses(doc: &Document, node: NodeId, rules: &Rules, which: PseudoElement) -> bool {
+    std::iter::once(rules.ua)
+        .chain(rules.sheets.iter())
+        .flat_map(|sheet| sheet.rules.iter())
+        .any(|rule| {
+            rule.selectors
+                .iter()
+                .any(|selector| selector.pseudo == Some(which) && selector.matches(doc, node))
+        })
 }
 
 fn compute(

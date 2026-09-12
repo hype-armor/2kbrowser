@@ -2,11 +2,12 @@
 //!
 //! Scope is the CSS 2.1 subset: type, class, id, universal, and attribute
 //! selectors, combined into compounds and joined by descendant, child, or
-//! adjacent sibling combinators, optionally addressing the `::before` or
-//! `::after` pseudo-element. Pseudo-classes are not here, nor are the
-//! pseudo-elements that restyle existing text (`::first-line`,
-//! `::first-letter`); a selector using one is dropped whole rather than
-//! matched partially, since matching too broadly is the worse failure.
+//! adjacent sibling combinators, optionally addressing the `::before`,
+//! `::after` or `::first-letter` pseudo-elements. Pseudo-classes are not here,
+//! nor is `::first-line`, the one pseudo-element whose extent is not known
+//! until the line has been broken; a selector using one is dropped whole
+//! rather than matched partially, since matching too broadly is the worse
+//! failure.
 //!
 //! The general sibling combinator `~` is deliberately absent: it is CSS 3, and
 //! the scope boundary is what gives this project a finish line (PLAN.md §2).
@@ -18,19 +19,24 @@
 
 use dom::{Document, NodeId};
 
-/// A pseudo-element: a box the stylesheet asks for that the document does not
-/// contain.
+/// A pseudo-element: a box a stylesheet addresses that the document does not
+/// contain as an element.
 ///
-/// Only the two CSS 2.1 defines that generate content. `::first-line` and
-/// `::first-letter` are pseudo-elements too and are not here: they restyle
-/// text that already exists rather than inventing any, which is a different
-/// piece of machinery.
+/// `::first-line` is the one CSS 2.1 defines that is not here. It is a
+/// different shape of problem from the other three: how much text is on the
+/// first line is not known until the line has been broken, and the style
+/// applied to it changes where it breaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PseudoElement {
     /// `::before` — generated content at the start of the element.
     Before,
     /// `::after` — generated content at its end.
     After,
+    /// `::first-letter` — the first letter of the first line, restyled.
+    ///
+    /// Unlike the other two it invents no content: it takes a piece of text
+    /// that is already there and gives it a box of its own.
+    FirstLetter,
 }
 
 /// How two compounds in a selector relate.
@@ -384,8 +390,10 @@ fn split_top_level(input: &str) -> Vec<&str> {
 fn split_pseudo(input: &str) -> (&str, Option<PseudoElement>) {
     let lowered = input.trim_end().to_ascii_lowercase();
     for (suffix, pseudo) in [
+        ("::first-letter", PseudoElement::FirstLetter),
         ("::before", PseudoElement::Before),
         ("::after", PseudoElement::After),
+        (":first-letter", PseudoElement::FirstLetter),
         (":before", PseudoElement::Before),
         (":after", PseudoElement::After),
     ] {
