@@ -358,7 +358,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { display: inline-block; width: 90px; height: 40px; background: #c00 }",
         body: "text <span id=t></span> text",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
 ];
 

@@ -69,7 +69,7 @@ hr { margin: 0.5em 0; height: 0; border-top: 1px solid #999999; }
 table { display: table; }
 thead, tbody, tfoot { display: table-row-group; }
 tr { display: table-row; }
-th, td { display: table-cell; padding: 1px; }
+th, td { display: table-cell; padding: 1px; vertical-align: middle; }
 th { text-align: center; }
 caption { display: block; text-align: center; }
 

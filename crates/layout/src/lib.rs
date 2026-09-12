@@ -322,6 +322,7 @@ fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.display == Display::TableCell
+        || style.display == Display::InlineBlock
         || style.overflow != Overflow::Visible
 }
 
@@ -1025,6 +1026,165 @@ struct LineBoxes<'a> {
     parent: &'a mut LayoutBox,
 }
 
+/// Inline-block boxes, already laid out, keyed by the node each belongs to.
+///
+/// An inline-block is a block container sized by its own content that sits on a
+/// line. The line breaker cannot leave room for one without knowing how big it
+/// is, and the only way to know is to lay it out — so it is laid out first, and
+/// the whole box is kept rather than measured now and built again later.
+type InlineBlocks = std::collections::HashMap<NodeId, LayoutBox>;
+
+/// Lays out every inline-block among `children`, and inside any inline element
+/// among them, so the line breaker has sizes to place.
+///
+/// Walks the same shapes [`gather_one`] does, and stops at the same places: a
+/// replaced element and a form control are atomic already, and an inline-block
+/// lays its own descendants out, including any inline-blocks among them.
+fn layout_inline_blocks(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    children: &[NodeId],
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
+    out: &mut InlineBlocks,
+) {
+    for &child in children {
+        let Some(style) = styles.get(child) else {
+            continue;
+        };
+        if style.display == Display::None || !is_inline_child(doc, styles, child, style) {
+            continue;
+        }
+        if is_replaced(doc, child) || forms::control_of(doc, child).is_some() {
+            continue;
+        }
+        if style.display == Display::InlineBlock {
+            let box_ =
+                layout_inline_block(doc, styles, fonts, child, style, intrinsic, available_width);
+            out.insert(child, box_);
+            continue;
+        }
+        layout_inline_blocks(
+            doc,
+            styles,
+            fonts,
+            doc.children(child),
+            intrinsic,
+            available_width,
+            out,
+        );
+    }
+}
+
+/// Lays one inline-block out on its own, at the width §10.3.9 gives it.
+///
+/// The box comes back positioned within its own *margin* box — its rect already
+/// offset by its left and top margins — because that is the box the line makes
+/// room for, and moving it onto the line is then a single translation.
+fn layout_inline_block(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
+) -> LayoutBox {
+    let font_size = style.font_size;
+    let margin = style.margin.left.to_px(font_size, available_width)
+        + style.margin.right.to_px(font_size, available_width);
+
+    // §10.3.9: an `auto` width shrinks to fit. As wide as the content would
+    // like, no wider than the room left on the line, and never narrower than
+    // the widest thing in it that cannot be broken — which is what keeps a
+    // one-word label from being squeezed to nothing in a narrow column.
+    //
+    // `layout_block` derives an auto width from what it is given, so the room
+    // it is handed *is* the answer. A declared width it works out itself, and
+    // is given the real available width so percentages inside resolve against
+    // the containing block rather than against the box.
+    let effective = match style.width {
+        Length::Auto => {
+            let room = (available_width - margin).max(0.0);
+            let (min, max) = subtree_widths(doc, styles, fonts, node, style, intrinsic, room, 0);
+            min.max(room).min(max.max(min)) + margin
+        }
+        _ => available_width,
+    };
+
+    let mut holder = LayoutBox {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: effective,
+            height: 0.0,
+        },
+        style: ComputedStyle::default(),
+        text: None,
+        content_origin: (0.0, 0.0),
+        content_width: effective,
+        children: Vec::new(),
+        replaced: None,
+        node: None,
+    };
+    let consumed = layout_block(
+        doc,
+        styles,
+        fonts,
+        node,
+        style,
+        intrinsic,
+        0.0,
+        0.0,
+        effective,
+        // An inline-block establishes a formatting context of its own, so no
+        // float declared outside it reaches in.
+        FloatContext::new(effective),
+        ContainingBlock::establish((effective, 0.0)),
+        &mut holder,
+    );
+    let mut box_ = match holder.children.pop() {
+        Some(box_) => box_,
+        // Unreachable: `layout_block` always pushes exactly one box. Returning
+        // an empty box rather than panicking keeps a layout bug from taking the
+        // whole page down with it.
+        None => holder,
+    };
+
+    // The margin box is what goes on the line, so the height the line is told
+    // about includes margins that do not collapse with anything — an
+    // inline-block keeps its own (§8.3.1, and `keeps_its_childrens_margins`).
+    box_.rect.y = consumed.margin_top;
+    box_
+}
+
+/// Distance from the top of `box_` to the baseline of its last line box.
+///
+/// §10.8.1: an inline-block lines up with the text beside it on the baseline of
+/// its own last line, not on its bottom edge — so a caption under a thumbnail
+/// sits level with the sentence it is part of. `None` when there is no line box
+/// to align on, in which case the caller falls back to the bottom margin edge,
+/// which is the same rule and the reason an empty spacer sits *on* the line.
+fn last_baseline(box_: &LayoutBox) -> Option<f32> {
+    let mut found = box_.text.as_ref().and_then(|text| {
+        let line = text.lines.last()?;
+        Some(box_.content_origin.1 + line.y + line.baseline)
+    });
+    for child in &box_.children {
+        // Out-of-flow boxes are not in the line-box run: an absolutely
+        // positioned footnote at the bottom of one of these must not drag the
+        // whole box down relative to the text beside it.
+        if child.style.position.is_out_of_flow() || child.style.float != Float::None {
+            continue;
+        }
+        if let Some(inner) = last_baseline(child) {
+            found = Some(child.rect.y + inner);
+        }
+    }
+    found
+}
+
 /// Turns the line breaker's placements into real child boxes.
 ///
 /// An inline image is still a box: it can carry a border, padding, and a
@@ -1037,6 +1197,7 @@ fn emit_replaced_boxes(
     fonts: &mut FontStore,
     layout: &TextLayout,
     style: &ComputedStyle,
+    blocks: &InlineBlocks,
     into: LineBoxes<'_>,
 ) {
     let LineBoxes {
@@ -1050,6 +1211,15 @@ fn emit_replaced_boxes(
         let dx = line_offset(style.text_align, line.width, content_width);
         for placed in &line.replaced {
             let node = NodeId(placed.id);
+            // An inline-block was laid out whole before the line was
+            // broken; placing it is moving it, not building it again.
+            if let Some(box_) = blocks.get(&node) {
+                let mut box_ = box_.clone();
+                box_.rect.x += origin.0 + dx + placed.x;
+                box_.rect.y += origin.1 + placed.y;
+                parent.children.push(box_);
+                continue;
+            }
             let Some(child_style) = styles.get(node) else {
                 continue;
             };
@@ -1143,6 +1313,51 @@ fn emit_replaced_boxes(
     }
 }
 
+/// Sorts the floats a block has to place into those declared before any in-flow
+/// block child and those declared after, so each is placed at the height it
+/// actually appears.
+///
+/// Descends through inline elements, because a float inside one belongs to this
+/// block all the same — `<span><div style="float: left">…</div></span>` is
+/// ordinary markup, and §9.7 makes that div block-level wherever it sits. Not
+/// descending is not merely inexact: the float is reached by nothing, neither
+/// gathered as an inline run nor walked as a block child, and disappears.
+fn collect_floats(
+    doc: &Document,
+    styles: &StyleMap,
+    children: &[NodeId],
+    early: &mut Vec<(NodeId, ComputedStyle)>,
+    late: &mut Vec<(NodeId, ComputedStyle)>,
+    seen_in_flow: &mut bool,
+) {
+    for &child in children {
+        let Some(child_style) = styles.get(child) else {
+            continue;
+        };
+        if child_style.display == Display::None {
+            continue;
+        }
+        if child_style.float != Float::None {
+            let into = if *seen_in_flow {
+                &mut *late
+            } else {
+                &mut *early
+            };
+            into.push((child, child_style.clone()));
+        } else if is_inline_child(doc, styles, child, child_style) {
+            // An inline-block places its own floats, in its own formatting
+            // context; a form control has no children to look inside.
+            if child_style.display != Display::InlineBlock
+                && forms::control_of(doc, child).is_none()
+            {
+                collect_floats(doc, styles, doc.children(child), early, late, seen_in_flow);
+            }
+        } else if !child_style.display.is_table_internal() {
+            *seen_in_flow = true;
+        }
+    }
+}
+
 /// Whether an inline element has a block-level element inside it.
 ///
 /// `<font>…<hr>…</font>` is ordinary in the era's markup, and an inline box
@@ -1162,6 +1377,20 @@ fn contains_block(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize)
     doc.children(node).iter().any(|&child| {
         styles.get(child).is_some_and(|style| {
             if style.display == Display::None || style.position.is_out_of_flow() {
+                return false;
+            }
+            // A float does not split the inline box around it either: it is
+            // taken out of the flow and placed against an edge, and the text
+            // beside it carries on across the line it came from. §9.7 gives it
+            // `display: block`, so without this every floated `<span>` inside a
+            // paragraph would read as a block child and break the line.
+            if style.float != Float::None {
+                return false;
+            }
+            // An inline-block is a block container, but it is *atomic*: it goes
+            // on the line whole, so a block inside one never reaches the inline
+            // box around it and never splits it.
+            if style.display == Display::InlineBlock {
                 return false;
             }
             if !style.display.is_inline() {
@@ -1184,6 +1413,13 @@ fn is_inline_child(doc: &Document, styles: &StyleMap, node: NodeId, style: &Comp
     // block box that filled the line.
     if forms::control_of(doc, node).is_some() {
         return style.display.is_inline();
+    }
+    // An inline-block is atomic for the same reason a control is: what is
+    // inside it is laid out by the box itself and cannot decide where the box
+    // goes. It is the case that makes the difference visible, because unlike a
+    // control it usually *does* hold blocks.
+    if style.display == Display::InlineBlock {
+        return true;
     }
     style.display.is_inline() && !contains_block(doc, styles, node, 0)
 }
@@ -1251,15 +1487,28 @@ fn subtree_widths(
 
     // The box's own inline content, then every block child, whichever is
     // widest — they stack, so the container must fit the widest of them.
-    let runs = collect_inline_runs(doc, styles, node, style, intrinsic, available);
+    let runs = collect_inline_runs(
+        doc,
+        styles,
+        node,
+        style,
+        intrinsic,
+        &InlineBlocks::new(),
+        available,
+    );
     let (mut min, mut max) = fonts.intrinsic_widths(&runs, style);
 
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
             continue;
         };
+        // An inline-block is measured here rather than among the runs: it is
+        // atomic, so its own content decides how wide it wants to be. Taking
+        // the widest rather than the sum understates a row of them, which
+        // costs a column too little width and never too much.
         if child_style.display == Display::None
-            || is_inline_child(doc, styles, child, child_style)
+            || (is_inline_child(doc, styles, child, child_style)
+                && child_style.display != Display::InlineBlock)
             || child_style.display.is_table_internal()
             || child_style.position.is_out_of_flow()
         {
@@ -1461,6 +1710,16 @@ fn flush_inline(
         return 0.0;
     }
     let children = std::mem::take(pending);
+    let mut blocks = InlineBlocks::new();
+    layout_inline_blocks(
+        doc,
+        styles,
+        fonts,
+        &children,
+        intrinsic,
+        content_width,
+        &mut blocks,
+    );
     let mut runs = Vec::new();
     runs.extend(lead);
     runs.extend(inline_runs_for(
@@ -1470,6 +1729,7 @@ fn flush_inline(
         style,
         holder,
         intrinsic,
+        &blocks,
         content_width,
     ));
     runs.extend(tail);
@@ -1522,6 +1782,7 @@ fn flush_inline(
             fonts,
             &laid_out,
             style,
+            &blocks,
             LineBoxes {
                 origin: (0.0, 0.0),
                 content_width,
@@ -1713,8 +1974,18 @@ fn layout_block(
                 && !child_style.position.is_out_of_flow()
         })
     });
+    let mut blocks = InlineBlocks::new();
     let runs = if all_inline {
-        collect_inline_runs(doc, styles, node, style, intrinsic, content_width)
+        layout_inline_blocks(
+            doc,
+            styles,
+            fonts,
+            doc.children(node),
+            intrinsic,
+            content_width,
+            &mut blocks,
+        );
+        collect_inline_runs(doc, styles, node, style, intrinsic, &blocks, content_width)
     } else {
         Vec::new()
     };
@@ -1735,25 +2006,14 @@ fn layout_block(
     let mut early: Vec<(NodeId, ComputedStyle)> = Vec::new();
     let mut late: Vec<(NodeId, ComputedStyle)> = Vec::new();
     let mut seen_in_flow = false;
-    for &child in doc.children(node) {
-        let Some(child_style) = styles.get(child) else {
-            continue;
-        };
-        if child_style.display == Display::None {
-            continue;
-        }
-        if child_style.float != Float::None {
-            if seen_in_flow {
-                late.push((child, child_style.clone()));
-            } else {
-                early.push((child, child_style.clone()));
-            }
-        } else if !is_inline_child(doc, styles, child, child_style)
-            && !child_style.display.is_table_internal()
-        {
-            seen_in_flow = true;
-        }
-    }
+    collect_floats(
+        doc,
+        styles,
+        doc.children(node),
+        &mut early,
+        &mut late,
+        &mut seen_in_flow,
+    );
     for (child, child_style) in &early {
         place_float(
             doc,
@@ -1801,6 +2061,7 @@ fn layout_block(
             fonts,
             &layout,
             style,
+            &blocks,
             LineBoxes {
                 origin: (padding_left + border_left, padding_top + border_top),
                 content_width,
@@ -2390,8 +2651,15 @@ fn layout_block(
         let available = child_containing.size.0;
         let width_basis = match child_style.width {
             Length::Auto => {
-                let runs =
-                    collect_inline_runs(doc, styles, child, &child_style, intrinsic, content_width);
+                let runs = collect_inline_runs(
+                    doc,
+                    styles,
+                    child,
+                    &child_style,
+                    intrinsic,
+                    &InlineBlocks::new(),
+                    content_width,
+                );
                 let (min, max) = fonts.intrinsic_widths(&runs, &child_style);
                 let surround = child_style
                     .padding
@@ -3093,6 +3361,7 @@ fn collect_inline_runs(
     node: NodeId,
     inherited: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
     available_width: f32,
 ) -> Vec<InlineRun> {
     let mut runs = Vec::new();
@@ -3112,6 +3381,7 @@ fn collect_inline_runs(
         inherited,
         node,
         intrinsic,
+        blocks,
         available_width,
     ));
     if let Some(after) = generated_run(styles, node, PseudoElement::After) {
@@ -3142,6 +3412,10 @@ fn generated_run(styles: &StyleMap, node: NodeId, which: PseudoElement) -> Optio
 /// Taking a slice rather than a parent is what lets a block container with
 /// mixed content lay out each stretch of inline children where it actually
 /// sits, instead of hoisting every one of them above the block children.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
 fn inline_runs_for(
     doc: &Document,
     styles: &StyleMap,
@@ -3149,6 +3423,7 @@ fn inline_runs_for(
     inherited: &ComputedStyle,
     holder: NodeId,
     intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
     available_width: f32,
 ) -> Vec<InlineRun> {
     let mut runs = Vec::new();
@@ -3160,6 +3435,7 @@ fn inline_runs_for(
             inherited,
             holder,
             intrinsic,
+            blocks,
             available_width,
             &mut runs,
         );
@@ -3200,6 +3476,7 @@ fn gather_one(
     inherited: &ComputedStyle,
     holder: NodeId,
     intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
     available_width: f32,
     out: &mut Vec<InlineRun>,
 ) {
@@ -3293,9 +3570,41 @@ fn gather_one(
                 id: child.0,
                 width: width + horizontal,
                 height: height + vertical,
+                baseline: height + vertical,
             },
             style.clone(),
         ));
+        return;
+    }
+
+    // An inline-block was laid out before the line was built, so what is left
+    // is to reserve its margin box and record where it aligns. It is asked
+    // *after* the replaced branch above, because `display: inline-block` on an
+    // image does not make it a block container: it is still sized from its own
+    // pixels, and routing it here instead made it disappear.
+    //
+    // Absent from the map means this pass is measuring rather than laying out —
+    // `subtree_widths` has no boxes to hand out and measures inline-blocks
+    // itself.
+    if style.display == Display::InlineBlock {
+        if let Some(box_) = blocks.get(&child) {
+            let font_size = style.font_size;
+            let margin_left = style.margin.left.to_px(font_size, available_width);
+            let margin_right = style.margin.right.to_px(font_size, available_width);
+            let margin_bottom = style.margin.bottom.to_px(font_size, available_width);
+            let height = box_.rect.y + box_.rect.height + margin_bottom;
+            out.push(InlineRun::replaced(
+                text::ReplacedInline {
+                    id: child.0,
+                    width: box_.rect.width + margin_left + margin_right,
+                    height,
+                    // §10.8.1: on the baseline of its own last line, or on its
+                    // bottom margin edge when it has no line to offer.
+                    baseline: last_baseline(box_).map_or(height, |baseline| box_.rect.y + baseline),
+                },
+                style.clone(),
+            ));
+        }
         return;
     }
 
@@ -3307,6 +3616,7 @@ fn gather_one(
             style,
             child,
             intrinsic,
+            blocks,
             available_width,
             out,
         );
@@ -5013,6 +5323,401 @@ mod tests {
         assert!(rule.is_some(), "the rule inside the font element vanished");
     }
 
+    /// Every inline-block box on the page, in document order.
+    fn inline_blocks(rendered: &Rendered) -> Vec<&LayoutBox> {
+        content_boxes(rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::InlineBlock)
+            .collect()
+    }
+
+    #[test]
+    fn an_inline_block_is_as_wide_as_its_content_and_no_wider() {
+        // §10.3.9. The whole difference between an inline-block and a block:
+        // one fills the line, the other takes what it needs.
+        let rendered = run(
+            "<body><div><span class=\"ib\">hi</span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 1, "the inline-block is not a box at all");
+        assert!(
+            ib[0].rect.width > 0.0 && ib[0].rect.width < 200.0,
+            "shrink-to-fit gave {:?}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn a_narrow_line_squeezes_an_inline_block_but_not_below_its_longest_word() {
+        // The other half of §10.3.5: available width caps it, the widest
+        // unbreakable thing in it floors it.
+        let rendered = run(
+            "<body><div><span class=\"ib\">antidisestablishmentarianism</span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block }",
+            20.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert!(
+            ib[0].rect.width > 20.0,
+            "squeezed below its longest word: {:?}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn an_empty_inline_block_still_takes_up_the_room_it_was_given() {
+        // The spacer that used to vanish. Laid out as a plain inline, an empty
+        // inline-block has no text and so contributed nothing at all — which is
+        // the silent failure that kept it out of `is_supported_layout`.
+        let rendered = run(
+            "<body><div><span class=\"ib\"></span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block; width: 40px; height: 12px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 1, "the empty inline-block vanished");
+        assert_eq!((ib[0].rect.width, ib[0].rect.height), (40.0, 12.0));
+    }
+
+    #[test]
+    fn two_inline_blocks_sit_side_by_side_until_the_line_runs_out() {
+        let row = |width: f32| {
+            let rendered = run(
+                "<body><div><span class=\"ib\">a</span><span class=\"ib\">b</span></div></body>",
+                "body { margin: 0 } .ib { display: inline-block; width: 60px; height: 10px }",
+                width,
+            );
+            let ib = inline_blocks(&rendered);
+            assert_eq!(ib.len(), 2);
+            (ib[0].rect, ib[1].rect)
+        };
+
+        let (first, second) = row(600.0);
+        assert_eq!(first.y, second.y, "both belong on the same line");
+        assert!(
+            second.x >= first.x + first.width,
+            "they overlap: {first:?} then {second:?}"
+        );
+
+        let (first, second) = row(80.0);
+        assert!(
+            second.y >= first.y + first.height,
+            "a line with room for one kept both: {first:?} then {second:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_block_lays_its_own_blocks_out_inside_itself() {
+        // The thing that makes it a block *container*: children stack, and the
+        // block inside does not split the line around it the way a block inside
+        // a plain inline element does.
+        let rendered = run(
+            "<body><p>before <span class=\"ib\"><b>one</b><b>two</b></span> after</p></body>",
+            "body { margin: 0 } .ib { display: inline-block } b { display: block }",
+            600.0,
+        );
+        let stacked: Vec<&LayoutBox> = inline_blocks(&rendered)
+            .into_iter()
+            .flat_map(|ib| boxes(ib))
+            .filter(|b| b.style.display == Display::Block && b.text.is_some())
+            .collect();
+        assert_eq!(stacked.len(), 2, "the blocks inside were not laid out");
+        assert!(
+            stacked[1].rect.y >= stacked[0].rect.y + stacked[0].rect.height,
+            "they did not stack: {:?} then {:?}",
+            stacked[0].rect,
+            stacked[1].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_lines_up_on_the_baseline_of_its_last_line() {
+        // §10.8.1. Two inline-blocks of different heights, each holding one
+        // line: their text must sit level with each other and with the text
+        // beside them, rather than their bottom edges lining up.
+        let rendered = run(
+            "<body><p>x<span class=\"tall\">y</span><span class=\"short\">z</span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .tall, .short { display: inline-block } \
+             .tall { padding-top: 30px } .short { padding-top: 0 }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 2);
+        let baseline = |b: &LayoutBox| b.rect.y + last_baseline(b).expect("a line to align on");
+        assert!(
+            (baseline(ib[0]) - baseline(ib[1])).abs() < 0.5,
+            "their text is not level: {:?} against {:?}",
+            ib[0].rect,
+            ib[1].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_with_no_line_in_it_sits_on_the_baseline() {
+        // The other half of §10.8.1: with no line box of its own, an
+        // inline-block aligns on its bottom margin edge, like an image. An
+        // empty spacer that hung below the text instead would drag every line
+        // holding one out of position.
+        let rendered = run(
+            "<body><p>text<span class=\"ib\"></span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .ib { display: inline-block; width: 10px; height: 40px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        let line = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.as_ref().is_some_and(|t| !t.lines.is_empty()))
+            .expect("a line of text");
+        let text_baseline =
+            line.rect.y + line.content_origin.1 + line.text.as_ref().unwrap().lines[0].baseline;
+        assert!(
+            (ib[0].rect.y + ib[0].rect.height - text_baseline).abs() < 0.5,
+            "the spacer does not sit on the baseline: {:?} against {text_baseline}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_with_room_takes_its_preferred_width_not_its_smallest() {
+        // The other end of §10.3.5. Shrinking to the *minimum* would be
+        // shrink-to-fit too, by a reading that puts every inline-block one word
+        // wide and several lines tall.
+        let rendered = run(
+            "<body><div><span class=\"ib\">one two three four</span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        let lines = ib[0]
+            .children
+            .iter()
+            .chain(std::iter::once(ib[0]))
+            .filter_map(|b| b.text.as_ref())
+            .map(|t| t.lines.len())
+            .sum::<usize>();
+        assert_eq!(lines, 1, "it wrapped where there was room not to");
+    }
+
+    #[test]
+    fn an_inline_block_holding_a_block_still_sits_on_the_line() {
+        // An inline element containing a block is laid out as a block here,
+        // because an inline box cannot contain one. An inline-block can: it is
+        // atomic, and the text before it belongs on the same line.
+        let rendered = run(
+            "<body><p>before <span class=\"ib\"><b>x</b></span></p></body>",
+            "body { margin: 0 } .ib { display: inline-block } b { display: block }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 1);
+        assert!(
+            ib[0].rect.x > 0.0,
+            "it was pushed onto a line of its own: {:?}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_keeps_its_childs_top_margin_inside_it() {
+        // §8.3.1: an inline-block establishes a formatting context, so a first
+        // child's margin does not escape through its top edge the way it does
+        // through an ordinary block's.
+        let rendered = run(
+            "<body><div><span class=\"ib\"><p>x</p></span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block } \
+             p { margin: 0; margin-top: 20px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        let inner = ib[0].children.first().expect("the paragraph inside");
+        assert!(
+            inner.rect.y >= 20.0,
+            "the margin escaped the inline-block: {:?}",
+            inner.rect
+        );
+    }
+
+    #[test]
+    fn a_line_grows_to_fit_a_box_aligned_to_its_top_or_bottom() {
+        // A `top`- or `bottom`-aligned box is hung from the line box rather
+        // than from the baseline, so it cannot be accounted for as ascent — but
+        // the line still has to be tall enough to hold it.
+        let height = |align: &str| {
+            let rendered = run(
+                "<body><p>text<span class=\"ib\"></span></p><hr></body>",
+                &format!(
+                    "body {{ margin: 0 }} p {{ margin: 0 }} hr {{ margin: 0 }} \
+                     .ib {{ display: inline-block; width: 10px; height: 60px; \
+                            vertical-align: {align} }}"
+                ),
+                600.0,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.style.display == Display::Block && b.node.is_some())
+                .map(|b| b.rect.height)
+                .expect("the paragraph")
+        };
+        for align in ["top", "bottom"] {
+            assert!(
+                height(align) >= 60.0,
+                "a {align}-aligned box overflowed its line: {}",
+                height(align)
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_makes_room_for_what_hangs_below_its_baseline() {
+        // A tall box fixes where the baseline is; a second box whose own
+        // baseline is near its top then hangs a long way below it. Counting
+        // only the tallest thing on the line leaves that overhang outside the
+        // line box, and the next line is drawn through it.
+        let rendered = run(
+            "<body><p><span class=\"tall\"></span><span class=\"hang\">x</span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .tall, .hang { display: inline-block } \
+             .tall { width: 10px; height: 60px } \
+             .hang { padding-bottom: 30px }",
+            600.0,
+        );
+        let paragraph = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Block && b.node.is_some())
+            .expect("the paragraph");
+        assert!(
+            paragraph.rect.height >= 80.0,
+            "the overhang fell outside the line: {:?}",
+            paragraph.rect
+        );
+    }
+
+    #[test]
+    fn a_floated_inline_block_is_a_float_and_not_a_box_on_the_line() {
+        // §9.7: `float` makes a box block-level whatever `display` said.
+        // `float: left; display: inline-block` is how a shrink-to-fit float
+        // gets written, and reading the `display` literally put the box on a
+        // line instead of against the containing block's edge.
+        let rendered = run(
+            "<body><div id=\"outer\"><span class=\"ib\">a</span><span class=\"f\">b</span></div></body>",
+            "body { margin: 0 } #outer { width: 300px } \
+             .ib, .f { display: inline-block; width: 100px; height: 20px } \
+             .f { float: left }",
+            600.0,
+        );
+        assert_eq!(
+            inline_blocks(&rendered).len(),
+            1,
+            "the floated one is still on the line"
+        );
+    }
+
+    #[test]
+    fn a_float_inside_an_inline_element_is_still_placed() {
+        // `<span><div style="float: left">…</div></span>`. The float is out of
+        // flow, so it must not break the line around it — and it must not be
+        // lost either, which is what happens if nothing descends to find it.
+        let rendered = run(
+            "<body><p>before <span><i class=\"f\"></i></span> after</p></body>",
+            "body { margin: 0 } .f { float: left; width: 30px; height: 30px; background: #ff0000 }",
+            600.0,
+        );
+        let float = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
+        assert!(float.is_some(), "the float inside the span vanished");
+        let lines: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.as_ref().is_some_and(|t| !t.lines.is_empty()))
+            .collect();
+        assert_eq!(lines.len(), 1, "the float broke the paragraph into pieces");
+    }
+
+    #[test]
+    fn vertical_align_decides_where_an_inline_block_hangs_on_the_line() {
+        // §10.8.1. One short box beside a tall one whose own baseline sits well
+        // above its bottom edge, so the four placements are four different
+        // places: at the line's top, on the baseline, straddling it, and at the
+        // line's bottom.
+        let placed = |align: &str| {
+            let rendered = run(
+                "<body><p><span class=\"tall\">x</span><span class=\"ib\"></span></p></body>",
+                &format!(
+                    "body {{ margin: 0 }} p {{ margin: 0 }} \
+                     .tall, .ib {{ display: inline-block; width: 10px }} \
+                     .tall {{ padding-top: 40px }} \
+                     .ib {{ height: 10px; vertical-align: {align} }}"
+                ),
+                600.0,
+            );
+            let ib = inline_blocks(&rendered);
+            assert_eq!(ib.len(), 2);
+            ib[1].rect.y
+        };
+        let top = placed("top");
+        let baseline = placed("baseline");
+        let middle = placed("middle");
+        let bottom = placed("bottom");
+        assert_eq!(top, 0.0, "top did not reach the top of the line");
+        assert!(
+            baseline < middle && middle < bottom,
+            "baseline {baseline}, middle {middle}, bottom {bottom} are not in order"
+        );
+        assert!(
+            top < baseline,
+            "top {top} is not above the baseline placement {baseline}"
+        );
+    }
+
+    #[test]
+    fn a_cell_still_centres_its_content_without_being_told_to() {
+        // The initial value of `vertical-align` is `baseline`, which an
+        // inline-block needs and a cell must not have. A cell's `middle` comes
+        // from the UA sheet instead — and this is the assertion that the two
+        // did not get swapped.
+        let rendered = run(
+            "<body><table><tr><td>short</td><td>a<br>b<br>c<br>d</td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0 }",
+            600.0,
+        );
+        let cells: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert!(
+            cells[0].content_origin.1 > 0.0,
+            "the short cell was not centred"
+        );
+    }
+
+    #[test]
+    fn margins_on_an_inline_block_hold_it_away_from_what_is_beside_it() {
+        // An inline-block's margins are its own: they neither collapse with a
+        // child's nor vanish the way an inline element's vertical ones do.
+        let rendered = run(
+            "<body><div><span class=\"ib\">a</span><span class=\"ib\">b</span></div></body>",
+            "body { margin: 0 } \
+             .ib { display: inline-block; width: 20px; height: 10px; margin: 5px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert!(
+            ib[1].rect.x - (ib[0].rect.x + ib[0].rect.width) >= 10.0,
+            "the two margins between them were lost: {:?} then {:?}",
+            ib[0].rect,
+            ib[1].rect
+        );
+        assert!(
+            ib[0].rect.y >= 5.0,
+            "the top margin was lost: {:?}",
+            ib[0].rect
+        );
+    }
+
     #[test]
     fn a_cell_is_middle_aligned_unless_told_otherwise() {
         let offset = |markup: &str| {
@@ -6449,6 +7154,7 @@ mod tests {
                 decorations: Vec::new(),
                 text: String::new(),
                 width: 200.0,
+                y: 0.0,
                 baseline: 10.0,
             }],
             height: 12.0,

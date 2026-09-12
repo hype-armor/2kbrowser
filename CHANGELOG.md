@@ -16,6 +16,41 @@ record for everything earlier.
 
 ## Unreleased
 
+**`inline-block` is laid out.** It was the largest thing CSS 2.1 asks for that
+this engine did not do, and the quietest: an inline-block was laid out as plain
+`inline`, so its width, height, border and background were dropped and an empty
+one — the spacer idiom — vanished entirely. It is a box now, sized by its own
+content the way §10.3.9 says (as wide as it wants, no wider than the room on the
+line, never narrower than its longest unbreakable word), placed on the line as
+one atom, and hung from the baseline of its own last line rather than from its
+bottom edge (§10.8.1), so a caption under a thumbnail sits level with the
+sentence it belongs to.
+
+`vertical-align` came with it. It existed here for table cells only, and the two
+contexts disagree about what "not stated" means — CSS's initial value is
+`baseline`, which an inline-block needs, while a cell wants `middle`. The
+initial value is now `baseline` and a cell's `middle` comes from the UA sheet,
+which is where the HTML specification puts it anyway. `top`, `middle` and
+`bottom` on an atomic inline box are honoured; raising and lowering *text* off
+the baseline — a `<sub>`, a `<sup>` — still is not.
+
+Two float bugs surfaced underneath. §9.7 makes a floated or absolutely
+positioned box block-level whatever `display` said, which this engine did not
+do, so `float: left; display: inline-block` — the ordinary way to write a
+shrink-to-fit float — put the box on a line instead of against the containing
+block's edge. And a float written inside an inline element
+(`<span><div style="float: left">…</div></span>`) was reached by nothing at all:
+not gathered as inline content, not walked as a block child, simply absent from
+the page. Both are fixed.
+
+Together: **2296 of 4821 reference tests to 2385**, 47.6% to 49.5%, with 97
+tests newly passing and 10 newly failing. The ten are worth naming rather than
+netting off, because each is a case where the inline-block is now *drawn* and
+was previously not drawn at all — the reftest matched because both sides were
+blank. What they point at: an inline box's own border and padding still take up
+no room on the line, and an `<iframe>` has no intrinsic size, so one with
+`width: auto` comes out empty instead of 300x150.
+
 **Forms are drawn.** An `<input>` is a void element with no content, so until now
 it laid out as nothing at all: a search box was not an empty box, it was absent,
 and a login form was a column of labels with no fields beside them. That reads as

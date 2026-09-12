@@ -395,10 +395,9 @@ such box here, so the table sits further left than a browser draws it —
 `empty-cells` — ignored in the separated model, where it applies, and
 correctly ignored in the collapsing one, where it does not — the corner where
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
-settled here by width rather than by a diagonal mitre, `inline-block` laid out as
-plain `inline` — and counted as unsupported layout for that reason, so a page
-depending on it falls back to a document rather than failing quietly — and
-proper block-in-inline splitting — an inline element containing a block is
+settled here by width rather than by a diagonal mitre, an inline box's own
+border and padding taking up no room on the line — so text after a bordered
+`<span>` wraps a little late — and proper block-in-inline splitting — an inline element containing a block is
 laid out as a block instead, which matches for the shapes that occur but is
 not what CSS 2.1 §9.2.1.1 describes.
 
@@ -969,7 +968,7 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**2296 of 4821 reference tests pass — 47.6%.** Zero panics across roughly ten
+**2385 of 4821 reference tests pass — 49.5%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
@@ -1115,7 +1114,7 @@ things we had noticed; this is the list.
 
 The engine's known gaps — an empty block collapsing through itself, an invalid
 selector not invalidating its rule, fixed table
-layout, `inline-block`, proper block-in-inline splitting — are listed
+layout, proper block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
 
