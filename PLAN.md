@@ -264,6 +264,20 @@ Work branches off **`next-release`** and its pull requests target
 one release that somebody read as a whole. `main` is what has shipped;
 `next-release` is what is going to.
 
+**Every branch comes off `next-release` itself.** Not off the branch before it,
+however tempting that is when one change builds on another: a stack of pull
+requests, each based on its predecessor, does not survive its own first merge.
+GitHub deletes a head branch when it merges, and a pull request whose *base*
+branch disappears is closed rather than re-pointed — so merging the bottom of a
+stack silently orphans the one above it, and the ones above that go on merging
+into branches with no route anywhere. That happened here with #37 through #42:
+four sound changes, three of them stranded, and `next-release` left holding
+only the first.
+
+The cost of the flat rule is that two branches touching the same area overlap
+in their diffs and their author resolves a conflict. That is a smaller price
+than a change that was reviewed, approved, and then quietly did not ship.
+
 The reason to collect rather than merge each change straight through is that a
 release is a unit worth reviewing. A dozen changes that are each individually
 sound can still add up to a week that reads badly — three overlapping additions
