@@ -668,11 +668,58 @@ pub fn layout(
 fn ink_bottom(box_: &LayoutBox, offset_y: f32) -> f32 {
     let top = offset_y + box_.rect.y;
     let mut bottom = top + box_.rect.height;
+    // `overflow: hidden` all but ends the question here (CSS 2.1 §11.1.1).
+    // What hangs out of this box is clipped, and clipped content is not part
+    // of the page: it cannot be scrolled to, because there is nothing to
+    // scroll to.
+    //
+    // This is how a page gets a mile of blank space under it. A dropdown
+    // written without scripting is `height: 0; overflow: hidden` until it is
+    // opened, and the menu inside it is as tall as its list — so the page
+    // carried hundreds of pixels of menu it never drew and could never show.
+    //
+    // "All but", because of what escapes: an absolutely positioned box is
+    // clipped by this one only if this one is its containing block, and a
+    // static box is nobody's containing block. Chromium agrees, and so does
+    // the reader — a tooltip anchored to the page, inside a clipped wrapper,
+    // is on the page.
+    if box_.style.overflow == Overflow::Clipped {
+        return bottom.max(escaping_bottom(box_, top));
+    }
     if let Some(text) = &box_.text {
         bottom = bottom.max(top + box_.content_origin.1 + text.height);
     }
     for child in &box_.children {
         bottom = bottom.max(ink_bottom(child, top));
+    }
+    bottom
+}
+
+/// How far down content reaches that a clipping box does not clip.
+///
+/// An absolutely positioned box is clipped by an ancestor only when that
+/// ancestor is its containing block — the nearest positioned one (§10.1). So
+/// the walk goes down through *static* descendants looking for absolutely
+/// positioned boxes, and stops at the first positioned one it meets: that box
+/// is the containing block for everything below it, and it is inside the clip.
+///
+/// A positioned clipper clips everything under it and never calls this.
+fn escaping_bottom(clipper: &LayoutBox, top: f32) -> f32 {
+    if clipper.style.position != Position::Static {
+        return f32::MIN;
+    }
+    let mut bottom = f32::MIN;
+    for child in &clipper.children {
+        bottom = bottom.max(match child.style.position {
+            // Anchored outside the clip, so it is drawn and scrolled to in
+            // full — and so is everything under it.
+            Position::Absolute | Position::Fixed => ink_bottom(child, top),
+            // Still static, so still nobody's containing block: keep looking.
+            Position::Static => escaping_bottom(child, top + child.rect.y),
+            // A positioned box is the containing block for anything below it,
+            // and it is inside the clip.
+            Position::Relative => f32::MIN,
+        });
     }
     bottom
 }
@@ -5593,6 +5640,123 @@ mod tests {
         let mut narrow = label.clone();
         clip_label(&mut narrow, 500.0);
         assert_eq!(narrow.width, 50.0, "clipping widened a label");
+    }
+}
+
+#[cfg(test)]
+mod clipped_overflow_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// How tall the page is, which is how far it can be scrolled.
+    fn height(html: &str) -> f32 {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css::ua::UA_STYLESHEET)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 800.0).height
+    }
+
+    #[test]
+    fn content_clipped_out_of_sight_is_not_somewhere_to_scroll() {
+        // CSS 2.1 §11.1.1: `overflow: hidden` clips, and offers no way to
+        // reach what it clipped. A page that can be scrolled to it is a page
+        // with a mile of blank space under it — which is what a dropdown
+        // written without scripting leaves behind, since it is `height: 0;
+        // overflow: hidden` with its whole menu inside.
+        let clipped = height(
+            "<body style=\"margin: 0\"><div style=\"height: 2000px\">spacer</div>\
+             <div style=\"position: absolute; height: 0; overflow: hidden\">\
+             <div style=\"height: 3000px\">menu</div></div></body>",
+        );
+        let visible = height(
+            "<body style=\"margin: 0\"><div style=\"height: 2000px\">spacer</div>\
+             <div style=\"position: absolute; height: 0\">\
+             <div style=\"height: 3000px\">menu</div></div></body>",
+        );
+
+        assert_eq!(clipped, 2000.0);
+        // The same page without the clip keeps every pixel of the overflow —
+        // the menu starts where the spacer ends and runs 3000px on from there
+        // — which is what makes the first number mean something.
+        assert_eq!(visible, 5000.0);
+    }
+
+    #[test]
+    fn a_box_anchored_outside_the_clip_is_not_clipped_by_it() {
+        // §10.1: an absolutely positioned box is clipped by an ancestor only
+        // when that ancestor is its containing block, and a static box is
+        // nobody's containing block. Chromium reaches 2000 here too, and the
+        // reader is right to expect it: a tooltip anchored to the page, inside
+        // a clipped wrapper, is on the page.
+        let escaped = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"height: 10px; overflow: hidden\">\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">out</div>\
+             </div></body>",
+        );
+
+        assert_eq!(escaped, 2000.0);
+    }
+
+    #[test]
+    fn a_box_escapes_from_however_deep_inside_the_clip_it_sits() {
+        // The walk has to go *through* static boxes, not only look at the
+        // clipper's own children: a static wrapper is nobody's containing
+        // block either, so a box below one is still anchored to the page.
+        // Chromium reaches 2000 here too.
+        let escaped = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"height: 10px; overflow: hidden\"><div><div>\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">out</div>\
+             </div></div></div></body>",
+        );
+
+        assert_eq!(escaped, 2000.0);
+    }
+
+    #[test]
+    fn a_relative_box_inside_the_clip_anchors_what_is_under_it() {
+        // And the walk has to stop there. The relative wrapper is the
+        // containing block for the box below it, and the wrapper is inside the
+        // clip — so the box is measured from it and clipped with it. Chromium
+        // stops at 1010 here as well.
+        let anchored = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"height: 10px; overflow: hidden\">\
+             <div style=\"position: relative\">\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">in</div>\
+             </div></div></body>",
+        );
+
+        assert_eq!(anchored, 1010.0);
+    }
+
+    #[test]
+    fn a_positioned_clipper_clips_what_it_anchors() {
+        // The other half of the same rule. Make the wrapper `relative` and it
+        // becomes the containing block, so the box inside is measured from it
+        // and clipped by it — which is Wikipedia's dropdown exactly.
+        let anchored = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"position: relative; height: 10px; overflow: hidden\">\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">in</div>\
+             </div></body>",
+        );
+
+        assert_eq!(anchored, 1010.0);
+    }
+
+    #[test]
+    fn a_clipping_box_still_takes_its_own_room() {
+        // Only what hangs *out* of it is gone. The box is in its parent's flow
+        // and as tall as it says it is.
+        let sized = height(
+            "<body style=\"margin: 0\"><div style=\"height: 300px; overflow: hidden\">\
+             <div style=\"height: 3000px\">tall</div></div></body>",
+        );
+
+        assert_eq!(sized, 300.0);
     }
 }
 
