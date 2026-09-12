@@ -4,6 +4,8 @@
 //! machines with no display server, so the window is a thin consumer of this
 //! rather than the only way to produce output.
 
+use std::collections::HashMap;
+
 use css::Stylesheet;
 use layout::{IntrinsicSizes, RenderMode};
 use net::{Fetcher, Origin, RequestKind};
@@ -691,8 +693,6 @@ pub(crate) fn render_sized(
     if let Some(body) = doc.find_element("body") {
         styles.keep_off_the_edges(body, PAGE_GUTTER, width as f32);
     }
-    let styles = styles;
-
     // Images are loaded whichever way the page is being rendered. They used to
     // be dropped on the document fallback, on the grounds that a rendering
     // which has discarded the author's layout should not spend requests on
@@ -716,6 +716,16 @@ pub(crate) fn render_sized(
         .filter(|(key, _)| key.slot == paint::ImageSlot::Content)
         .map(|(key, image)| (key.node, (image.width(), image.height())))
         .collect();
+
+    if !matches!(mode, RenderMode::Authored) {
+        hide_missing_images(&doc, &intrinsic, &mut styles);
+        // After the images and not before: the boxes this finds are mostly
+        // the ones the line above just emptied.
+        hide_empty_boxes(&doc, &mut styles);
+    }
+    // Settled: everything that patches a computed style after the cascade has
+    // had its turn, and the rest of the pipeline reads.
+    let styles = styles;
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
@@ -1059,6 +1069,164 @@ fn collapse_blank_lines(doc: &dom::Document, styles: &mut css::cascade::StyleMap
     }
 }
 
+/// Hides boxes that have nothing left to draw, in a document rendering.
+///
+/// The counterpart to [`hide_missing_images`], and it runs second because it
+/// depends on it. A picture on a Wikipedia article arrives wrapped in three
+/// or four sized `<div>`s, and the taxobox at the top of the page stacks six
+/// of those inside a table: hide the images and 850 pixels of empty scaffold
+/// are still standing, each box holding the height its inline `style` asked
+/// for around nothing at all. Hiding the pictures without this only moves the
+/// hole.
+///
+/// The rule is about content rather than cause, which is what makes it safe
+/// to apply to a whole document: an element is hidden when its subtree holds
+/// no text and nothing that draws by itself. Already-hidden descendants do
+/// not count — that is the point, since what makes these boxes empty is
+/// precisely what [`slop::extract`] and `hide_missing_images` hid.
+///
+/// Only on the fallback, and for the same reason as the images: a rendering
+/// that has kept the author's stylesheet has to keep the boxes it sizes, and
+/// a rendering that threw the sheet away has already decided that the
+/// author's arrangement was not serving the reader.
+///
+/// Bottom-up in reverse document order, so each element reads an answer its
+/// children have already written instead of walking its own subtree. On an
+/// article whose tables nest five deep that is the difference between a pass
+/// and a page-load.
+fn hide_empty_boxes(doc: &dom::Document, styles: &mut css::cascade::StyleMap) {
+    let mut draws: HashMap<dom::NodeId, bool> = HashMap::new();
+    for node in doc.descendants(doc.root()).into_iter().rev() {
+        let drawn = draws_something(doc, styles, node, &draws);
+        draws.insert(node, drawn);
+        // The root and the body are the page itself. Hiding them turns an
+        // article that happens to be all pictures into a blank window, with
+        // nothing left underneath to explain where it went.
+        if !drawn
+            && doc
+                .element(node)
+                .is_some_and(|element| may_go(element.local_name()))
+        {
+            styles.hide(node);
+        }
+    }
+}
+
+/// Whether an empty element of this name may be taken out of the flow.
+///
+/// Emptiness is not on its own a licence to remove something. An element can
+/// hold a place as well as hold content, and these hold places:
+///
+/// * A cell keeps a column in line. `<td></td>` is ordinary in a data table,
+///   and dropping it slides every later cell in that row one column left —
+///   which puts the wrong numbers under the headings, silently.
+/// * A list item keeps the count. Dropping an empty one renumbers every item
+///   after it.
+///
+/// The root and the body are not on the list, and not because they are safe
+/// to drop: layout reads the body's style and then lays out its children
+/// whatever its `display` says, so hiding it does nothing at all. An entry
+/// here would be a comment claiming a danger the code cannot have.
+fn may_go(local_name: &str) -> bool {
+    !matches!(
+        local_name,
+        "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "col"
+            | "colgroup"
+            | "caption"
+            | "li"
+            | "dt"
+            | "dd"
+    )
+}
+
+/// Whether this node puts ink on the page, given what its children have
+/// already answered.
+///
+/// Text, or an element that draws on its own account. The list is short and
+/// errs towards keeping things: a false "yes" costs an empty box, a false
+/// "no" deletes something the reader came for.
+fn draws_something(
+    doc: &dom::Document,
+    styles: &css::cascade::StyleMap,
+    node: dom::NodeId,
+    draws: &HashMap<dom::NodeId, bool>,
+) -> bool {
+    /// Elements that draw with no text of their own.
+    const SELF_DRAWING: &[&str] = &[
+        "img", "hr", "canvas", "svg", "video", "audio", "iframe", "object", "embed", "input",
+        "textarea", "select", "button",
+    ];
+    if styles
+        .get(node)
+        .is_some_and(|style| style.display == css::style::Display::None)
+    {
+        return false;
+    }
+    if let Some(text) = doc.text(node) {
+        return !text.trim().is_empty();
+    }
+    let Some(element) = doc.element(node) else {
+        return false;
+    };
+    // A `<br>` puts no ink anywhere and is still the whole of what its author
+    // wrote — an address, a verse, a signature. It counts.
+    if element.local_name() == "br" {
+        return true;
+    }
+    if SELF_DRAWING.contains(&element.local_name()) {
+        return true;
+    }
+    doc.children(node)
+        .iter()
+        .any(|child| draws.get(child).copied().unwrap_or(false))
+}
+
+/// Hides images that are not going to be drawn, in a document rendering.
+///
+/// This is where the reading view's empty gaps came from. Every large blank
+/// band on a Wikipedia article — 312 pixels, 294, 282, on down — was an
+/// `<img>` holding open the box its `width` and `height` attributes asked
+/// for, with no picture in it. Wikipedia serves its images from a different
+/// host, third-party requests are refused (ADR-0006), and an article is
+/// mostly photographs: the reader was scrolling past holes.
+///
+/// A browser rendering the page as authored has to keep the hole. The
+/// author's layout is built around a box of that size, and Chromium reserves
+/// it too — a broken image with dimensions is 250x290 of nothing there as
+/// well. A document rendering has already given that up: it threw away the
+/// author's sheet precisely because their layout was not serving the reader,
+/// and a gap reserved for a picture that does not exist is the clearest case
+/// of it. So this only runs on the fallback, and `Authored` keeps Chromium's
+/// behaviour, gaps and all.
+///
+/// "Not going to be drawn" is decided after the fetch, so it means failed or
+/// refused rather than still coming: `intrinsic` holds every image that
+/// loaded and decoded, and layout is about to size the rest from thin air.
+///
+/// The caption stays. It is text, the reader can still learn what the picture
+/// showed, and losing it as well would be a second, quieter kind of hole.
+fn hide_missing_images(
+    doc: &dom::Document,
+    intrinsic: &IntrinsicSizes,
+    styles: &mut css::cascade::StyleMap,
+) {
+    for node in doc.descendants(doc.root()) {
+        let is_image = doc
+            .element(node)
+            .is_some_and(|element| element.local_name() == "img");
+        if is_image && !intrinsic.contains_key(&node) {
+            styles.hide(node);
+        }
+    }
+}
+
 /// How deeply `@import` may nest before we stop following it.
 ///
 /// A stylesheet can import itself, directly or through a cycle, and a browser
@@ -1313,6 +1481,267 @@ mod tests {
         assert!(
             rows_with_green.abs_diff(expected_rows) <= 2,
             "{widest}x{rows_with_green} is not the 15:2 image scaled down"
+        );
+    }
+
+    /// A loader that fetches nothing, like a page whose images are all on
+    /// another host and refused (ADR-0006).
+    struct NoImages;
+
+    impl Loader for NoImages {
+        fn load(
+            &mut self,
+            _url: &str,
+            _document: Option<&Origin>,
+            _kind: RequestKind,
+        ) -> Option<Loaded> {
+            None
+        }
+    }
+
+    /// Height of a page rendered as a document, with `loader` for its images.
+    fn document_height(html: &str, loader: &mut dyn Loader) -> f32 {
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        render_as_document_with(html, 900, 0, 4000, &mut fonts, loader, Some((&origin, &at)))
+            .content_height
+    }
+
+    #[test]
+    fn a_document_rendering_does_not_hold_a_gap_open_for_an_image_that_never_arrived() {
+        // Every large blank band in the reading view of a Wikipedia article
+        // was one of these: an `<img>` whose `width` and `height` attributes
+        // reserved a box, with nothing in it because the picture is on
+        // another host and third-party requests are refused. The article was
+        // holes.
+        let html = "<body><p>before</p><img src=\"gone.png\" width=\"250\" height=\"290\"><p>after</p></body>";
+        let gap = document_height(html, &mut NoImages);
+        let no_image = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+
+        assert!(
+            (gap - no_image).abs() < 1.0,
+            "the missing image still holds {}px open",
+            gap - no_image
+        );
+    }
+
+    #[test]
+    fn a_document_rendering_keeps_the_gap_for_an_image_that_did_arrive() {
+        // The other half, and the one that matters: the rule is "there is no
+        // picture", not "pictures are noise". An image that loaded is the
+        // content of the article and takes exactly the room it always did.
+        let html = "<body><p>before</p><img src=\"here.png\" width=\"250\" height=\"290\"><p>after</p></body>";
+        let mut green = GreenImages {
+            png: green_png(250, 290),
+        };
+        let shown = document_height(html, &mut green);
+        let no_image = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+
+        assert!(
+            shown - no_image > 280.0,
+            "the image only added {}px",
+            shown - no_image
+        );
+    }
+
+    #[test]
+    fn a_document_rendering_drops_the_scaffolding_left_around_a_missing_image() {
+        // Hiding the picture alone only moves the hole. A Wikipedia photograph
+        // arrives inside three or four `<div>`s carrying its size in an inline
+        // style, and the taxobox stacks six of those in a table: 850 pixels of
+        // empty frame around nothing.
+        let html = "<body><p>before</p>\
+            <div style=\"height: 300px\"><div style=\"height: 290px\">\
+            <img src=\"gone.png\" width=\"250\" height=\"290\"></div></div>\
+            <p>after</p></body>";
+        let scaffold = document_height(html, &mut NoImages);
+        let no_image = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+
+        assert!(
+            (scaffold - no_image).abs() < 1.0,
+            "the empty frame still holds {}px open",
+            scaffold - no_image
+        );
+    }
+
+    #[test]
+    fn an_empty_box_next_to_a_caption_goes_without_taking_the_caption_with_it() {
+        // The caption is text and the reader can still learn what the picture
+        // showed. Losing it as well would be a second, quieter hole — and it
+        // is the case that tells "hide what draws nothing" apart from "hide
+        // the figure".
+        let html = "<body><figure><div style=\"height: 290px\">\
+            <img src=\"gone.png\" width=\"250\" height=\"290\"></div>\
+            <figcaption>A cat, asleep.</figcaption></figure></body>";
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut NoImages,
+            Some((&origin, &at)),
+        );
+
+        assert!(
+            page.content_height < 120.0,
+            "the empty frame is still {}px tall",
+            page.content_height
+        );
+        assert!(
+            page.content_height > 20.0,
+            "the caption went with the picture"
+        );
+    }
+
+    #[test]
+    fn a_page_rendered_as_authored_keeps_the_box_a_missing_image_asked_for() {
+        // Deliberately Chromium's behaviour, which reserves the full box for a
+        // broken image that gave its dimensions. The author's layout is built
+        // around it, and a rendering that kept their stylesheet has to keep
+        // their boxes; it is giving the sheet up that earns the right to
+        // close the gap.
+        let html = "<body><p>before</p><img src=\"gone.png\" width=\"250\" height=\"290\"><p>after</p></body>";
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_authored_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut NoImages,
+            Some((&origin, &at)),
+        );
+
+        assert!(
+            page.content_height > 280.0,
+            "the box is only {}px tall",
+            page.content_height
+        );
+    }
+
+    /// Where the words of a page ended up, left to right and top to bottom.
+    fn document_text(html: &str) -> Vec<String> {
+        document_words(html)
+            .into_iter()
+            .map(|(_, _, word)| word)
+            .collect()
+    }
+
+    /// The same, keeping each line's baseline and left edge.
+    fn document_words(html: &str) -> Vec<(i32, i32, String)> {
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut NoImages,
+            Some((&origin, &at)),
+        );
+        let mut placed: Vec<(i32, i32, String)> = Vec::new();
+        collect_text(&page.frames[0].layout.root, 0.0, 0.0, &mut placed);
+        placed.sort();
+        placed
+    }
+
+    fn collect_text(box_: &layout::LayoutBox, x: f32, y: f32, out: &mut Vec<(i32, i32, String)>) {
+        let (x, y) = (x + box_.rect.x, y + box_.rect.y);
+        if let Some(text) = &box_.text {
+            for line in &text.lines {
+                if line.text.trim().is_empty() {
+                    continue;
+                }
+                let left = line.glyphs.first().map_or(0.0, |glyph| glyph.x);
+                out.push((
+                    (y + line.baseline) as i32,
+                    (x + left) as i32,
+                    line.text.trim().to_owned(),
+                ));
+            }
+        }
+        for child in &box_.children {
+            collect_text(child, x, y, out);
+        }
+    }
+
+    #[test]
+    fn a_wrapper_holding_only_a_newline_is_holding_nothing() {
+        // What separates a box with nothing in it from a box with a line of
+        // text in it is a `trim`, and almost every wrapper on a real page is
+        // this case: markup is indented, so an "empty" div holds a newline
+        // and two spaces. Without the trim the pass finds nearly nothing.
+        let bare = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+        let indented = document_height(
+            "<body><p>before</p><div style=\"height: 290px\">\n  \n</div><p>after</p></body>",
+            &mut NoImages,
+        );
+
+        assert!(
+            (indented - bare).abs() < 1.0,
+            "the whitespace held {}px open",
+            indented - bare
+        );
+    }
+
+    #[test]
+    fn an_empty_cell_keeps_its_column_in_line() {
+        // Emptiness is not on its own a licence to remove something. `<td></td>`
+        // is ordinary in a data table, and taking it out slides every later
+        // cell in that row one column left — which files the wrong numbers
+        // under the headings and says nothing about having done it.
+        let html = "<body><table>\
+            <tr><td>top left</td><td>top right</td></tr>\
+            <tr><td></td><td>bottom right</td></tr></table></body>";
+        let words = document_words(html);
+        let column = |wanted: &str| {
+            words
+                .iter()
+                .find(|(_, _, word)| word.contains(wanted))
+                .unwrap_or_else(|| panic!("{wanted} is not on the page: {words:?}"))
+                .1
+        };
+
+        assert!(
+            column("top left") < column("top right"),
+            "the two columns are in one place: {words:?}"
+        );
+        assert_eq!(
+            column("bottom right"),
+            column("top right"),
+            "the empty cell was dropped and the row slid a column left: {words:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_item_keeps_the_count() {
+        // Same reason as the cell, counted differently: drop an empty item and
+        // every item after it is renumbered, so a list of six references
+        // silently becomes a list of five with the wrong numbers on them.
+        let gapped = document_text("<body><ol><li>one</li><li></li><li>three</li></ol></body>");
+        let marker = |words: &[String], word: &str| {
+            let at = words
+                .iter()
+                .position(|found| found.contains(word))
+                .unwrap_or_else(|| panic!("{word} is not on the page: {words:?}"));
+            words[..at]
+                .iter()
+                .rev()
+                .find(|found| found.ends_with('.'))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        assert_eq!(marker(&gapped, "one"), "1.", "{gapped:?}");
+        assert_eq!(
+            marker(&gapped, "three"),
+            "3.",
+            "the empty item was dropped and the third was renumbered: {gapped:?}"
         );
     }
 
