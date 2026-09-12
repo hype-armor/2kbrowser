@@ -1,0 +1,26 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font: 13px/17px serif; }
+  h3 { font: bold 13px serif; margin: 10px 0 4px 0; }
+  .outer { background: #eeeeee; width: 300px; margin-bottom: 8px; }
+  .tall { height: 200px; }
+  .half { height: 50%; background: #cce5ff; }
+  .full { height: 100%; background: #ffddcc; }
+  .kept { height: 50px; height: -1%; background: #ddffdd; }
+</style></head><body>
+
+<h3>Against an auto parent, a percentage height is auto</h3>
+<div class="outer"><div class="full">one line, not a thousand pixels</div></div>
+
+<h3>Against a parent that has one, it resolves</h3>
+<div class="outer tall"><div class="half">half of two hundred</div></div>
+
+<h3>It chains through a percentage parent, which is also definite</h3>
+<div class="outer tall"><div class="half"><div class="half">a quarter of two hundred</div></div></div>
+
+<h3>It stops at the first auto ancestor</h3>
+<div class="outer tall"><div><div class="half">auto, because the middle box has no height</div></div></div>
+
+<h3>A negative height is invalid, so the earlier one stands</h3>
+<div class="outer"><div class="kept">fifty pixels tall</div></div>
+
+</body></html>

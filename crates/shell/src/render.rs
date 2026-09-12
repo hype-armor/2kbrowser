@@ -662,7 +662,7 @@ pub(crate) fn render_sized(
         );
     }
 
-    let author_sheets = collect_stylesheets(&doc, loader, base);
+    let author_sheets = collect_stylesheets(&doc, loader, base, width as f32);
     let styles = css::cascade::cascade_at(&doc, &author_sheets, settings.zoom);
 
     // Classify before laying out: if the page needs layout we do not implement,
@@ -1282,6 +1282,7 @@ fn push_with_imports(
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
     depth: usize,
+    viewport_width: f32,
 ) {
     if depth < MAX_IMPORT_DEPTH
         && let Some((origin, path)) = base
@@ -1299,10 +1300,11 @@ fn push_with_imports(
             };
             push_with_imports(
                 sheets,
-                Stylesheet::parse(&resource.text()),
+                Stylesheet::parse_at(&resource.text(), viewport_width),
                 loader,
                 Some((&sheet_origin, &sheet_path)),
                 depth + 1,
+                viewport_width,
             );
         }
     }
@@ -1331,6 +1333,9 @@ fn collect_stylesheets(
     doc: &dom::Document,
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
+    // The width the page is being rendered at, which decides which `@media`
+    // blocks contribute any rules at all.
+    viewport_width: f32,
 ) -> Vec<Stylesheet> {
     let mut sheets = Vec::new();
 
@@ -1340,9 +1345,9 @@ fn collect_stylesheets(
         };
         match element.local_name() {
             "style" => {
-                let sheet = Stylesheet::parse(&doc.text_content(node));
+                let sheet = Stylesheet::parse_at(&doc.text_content(node), viewport_width);
                 // A `<style>` block's imports resolve against the document.
-                push_with_imports(&mut sheets, sheet, loader, base, 0);
+                push_with_imports(&mut sheets, sheet, loader, base, 0, viewport_width);
             }
             // An external stylesheet is how a site of this era shared one look
             // across every page; skipping them leaves those pages unstyled.
@@ -1360,7 +1365,7 @@ fn collect_stylesheets(
                 if let Some(resource) = loader.load(&url, Some(origin), RequestKind::Subresource)
                     && let Ok((sheet_origin, sheet_path)) = net::parse_url(&url)
                 {
-                    let sheet = Stylesheet::parse(&resource.text());
+                    let sheet = Stylesheet::parse_at(&resource.text(), viewport_width);
                     // An imported sheet's URLs resolve against the sheet that
                     // imported it, not against the document.
                     push_with_imports(
@@ -1369,6 +1374,7 @@ fn collect_stylesheets(
                         loader,
                         Some((&sheet_origin, &sheet_path)),
                         0,
+                        viewport_width,
                     );
                 }
             }

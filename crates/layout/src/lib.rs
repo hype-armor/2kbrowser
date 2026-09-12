@@ -47,6 +47,15 @@ pub struct ContainingBlock {
     offset: (f32, f32),
     /// The containing block's content size.
     size: (f32, f32),
+    /// The containing block's height, where it has a definite one.
+    ///
+    /// §10.5 turns on this and nothing else: a percentage `height` resolves
+    /// against the containing block's height only when that height does not
+    /// itself depend on the content. Otherwise the percentage computes to
+    /// `auto`. `size.1` cannot answer it — that is a number whatever its
+    /// provenance, and for a normal-flow block it is a width standing in for a
+    /// height it does not know.
+    definite_height: Option<f32>,
 }
 
 impl ContainingBlock {
@@ -55,6 +64,10 @@ impl ContainingBlock {
         Self {
             offset: (0.0, 0.0),
             size: (width, height),
+            // The initial containing block is the viewport, whose height is
+            // as definite as a height gets: `height: 100%` on the root fills
+            // the window.
+            definite_height: Some(height),
         }
     }
 
@@ -64,14 +77,28 @@ impl ContainingBlock {
         Self {
             offset: (self.offset.0 + dx, self.offset.1 + dy),
             size: self.size,
+            definite_height: self.definite_height,
+        }
+    }
+
+    /// This containing block with a definite height of `height`.
+    fn with_definite_height(self, height: Option<f32>) -> Self {
+        Self {
+            definite_height: height,
+            ..self
         }
     }
 
     /// A box establishing itself as the containing block for its descendants.
+    ///
+    /// Its height is definite: a positioned box has been sized by the time it
+    /// becomes a containing block, so a percentage height inside it has a
+    /// real number to resolve against.
     fn establish(size: (f32, f32)) -> Self {
         Self {
             offset: (0.0, 0.0),
             size,
+            definite_height: Some(size.1),
         }
     }
 }
@@ -1925,6 +1952,39 @@ fn layout_block(
     let mut cursor_y = padding_top + border_top + content_height;
     // Inline children seen since the last block child. Flushed as an anonymous
     // box when a block child arrives, and again at the end.
+    // This box's own height, where it has a definite one — what a child's
+    // percentage height resolves against (§10.5). A percentage here is itself
+    // definite only if the chain above it was, which is what stops a
+    // percentage resolving against nothing at all.
+    let own_definite_height = match style.height {
+        Length::Auto => None,
+        Length::Percent(percent) => containing
+            .definite_height
+            .map(|basis| basis * percent / 100.0),
+        length => Some(length.to_px(style.font_size, available_width)),
+    };
+    // Clamped, because what a child resolves its percentage against is the
+    // *used* height and not the declared one. A box with `height: 4em;
+    // max-height: 2em` is two ems tall, and a child asking for 50% of it wants
+    // one em rather than two — `absolute-non-replaced-max-001` in the suite is
+    // exactly this, with a black square that comes out four times too big.
+    //
+    // §10.7's order, the maximum and then the minimum, so a box given both
+    // takes the minimum. Both bound the content box, which is what this is.
+    // A percentage bound resolves against a height that is not known here, so
+    // those are no bound rather than a guess — the same rule the used height
+    // itself follows a few hundred lines below.
+    let own_definite_height = own_definite_height.map(|height| {
+        let mut height = height;
+        if let Length::Px(_) | Length::Em(_) = style.max_height {
+            height = height.min(style.max_height.to_px(style.font_size, 0.0));
+        }
+        if let Length::Px(_) | Length::Em(_) = style.min_height {
+            height = height.max(style.min_height.to_px(style.font_size, 0.0));
+        }
+        height
+    });
+
     let mut pending: Vec<NodeId> = Vec::new();
     // §12.1: the generated boxes bracket the element's content, so they go on
     // the first and last stretch of it and nowhere else. `all_inline` has its
@@ -2075,7 +2135,14 @@ fn layout_block(
         // than it would have without the collapse.
         cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
         let child_context = context.translated(0.0, cursor_y - into_context, content_width);
-        let child_containing = containing.descend(padding_left + border_left, cursor_y);
+        // A normal-flow child's containing block is *this* box, so the
+        // definite height it may resolve a percentage against is this box's,
+        // not an ancestor's. Carrying the ancestor's down instead would let
+        // `height: 50%` find a basis through a chain of auto-height parents
+        // that CSS 2.1 says stops at the first one.
+        let child_containing = containing
+            .descend(padding_left + border_left, cursor_y)
+            .with_definite_height(own_definite_height);
         let consumed = layout_block(
             doc,
             styles,
@@ -2227,15 +2294,21 @@ fn layout_block(
     let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
         + padding_bottom
         + border_bottom;
+    let surround = padding_top + padding_bottom + border_top + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
-        length => {
-            length.to_px(font_size, available_width)
-                + padding_top
-                + padding_bottom
-                + border_top
-                + border_bottom
-        }
+        // §10.5: a percentage height resolves against the containing block's
+        // height, and where that height is not itself definite the percentage
+        // computes to `auto`. Resolving it against the *width* instead — which
+        // is what `to_px` does when handed `available_width`, and what this
+        // used to do — is how `height: 100%` on Wikipedia's logo became a
+        // 1000-pixel-tall empty box that pushed the entire article off the
+        // screen. A percentage of a width is not a height.
+        Length::Percent(percent) => match containing.definite_height {
+            Some(basis) => basis * percent / 100.0 + surround,
+            None => content_end,
+        },
+        length => length.to_px(font_size, available_width) + surround,
     };
     // §10.7: the used height is capped at `max-height` first, and raised to
     // `min-height` after — that order is the spec's, and it is what makes
@@ -3775,6 +3848,143 @@ mod tests {
             .into_iter()
             .find(|b| b.style.display == Display::Table)
             .expect("a table box")
+    }
+
+    #[test]
+    fn a_percentage_height_against_an_auto_parent_is_auto() {
+        // §10.5. The parent's height depends on its content, so there is
+        // nothing for the percentage to be a percentage *of*, and it computes
+        // to `auto`. Resolving it against the width instead is how
+        // `height: 100%` on Wikipedia's logo became a 1000-pixel empty box
+        // that pushed the article off the screen.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #inner { height: 100% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        // Not merely "small": `auto` means the content's height, so a box
+        // with one line in it is one line tall. Collapsing it to zero would
+        // satisfy a looser assertion and lose the text.
+        let line = run("<body><div>x</div></body>", "body { margin: 0 }", 1000.0);
+        assert_eq!(
+            inner.rect.height,
+            content_boxes(&line)[0].rect.height,
+            "a percentage against an auto parent should be the content height"
+        );
+    }
+
+    #[test]
+    fn a_percentage_height_chains_through_a_parent_that_has_one() {
+        // The middle box's own height is a percentage, and a definite one,
+        // so the inner box resolves against *it* rather than finding nothing.
+        let rendered = run(
+            "<body><div id=outer><div id=mid><div id=inner>x</div></div></div></body>",
+            "body { margin: 0 } #outer { height: 400px } #mid { height: 50% } \
+             #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        assert_eq!(inner.rect.height, 100.0, "half of half of 400");
+    }
+
+    #[test]
+    fn a_percentage_height_resolves_against_a_parent_that_has_one() {
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { height: 400px } #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        assert_eq!(inner.rect.height, 200.0);
+    }
+
+    #[test]
+    fn a_definite_height_does_not_reach_past_an_auto_parent() {
+        // The chain stops at the first auto ancestor: the inner box's
+        // containing block is the middle one, which has no definite height of
+        // its own, so the outer 400px is not what 50% means here.
+        let rendered = run(
+            "<body><div id=outer><div id=mid><div id=inner>x</div></div></div></body>",
+            "body { margin: 0 } #outer { height: 400px } #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        assert!(
+            inner.rect.height < 100.0,
+            "the percentage found a basis through an auto parent: {}",
+            inner.rect.height
+        );
+    }
+
+    #[test]
+    fn a_percentage_resolves_against_the_height_a_bound_left_behind() {
+        // What a child resolves against is the *used* height, not the declared
+        // one. This only became reachable when `max-height` arrived: a box
+        // told `height: 400px; max-height: 200px` is 200 tall, and a child
+        // asking for half of it wants 100 rather than 200.
+        //
+        // `absolute-non-replaced-max-001` in the suite is exactly this, and
+        // caught it — the black square came out four times its area.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { height: 400px; max-height: 200px } \
+             #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+
+        assert_eq!(inner.rect.height, 100.0);
+    }
+
+    #[test]
+    fn a_percentage_resolves_against_a_floor_the_same_way() {
+        // §10.7's other half, and the order matters: the maximum is applied
+        // first and the minimum second, so a box given both takes the minimum
+        // — and a child measures itself against that.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { height: 50px; max-height: 100px; min-height: 300px } \
+             #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+
+        assert_eq!(inner.rect.height, 150.0);
+    }
+
+    #[test]
+    fn a_negative_height_is_invalid_and_leaves_the_earlier_one_standing() {
+        // The earlier declaration has to be one the invalid value would
+        // visibly replace: with `height: 0` first, dropping and accepting
+        // both land on zero and the test cannot tell them apart.
+        for bad in ["-1%", "-1px", "-1em"] {
+            let css = format!("body {{ margin: 0 }} div {{ height: 50px; height: {bad} }}");
+            let rendered = run("<body><div></div></body>", &css, 1000.0);
+            assert_eq!(
+                content_boxes(&rendered)[0].rect.height,
+                50.0,
+                "{bad} was accepted"
+            );
+        }
     }
 
     #[test]
