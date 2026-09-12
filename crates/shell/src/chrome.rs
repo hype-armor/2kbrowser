@@ -22,11 +22,14 @@ use css::value::Color;
 /// Height of the URL bar, in pixels.
 pub const HEIGHT: u32 = 46;
 
-/// Height of the tab strip, shown only when there is more than one tab.
+/// Height of the tab strip.
 ///
-/// A strip above a single tab is a row of chrome that says nothing — the URL
-/// bar already names the page — so it is not drawn until it has something to
-/// distinguish.
+/// Always drawn, even above a single tab. It used to appear only once there
+/// were two, on the grounds that a strip with one tab in it says nothing the
+/// URL bar has not already said — which was true of the tab and not of the
+/// strip, because the only way to open a tab was to know that Ctrl+T did it
+/// (#58). The button has to live somewhere, and a row that appears the moment
+/// you use it is a row you cannot click first.
 pub const TAB_HEIGHT: u32 = 28;
 
 /// Widest a tab may be. Beyond this they stop growing and the strip has room
@@ -34,6 +37,8 @@ pub const TAB_HEIGHT: u32 = 28;
 const TAB_MAX_WIDTH: f32 = 200.0;
 /// Narrowest a tab may be before its label is pointless.
 const TAB_MIN_WIDTH: f32 = 70.0;
+/// Width of the new-tab button at the end of the strip.
+const NEW_TAB_WIDTH: f32 = 28.0;
 
 /// Width of the back and forward buttons.
 const BUTTON: f32 = 40.0;
@@ -135,17 +140,14 @@ impl Default for Theme {
     }
 }
 
-/// Total height of the chrome, given how many tabs there are.
-pub fn total_height(tab_count: usize) -> u32 {
-    HEIGHT + if tab_count > 1 { TAB_HEIGHT } else { 0 }
+/// Total height of the chrome: the URL bar and the tab strip above it.
+pub fn total_height() -> u32 {
+    HEIGHT + TAB_HEIGHT
 }
 
 /// Where each tab sits in the strip.
 pub fn tab_rects(tab_count: usize, width: f32) -> Vec<Rect> {
-    if tab_count <= 1 {
-        return Vec::new();
-    }
-    let each = (width / tab_count as f32).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
+    let each = (width / tab_count.max(1) as f32).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
     (0..tab_count)
         .map(|index| Rect {
             x: index as f32 * each,
@@ -156,24 +158,81 @@ pub fn tab_rects(tab_count: usize, width: f32) -> Vec<Rect> {
         .collect()
 }
 
+/// What a click in the tab strip asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripClick {
+    /// Open another tab.
+    NewTab,
+    /// Switch to this one.
+    Select(usize),
+    /// Close this one.
+    Close(usize),
+}
+
+/// What a point in the strip's own coordinates means.
+///
+/// One function rather than a hit test per control, because the order matters
+/// and the window is the wrong place to keep it: on a strip too full for the
+/// new-tab button it is drawn over the end of the last tab, so it has to be
+/// asked about before the tabs are. Answering "select the last tab" to a click
+/// on a button drawn on top of it is the kind of disagreement between drawing
+/// and hit-testing that nothing would notice.
+pub fn strip_click(tab_count: usize, width: f32, x: f32, y: f32) -> Option<StripClick> {
+    if on_new_tab(tab_count, width, x, y) {
+        return Some(StripClick::NewTab);
+    }
+    match tab_at(tab_count, width, x, y) {
+        Some((index, true)) => Some(StripClick::Close(index)),
+        Some((index, false)) => Some(StripClick::Select(index)),
+        None => None,
+    }
+}
+
 /// The tab at a point in the strip's own coordinates, and whether the point is
 /// on its close button.
-pub fn tab_at(tab_count: usize, width: f32, x: f32, y: f32) -> Option<(usize, bool)> {
+fn tab_at(tab_count: usize, width: f32, x: f32, y: f32) -> Option<(usize, bool)> {
     tab_rects(tab_count, width)
         .into_iter()
         .enumerate()
         .find_map(|(index, rect)| {
             let inside =
                 x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
-            // The close button is the right-hand end of the tab.
-            inside.then_some((index, x > rect.x + rect.width - CLOSE_WIDTH))
+            // The close button is the right-hand end of the tab, and the last
+            // tab has none: closing it is refused, and a button that does
+            // nothing is worse than no button.
+            let closable = tab_count > 1 && x > rect.x + rect.width - CLOSE_WIDTH;
+            inside.then_some((index, closable))
         })
 }
 
 /// Width of a tab's close button.
 const CLOSE_WIDTH: f32 = 22.0;
 
-/// Draws the tab strip. Empty when there is only one tab.
+/// Where the new-tab button sits: after the last tab, or against the right
+/// edge once the tabs have filled the strip.
+///
+/// It is drawn after the tabs and asked about before them, so on a full strip
+/// it sits over the end of the last tab rather than off the side of the
+/// window. A button that leaves the window is a button that is not there.
+pub fn new_tab_rect(tab_count: usize, width: f32) -> Rect {
+    let after = tab_rects(tab_count, width)
+        .last()
+        .map_or(0.0, |last| last.x + last.width);
+    Rect {
+        x: after.min((width - NEW_TAB_WIDTH).max(0.0)),
+        y: 0.0,
+        width: NEW_TAB_WIDTH,
+        height: TAB_HEIGHT as f32,
+    }
+}
+
+/// Whether a point in the strip's own coordinates is on the new-tab button.
+fn on_new_tab(tab_count: usize, width: f32, x: f32, y: f32) -> bool {
+    let rect = new_tab_rect(tab_count, width);
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+/// Draws the tab strip: the tabs, then the button that opens another.
 pub fn render_tabs(
     labels: &[&str],
     active: usize,
@@ -223,17 +282,39 @@ pub fn render_tabs(
             },
             rect.width - PADDING * 2.0 - CLOSE_WIDTH,
         );
-        draw_text(
-            &mut list,
-            fonts,
-            "\u{00d7}",
-            &ui_style(14.0),
-            rect.x + rect.width - CLOSE_WIDTH + 5.0,
-            TAB_HEIGHT as f32 / 2.0 - 9.0,
-            theme.dim,
-            CLOSE_WIDTH,
-        );
+        // No close button on the only tab: closing it is refused, so drawing
+        // one would be a button that does nothing.
+        if labels.len() > 1 {
+            draw_text(
+                &mut list,
+                fonts,
+                "\u{00d7}",
+                &ui_style(14.0),
+                rect.x + rect.width - CLOSE_WIDTH + 5.0,
+                TAB_HEIGHT as f32 / 2.0 - 9.0,
+                theme.dim,
+                CLOSE_WIDTH,
+            );
+        }
     }
+
+    // Last, so that on a strip full of tabs it is drawn over the end of one
+    // rather than under it.
+    let plus = new_tab_rect(labels.len(), width as f32);
+    list.items.push(DisplayItem::Rect {
+        rect: plus,
+        color: theme.rule,
+    });
+    draw_text(
+        &mut list,
+        fonts,
+        "+",
+        &ui_style(16.0),
+        plus.x + NEW_TAB_WIDTH / 2.0 - 4.0,
+        TAB_HEIGHT as f32 / 2.0 - 10.0,
+        theme.dim,
+        NEW_TAB_WIDTH,
+    );
 
     rasterise(
         &list,
@@ -2069,18 +2150,75 @@ mod tab_strip_tests {
     use super::*;
 
     #[test]
-    fn a_single_tab_gets_no_strip() {
-        // A strip above one tab is a row of chrome that says nothing: the URL
-        // bar already names the page.
-        assert!(tab_rects(1, 800.0).is_empty());
-        assert_eq!(total_height(1), HEIGHT);
-        assert_eq!(tab_at(1, 800.0, 10.0, 5.0), None);
+    fn a_single_tab_gets_a_strip_too() {
+        // It used to appear only with a second tab, on the grounds that a
+        // strip above one tab says nothing the URL bar has not already said.
+        // True of the tab; not of the strip, which is where the button that
+        // opens the second one lives — and a row that appears the moment you
+        // use it is a row you cannot click first (#58).
+        assert_eq!(tab_rects(1, 800.0).len(), 1);
+        assert_eq!(total_height(), HEIGHT + TAB_HEIGHT);
+        assert_eq!(
+            strip_click(1, 800.0, 10.0, 5.0),
+            Some(StripClick::Select(0))
+        );
+        // Including at the right-hand end, where a second tab would have a
+        // close button: closing the last tab is refused, so it has none.
+        assert_eq!(
+            strip_click(1, 800.0, 195.0, 5.0),
+            Some(StripClick::Select(0))
+        );
+        assert_eq!(
+            strip_click(2, 800.0, 195.0, 5.0),
+            Some(StripClick::Close(0))
+        );
     }
 
     #[test]
-    fn the_strip_appears_with_a_second_tab() {
+    fn the_strip_takes_a_second_tab() {
         assert_eq!(tab_rects(2, 800.0).len(), 2);
-        assert_eq!(total_height(2), HEIGHT + TAB_HEIGHT);
+    }
+
+    #[test]
+    fn the_new_tab_button_follows_the_last_tab() {
+        // Beside the tabs rather than pinned to the far edge: with two tabs on
+        // a wide window, a button against the right-hand side is a long way
+        // from anything it relates to.
+        // Three tabs of 200 across 800 leave room for it; five would not, and
+        // that case is the next test.
+        for count in [1_usize, 2, 3] {
+            let tabs = tab_rects(count, 800.0);
+            let last = tabs.last().expect("a tab");
+            let plus = new_tab_rect(count, 800.0);
+
+            assert_eq!(plus.x, last.x + last.width, "{count} tabs");
+            assert_eq!(
+                strip_click(count, 800.0, plus.x + 4.0, 10.0),
+                Some(StripClick::NewTab),
+                "{count} tabs"
+            );
+            assert_eq!(
+                strip_click(count, 800.0, last.x, 10.0),
+                Some(StripClick::Select(count - 1)),
+                "{count} tabs"
+            );
+        }
+    }
+
+    #[test]
+    fn a_strip_too_full_for_the_button_keeps_it_in_the_window() {
+        // Tabs stop shrinking at a minimum width, so enough of them run off
+        // the side. The button goes over the end of the last tab instead of
+        // off the window with them — it is drawn last, so it is on top there
+        // — because a button outside the window is a button that is not there.
+        let plus = new_tab_rect(40, 800.0);
+
+        assert!(plus.x + plus.width <= 800.0, "{plus:?}");
+        // And it wins the click, because it is what is drawn there.
+        assert_eq!(
+            strip_click(40, 800.0, 799.0, 10.0),
+            Some(StripClick::NewTab)
+        );
     }
 
     #[test]

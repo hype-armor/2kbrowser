@@ -420,7 +420,7 @@ struct App {
     modifiers: winit::event::Modifiers,
     /// The chrome bar, redrawn whenever what it says changes.
     chrome: paint::Pixmap,
-    /// The tab strip. Empty when there is only one tab.
+    /// The tab strip, which is always drawn: it carries the new-tab button.
     strip: paint::Pixmap,
     /// The URL bar when it has focus. `None` means it is showing where you
     /// are rather than accepting where you want to go.
@@ -1323,9 +1323,9 @@ impl App {
         self.scroll_by(to - self.tab().scroll);
     }
 
-    /// Total chrome height: the URL bar, plus the tab strip when there is one.
+    /// Total chrome height: the URL bar and the tab strip above it.
     fn chrome_height(&self) -> u32 {
-        crate::chrome::total_height(self.tabs.len())
+        crate::chrome::total_height()
     }
 
     /// Height of the page area, which is the window less the chrome.
@@ -1381,11 +1381,7 @@ impl App {
 
         let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
-        let strip_height = if tabs.len() > 1 {
-            crate::chrome::TAB_HEIGHT.min(height.get())
-        } else {
-            0
-        };
+        let strip_height = crate::chrome::TAB_HEIGHT.min(height.get());
         let bar_height = (strip_height + crate::chrome::HEIGHT).min(height.get());
 
         // The strip, then the bar, across the top.
@@ -1888,23 +1884,27 @@ impl ApplicationHandler<BandReady> for App {
                     }
                     // The bar owns the top of the window, so it gets first
                     // refusal on a click there.
-                    let strip_height = if self.tabs.len() > 1 {
-                        crate::chrome::TAB_HEIGHT as f32
-                    } else {
-                        0.0
-                    };
-                    if self.pointer.1 < strip_height {
-                        if let Some((index, on_close)) = crate::chrome::tab_at(
+                    if self.pointer.1 < crate::chrome::TAB_HEIGHT as f32 {
+                        match crate::chrome::strip_click(
                             self.tabs.len(),
                             self.size.0 as f32,
                             self.pointer.0,
                             self.pointer.1,
                         ) {
-                            if on_close {
+                            // A new tab shows the page you are on, which is
+                            // what Ctrl+T does and the only thing this browser
+                            // could put there.
+                            Some(crate::chrome::StripClick::NewTab) => {
+                                let url = self.tab().history.current().to_owned();
+                                self.open_tab(&url);
+                            }
+                            Some(crate::chrome::StripClick::Close(index)) => {
                                 self.close_tab(index);
-                            } else {
+                            }
+                            Some(crate::chrome::StripClick::Select(index)) => {
                                 self.select_tab(index);
                             }
+                            None => {}
                         }
                     } else if self.pointer.1 < self.chrome_height() as f32 {
                         match self.control_under_pointer() {
@@ -2290,7 +2290,7 @@ mod tests {
 
     #[test]
     fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
-        let chrome = crate::chrome::total_height(1);
+        let chrome = crate::chrome::total_height();
         assert_eq!(document_point((10.0, 0.0), chrome, 0.0), None);
         assert_eq!(
             document_point((10.0, chrome as f32 - 1.0), chrome, 0.0),
@@ -2305,7 +2305,7 @@ mod tests {
 
     #[test]
     fn scrolling_moves_the_document_under_the_pointer() {
-        let chrome = crate::chrome::total_height(1);
+        let chrome = crate::chrome::total_height();
         let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, scroll);
         assert_eq!(at(0.0), Some((0.0, 100.0)));
         assert_eq!(at(973.0), Some((0.0, 1073.0)));
@@ -2325,25 +2325,18 @@ mod tests {
         // browser where they disagree paints a link in one place and follows it
         // from another. This is the check that was missing when the bar grew
         // from 34 pixels to 46.
-        for tabs in [1_usize, 2, 5] {
-            let chrome = crate::chrome::total_height(tabs);
-            // Exactly how `draw` computes it, from the same constants.
-            let strip = if tabs > 1 {
-                crate::chrome::TAB_HEIGHT
-            } else {
-                0
-            };
-            let bar = strip + crate::chrome::HEIGHT;
-            for row in [bar, bar + 1, bar + 250, bar + 4000] {
-                for scroll in [0_u32, 1, 973, 10_000] {
-                    let drawn = row - bar + scroll;
-                    let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
-                        .expect("a row at or below the bar is on the page");
-                    assert_eq!(
-                        hit as u32, drawn,
-                        "tabs={tabs} row={row} scroll={scroll}: drawn {drawn}, hit {hit}"
-                    );
-                }
+        let chrome = crate::chrome::total_height();
+        // Exactly how `draw` computes it, from the same constants.
+        let bar = crate::chrome::TAB_HEIGHT + crate::chrome::HEIGHT;
+        for row in [bar, bar + 1, bar + 250, bar + 4000] {
+            for scroll in [0_u32, 1, 973, 10_000] {
+                let drawn = row - bar + scroll;
+                let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
+                    .expect("a row at or below the bar is on the page");
+                assert_eq!(
+                    hit as u32, drawn,
+                    "row={row} scroll={scroll}: drawn {drawn}, hit {hit}"
+                );
             }
         }
     }
