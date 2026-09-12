@@ -2011,7 +2011,24 @@ fn layout_block(
                 + border_bottom
         }
     };
-    // §10.7: the used height is then raised to `min-height`, whether it came
+    // §10.7: the used height is capped at `max-height` first, and raised to
+    // `min-height` after — that order is the spec's, and it is what makes
+    // `min-height` win when an author asks for both at once. Content taller
+    // than the cap overflows rather than being clipped, which is the same
+    // thing this engine does everywhere else and is why the canvas is sized
+    // from what is drawn rather than from the boxes.
+    //
+    // A percentage is treated as no bound, for the reason given below.
+    if let Length::Px(_) | Length::Em(_) = style.max_height {
+        let ceiling = style.max_height.to_px(font_size, 0.0)
+            + padding_top
+            + padding_bottom
+            + border_top
+            + border_bottom;
+        box_.rect.height = box_.rect.height.min(ceiling);
+    }
+
+    // The used height is then raised to `min-height`, whether it came
     // from a declared height or from the content. Like `height` it bounds the
     // *content* box, so the surround is added back on — the same shape as
     // `max-width` above, and wrong in the same visible way if it is not.
@@ -3340,6 +3357,133 @@ mod tests {
             (box_.rect.height - (120.0 + 20.0 + 10.0)).abs() < 0.01,
             "got {:?}",
             box_.rect
+        );
+    }
+
+    #[test]
+    fn max_height_caps_a_box_that_would_be_taller() {
+        let rendered = run(
+            "<body><div>one<br>two<br>three<br>four</div></body>",
+            "body { margin: 0 } div { max-height: 30px }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.height, 30.0);
+    }
+
+    #[test]
+    fn max_height_does_not_stretch_a_shorter_box() {
+        let rendered = run(
+            "<body><div>one line</div></body>",
+            "body { margin: 0 } div { max-height: 300px }",
+            600.0,
+        );
+        let height = content_boxes(&rendered)[0].rect.height;
+        assert!(
+            height < 300.0,
+            "a cap is not a height: the box grew to {height}"
+        );
+    }
+
+    #[test]
+    fn max_height_none_takes_an_earlier_cap_back_off() {
+        // How a page overrides a cap set by a rule above it. `none` is a
+        // keyword, not a length, so parsing one is not enough to see it.
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { height: 96px; max-height: 0; max-height: none }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.height, 96.0);
+    }
+
+    #[test]
+    fn a_negative_bound_is_invalid_and_leaves_the_box_alone() {
+        // CSS 2.1 forbids a negative value here, and an invalid declaration is
+        // dropped rather than clamped to zero — the box keeps the height it
+        // had. Clamping instead collapses a one-inch square to nothing, which
+        // is what four of the suite's `max-height` tests check for directly.
+        for bound in [
+            "max-height: -1px",
+            "min-height: -1px",
+            "width: -1px",
+            "height: -1px",
+        ] {
+            let css = format!("body {{ margin: 0 }} div {{ height: 96px; width: 96px; {bound} }}");
+            let rendered = run("<body><div></div></body>", &css, 600.0);
+            let rect = content_boxes(&rendered)[0].rect;
+            assert_eq!((rect.width, rect.height), (96.0, 96.0), "{bound}");
+        }
+    }
+
+    #[test]
+    fn a_negative_padding_is_invalid_but_a_negative_margin_is_not() {
+        // The one place the two edges differ. A negative margin is legal and
+        // was how the era pulled a box back over its neighbour; a negative
+        // padding is invalid and the declaration goes.
+        let padded = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { padding: 10px; padding-top: -5px }",
+            600.0,
+        );
+        assert_eq!(
+            content_boxes(&padded)[0].style.padding.top,
+            css::Length::Px(10.0),
+            "a negative padding was accepted"
+        );
+        let pulled = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { margin-top: -5px }",
+            600.0,
+        );
+        assert_eq!(
+            content_boxes(&pulled)[0].style.margin.top,
+            css::Length::Px(-5.0),
+            "a negative margin was rejected"
+        );
+    }
+
+    #[test]
+    fn min_height_wins_when_both_bounds_apply() {
+        // §10.7 applies the maximum first and the minimum second, so a box
+        // asked to be at most 10px and at least 60px is 60px. Applying them
+        // the other way round gives 10px and looks just as deliberate.
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { max-height: 10px; min-height: 60px }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.height, 60.0);
+    }
+
+    #[test]
+    fn max_height_bounds_the_content_box_and_not_the_border_box() {
+        // The same shape as `max-width` and `min-height`: the bound is on the
+        // content box, so padding and border are added back on. Getting this
+        // wrong is a few pixels and is plainly visible on a bordered box.
+        let rendered = run(
+            "<body><div>one<br>two<br>three</div></body>",
+            "body { margin: 0 } div { max-height: 20px; padding: 5px; border: 2px solid black }",
+            600.0,
+        );
+        assert_eq!(
+            content_boxes(&rendered)[0].rect.height,
+            20.0 + 10.0 + 4.0,
+            "the cap swallowed the padding and border"
+        );
+    }
+
+    #[test]
+    fn a_percentage_max_height_is_no_bound() {
+        // It resolves against the containing block's height, which is `auto`
+        // for nearly every box here. Chromium leaves such a box unbounded too.
+        let rendered = run(
+            "<body><div>one<br>two<br>three<br>four</div></body>",
+            "body { margin: 0 } div { max-height: 25% }",
+            600.0,
+        );
+        assert!(
+            content_boxes(&rendered)[0].rect.height > 40.0,
+            "a percentage was treated as a bound"
         );
     }
 

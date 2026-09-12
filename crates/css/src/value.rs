@@ -299,6 +299,23 @@ impl Length {
         }
     }
 
+    /// Whether this length is negative.
+    ///
+    /// CSS 2.1 forbids a negative value for `width`, `height`, the `min-` and
+    /// `max-` bounds, `border-spacing` and padding, and an invalid value means
+    /// the declaration is dropped — the property keeps what it had. The suite
+    /// checks it head-on: `max-height: -1px` on a box with `height: 1in` must
+    /// leave a one-inch square, where a cap of minus one pixel collapses it to
+    /// nothing. `min-height: -1px` and `padding-top: -1px` are tested the same
+    /// way, and margins and offsets are *not*, because a negative one is legal
+    /// there and useful.
+    pub fn is_negative(self) -> bool {
+        match self {
+            Length::Px(value) | Length::Em(value) | Length::Percent(value) => value < 0.0,
+            Length::Auto => false,
+        }
+    }
+
     /// Resolves to pixels. `auto` and percentages need context the caller has.
     pub fn to_px(self, font_size: f32, percent_basis: f32) -> f32 {
         match self {

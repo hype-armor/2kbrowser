@@ -60,8 +60,9 @@ wikitable is built out of; table captions, which sit outside the table's
 border box on whichever side `caption-side` names; `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
-`letter-spacing`, `text-indent` on a block's first line, `min-height`, and
-`z-index`, so that two overlapping positioned boxes land in the order their
+`letter-spacing`, `text-indent` on a block's first line, `min-height` and
+`max-height` — applied in the order §10.7 gives them, so a box asked for both
+at once takes the minimum — and `z-index`, so that two overlapping positioned boxes land in the order their
 author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
@@ -93,8 +94,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2106 of 4821 reference tests pass,
-43.7%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2180 of 4821 reference tests pass,
+45.2%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -162,7 +163,7 @@ its group rather than breaking the rule it is written into.
 
 And a list of properties that parse and are then ignored, which is longer than
 this file used to admit: `word-spacing`, `font-variant`, `outline`,
-`max-height`, `text-align: justify`, `list-style-position`, `list-style-image`,
+`text-align: justify`, `list-style-position`, `list-style-image`,
 `clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so

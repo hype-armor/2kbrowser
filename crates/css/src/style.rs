@@ -1060,6 +1060,12 @@ pub struct ComputedStyle {
     ///
     /// `Auto` means no bound, as it does for `max_width`.
     pub min_height: Length,
+    /// An upper bound on the used height.
+    ///
+    /// `Auto` means no bound. Where both apply, `min_height` wins: §10.7
+    /// applies the maximum first and the minimum second, so a box asked to be
+    /// at most 10px and at least 20px is 20px.
+    pub max_height: Length,
     /// `z-index`, and `None` for `auto`.
     ///
     /// Only consulted on a positioned box, which is the only place §9.9 gives
@@ -1140,6 +1146,7 @@ impl Default for ComputedStyle {
             letter_spacing: 0.0,
             text_indent: Length::Px(0.0),
             min_height: Length::Auto,
+            max_height: Length::Auto,
             z_index: None,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
