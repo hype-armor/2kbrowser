@@ -709,6 +709,16 @@ fn apply(
                 style.max_height = length;
             }
         }
+        // §10.4. `auto` is not a value `min-width` takes in CSS 2.1 — the
+        // initial value is `0` — but `Auto` is how "no bound" is spelled here,
+        // and a zero floor and no floor are the same floor. `parse_size`
+        // rather than `parse_length`, because a negative floor is one of the
+        // values §10.4 forbids outright.
+        "min-width" => {
+            if let Some(length) = parse_size(first) {
+                style.min_width = length;
+            }
+        }
         // §9.9. `auto` is the initial value and means "no new stacking context
         // and paint in tree order", which is what `None` stands for.
         "z-index" => {

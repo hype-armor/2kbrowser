@@ -1189,10 +1189,15 @@ pub struct ComputedStyle {
     pub width: Length,
     /// An upper bound on the used width, which `width` is clamped to.
     ///
-    /// `Auto` means no bound. Only the maximum is modelled: `min-width` has no
-    /// use here yet, and a property that is parsed and ignored is worse than
-    /// one that is absent — it reads as supported.
+    /// `Auto` means no bound.
     pub max_width: Length,
+    /// A lower bound on the used width, applied after `max_width` (§10.4).
+    ///
+    /// `Auto` means no bound, as it does for `max_width`. This used to be
+    /// absent on the grounds that nothing needed it — a property parsed and
+    /// ignored reads as supported, which is worse than one that is missing.
+    /// Wikipedia's stylesheet asks for it 33 times.
+    pub min_width: Length,
     /// `height`.
     pub height: Length,
 }
@@ -1231,6 +1236,7 @@ impl Default for ComputedStyle {
             max_height: Length::Auto,
             content: None,
             clip: None,
+            min_width: Length::Auto,
             z_index: None,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,

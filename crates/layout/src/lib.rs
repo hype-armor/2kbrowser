@@ -1610,6 +1610,15 @@ fn layout_block(
         Length::Auto => outer_width,
         bound => outer_width.min(bound.to_px(font_size, available_width) + surround),
     };
+    // §10.4 again, and after the maximum rather than before it: where the two
+    // bounds cross, the minimum wins. A box told to be at most 100px and at
+    // least 200px is 200px wide — which looks like a mistake in the stylesheet
+    // and is what the specification asks for, because the author who wrote a
+    // floor meant the content to fit.
+    let outer_width = match style.min_width {
+        Length::Auto => outer_width,
+        bound => outer_width.max(bound.to_px(font_size, available_width) + surround),
+    };
     let content_width = (outer_width - surround).max(0.0);
 
     // CSS 2.1 §10.3.3. An auto margin beside a definite width takes the space
@@ -5527,6 +5536,77 @@ mod tests {
         assert_eq!(width_of("width: 800px; max-width: 300px", 1000.0), 300.0);
         // And a bound wider than the space available does not widen anything.
         assert_eq!(width_of("max-width: 900px", 400.0), 400.0);
+    }
+
+    /// Width of the one 10px-tall box on a page, which is how these ask.
+    fn bounded_width(css: &str, available: f32) -> f32 {
+        let rendered = run(
+            "<body><div class=\"b\"></div></body>",
+            &format!("body {{ margin: 0 }} .b {{ height: 10px; {css} }}"),
+            available,
+        );
+        content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.rect.height == 10.0)
+            .expect("the box")
+            .rect
+            .width
+    }
+
+    #[test]
+    fn min_width_raises_a_box_that_would_be_narrower() {
+        // §10.4, and absent until now on the grounds that nothing needed it.
+        // Wikipedia's stylesheet asks for it 33 times, and 27 WPT tests went
+        // from failing to passing when it arrived.
+        assert_eq!(bounded_width("width: 10px; min-width: 300px", 800.0), 300.0);
+        // One already above the floor is left exactly alone. Getting this
+        // backwards would make every floored box the same size.
+        assert_eq!(
+            bounded_width("width: 600px; min-width: 100px", 800.0),
+            600.0
+        );
+    }
+
+    #[test]
+    fn a_negative_floor_is_dropped_rather_than_obeyed() {
+        // §10.4 forbids a negative value here, and an invalid declaration is
+        // dropped rather than clamped: the box keeps the width it already had.
+        // Free with `parse_size`, which arrived with `max-height`, and worth
+        // pinning because using the plain length parser would look right until
+        // a stylesheet said `min-width: -1px`.
+        assert_eq!(bounded_width("width: 60px; min-width: -1px", 800.0), 60.0);
+    }
+
+    #[test]
+    fn min_width_wins_where_it_crosses_max_width() {
+        // §10.4 applies the maximum and *then* the minimum, so where the two
+        // cross the floor is what survives. It looks like a mistake in the
+        // stylesheet and is what the specification asks for: the author who
+        // wrote a floor meant the content to fit. Chromium gives 200 here too.
+        assert_eq!(
+            bounded_width("width: 10px; max-width: 50px; min-width: 200px", 800.0),
+            200.0
+        );
+    }
+
+    #[test]
+    fn min_width_measures_the_content_box_like_width_does() {
+        // The same shape as `max-width`: CSS 2.1 sizes the *content* box, so
+        // padding and border grow the box outwards past the floor rather than
+        // eating into it. 200 of content and 50 of padding is 250 of box, which
+        // is what Chromium lays out.
+        assert_eq!(
+            bounded_width("width: 100px; min-width: 200px; padding: 0 25px", 800.0),
+            250.0
+        );
+    }
+
+    #[test]
+    fn a_floor_below_the_width_already_taken_changes_nothing() {
+        // A percentage floor resolves against the containing block's width, so
+        // a box filling its container is already past a floor of less than all
+        // of it.
+        assert_eq!(bounded_width("min-width: 40%", 100.0), 100.0);
     }
 
     #[test]
