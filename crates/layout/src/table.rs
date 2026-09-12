@@ -250,6 +250,106 @@ fn collect_columns(
     }
 }
 
+/// Reads a row's cells, in document order, assigning each a column.
+///
+/// `occupied` carries how many further rows each column is still held by a
+/// cell spanning down from above, and is advanced by one row here.
+fn collect_cells(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    nodes: &[NodeId],
+    occupied: &mut Vec<usize>,
+) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    let mut column = 0;
+    for &cell_node in nodes {
+        // Step over columns a cell from an earlier row still holds.
+        while occupied.get(column).is_some_and(|rows| *rows > 0) {
+            column += 1;
+        }
+        let Some(cell_element) = doc.element(cell_node) else {
+            continue;
+        };
+        let Some(cell_style) = styles.get(cell_node) else {
+            continue;
+        };
+        if cell_style.display != Display::TableCell {
+            continue;
+        }
+        let span = |name: &str| {
+            cell_element
+                .attr(name)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, MAX_SPAN)
+        };
+        let colspan = span("colspan");
+        let rowspan = span("rowspan");
+
+        if occupied.len() < column + colspan {
+            occupied.resize(column + colspan, 0);
+        }
+        for slot in &mut occupied[column..column + colspan] {
+            // This row included, so a rowspan of 1 leaves nothing behind once
+            // the row is done.
+            *slot = rowspan;
+        }
+
+        cells.push(Cell {
+            node: cell_node,
+            style: cell_style.clone(),
+            colspan,
+            rowspan,
+            column,
+        });
+        column += colspan;
+    }
+    // The row is finished, so every occupancy count owes one fewer row from
+    // here on.
+    for slot in occupied.iter_mut() {
+        *slot = slot.saturating_sub(1);
+    }
+    cells
+}
+
+/// Emits the anonymous row §17.2.1 puts around a run of cells that had no row
+/// of their own, and empties the run.
+///
+/// The row is not an element, so it borrows the parent's node for identity and
+/// takes a style that paints nothing: an anonymous box is not something an
+/// author wrote and must not draw a second background or border.
+fn flush_anonymous_row(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    stray: &mut Vec<NodeId>,
+    parent: NodeId,
+    group: Option<usize>,
+    occupied: &mut Vec<usize>,
+    grid: &mut Grid,
+) {
+    if stray.is_empty() {
+        return;
+    }
+    let nodes = std::mem::take(stray);
+    let cells = collect_cells(doc, styles, &nodes, occupied);
+    if cells.is_empty() {
+        return;
+    }
+    let style = styles.get(parent).cloned().unwrap_or_default();
+    grid.rows.push(Row {
+        node: parent,
+        style: ComputedStyle {
+            display: Display::TableRow,
+            background_color: css::Color::TRANSPARENT,
+            background_image: None,
+            border: css::style::Borders::default(),
+            ..style
+        },
+        cells,
+        group,
+    });
+}
+
 fn collect_rows(
     doc: &Document,
     styles: &css::cascade::StyleMap,
@@ -258,6 +358,8 @@ fn collect_rows(
     occupied: &mut Vec<usize>,
     grid: &mut Grid,
 ) {
+    // Cells found where a row was expected, waiting for the run to end.
+    let mut stray: Vec<NodeId> = Vec::new();
     for &child in doc.children(node) {
         let Some(style) = styles.get(child) else {
             continue;
@@ -273,56 +375,8 @@ fn collect_rows(
         match style.display {
             Display::None => {}
             Display::TableRow => {
-                let mut cells = Vec::new();
-                let mut column = 0;
-                for &cell_node in doc.children(child) {
-                    // Step over columns a cell from an earlier row still holds.
-                    while occupied.get(column).is_some_and(|rows| *rows > 0) {
-                        column += 1;
-                    }
-                    let Some(cell_element) = doc.element(cell_node) else {
-                        continue;
-                    };
-                    let Some(cell_style) = styles.get(cell_node) else {
-                        continue;
-                    };
-                    if cell_style.display != Display::TableCell {
-                        continue;
-                    }
-                    let span = |name: &str| {
-                        cell_element
-                            .attr(name)
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .unwrap_or(1)
-                            .clamp(1, MAX_SPAN)
-                    };
-                    let colspan = span("colspan");
-                    let rowspan = span("rowspan");
-
-                    if occupied.len() < column + colspan {
-                        occupied.resize(column + colspan, 0);
-                    }
-                    for slot in &mut occupied[column..column + colspan] {
-                        // This row included, so a rowspan of 1 leaves nothing
-                        // behind once the row is done.
-                        *slot = rowspan;
-                    }
-
-                    cells.push(Cell {
-                        node: cell_node,
-                        style: cell_style.clone(),
-                        colspan,
-                        rowspan,
-                        column,
-                    });
-                    column += colspan;
-                }
-
-                // The row is finished, so every occupancy count owes one fewer
-                // row from here on.
-                for slot in occupied.iter_mut() {
-                    *slot = slot.saturating_sub(1);
-                }
+                flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
+                let cells = collect_cells(doc, styles, doc.children(child), occupied);
                 if !cells.is_empty() {
                     grid.rows.push(Row {
                         node: child,
@@ -332,11 +386,17 @@ fn collect_rows(
                     });
                 }
             }
+            // §17.2.1: a cell whose parent is not a row gets an anonymous row
+            // around it, together with the cells beside it. Gathered here and
+            // emitted when the run ends, because "the cells beside it" is not
+            // known until something that is not a cell turns up.
+            Display::TableCell => stray.push(child),
             // A row group is still descended through — its rows are flattened
             // into the grid exactly as before — but it is recorded on the way
             // past, because the collapsing model needs its borders and its
             // first and last rows.
             Display::TableRowGroup => {
+                flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
                 let band = grid.row_groups.len();
                 let first = grid.rows.len();
                 grid.row_groups.push(RowBand {
@@ -352,12 +412,25 @@ fn collect_rows(
             // A caption or a column band is the table's business, not a row's:
             // descending into one would read its contents as rows.
             Display::TableCaption | Display::TableColumn | Display::TableColumnGroup => {}
-            // Any other wrapper is transparent, and a row inside one keeps the
-            // group it is nested in. §17.2.1 would make an anonymous row box
-            // here instead; flattening is what this engine does until it does.
-            _ => collect_rows(doc, styles, child, group, occupied, grid),
+            // Neither is anything inside a nested table. The walk below descends
+            // through plain wrappers on purpose — a `<tr>` inside a `<div>`
+            // inside a `<table>` is still that table's row — and without these
+            // two stops it keeps going into boxes that belong to somebody
+            // else, and an outer table collects an inner one's rows as its
+            // own. A markup table hides this: a nested `<table>` lives inside
+            // a `<td>`, and cells are read by the row loop above, which never
+            // recurses. Put the nested table in a `<div>`, or build both out
+            // of `display` values, and the outer grid swallows the inner one.
+            Display::Table => {}
+            // Any other wrapper is transparent, and a row inside one keeps
+            // the group it is nested in.
+            _ => {
+                flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
+                collect_rows(doc, styles, child, group, occupied, grid);
+            }
         }
     }
+    flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
 }
 
 /// Which edge of a box a candidate border came from.
@@ -1078,6 +1151,45 @@ mod tests {
              .c { display: table-cell } .b { display: block }",
         );
         assert_eq!(grid.rows[0].cells.len(), 1, "a block child became a cell");
+    }
+
+    #[test]
+    fn an_outer_table_does_not_collect_a_nested_tables_rows() {
+        // The walk descends through plain wrappers on purpose, so that a row
+        // inside a `<div>` inside a table is still that table's row. Without a
+        // stop at a nested table it keeps going, and the outer grid swallows
+        // the inner one whole — which is two tables drawn as one, with the
+        // inner one's columns spread across the outer one's width.
+        //
+        // Markup hides this: a nested `<table>` lives inside a `<td>`, and
+        // cells are read by the row loop, which never recurses. It shows the
+        // moment either table is built out of `display` values.
+        let grid = css_grid_of(
+            "<body><div id=t><div class=cell>\
+             <div class=inner><div class=r><div class=c>a</div><div class=c>b</div></div></div>\
+             </div></div></body>",
+            "#t, .inner { display: table } .cell { display: table-cell } \
+             .r { display: table-row } .c { display: table-cell }",
+        );
+        // One row, holding the one stray cell §17.2.1 wraps — not two, and not
+        // the inner table's `a` and `b`.
+        assert_eq!(grid.rows.len(), 1);
+        assert_eq!(
+            grid.rows[0].cells.len(),
+            1,
+            "the outer table took the inner table's cells"
+        );
+    }
+
+    #[test]
+    fn a_row_inside_a_plain_wrapper_is_still_the_tables_row() {
+        // The other half, and the reason the walk descends at all.
+        let grid = css_grid_of(
+            "<body><div id=t><div class=wrap><div class=r><div class=c>a</div></div></div></div></body>",
+            "#t { display: table } .wrap { display: block } \
+             .r { display: table-row } .c { display: table-cell }",
+        );
+        assert_eq!(grid.rows.len(), 1, "the wrapper hid the row");
     }
 
     #[test]
