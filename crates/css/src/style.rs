@@ -17,10 +17,12 @@ pub enum Display {
     Inline,
     /// Inline-level box with a block container inside.
     ///
-    /// Parsed and cascaded, and **not laid out**: it is treated as plain
-    /// `inline`, so a width, a height, a border and a background on one are all
-    /// dropped, and an empty one collapses to nothing at all. Counted as
-    /// unsupported layout for that reason — see [`Display::is_supported_layout`].
+    /// Laid out: the box is sized by its own content, placed on a line as one
+    /// atom, and aligned on the baseline of its own last line (§10.3.9,
+    /// §10.8.1). It was for a long time the one unimplemented thing here that
+    /// failed *silently* — laid out as a plain inline, so its width, height,
+    /// border and background were dropped and an empty spacer vanished — which
+    /// is why it is called out here rather than left to the enum.
     InlineBlock,
     /// A list item; laid out as a block for now.
     ListItem,
@@ -58,21 +60,17 @@ impl Display {
     /// path: the page is still rendered, just as a document rather than with
     /// the author's layout.
     ///
-    /// `InlineBlock` is here alongside flex and grid, and it is the one that
-    /// reads as a mistake. The difference between it and them is only that it
-    /// *nearly* works: an inline-block is laid out as a plain inline, so its
-    /// content still appears and only its box is lost. That made it the one
-    /// unimplemented thing here that failed **silently** — no fallback, no
-    /// notice, just a page that is subtly wrong and an empty spacer that
-    /// vanishes. Being nearly right is not a reason to say nothing; it is the
-    /// case ADR-0009 was written for.
+    /// `InlineBlock` used to be here alongside flex and grid, because it was
+    /// laid out as a plain inline and so failed silently — the content still
+    /// appeared and only the box was lost. It is laid out properly now, so a
+    /// page built out of inline-blocks no longer falls back to document mode.
     ///
     /// This is a share, not a switch: the classifier weighs how much of the
-    /// page's text sits under unsupported layout, so a navigation bar built
-    /// from inline-blocks does not push an article into document mode, and a
-    /// page whose body depends on them does.
+    /// page's text sits under unsupported layout, so one flex container in a
+    /// navigation bar does not push an article into document mode, and a page
+    /// whose body depends on them does.
     pub fn is_supported_layout(self) -> bool {
-        !matches!(self, Display::Flex | Display::Grid | Display::InlineBlock)
+        !matches!(self, Display::Flex | Display::Grid)
     }
 
     /// Whether the box participates in inline layout.
@@ -195,23 +193,28 @@ pub fn parse_text_decoration(words: &[String]) -> TextDecoration {
     out
 }
 
-/// The `vertical-align` property, restricted to the values a table cell uses.
+/// The `vertical-align` property, restricted to its keyword values.
 ///
-/// Only the cell case is modelled. Vertical alignment *within a line box* — a
-/// superscript, an image raised off the baseline — is a different mechanism in
-/// a different place, and the era's markup reaches for `valign` on cells far
-/// more than for either.
+/// Two mechanisms share one property. In a table cell it aligns the cell's
+/// content within the row; on an atomic inline box — an image, an inline-block
+/// — it decides where the box hangs on the line. Raising and lowering *text*
+/// (a superscript, a `<sub>`) is the part still not modelled: that needs a
+/// baseline shift applied to a run's glyphs, which is a different place again.
+///
+/// A cell's `middle` comes from the UA sheet rather than from this enum's
+/// default, because the two contexts disagree about what "not stated" means:
+/// CSS's initial value is `baseline`, which is what an inline-block must get,
+/// and what a cell must not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerticalAlign {
-    /// Align the content's top with the cell's.
+    /// Align the box's or content's top with the line box's or cell's.
     Top,
-    /// Centre it in the cell. The default for a cell, and the reason a short
-    /// column looks centred against a long one unless told otherwise.
-    #[default]
+    /// Centre it: in the cell, or against the middle of the parent's text.
     Middle,
-    /// Align the content's bottom with the cell's.
+    /// Align the box's or content's bottom with the line box's or cell's.
     Bottom,
-    /// Align the first line's baseline with the row's.
+    /// Sit on the baseline — the initial value, and for a cell the row's.
+    #[default]
     Baseline,
 }
 
@@ -1224,7 +1227,7 @@ impl Default for ComputedStyle {
             background_repeat: BackgroundRepeat::Repeat,
             background_position: BackgroundPosition::default(),
             overflow: Overflow::Visible,
-            vertical_align: VerticalAlign::Middle,
+            vertical_align: VerticalAlign::Baseline,
             border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
             border_collapse: BorderCollapse::Separate,
             caption_side: CaptionSide::Top,

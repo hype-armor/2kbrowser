@@ -14,7 +14,9 @@ use cosmic_text::{
     Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache,
     Weight,
 };
-use css::style::{ComputedStyle, FontStyle, GenericFamily, TextDecoration, Visibility, WhiteSpace};
+use css::style::{
+    ComputedStyle, FontStyle, GenericFamily, TextDecoration, VerticalAlign, Visibility, WhiteSpace,
+};
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
 const SANS: &[(&str, &[u8])] = &[
@@ -129,6 +131,15 @@ fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
     Some((color.r, color.g, color.b, color.a))
 }
 
+/// The x-height every face bundled here is treated as having, as a fraction of
+/// the font size.
+///
+/// Only `vertical-align: middle` needs it, and only to decide where "the middle
+/// of the parent's text" is. Measuring the real x-height per face would be more
+/// correct and would move nothing perceptible: the four bundled faces sit
+/// between 0.52 and 0.53, and the value is halved before it is used.
+const X_HEIGHT: f32 = 0.5;
+
 /// An atomic inline box that takes up room on a line without contributing
 /// glyphs — an image, in practice.
 ///
@@ -143,6 +154,14 @@ pub struct ReplacedInline {
     pub width: f32,
     /// Used height.
     pub height: f32,
+    /// Distance from the box's top edge to the baseline it aligns on.
+    ///
+    /// Equal to `height` for an image, which is what `vertical-align: baseline`
+    /// means for a replaced element: the bottom edge sits on the line's
+    /// baseline. An inline-block aligns on the baseline of its own last line
+    /// instead (§10.8.1), so part of it hangs below the line's baseline and
+    /// this is smaller than its height.
+    pub baseline: f32,
 }
 
 /// A replaced box after line breaking has placed it.
@@ -265,6 +284,8 @@ pub struct Line {
     pub text: String,
     /// Width of the line's inked content.
     pub width: f32,
+    /// Top of the line box, relative to the text origin.
+    pub y: f32,
     /// Distance from the line box top to the baseline.
     pub baseline: f32,
 }
@@ -306,6 +327,9 @@ struct Segment {
     trailing_space: f32,
     /// Whether a line break is required after this segment.
     mandatory_break: bool,
+    /// Where this segment hangs on the line. Read for atomic inline boxes
+    /// only: raising and lowering *text* is not modelled here.
+    align: VerticalAlign,
     /// Horizontal position within the line, filled in during placement.
     x: f32,
     /// Decoration the segment's style asks for.
@@ -663,6 +687,20 @@ impl FontStore {
         } else {
             0.0
         };
+        // What hangs below the baseline, counted for atomic inline boxes only.
+        //
+        // A line's height here is the tallest thing on it, which is right while
+        // everything on the line is hung from the same baseline. An inline-block
+        // is not: it brings its own, and whatever sits below that baseline is
+        // height the line has to find from somewhere or the box overlaps the
+        // line beneath it.
+        //
+        // Text is deliberately left out. Its ascent and height come from
+        // different places — the shaper's metrics and the computed
+        // `line-height` — and mixing them here is the half-leading model, which
+        // is a larger change than this: it moves every line on every page,
+        // including ones with nothing atomic on them at all.
+        let mut descent = 0.0f32;
 
         // The available width depends on the line's height, and the height
         // depends on what lands on the line. Query with the height so far and
@@ -697,11 +735,40 @@ impl FontStore {
                 x = 0.0;
                 line_height = Self::line_height_for(default_style);
                 ascent = default_style.font_size * 0.8;
+                descent = 0.0;
                 available = constraints(y, line_height).1;
             }
 
-            line_height = line_height.max(segment.shaped.height);
-            ascent = ascent.max(segment.shaped.ascent);
+            match (segment.replaced, segment.align) {
+                // §10.8.1: aligned to the line box rather than to a baseline.
+                // Such a box makes the line at least as tall as itself and
+                // moves the baseline not at all — which is what lets a row of
+                // `vertical-align: bottom` inline-blocks line their bottoms up
+                // however deep each one is.
+                (Some(box_), VerticalAlign::Top | VerticalAlign::Bottom) => {
+                    line_height = line_height.max(box_.height);
+                }
+                // `middle` centres the box on the parent's baseline raised by
+                // half an x-height. The x-height here is taken as a quarter of
+                // the font size rather than measured, which is close for every
+                // face bundled with this engine.
+                (Some(box_), VerticalAlign::Middle) => {
+                    let half = box_.height / 2.0;
+                    let shift = segment.font_size * X_HEIGHT / 2.0;
+                    ascent = ascent.max(half + shift);
+                    descent = descent.max((half - shift).max(0.0));
+                }
+                (replaced, _) => {
+                    ascent = ascent.max(segment.shaped.ascent);
+                    if replaced.is_some() {
+                        descent = descent.max(segment.shaped.height - segment.shaped.ascent);
+                    }
+                    line_height = line_height.max(segment.shaped.height);
+                }
+            }
+            if descent > 0.0 {
+                line_height = line_height.max(ascent + descent);
+            }
             let advance = segment.shaped.width + segment.trailing_space;
             let forced = segment.mandatory_break;
             let mut placed = segment;
@@ -720,6 +787,7 @@ impl FontStore {
                 x = 0.0;
                 line_height = Self::line_height_for(default_style);
                 ascent = default_style.font_size * 0.8;
+                descent = 0.0;
                 available = constraints(y, line_height).1;
             }
         }
@@ -780,11 +848,12 @@ impl FontStore {
         }
         layout.lines.push(Line {
             glyphs,
-            replaced: Self::replaced_for(current, offset, line_y, ascent),
+            replaced: Self::replaced_for(current, offset, line_y, ascent, line_height),
             spans: Self::spans_for(current, offset, line_y, line_height),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
             text,
             width,
+            y: line_y,
             baseline: ascent,
         });
         current.clear();
@@ -825,22 +894,33 @@ impl FontStore {
 
     /// Places one line's atomic inline boxes.
     ///
-    /// Each sits with its bottom edge on the baseline, so an image amid running
-    /// text lines up with it rather than floating above or below.
+    /// Each is hung from the line's baseline by its own: an image, whose
+    /// baseline is its bottom edge, sits on the line rather than floating above
+    /// or below it, and an inline-block lines its last line of text up with the
+    /// text beside it.
     fn replaced_for(
         segments: &[Segment],
         offset: f32,
         line_y: f32,
         ascent: f32,
+        line_height: f32,
     ) -> Vec<PlacedReplaced> {
         segments
             .iter()
             .filter_map(|segment| {
                 let box_ = segment.replaced?;
+                let y = match segment.align {
+                    VerticalAlign::Top => line_y,
+                    VerticalAlign::Bottom => line_y + line_height - box_.height,
+                    VerticalAlign::Middle => {
+                        line_y + ascent - box_.height / 2.0 - segment.font_size * X_HEIGHT / 2.0
+                    }
+                    VerticalAlign::Baseline => line_y + ascent - box_.baseline,
+                };
                 Some(PlacedReplaced {
                     id: box_.id,
                     x: segment.x + offset,
-                    y: line_y + ascent - box_.height,
+                    y,
                     width: box_.width,
                     height: box_.height,
                 })
@@ -944,21 +1024,23 @@ impl FontStore {
     fn segment(&mut self, runs: &[InlineRun]) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::new();
         for run in runs {
-            // An atomic inline box is one unbreakable segment of its own size.
-            // Its baseline is its bottom edge, which is what `vertical-align:
-            // baseline` means for a replaced element and why an inline image
-            // sits on the text's baseline rather than centred on it.
+            // An atomic inline box is one unbreakable segment of its own size,
+            // aligned on the baseline it declares. For an image that is its
+            // bottom edge, which is what `vertical-align: baseline` means for a
+            // replaced element and why an inline image sits on the text's
+            // baseline rather than centred on it.
             if let Some(box_) = run.replaced {
                 out.push(Segment {
                     shaped: Shaped {
                         glyphs: Vec::new(),
                         text: String::new(),
                         width: box_.width,
-                        ascent: box_.height,
+                        ascent: box_.baseline,
                         height: box_.height,
                     },
                     trailing_space: 0.0,
                     mandatory_break: false,
+                    align: run.style.vertical_align,
                     x: 0.0,
                     replaced: Some(box_),
                     source: run.source,
@@ -1027,6 +1109,7 @@ impl FontStore {
                             },
                             trailing_space: space_width,
                             mandatory_break: true,
+                            align: run.style.vertical_align,
                             x: 0.0,
                             replaced: None,
                             source: run.source,
@@ -1044,6 +1127,7 @@ impl FontStore {
                     shaped,
                     trailing_space: space_width,
                     mandatory_break: mandatory,
+                    align: run.style.vertical_align,
                     x: 0.0,
                     replaced: None,
                     source: run.source,

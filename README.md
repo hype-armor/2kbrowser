@@ -101,8 +101,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2296 of 4821 reference tests pass,
-47.6%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2385 of 4821 reference tests pass,
+49.5%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -151,13 +151,18 @@ separated model where it applies — it is correctly ignored in the collapsing
 one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to
 the wider of them rather than mitring it diagonally as browsers do; fixed
-table layout; and `inline-block`,
-which is recognised and then laid out as though it were plain `inline` — an
-empty one with a width and a height collapses to nothing at all. That last one
-now counts as layout this engine does not implement, alongside flex and grid,
-so a page built on inline-blocks is re-rendered as a document and told so
-rather than coming out subtly wrong in silence (ADR-0009). It is a share and
-not a switch, so a navigation bar of them does not move an article.
+table layout; and raising or lowering *text* off the baseline, so a `<sub>` or a
+`<sup>` sits level with the words around it.
+
+`inline-block` used to head this list. It is laid out now: sized by its own
+content (§10.3.9), placed on the line as one atom, and hung from the baseline of
+its own last line (§10.8.1), with `vertical-align` deciding where on the line it
+hangs. It no longer counts as layout this engine cannot do, so a page built on
+inline-blocks keeps the author's layout instead of falling back to a document
+(ADR-0009). What is still missing around it: an inline box's own border and
+padding take up no room on the line, so text after a bordered `<span>` does not
+wrap where it should; and an `<iframe>` has no intrinsic size, so one with
+`width: auto` comes out empty rather than 300x150.
 
 A page can also fall back because its *frame* is unsupported while its prose is
 not — a Wikipedia article is the case, where the text is ordinary flow and the

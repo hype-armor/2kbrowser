@@ -7,7 +7,7 @@ use dom::{Document, ElementData, NodeId};
 use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Edges, Float, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
+    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
     NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
     parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_clip,
     parse_display, parse_float, parse_list_style_type, parse_overflow, parse_position,
@@ -389,6 +389,19 @@ fn compute(
     // places that would each have to remember to ask about `position` first.
     if style.position.is_out_of_flow() {
         style.float = Float::None;
+    }
+
+    // §9.7: a floated or absolutely positioned box is block-level whatever
+    // `display` said, because there is no line for an inline one to sit on.
+    // The spec's table maps several displays; the two that occur are these.
+    // `float: left` beside `display: inline-block` is not a contradiction an
+    // author has to notice — it is how a floated box with a shrink-to-fit
+    // width gets written — and reading the `display` literally put the box on
+    // a line instead of against the containing block's edge.
+    if (style.float != Float::None || style.position.is_out_of_flow())
+        && matches!(style.display, Display::Inline | Display::InlineBlock)
+    {
+        style.display = Display::Block;
     }
 
     style
