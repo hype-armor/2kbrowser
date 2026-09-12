@@ -43,7 +43,9 @@ Ctrl and the wheel zooms, as do Ctrl+plus and Ctrl+minus; Ctrl+0 goes back to
 100%. The page is laid out again at the new size rather than magnified, so the
 text stays sharp and rewraps to the window.
 
-Drag across the page to select text, and Ctrl+C to copy it.";
+Drag across the page to select text, and Ctrl+C to copy it. The right-hand
+button opens a menu: what a link can do, what is selected, where the tab has
+been, and reload.";
 
 /// Prints a line of output, treating a closed pipe as the end of the job.
 ///
