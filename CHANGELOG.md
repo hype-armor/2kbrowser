@@ -16,6 +16,28 @@ record for everything earlier.
 
 ## Unreleased
 
+**Counters.** `counter-reset`, `counter-increment`, `counter()` and
+`counters()` (§12.4), with the self-nesting scope the spec describes — an
+instance created by a reset covers the element, its *following siblings*, and
+all of their descendants. That middle clause is the one easiest to read past,
+and getting it wrong is not subtle: it decides whether the second chapter of a
+document is numbered 2 or 1.
+
+Until now `counter()` in a `content` value dropped the whole declaration, since
+a pseudo-element showing half of what was asked for looks deliberate. That
+turned out to be the larger half of the generated-content failures.
+
+**A `::before` on an inline element reached nothing at all.** Generated boxes
+were bracketed around the *block's* content, so a `::before` on a span inside
+it was never gathered as an inline run and never walked as a block child: it
+simply was not on the page. A span is where a stylesheet usually puts one, so
+every list numbered with `counter()` on inline elements came out blank — which
+is how this was found, by a counter test that produced the right numbers on one
+line and nothing at all on the other.
+
+**3064 of 4821 reference tests to 3180**, 63.6% to 66.0%, with 116 newly
+passing and none newly failing.
+
 **A table is what `display` says it is, not what the tag says.** The grid was
 built by looking for `tr`, `td` and `th` elements, so a table written the way
 CSS defines one — `display: table` on a div, `table-row` on its children —

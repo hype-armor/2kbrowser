@@ -261,11 +261,11 @@ const PROPERTIES: &[Property] = &[
     Property {
         name: "content: counter()",
         scaffold: "",
-        // Out of scope: there is no counter state. The whole declaration is
-        // dropped rather than half-applied, so this must change nothing.
+        // §12.4. A counter nobody reset still counts from zero, so this draws
+        // a number without any `counter-reset` to go with it.
         declaration: "#t::before { content: counter(c) }",
         body: "<p id=t>own text</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "min-height",

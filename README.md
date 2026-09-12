@@ -101,8 +101,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3064 of 4821 reference tests pass,
-63.6%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **3180 of 4821 reference tests pass,
+66.0%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -199,11 +199,16 @@ this file used to admit: `word-spacing`, `font-variant`, `outline`,
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
 leave the page's own styling standing, the second value of `border-spacing`, `direction` and everything else
-about right-to-left text, and the parts of generated content that need state
-this engine does not keep: `counter()`, `counters()`, `open-quote` and its
-family, and `url()` in `content`. Each of those drops the whole declaration
-rather than showing part of what the author asked for, which would look
-deliberate.
+about right-to-left text, and the parts of generated content still out of
+scope: `open-quote` and its family, which needs the nesting depth of quotation
+marks, and `url()` in `content`, which needs an image fetched for a box that is
+not an element. Each of those drops the whole declaration rather than showing
+part of what the author asked for, which would look deliberate.
+
+`counter()` and `counters()` came off that list. Counters are kept now, with
+the self-nesting scope §12.4.1 describes — an instance created by
+`counter-reset` covers the element, its **following siblings**, and all of
+their descendants, which is the part of that sentence easiest to read past.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have

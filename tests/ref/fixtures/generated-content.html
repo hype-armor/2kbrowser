@@ -23,10 +23,20 @@
   .empty::before { content: ""; background: #ffcc00; padding: 0 8px; }
 
   /* Out of scope, so the whole declaration goes rather than half of it.
-     Chromium draws a "0" and a quote mark for these; this engine draws
-     nothing, which is the deliberate difference. */
-  .counter::before { content: counter(c); color: #cc0000; }
+     Chromium draws a quote mark here; this engine draws nothing, which is the
+     deliberate difference. */
   .quote::before   { content: open-quote; color: #cc0000; }
+
+  /* Counters. A counter nobody reset still counts from zero (§12.4.1), and a
+     nested one prints every instance in scope. */
+  ol.chapters { counter-reset: chapter; list-style: none; padding-left: 0; }
+  ol.chapters > li { counter-increment: chapter; }
+  ol.chapters > li::before { content: "Chapter " counter(chapter) ". "; color: #0066aa; }
+  ol.nested, ol.nested ol { counter-reset: section; list-style: none; padding-left: 16px; }
+  ol.nested li { counter-increment: section; }
+  ol.nested li::before { content: counters(section, ".") " "; color: #0066aa; }
+  .roman::before { content: counter(page, upper-roman) " — "; color: #0066aa; }
+  .roman { counter-reset: page 7; }
 
   /* A column box renders no content. */
   .column::before { content: "FAIL"; display: table-column; color: #cc0000; }
@@ -53,13 +63,17 @@
 <h3>Nothing generated</h3>
 <p class="none">content: none</p>
 <p class="normal">content: normal</p>
-<p class="counter">counter() is out of scope</p>
 <p class="quote">open-quote is out of scope</p>
 <p class="column">display: table-column</p>
 <p class="hidden">display: none</p>
 
 <h3>An empty string generates a box, which paints nothing here (#46)</h3>
 <p class="empty">no yellow: an inline box has no background yet</p>
+
+<h3>Counters</h3>
+<ol class="chapters"><li>first</li><li>second</li><li>third</li></ol>
+<ol class="nested"><li>one<ol><li>one one</li><li>one two</li></ol></li><li>two</li></ol>
+<p class="roman">a counter reset to seven, in roman</p>
 
 <h3>Mixed content: the brackets go outside, once</h3>
 <div class="mixed">first<p>a block in the middle</p>last</div>

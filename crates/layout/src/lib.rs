@@ -3691,6 +3691,15 @@ fn gather_one(
         return;
     }
 
+    // §12.1 again, one level in: a `::before` on an inline element inside the
+    // block is part of the same line, and nothing else reaches it.
+    // `collect_inline_runs` brackets the block's own generated boxes, and this
+    // brackets every inline element below it — which is where they usually
+    // are, since the elements a stylesheet numbers or labels are spans and
+    // anchors far more often than they are the container.
+    if let Some(before) = generated_run(styles, child, PseudoElement::Before) {
+        out.push(before);
+    }
     for &grandchild in doc.children(child) {
         gather_one(
             doc,
@@ -3703,6 +3712,9 @@ fn gather_one(
             available_width,
             out,
         );
+    }
+    if let Some(after) = generated_run(styles, child, PseudoElement::After) {
+        out.push(after);
     }
 }
 
@@ -5593,6 +5605,27 @@ mod tests {
             .into_iter()
             .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
         assert!(cell.is_some(), "the orphan cell vanished");
+    }
+
+    #[test]
+    fn a_generated_box_on_an_inline_element_reaches_the_line() {
+        // `collect_inline_runs` brackets the *block's* generated boxes. A
+        // `::before` on a span inside it was reached by nothing at all — and a
+        // span is where a stylesheet usually puts one, so every numbered list
+        // built out of `counter()` on inline elements came out blank.
+        let rendered = run(
+            "<body><p>before <span>x</span> after</p></body>",
+            "body { margin: 0 } span::before { content: \"[\" } \
+             span::after { content: \"]\" }",
+            600.0,
+        );
+        let text: String = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter())
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(text, "before [x] after");
     }
 
     #[test]
