@@ -1,0 +1,70 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font: 13px/17px serif; }
+  h3 { font: bold 13px serif; margin: 10px 0 4px 0; }
+
+  .both::before { content: "BEFORE "; color: #cc0000; }
+  .both::after  { content: " AFTER";  color: #008000; }
+
+  /* The era's spelling, one colon. */
+  .old:before { content: "one colon "; color: #0000cc; }
+
+  /* Strings and attributes concatenate. */
+  .attr::before { content: "[" attr(title) "] "; color: #800080; }
+  /* A missing attribute is the empty string, not a failure. */
+  .missing::before { content: "<" attr(nosuch) ">"; color: #800080; }
+
+  /* Neither generates a box. */
+  .none::before   { content: none; color: #cc0000; }
+  .normal::before { content: normal; color: #cc0000; }
+
+  /* An empty string generates a box. It is invisible here and should not be:
+     no inline box paints a background or padding yet — issue #46, and nothing
+     to do with generated content. Kept so the baseline records it. */
+  .empty::before { content: ""; background: #ffcc00; padding: 0 8px; }
+
+  /* Out of scope, so the whole declaration goes rather than half of it.
+     Chromium draws a "0" and a quote mark for these; this engine draws
+     nothing, which is the deliberate difference. */
+  .counter::before { content: counter(c); color: #cc0000; }
+  .quote::before   { content: open-quote; color: #cc0000; }
+
+  /* A column box renders no content. */
+  .column::before { content: "FAIL"; display: table-column; color: #cc0000; }
+  .hidden::before { content: "FAIL"; display: none; color: #cc0000; }
+
+  /* The generated boxes bracket the element, not each stretch inside it. */
+  .mixed::before { content: "A "; color: #cc6600; }
+  .mixed::after  { content: " Z"; color: #cc6600; }
+  .mixed p { margin: 2px 0; }
+
+  /* A pseudo-element inherits, but does not take its originator's own rules. */
+  .inherit { color: #006666; }
+  .inherit::before { content: "inherits the colour "; }
+</style></head><body>
+
+<h3>Before and after bracket the content</h3>
+<p class="both">middle</p>
+<p class="old">the era's spelling</p>
+
+<h3>Strings and attributes</h3>
+<p class="attr" title="a title">concatenated</p>
+<p class="missing">a missing attribute is empty</p>
+
+<h3>Nothing generated</h3>
+<p class="none">content: none</p>
+<p class="normal">content: normal</p>
+<p class="counter">counter() is out of scope</p>
+<p class="quote">open-quote is out of scope</p>
+<p class="column">display: table-column</p>
+<p class="hidden">display: none</p>
+
+<h3>An empty string generates a box, which paints nothing here (#46)</h3>
+<p class="empty">no yellow: an inline box has no background yet</p>
+
+<h3>Mixed content: the brackets go outside, once</h3>
+<div class="mixed">first<p>a block in the middle</p>last</div>
+
+<h3>Inheritance</h3>
+<p class="inherit">and the rest</p>
+
+</body></html>

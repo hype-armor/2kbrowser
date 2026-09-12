@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use dom::{Document, ElementData, NodeId};
 
+use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
     DEFAULT_FONT_SIZE, Edges, Float, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
@@ -35,12 +36,26 @@ pub enum Origin {
 #[derive(Debug, Clone, Default)]
 pub struct StyleMap {
     styles: HashMap<NodeId, ComputedStyle>,
+    /// Styles for the boxes a stylesheet asks for that the document does not
+    /// contain. Kept beside the element styles rather than in them because a
+    /// pseudo-element is a box, with its own colour, font and display, and
+    /// folding it into its originator's style would flatten that.
+    pseudos: HashMap<(NodeId, PseudoElement), ComputedStyle>,
 }
 
 impl StyleMap {
     /// The computed style for a node, if it is a styled element.
     pub fn get(&self, node: NodeId) -> Option<&ComputedStyle> {
         self.styles.get(&node)
+    }
+
+    /// The style for one of a node's generated boxes, if it generates one.
+    ///
+    /// Absent unless the cascade gave it `content`, since a pseudo-element
+    /// without content generates no box at all (§12.1) — so a caller can take
+    /// the presence of a style here as "this box exists".
+    pub fn pseudo(&self, node: NodeId, which: PseudoElement) -> Option<&ComputedStyle> {
+        self.pseudos.get(&(node, which))
     }
 
     /// Takes a node out of the flow, exactly as `display: none` does.
@@ -166,8 +181,18 @@ fn style_subtree(
     out: &mut StyleMap,
 ) {
     let style = if doc.element(node).is_some() {
-        let computed = compute(doc, node, parent_style, rules);
+        let computed = compute(doc, node, parent_style, rules, None);
         out.styles.insert(node, computed.clone());
+        // §12.1: a pseudo-element generates a box only when `content` gives it
+        // one. Computing the style and then throwing it away when there is no
+        // content keeps that decision in one place, and lets every later stage
+        // read "a style exists here" as "this box exists".
+        for which in [PseudoElement::Before, PseudoElement::After] {
+            let generated = compute(doc, node, &computed, rules, Some(which));
+            if generated.content.is_some() {
+                out.pseudos.insert((node, which), generated);
+            }
+        }
         computed
     } else {
         parent_style.clone()
@@ -178,7 +203,13 @@ fn style_subtree(
     }
 }
 
-fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) -> ComputedStyle {
+fn compute(
+    doc: &Document,
+    node: NodeId,
+    parent: &ComputedStyle,
+    rules: &Rules,
+    pseudo: Option<PseudoElement>,
+) -> ComputedStyle {
     let (quirks, zoom) = (rules.quirks, rules.zoom);
     let mut matched: Vec<(Precedence, &Declaration)> = Vec::new();
     let mut order = 0usize;
@@ -190,7 +221,12 @@ fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) 
             let best = rule
                 .selectors
                 .iter()
-                .filter(|selector| selector.matches(doc, node))
+                // A rule addressing `::before` styles that box and nothing
+                // else, and a rule addressing no pseudo-element styles the
+                // element and not its generated boxes. `matches` answers for
+                // the originating element in both cases, so this is the only
+                // thing keeping them apart.
+                .filter(|selector| selector.pseudo == pseudo && selector.matches(doc, node))
                 .map(|selector| selector.specificity())
                 .max();
             if let Some(specificity) = best {
@@ -213,7 +249,14 @@ fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) 
     // Presentational attributes, which carry most of the era's styling. They
     // sit below author CSS so a stylesheet can always override them, and above
     // the UA sheet so they actually take effect.
-    let hints = presentational_hints(doc, node);
+    // Both these and the `style` attribute belong to the *element*. A
+    // `bgcolor` is not also a request to paint the box `::before` generates,
+    // so a pseudo-element takes neither.
+    let hints = if pseudo.is_none() {
+        presentational_hints(doc, node)
+    } else {
+        Vec::new()
+    };
     for declaration in &hints {
         order += 1;
         matched.push((
@@ -230,6 +273,7 @@ fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) 
     // A `style` attribute applies to this element alone and beats every rule.
     let inline = doc
         .element(node)
+        .filter(|_| pseudo.is_none())
         .and_then(|element| element.attr("style"))
         .map(crate::parse_style_attribute)
         .unwrap_or_default();
@@ -252,7 +296,14 @@ fn compute(doc: &Document, node: NodeId, parent: &ComputedStyle, rules: &Rules) 
     // The UA sheet gives `display: block` to block-level elements; everything
     // else starts inline, which is the CSS initial value.
     for (_, declaration) in matched {
-        apply(&mut style, declaration, parent, quirks, zoom);
+        apply(
+            &mut style,
+            declaration,
+            parent,
+            quirks,
+            zoom,
+            doc.element(node),
+        );
     }
 
     // §16.3: an ancestor's decoration is drawn across this element's text too,
@@ -328,6 +379,9 @@ fn apply(
     parent: &ComputedStyle,
     quirks: bool,
     zoom: f32,
+    // The originating element, for the one property that reads the document
+    // rather than only its own value: `content: attr(href)`.
+    element: Option<&ElementData>,
 ) {
     let values = &declaration.value;
     let Some(first) = values.first() else { return };
@@ -561,6 +615,12 @@ fn apply(
             if let Some(length) = parse_length(first) {
                 style.text_indent = length;
             }
+        }
+        // §12.2. Resolved to text here rather than carried as a value list:
+        // every form in scope is known at this point, and `attr()` needs the
+        // originating element, which layout does not have.
+        "content" => {
+            style.content = parse_content(element, values);
         }
         "min-height" => {
             if let Some(length) = parse_size(first) {
@@ -835,6 +895,51 @@ fn parse_font_shorthand(
         line_height,
         family: parse_font_family(rest),
     })
+}
+
+/// Parses `content`, resolving it to the text it stands for.
+///
+/// In scope: strings and `attr()`, which concatenate — that is how a page
+/// writes `content: "[" attr(href) "]"`.
+///
+/// Out of scope, and dropping the whole declaration rather than half of it:
+/// `counter()`, `counters()`, `open-quote` and its family, and `url()`. Each
+/// needs machinery this does not have — a counter state, the `quotes`
+/// property, an image load — and a pseudo-element showing *part* of what the
+/// author asked for is worse than one showing nothing, because it looks
+/// deliberate.
+///
+/// `none` and `normal` need no case of their own, though writing one is the
+/// obvious thing to do. Neither is a string or an `attr()`, so both fall to
+/// the rejection below and drop the declaration, which is exactly what they
+/// mean. A branch for them was written first and deleted when a mutation
+/// showed it changed nothing.
+fn parse_content(element: Option<&ElementData>, values: &[Raw]) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for value in values {
+        match value {
+            Raw::Str(text) => out.push_str(text),
+            Raw::Function(name, args) if name == "attr" => {
+                // A missing attribute is the empty string, not a failure:
+                // §12.2 says so, and it is what makes `content: attr(title)`
+                // safe to write across a whole document.
+                let attribute = match args.first() {
+                    Some(Raw::Ident(name)) => name.clone(),
+                    Some(Raw::Str(name)) => name.clone(),
+                    _ => return None,
+                };
+                let value = element
+                    .and_then(|element| element.attr(&attribute))
+                    .unwrap_or_default();
+                out.push_str(value);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn parse_font_family(values: &[Raw]) -> FontStack {
@@ -1566,6 +1671,159 @@ mod tests {
         // token, which is how the whole declaration came to be dropped.
         let style = style_of("<p>x</p>", "p { font: 20px/10px serif }", "p");
         assert_eq!(style.line_height, 10.0);
+    }
+
+    fn content_of(html: &str, css: &str, tag: &str, which: PseudoElement) -> Option<String> {
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[Stylesheet::parse(css)]);
+        let node = doc.find_element(tag).expect("element present");
+        map.pseudo(node, which)
+            .and_then(|style| style.content.clone())
+    }
+
+    #[test]
+    fn a_pseudo_element_gets_its_own_style_and_content() {
+        let doc = dom::parse("<p>x</p>");
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "p { color: #000000 } p::before { content: \"hi\"; color: #ff0000 }",
+            )],
+        );
+        let node = doc.find_element("p").expect("p");
+        let before = map
+            .pseudo(node, PseudoElement::Before)
+            .expect("a before box");
+        assert_eq!(before.content.as_deref(), Some("hi"));
+        assert_eq!(before.color, Color::rgb(255, 0, 0));
+        assert_eq!(
+            map.get(node).expect("the element").color,
+            Color::rgb(0, 0, 0),
+            "the pseudo-element's colour leaked onto its originator"
+        );
+    }
+
+    #[test]
+    fn both_spellings_of_the_pseudo_element_are_accepted() {
+        // CSS 2.1 writes one colon, CSS 2.2 onwards writes two, and the era's
+        // pages use the single-colon form.
+        for css in [
+            "p::before { content: \"x\" }",
+            "p:before { content: \"x\" }",
+        ] {
+            assert_eq!(
+                content_of("<p>y</p>", css, "p", PseudoElement::Before).as_deref(),
+                Some("x"),
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_content_means_no_box() {
+        // §12.1, and the style has to be *absent* rather than merely
+        // contentless: every later stage reads "a style is here" as "this box
+        // exists".
+        for css in [
+            "p::before { color: red }",
+            "p::before { content: none }",
+            "p::before { content: normal }",
+        ] {
+            let doc = dom::parse("<p>y</p>");
+            let map = cascade(&doc, &[Stylesheet::parse(css)]);
+            let node = doc.find_element("p").expect("p");
+            assert!(map.pseudo(node, PseudoElement::Before).is_none(), "{css}");
+        }
+    }
+
+    #[test]
+    fn content_concatenates_strings_and_attributes() {
+        assert_eq!(
+            content_of(
+                r#"<p title="T">y</p>"#,
+                r#"p::before { content: "[" attr(title) "]" }"#,
+                "p",
+                PseudoElement::Before
+            )
+            .as_deref(),
+            Some("[T]")
+        );
+    }
+
+    #[test]
+    fn a_missing_attribute_is_the_empty_string_and_not_a_failure() {
+        // §12.2 says so, and it is what makes `content: attr(title)` safe to
+        // write across a whole document.
+        assert_eq!(
+            content_of(
+                "<p>y</p>",
+                "p::before { content: attr(title) }",
+                "p",
+                PseudoElement::Before
+            )
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn a_content_form_out_of_scope_drops_the_whole_declaration() {
+        // A pseudo-element showing *part* of what the author asked for is
+        // worse than one showing nothing: it looks deliberate.
+        for css in [
+            "p::before { content: counter(x) }",
+            "p::before { content: open-quote }",
+            "p::before { content: \"a\" counter(x) }",
+        ] {
+            assert_eq!(
+                content_of("<p>y</p>", css, "p", PseudoElement::Before),
+                None,
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_without_a_pseudo_element_does_not_style_one() {
+        let doc = dom::parse("<p>x</p>");
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "p { background-color: #ff0000; color: #00ff00 } p::before { content: \"x\" }",
+            )],
+        );
+        let node = doc.find_element("p").expect("p");
+        let before = map
+            .pseudo(node, PseudoElement::Before)
+            .expect("a before box");
+        assert_eq!(
+            before.color,
+            Color::rgb(0, 255, 0),
+            "an inherited property should come across"
+        );
+        assert_eq!(
+            before.background_color,
+            Color::TRANSPARENT,
+            "a non-inherited property came across from the element's own rule"
+        );
+    }
+
+    #[test]
+    fn a_presentational_attribute_does_not_reach_the_generated_box() {
+        let doc = dom::parse(r##"<body bgcolor="#ff0000"><p>x</p></body>"##);
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse("body::before { content: \"x\" }")],
+        );
+        let node = doc.find_element("body").expect("body");
+        let before = map
+            .pseudo(node, PseudoElement::Before)
+            .expect("a before box");
+        assert_eq!(
+            before.background_color,
+            Color::TRANSPARENT,
+            "a `bgcolor` painted the box `::before` generates"
+        );
     }
 
     #[test]

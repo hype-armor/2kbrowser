@@ -78,6 +78,9 @@ than leaving half a dash there, and `double`, `groove`, `ridge`, `inset` and
 buttons look like buttons; the `font` shorthand, which is how the era's
 stylesheets actually set type — `font: bold 12px Arial` — and which until
 recently parsed as nothing at all, taking the line height down with it;
+generated content, where `::before` and `::after`
+take a string or an `attr()` and bracket the element's own content — in both
+spellings, since CSS 2.1 writes one colon and the era's pages use it;
 external stylesheets, including
 `@import` chains and `@media` blocks; and legacy
 character encodings, which most of the surviving old web needs — a page in
@@ -94,8 +97,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2180 of 4821 reference tests pass,
-45.2%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2232 of 4821 reference tests pass,
+46.3%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -125,7 +128,10 @@ found them; they turned up only because a fix aimed at something else made them
 move. See PLAN.md — the harness's own bugs have been more instructive than the
 figure every time.
 
-Known to be missing or wrong, rather than hidden: `overflow` is understood
+Known to be missing or wrong, rather than hidden: an inline box paints no
+background, padding or border, so a highlighted phrase or a tinted `<code>`
+comes out as plain text (issue #46) — "the box model with borders and
+backgrounds" above means *block* boxes; `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
 not clipped — it is drawn, and the canvas is now grown to hold it, which it was
 not until a `height: 0` box turned out to be losing its text off the bottom
@@ -176,8 +182,11 @@ this file used to admit: `word-spacing`, `font-variant`, `outline`,
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
 leave the page's own styling standing, the second value of `border-spacing`, `direction` and everything else
-about right-to-left text, and generated content in all its forms: `:before`,
-`:after`, `content`, counters and `quotes`.
+about right-to-left text, and the parts of generated content that need state
+this engine does not keep: `counter()`, `counters()`, `open-quote` and its
+family, and `url()` in `content`. Each of those drops the whole declaration
+rather than showing part of what the author asked for, which would look
+deliberate.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have

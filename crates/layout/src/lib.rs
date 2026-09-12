@@ -12,6 +12,7 @@ pub mod frameset;
 pub mod table;
 
 use css::cascade::StyleMap;
+use css::selector::PseudoElement;
 use css::style::{
     BorderCollapse, CaptionSide, ComputedStyle, Display, Float, Overflow, Position, TextAlign,
     VerticalAlign, WhiteSpace,
@@ -1420,12 +1421,22 @@ fn flush_inline(
     context: &FloatContext,
     content_top: f32,
     parent: &mut LayoutBox,
+    // Generated content bracketing the holder's own. Only ever passed on the
+    // first and last stretch respectively, which is what keeps a `::before`
+    // from reappearing above every block child.
+    generated: (Option<InlineRun>, Option<InlineRun>),
 ) -> f32 {
-    if pending.is_empty() {
+    let (lead, tail) = generated;
+    // Not `pending.is_empty()` alone: an element whose content is entirely
+    // block-level still gets its generated boxes, and they arrive here with
+    // nothing pending beside them.
+    if pending.is_empty() && lead.is_none() && tail.is_none() {
         return 0.0;
     }
     let children = std::mem::take(pending);
-    let runs = inline_runs_for(
+    let mut runs = Vec::new();
+    runs.extend(lead);
+    runs.extend(inline_runs_for(
         doc,
         styles,
         &children,
@@ -1433,7 +1444,8 @@ fn flush_inline(
         holder,
         intrinsic,
         content_width,
-    );
+    ));
+    runs.extend(tail);
     if !runs
         .iter()
         .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
@@ -1914,6 +1926,16 @@ fn layout_block(
     // Inline children seen since the last block child. Flushed as an anonymous
     // box when a block child arrives, and again at the end.
     let mut pending: Vec<NodeId> = Vec::new();
+    // §12.1: the generated boxes bracket the element's content, so they go on
+    // the first and last stretch of it and nowhere else. `all_inline` has its
+    // own path through `collect_inline_runs`; these are for the mixed case,
+    // where content is collected in stretches between the block children.
+    let mut lead = (!all_inline)
+        .then(|| generated_run(styles, node, PseudoElement::Before))
+        .flatten();
+    let tail = (!all_inline)
+        .then(|| generated_run(styles, node, PseudoElement::After))
+        .flatten();
     // The bottom margin of the last in-flow block placed, kept so the next
     // one's top margin can collapse into it (§8.3.1). `None` means there is
     // nothing to collapse with — either nothing has been placed yet, or
@@ -1980,6 +2002,7 @@ fn layout_block(
             &context,
             padding_top + border_top,
             &mut box_,
+            (lead.take(), None),
         );
         cursor_y += flushed;
         if flushed > 0.0 {
@@ -2164,6 +2187,10 @@ fn layout_block(
         &context,
         padding_top + border_top,
         &mut box_,
+        // `lead` is still here when every child was block-level and the loop
+        // never flushed anything, which is the case that would otherwise drop
+        // a `::before` entirely.
+        (lead.take(), tail),
     );
     cursor_y += trailing;
     if trailing > 0.0 {
@@ -2986,7 +3013,17 @@ fn collect_inline_runs(
     intrinsic: &IntrinsicSizes,
     available_width: f32,
 ) -> Vec<InlineRun> {
-    inline_runs_for(
+    let mut runs = Vec::new();
+    // §12.1: `::before` and `::after` are boxes at the very start and very end
+    // of the element's content, so they bracket the children rather than
+    // joining them. Done here rather than in `inline_runs_for` because that
+    // one also collects a *stretch* of inline children between two blocks,
+    // and a pseudo-element attached to every stretch would appear several
+    // times over.
+    if let Some(before) = generated_run(styles, node, PseudoElement::Before) {
+        runs.push(before);
+    }
+    runs.extend(inline_runs_for(
         doc,
         styles,
         doc.children(node),
@@ -2994,7 +3031,28 @@ fn collect_inline_runs(
         node,
         intrinsic,
         available_width,
-    )
+    ));
+    if let Some(after) = generated_run(styles, node, PseudoElement::After) {
+        runs.push(after);
+    }
+    runs
+}
+
+/// The inline run for one of an element's generated boxes, if it has one.
+///
+/// A style in the pseudo table means the cascade gave it `content`, which is
+/// what decides whether the box exists at all — so there is nothing to check
+/// here beyond whether the style is present.
+fn generated_run(styles: &StyleMap, node: NodeId, which: PseudoElement) -> Option<InlineRun> {
+    let style = styles.pseudo(node, which)?;
+    let content = style.content.clone()?;
+    // A column box renders no content — §17.2 gives `table-column` and
+    // `table-column-group` a box that sizes a column and draws its own
+    // background, and nothing inside it. So a pseudo-element given one of
+    // those displays has its content dropped rather than shown somewhere
+    // else, which is what the suite checks by putting the word FAIL in it.
+    let boxless = matches!(style.display, Display::None | Display::TableColumn);
+    (!boxless).then(|| InlineRun::text(content, style.clone()))
 }
 
 /// Collects inline runs from a specific list of siblings.
@@ -3381,6 +3439,58 @@ mod tests {
     fn content_boxes(rendered: &Rendered) -> Vec<&LayoutBox> {
         let body = rendered.layout.root.children.first().expect("body box");
         boxes(body)
+    }
+
+    #[test]
+    fn generated_content_brackets_the_elements_own_content() {
+        let rendered = run(
+            "<body><p>middle</p></body>",
+            "body { margin: 0 } p::before { content: \"A\" } p::after { content: \"Z\" }",
+            600.0,
+        );
+        let text = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter().map(|line| line.text.clone()))
+            .collect::<String>();
+        assert_eq!(text.trim(), "AmiddleZ");
+    }
+
+    #[test]
+    fn generated_content_appears_once_around_mixed_content() {
+        // The element's inline children are collected in stretches between its
+        // block children. Attaching the generated boxes to each stretch rather
+        // than to the element would repeat them.
+        let rendered = run(
+            "<body><div>one<p>block</p>two</div></body>",
+            "body { margin: 0 } div::before { content: \"A\" }",
+            600.0,
+        );
+        let count = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter())
+            .filter(|line| line.text.contains('A'))
+            .count();
+        assert_eq!(count, 1, "the generated box was emitted {count} times");
+    }
+
+    #[test]
+    fn a_column_display_generates_no_content_box() {
+        // §17.2: a column box sizes a column and draws its own background,
+        // and renders nothing inside it.
+        for display in ["table-column", "table-column-group", "none"] {
+            let css = format!(
+                "body {{ margin: 0 }} p::before {{ content: \"FAIL\"; display: {display} }}"
+            );
+            let rendered = run("<body><p>ok</p></body>", &css, 600.0);
+            let text = content_boxes(&rendered)
+                .into_iter()
+                .filter_map(|b| b.text.as_ref())
+                .flat_map(|t| t.lines.iter().map(|line| line.text.clone()))
+                .collect::<String>();
+            assert!(!text.contains("FAIL"), "{display} drew its content");
+        }
     }
 
     #[test]
