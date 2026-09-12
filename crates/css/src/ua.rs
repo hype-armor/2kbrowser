@@ -66,12 +66,18 @@ center { text-align: -webkit-center; }
    era's pages used it constantly as a section divider. */
 hr { margin: 0.5em 0; height: 0; border-top: 1px solid #999999; }
 
-table { display: table; }
+/* The table structure is declared here rather than recognised by tag name in
+   layout, which is what lets a table built out of `display` values on plain
+   divs — the shape most of the CSS 2.1 suite's table tests use — be laid out
+   as one. */
+table { display: table; border-spacing: 2px; }
 thead, tbody, tfoot { display: table-row-group; }
 tr { display: table-row; }
 th, td { display: table-cell; padding: 1px; vertical-align: middle; }
 th { text-align: center; }
-caption { display: block; text-align: center; }
+caption { display: table-caption; text-align: center; }
+colgroup { display: table-column-group; }
+col { display: table-column; }
 
 /* Form controls. Nothing here can be typed into or submitted — see
    `layout::forms` — so this is what a control *looks* like, and looking right

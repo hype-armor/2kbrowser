@@ -322,6 +322,7 @@ fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.display == Display::TableCell
+        || style.display == Display::TableCaption
         || style.display == Display::InlineBlock
         || style.overflow != Overflow::Visible
 }
@@ -1358,6 +1359,25 @@ fn collect_floats(
     }
 }
 
+/// Whether a table-internal box will be laid out by some table above it.
+///
+/// §17.2.1 says a `display: table-cell` with no table around it gets one:
+/// anonymous boxes are generated until the structure is legal. This engine
+/// does not generate them, and a box nobody lays out is a box that vanishes —
+/// so an orphan is treated as an ordinary block instead, which is what it
+/// mostly looks like once a table has been wrapped around it on its own.
+///
+/// The check is "is there a table above me", not "is my parent a table",
+/// because `build_grid` descends through plain wrappers: a `<tr>` inside a
+/// `<div>` inside a `<table>` is collected, and is therefore not an orphan.
+fn inside_a_table(doc: &Document, styles: &StyleMap, node: NodeId) -> bool {
+    doc.ancestors(node).any(|ancestor| {
+        styles
+            .get(ancestor)
+            .is_some_and(|style| style.display == Display::Table)
+    })
+}
+
 /// Whether an inline element has a block-level element inside it.
 ///
 /// `<font>…<hr>…</font>` is ordinary in the era's markup, and an inline box
@@ -1979,7 +1999,7 @@ fn layout_block(
         styles.get(child).is_some_and(|child_style| {
             child_style.display != Display::None
                 && !is_inline_child(doc, styles, child, child_style)
-                && !child_style.display.is_table_internal()
+                && !(child_style.display.is_table_internal() && inside_a_table(doc, styles, child))
                 && child_style.float == Float::None
                 && !child_style.position.is_out_of_flow()
         })
@@ -2321,7 +2341,7 @@ fn layout_block(
             continue;
         }
         if child_style.display == Display::None
-            || child_style.display.is_table_internal()
+            || (child_style.display.is_table_internal() && inside_a_table(doc, styles, child))
             // Floated children were placed above, out of the normal flow.
             || child_style.float != Float::None
         {
@@ -3463,7 +3483,10 @@ fn generated_run(styles: &StyleMap, node: NodeId, which: PseudoElement) -> Optio
     // background, and nothing inside it. So a pseudo-element given one of
     // those displays has its content dropped rather than shown somewhere
     // else, which is what the suite checks by putting the word FAIL in it.
-    let boxless = matches!(style.display, Display::None | Display::TableColumn);
+    let boxless = matches!(
+        style.display,
+        Display::None | Display::TableColumn | Display::TableColumnGroup
+    );
     (!boxless).then(|| InlineRun::text(content, style.clone()))
 }
 
@@ -5521,6 +5544,55 @@ mod tests {
             "",
             "the box reached into the cell"
         );
+    }
+
+    #[test]
+    fn a_table_element_is_spaced_and_a_display_table_box_is_not() {
+        // §17.6.1's initial value is zero. The two pixels every era table has
+        // are the UA sheet's rule for the `table` *element*, and applying them
+        // as the initial value gave every `display: table` box a gap nobody
+        // asked for — 2px per edge, plainly visible, and wrong on exactly the
+        // tables the suite is built out of.
+        let width = |markup: &str, css_text: &str| {
+            let rendered = run(markup, css_text, 600.0);
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.style.display == Display::Table)
+                .expect("a table box")
+                .rect
+                .width
+        };
+        let markup = width(
+            "<body><table><tr><td>a</td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0; width: 40px }",
+        );
+        let styled = width(
+            "<body><div id=t><div class=r><div class=c>a</div></div></div></body>",
+            "body { margin: 0 } #t { display: table } .r { display: table-row } \
+             .c { display: table-cell; padding: 0; width: 40px }",
+        );
+        assert!(
+            markup > styled,
+            "the element and the display value were spaced alike: {markup} against {styled}"
+        );
+        assert_eq!(markup - styled, 4.0, "two pixels on each side");
+    }
+
+    #[test]
+    fn a_table_cell_with_no_table_around_it_is_still_drawn() {
+        // §17.2.1 wraps an orphan in anonymous table boxes. This engine does
+        // not generate them, and a box nobody lays out is a box that vanishes
+        // — so an orphan falls back to being an ordinary block, which is close
+        // to what a table wrapped around one on its own looks like.
+        let rendered = run(
+            "<body><div><span class=c>cell</span></div></body>",
+            "body { margin: 0 } .c { display: table-cell; background: #ff0000 }",
+            600.0,
+        );
+        let cell = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
+        assert!(cell.is_some(), "the orphan cell vanished");
     }
 
     #[test]

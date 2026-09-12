@@ -45,6 +45,14 @@ pub enum Display {
     /// `display: table-column` draw its content, and the suite puts the word
     /// FAIL in exactly that place.
     TableColumn,
+    /// `table-column-group` — a band of columns.
+    ///
+    /// Apart from `TableColumn` because a group's extent is its `table-column`
+    /// children where it has any, and its own `span` where it has none; the
+    /// grid cannot tell those two apart from one variant.
+    TableColumnGroup,
+    /// `table-caption` — a table's heading, outside its border box (§17.4).
+    TableCaption,
     /// Generates no box at all.
     None,
     /// `flex` or `inline-flex` — recognised, not implemented (ADR-0004).
@@ -80,10 +88,19 @@ impl Display {
 
     /// Whether the box is internal table structure, laid out by the table
     /// rather than by normal block flow.
+    ///
+    /// A caption is here too. It is not *inside* the table's border box —
+    /// §17.4 makes it a sibling — but it is the table that places it, and a
+    /// block walk that laid it out as an ordinary child would draw it twice.
     pub fn is_table_internal(self) -> bool {
         matches!(
             self,
-            Display::TableRow | Display::TableRowGroup | Display::TableCell | Display::TableColumn
+            Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableCell
+                | Display::TableColumn
+                | Display::TableColumnGroup
+                | Display::TableCaption
         )
     }
 
@@ -102,9 +119,12 @@ impl Display {
                 Display::TableRowGroup
             }
             "table-cell" => Display::TableCell,
-            "table-column" | "table-column-group" => Display::TableColumn,
-            // Column and caption boxes are not implemented; treating them as
-            // blocks keeps their content visible rather than dropping it.
+            "table-column" => Display::TableColumn,
+            "table-column-group" => Display::TableColumnGroup,
+            "table-caption" => Display::TableCaption,
+            // Nothing else in CSS 2.1 begins with `table`, so this catches a
+            // misspelling rather than a value. A block keeps its content
+            // visible, which is the better of the two ways to be wrong.
             name if name.starts_with("table") => Display::Block,
             _ => return None,
         };
@@ -1205,10 +1225,18 @@ pub struct ComputedStyle {
     pub height: Length,
 }
 
-/// The CSS 2.1 initial value of `border-spacing`.
+/// What a `<table>` element gets for `border-spacing` when nothing says
+/// otherwise.
 ///
 /// Two pixels, and it matters: getting it wrong by 2px per edge is plainly
 /// visible on a dense table, which the era's pages are full of.
+///
+/// **Not the initial value.** §17.6.1 makes that zero; the two pixels are the
+/// HTML user-agent sheet's rule for the `table` *element*, and applying them
+/// as the initial value instead gave every `display: table` box a gap it never
+/// asked for. That is invisible in era markup, where a table is always a
+/// `<table>`, and plainly wrong on a table built out of `display` values —
+/// which is most of the CSS 2.1 suite's tables, and a modern page's.
 pub const DEFAULT_BORDER_SPACING: f32 = 2.0;
 
 /// The initial font size, and the basis for `em` at the root.
@@ -1228,7 +1256,7 @@ impl Default for ComputedStyle {
             background_position: BackgroundPosition::default(),
             overflow: Overflow::Visible,
             vertical_align: VerticalAlign::Baseline,
-            border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
+            border_spacing: Length::Px(0.0),
             border_collapse: BorderCollapse::Separate,
             caption_side: CaptionSide::Top,
             visibility: Visibility::Visible,

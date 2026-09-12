@@ -499,16 +499,28 @@ fn compute(
     }
 
     // §9.7: a floated or absolutely positioned box is block-level whatever
-    // `display` said, because there is no line for an inline one to sit on.
-    // The spec's table maps several displays; the two that occur are these.
-    // `float: left` beside `display: inline-block` is not a contradiction an
-    // author has to notice — it is how a floated box with a shrink-to-fit
-    // width gets written — and reading the `display` literally put the box on
-    // a line instead of against the containing block's edge.
-    if (style.float != Float::None || style.position.is_out_of_flow())
-        && matches!(style.display, Display::Inline | Display::InlineBlock)
-    {
-        style.display = Display::Block;
+    // `display` said. `float: left` beside `display: inline-block` is not a
+    // contradiction an author has to notice — it is how a floated box with a
+    // shrink-to-fit width gets written — and reading the `display` literally
+    // put the box on a line instead of against the containing block's edge.
+    //
+    // The table displays are in the spec's table too, and for a sharper
+    // reason: a floated `table-row` is no longer part of any table, so a box
+    // that stayed a row would be collected into a grid that no longer contains
+    // it and then never laid out at all. `table` itself is the one row of that
+    // table that maps to itself.
+    if style.float != Float::None || style.position.is_out_of_flow() {
+        style.display = match style.display {
+            Display::Inline
+            | Display::InlineBlock
+            | Display::TableRow
+            | Display::TableRowGroup
+            | Display::TableCell
+            | Display::TableColumn
+            | Display::TableColumnGroup
+            | Display::TableCaption => Display::Block,
+            display => display,
+        };
     }
 
     style
@@ -2871,6 +2883,46 @@ mod tests {
         assert_eq!(style.margin.left, Length::Auto);
         assert_eq!(style.margin.right, Length::Auto);
         assert_eq!(style.text_align, TextAlign::Left);
+    }
+
+    #[test]
+    fn a_float_makes_a_table_box_block_level() {
+        // §9.7's table. A floated row is no longer part of any table, so a box
+        // that kept `display: table-row` would be looked for in a grid that no
+        // longer contains it. `table` is the one entry that maps to itself.
+        let display = |declaration: &str| {
+            style_of(
+                "<body><div id=t>x</div></body>",
+                &format!("#t {{ {declaration} }}"),
+                "div",
+            )
+            .display
+        };
+        for value in [
+            "table-row",
+            "table-row-group",
+            "table-cell",
+            "table-caption",
+            "table-column",
+            "inline-block",
+            "inline",
+        ] {
+            assert_eq!(
+                display(&format!("display: {value}; float: left")),
+                Display::Block,
+                "float left `display: {value}`"
+            );
+            assert_eq!(
+                display(&format!("display: {value}; position: absolute")),
+                Display::Block,
+                "absolute `display: {value}`"
+            );
+        }
+        assert_eq!(
+            display("display: table; float: left"),
+            Display::Table,
+            "a floated table is still a table"
+        );
     }
 
     #[test]

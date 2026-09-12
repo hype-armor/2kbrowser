@@ -153,13 +153,13 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
     grid
 }
 
-/// A table's `caption` children, in document order, with their styles.
+/// A table's caption children, in document order, with their styles.
 ///
-/// Found by tag name, as the rows and the column bands are: `display` is not
-/// consulted because `table-caption` is not a display value this engine has
-/// (see `Display::parse`), and the era's markup writes `<caption>` anyway.
+/// Found by `display`, as the rows and the column bands are. The UA sheet is
+/// what gives `<caption>` its display, so era markup still works and a
+/// `<div style="display: table-caption">` works too.
 ///
-/// Only direct children. A `caption` deeper in the subtree belongs to a nested
+/// Only direct children. A caption deeper in the subtree belongs to a nested
 /// table, and stealing it would move somebody else's heading.
 pub fn captions(
     doc: &Document,
@@ -168,13 +168,9 @@ pub fn captions(
 ) -> Vec<(NodeId, ComputedStyle)> {
     doc.children(table)
         .iter()
-        .filter(|&&child| {
-            doc.element(child)
-                .is_some_and(|element| element.local_name() == "caption")
-        })
         .filter_map(|&child| {
             let style = styles.get(child)?;
-            (style.display != Display::None).then(|| (child, style.clone()))
+            (style.display == Display::TableCaption).then(|| (child, style.clone()))
         })
         .collect()
 }
@@ -203,51 +199,51 @@ fn collect_columns(
         let Some(element) = doc.element(child) else {
             continue;
         };
-        match element.local_name() {
-            "col" => {
+        let Some(style) = styles.get(child) else {
+            continue;
+        };
+        match style.display {
+            Display::TableColumn => {
                 let span = span_of(element);
-                if let Some(style) = styles.get(child) {
-                    grid.columns_declared.push(ColumnBand {
-                        style: style.clone(),
-                        start: column,
-                        end: column + span,
-                    });
-                }
+                grid.columns_declared.push(ColumnBand {
+                    style: style.clone(),
+                    start: column,
+                    end: column + span,
+                });
                 column += span;
             }
-            "colgroup" => {
+            Display::TableColumnGroup => {
                 let start = column;
-                // A group's own `span` counts only when it has no `col`
+                // A group's own `span` counts only when it has no column
                 // children; with them, the children decide how wide it is.
                 let mut has_children = false;
                 for &inner in doc.children(child) {
                     let Some(col) = doc.element(inner) else {
                         continue;
                     };
-                    if col.local_name() != "col" {
+                    let Some(col_style) = styles.get(inner) else {
+                        continue;
+                    };
+                    if col_style.display != Display::TableColumn {
                         continue;
                     }
                     has_children = true;
                     let span = span_of(col);
-                    if let Some(style) = styles.get(inner) {
-                        grid.columns_declared.push(ColumnBand {
-                            style: style.clone(),
-                            start: column,
-                            end: column + span,
-                        });
-                    }
+                    grid.columns_declared.push(ColumnBand {
+                        style: col_style.clone(),
+                        start: column,
+                        end: column + span,
+                    });
                     column += span;
                 }
                 if !has_children {
                     column += span_of(element);
                 }
-                if let Some(style) = styles.get(child) {
-                    grid.column_groups.push(ColumnBand {
-                        style: style.clone(),
-                        start,
-                        end: column,
-                    });
-                }
+                grid.column_groups.push(ColumnBand {
+                    style: style.clone(),
+                    start,
+                    end: column,
+                });
             }
             _ => {}
         }
@@ -263,17 +259,20 @@ fn collect_rows(
     grid: &mut Grid,
 ) {
     for &child in doc.children(node) {
-        let Some(element) = doc.element(child) else {
-            continue;
-        };
         let Some(style) = styles.get(child) else {
             continue;
         };
-        if style.display == Display::None {
+        // A float or an absolutely positioned box is out of the table's flow —
+        // §9.7 has already made it a block — so neither it nor anything under
+        // it is part of this grid. Without this a floated row group's rows are
+        // collected into the table they were taken out of, and then laid out
+        // twice.
+        if style.float != css::style::Float::None || style.position.is_out_of_flow() {
             continue;
         }
-        match element.local_name() {
-            "tr" => {
+        match style.display {
+            Display::None => {}
+            Display::TableRow => {
                 let mut cells = Vec::new();
                 let mut column = 0;
                 for &cell_node in doc.children(child) {
@@ -284,13 +283,10 @@ fn collect_rows(
                     let Some(cell_element) = doc.element(cell_node) else {
                         continue;
                     };
-                    if !matches!(cell_element.local_name(), "td" | "th") {
-                        continue;
-                    }
                     let Some(cell_style) = styles.get(cell_node) else {
                         continue;
                     };
-                    if cell_style.display == Display::None {
+                    if cell_style.display != Display::TableCell {
                         continue;
                     }
                     let span = |name: &str| {
@@ -340,7 +336,7 @@ fn collect_rows(
             // into the grid exactly as before — but it is recorded on the way
             // past, because the collapsing model needs its borders and its
             // first and last rows.
-            "thead" | "tbody" | "tfoot" => {
+            Display::TableRowGroup => {
                 let band = grid.row_groups.len();
                 let first = grid.rows.len();
                 grid.row_groups.push(RowBand {
@@ -353,8 +349,12 @@ fn collect_rows(
                 // empty range, which no row points at and nothing reads.
                 grid.row_groups[band].end = grid.rows.len();
             }
+            // A caption or a column band is the table's business, not a row's:
+            // descending into one would read its contents as rows.
+            Display::TableCaption | Display::TableColumn | Display::TableColumnGroup => {}
             // Any other wrapper is transparent, and a row inside one keeps the
-            // group it is nested in.
+            // group it is nested in. §17.2.1 would make an anonymous row box
+            // here instead; flattening is what this engine does until it does.
             _ => collect_rows(doc, styles, child, group, occupied, grid),
         }
     }
@@ -957,6 +957,136 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &[]);
         let table = doc.find_element("table").expect("table");
         build_grid(&doc, &styles, table)
+    }
+
+    /// The grid of a table built out of `display` values rather than markup,
+    /// rooted at the element with `id="t"`.
+    fn css_grid_of(html: &str, css_text: &str) -> Grid {
+        let doc = dom::parse(html);
+        let sheets = [css::Stylesheet::parse(css_text)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let table = doc
+            .descendants(doc.root())
+            .into_iter()
+            .find(|&node| doc.element(node).is_some_and(|e| e.id() == Some("t")))
+            .expect("the table element");
+        build_grid(&doc, &styles, table)
+    }
+
+    #[test]
+    fn a_table_built_out_of_display_values_has_a_grid() {
+        // The whole point of reading `display` rather than tag names. This is
+        // the shape most of the CSS 2.1 suite's table tests use, and what a
+        // page that is not from the era means by a table.
+        let grid = css_grid_of(
+            "<body><div id=t><div class=r><div class=c>a</div><div class=c>b</div></div>\
+             <div class=r><div class=c>c</div><div class=c>d</div></div></div></body>",
+            "#t { display: table } .r { display: table-row } .c { display: table-cell }",
+        );
+        assert_eq!(grid.rows.len(), 2, "no rows were found");
+        assert_eq!(grid.columns, 2);
+        assert_eq!(grid.rows[0].cells.len(), 2);
+    }
+
+    #[test]
+    fn a_row_group_by_display_is_a_band_like_thead_is() {
+        let grid = css_grid_of(
+            "<body><div id=t><div class=g><div class=r><div class=c>a</div></div></div></div></body>",
+            "#t { display: table } .g { display: table-row-group } \
+             .r { display: table-row } .c { display: table-cell }",
+        );
+        assert_eq!(grid.row_groups.len(), 1, "the group was not recorded");
+        assert_eq!(grid.rows.len(), 1);
+        assert_eq!(grid.rows[0].group, Some(0));
+    }
+
+    #[test]
+    fn a_caption_is_found_by_display_and_not_by_tag() {
+        let doc = dom::parse(
+            "<body><div id=t><div class=cap>heading</div>\
+             <div class=r><div class=c>a</div></div></div></body>",
+        );
+        let sheets = [css::Stylesheet::parse(
+            "#t { display: table } .cap { display: table-caption }              .r { display: table-row } .c { display: table-cell }",
+        )];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let table = doc
+            .descendants(doc.root())
+            .into_iter()
+            .find(|&node| doc.element(node).is_some_and(|e| e.id() == Some("t")))
+            .expect("the table element");
+        assert_eq!(
+            captions(&doc, &styles, table).len(),
+            1,
+            "a div captioning a div table was not found"
+        );
+    }
+
+    #[test]
+    fn a_column_band_by_display_sizes_the_same_columns() {
+        let grid = css_grid_of(
+            "<body><div id=t><div class=cg><div class=col></div><div class=col></div></div>\
+             <div class=r><div class=c>a</div><div class=c>b</div></div></div></body>",
+            "#t { display: table } .cg { display: table-column-group } \
+             .col { display: table-column } .r { display: table-row } \
+             .c { display: table-cell }",
+        );
+        assert_eq!(grid.columns_declared.len(), 2);
+        assert_eq!(grid.column_groups.len(), 1);
+        assert_eq!(grid.column_groups[0].end, 2, "the group did not span both");
+    }
+
+    #[test]
+    fn a_floated_row_group_is_no_longer_part_of_the_table() {
+        // §9.7 takes it out of the table and makes it a block. Collecting its
+        // rows anyway would lay them out twice: once where the float went, and
+        // once in a grid that no longer contains them.
+        let grid = css_grid_of(
+            "<body><div id=t><div class=g><div class=r><div class=c>a</div></div></div>\
+             <div class=r><div class=c>b</div></div></div></body>",
+            "#t { display: table } .g { display: table-row-group; float: left } \
+             .r { display: table-row } .c { display: table-cell }",
+        );
+        assert_eq!(grid.rows.len(), 1, "the floated group's row was collected");
+        assert_eq!(grid.row_groups.len(), 0);
+    }
+
+    #[test]
+    fn a_caption_is_not_searched_for_rows() {
+        // A caption and a column band are the table's business but not the
+        // grid's. Descending into one reads whatever is inside it as rows,
+        // and a caption holding a `display: table-row` div would gain the
+        // table a row that is not in it.
+        let grid = css_grid_of(
+            "<body><div id=t><div class=cap><div class=r><div class=c>x</div></div></div>\
+             <div class=r><div class=c>a</div></div></div></body>",
+            "#t { display: table } .cap { display: table-caption } \
+             .r { display: table-row } .c { display: table-cell }",
+        );
+        assert_eq!(grid.rows.len(), 1, "a row inside the caption was collected");
+    }
+
+    #[test]
+    fn only_a_table_cell_is_a_cell() {
+        // A row's other children are not cells. Taking every element in a row
+        // as one is what a tag-name check used to prevent, and the display
+        // check has to keep preventing it.
+        let grid = css_grid_of(
+            "<body><div id=t><div class=r><div class=c>a</div><div class=b>not a cell</div>\
+             </div></div></body>",
+            "#t { display: table } .r { display: table-row } \
+             .c { display: table-cell } .b { display: block }",
+        );
+        assert_eq!(grid.rows[0].cells.len(), 1, "a block child became a cell");
+    }
+
+    #[test]
+    fn markup_tables_still_build_the_same_grid() {
+        // The UA sheet is what gives `<tr>` and `<td>` their displays, so era
+        // markup reaches the same place by a different road.
+        let grid = grid_of("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>");
+        assert_eq!(grid.rows.len(), 2);
+        assert_eq!(grid.columns, 2);
     }
 
     #[test]

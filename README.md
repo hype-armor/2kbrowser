@@ -101,8 +101,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2736 of 4821 reference tests pass,
-56.8%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **3064 of 4821 reference tests pass,
+63.6%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
