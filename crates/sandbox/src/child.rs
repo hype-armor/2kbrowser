@@ -82,6 +82,27 @@ pub fn serve(
     output: &mut impl Write,
     renderer: &mut impl Render,
 ) -> Result<(), Error> {
+    match answer_until_the_parent_goes(input, output, renderer) {
+        // The parent went away between asking and being answered. Closing the
+        // window while a page is still rendering does exactly this: the pipe
+        // is gone by the time the pixels are ready, and the write fails.
+        //
+        // A closed pipe on the way *in* was already the ordinary end of this
+        // process; a closed pipe on the way *out* is the same thing half a
+        // message later, and it was being reported as a failure. Someone who
+        // closed the browser got "renderer pipe failed: Broken pipe (os error
+        // 32)" on their terminal — one line per tab still rendering — and a
+        // non-zero exit, for having closed a window (#51).
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        outcome => outcome,
+    }
+}
+
+fn answer_until_the_parent_goes(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    renderer: &mut impl Render,
+) -> Result<(), Error> {
     loop {
         // A closed pipe is the parent exiting, which is how this ends.
         let frame = match read_frame(input) {
@@ -285,6 +306,58 @@ mod tests {
             write_frame(&mut out, frame).expect("writes");
         }
         out
+    }
+
+    /// A pipe with nobody on the other end of it.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pipe that refuses for a reason of its own.
+    struct DeadPipe;
+
+    impl Write for DeadPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_parent_that_goes_away_mid_render_is_the_end_of_the_work_and_not_a_failure() {
+        // Closing the window while a page is still rendering does exactly
+        // this: the pipe is gone by the time the pixels are ready. A closed
+        // pipe on the way *in* was already the ordinary end of this process,
+        // and this is the same thing half a message later — but it was
+        // reported as a failure, so closing a browser window printed
+        // "renderer pipe failed: Broken pipe" per tab still rendering, and
+        // exited non-zero (#51).
+        let input = pipe(&[request()]);
+        let outcome = serve(&mut input.as_slice(), &mut ClosedPipe, &mut Stub::new());
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_pipe_that_fails_for_any_other_reason_is_still_a_failure() {
+        // The narrowness is the point. "The parent has gone" is one specific
+        // error, and swallowing every write failure would turn a renderer that
+        // cannot speak at all into one that exits quietly and says nothing.
+        let input = pipe(&[request()]);
+        let outcome = serve(&mut input.as_slice(), &mut DeadPipe, &mut Stub::new());
+
+        assert!(matches!(outcome, Err(Error::Io(_))), "{outcome:?}");
     }
 
     #[test]
