@@ -10,6 +10,8 @@
 //! never consulted; a [`FontStore`] is built from embedded font data alone. That
 //! is the difference between one set of reference baselines and three.
 
+pub mod first_letter;
+
 use cosmic_text::{
     Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache,
     Weight,

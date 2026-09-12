@@ -968,7 +968,7 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**2385 of 4821 reference tests pass — 49.5%.** Zero panics across roughly ten
+**2736 of 4821 reference tests pass — 56.8%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
@@ -1092,12 +1092,16 @@ error anywhere in its selector is ignored entirely, so
 `[1digit], div { color: red }` must style nothing — the malformed attribute name
 takes the valid `div` with it. This engine keeps the `div` and applies the red.
 The suite catches it the way it catches everything: a page whose whole assertion
-is "no red". `selectors` is the worst-scoring chapter with content — 62 of 463 —
-though most of that is one absence rather than many: **339 of its 401 failures
-are `first-letter-punctuation`**, the suite's per-character sweep of which
-punctuation `::first-letter` draws along with the letter. One pseudo-element
-accounts for 7% of the entire suite, which is worth knowing before reading the
-chapter's score as a verdict on selector matching.
+is "no red".
+
+`selectors` was for a long time the worst-scoring chapter with content — 62 of
+463 — though most of that was one absence rather than many: **339 of its 401
+failures were `first-letter-punctuation`**, the suite's per-character sweep of
+which punctuation `::first-letter` draws along with the letter. One
+pseudo-element accounted for 7% of the entire suite, which was worth knowing
+before reading the chapter's score as a verdict on selector matching. It is
+implemented now and the chapter reads quite differently; the lesson to keep is
+the one about reading a chapter score, not the number.
 
 Being strict is not the fix, which is the interesting part. Two different
 failures reach the parser as the same "did not parse": syntax that is *invalid*,

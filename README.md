@@ -101,8 +101,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **2385 of 4821 reference tests pass,
-49.5%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **2736 of 4821 reference tests pass,
+56.8%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -151,8 +151,16 @@ separated model where it applies — it is correctly ignored in the collapsing
 one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to
 the wider of them rather than mitring it diagonally as browsers do; fixed
-table layout; and raising or lowering *text* off the baseline, so a `<sub>` or a
-`<sup>` sits level with the words around it.
+table layout; raising or lowering *text* off the baseline, so a `<sub>` or a
+`<sup>` sits level with the words around it; and `::first-letter` taking the
+pseudo-element's style whole, so with `<p><b>Bold</b>…` the first letter loses
+the `<b>` — the box should inherit from the innermost inline element around the
+letter, which needs the cascade where layout cannot reach it.
+
+`::first-line` is the one CSS 2.1 pseudo-element still absent. It is a
+different shape of problem from the other three: how much text is on the first
+line is not known until the line has been broken, and the style applied to it
+changes where it breaks.
 
 `inline-block` used to head this list. It is laid out now: sized by its own
 content (§10.3.9), placed on the line as one atom, and hung from the baseline of

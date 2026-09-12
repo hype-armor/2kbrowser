@@ -1701,6 +1701,11 @@ fn flush_inline(
     // first and last stretch respectively, which is what keeps a `::before`
     // from reappearing above every block child.
     generated: (Option<InlineRun>, Option<InlineRun>),
+    // The `::first-letter` style, taken by whichever stretch turns out to hold
+    // the first letter. Offered to each in turn rather than only to the first,
+    // because a block whose first child is a block has its first letter
+    // further down the page than its first stretch.
+    first_letter: &mut Option<&ComputedStyle>,
 ) -> f32 {
     let (lead, tail) = generated;
     // Not `pending.is_empty()` alone: an element whose content is entirely
@@ -1738,6 +1743,11 @@ fn flush_inline(
         .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
     {
         return 0.0;
+    }
+    if let Some(style) = *first_letter
+        && apply_first_letter(&mut runs, style)
+    {
+        *first_letter = None;
     }
 
     // Floats are seen from where this stretch actually starts, so text after a
@@ -1985,7 +1995,12 @@ fn layout_block(
             content_width,
             &mut blocks,
         );
-        collect_inline_runs(doc, styles, node, style, intrinsic, &blocks, content_width)
+        let mut runs =
+            collect_inline_runs(doc, styles, node, style, intrinsic, &blocks, content_width);
+        if let Some(first) = styles.pseudo(node, PseudoElement::FirstLetter) {
+            apply_first_letter(&mut runs, first);
+        }
+        runs
     } else {
         Vec::new()
     };
@@ -2260,6 +2275,9 @@ fn layout_block(
     // the first and last stretch of it and nowhere else. `all_inline` has its
     // own path through `collect_inline_runs`; these are for the mixed case,
     // where content is collected in stretches between the block children.
+    // §5.12.2 applies to a block container, and this is one. Held as an option
+    // so the first stretch that actually has a letter in it takes it.
+    let mut first_letter = styles.pseudo(node, PseudoElement::FirstLetter);
     let mut lead = (!all_inline)
         .then(|| generated_run(styles, node, PseudoElement::Before))
         .flatten();
@@ -2333,6 +2351,7 @@ fn layout_block(
             padding_top + border_top,
             &mut box_,
             (lead.take(), None),
+            &mut first_letter,
         );
         cursor_y += flushed;
         if flushed > 0.0 {
@@ -2528,6 +2547,7 @@ fn layout_block(
         // never flushed anything, which is the case that would otherwise drop
         // a `::before` entirely.
         (lead.take(), tail),
+        &mut first_letter,
     );
     cursor_y += trailing;
     if trailing > 0.0 {
@@ -3388,6 +3408,46 @@ fn collect_inline_runs(
         runs.push(after);
     }
     runs
+}
+
+/// Gives the `::first-letter` box its own run, split out of the first run that
+/// has a letter in it. Answers whether it found one.
+///
+/// §5.12.2. The split is by bytes rather than by characters because the first
+/// letter is not one character: `")T)"` is three, `"e\u{0301}"` is two, and
+/// `text::first_letter::first_letter_len` is what knows the difference.
+///
+/// **The box takes the pseudo-element's style whole**, which is exact when the
+/// block's first text is its own — every case in the suite, and the ordinary
+/// one on a page — and wrong in one way worth naming: with `<p><b>Bold</b>…`
+/// the first letter loses the `<b>`. CSS 2.1 makes the box a child of the
+/// innermost inline box around the letter, so it should inherit from the `<b>`
+/// and take the `::first-letter` declarations over the top. That needs the
+/// cascade run again with a different parent, at a point where layout has no
+/// cascade, so it is a gap rather than an oversight.
+fn apply_first_letter(runs: &mut Vec<InlineRun>, style: &ComputedStyle) -> bool {
+    let Some(index) = runs
+        .iter()
+        .position(|run| run.replaced.is_some() || !run.text.trim().is_empty())
+    else {
+        return false;
+    };
+    // An image at the head of the line needs no special case: a replaced run
+    // carries no text, and a run with no letter in it yields no box. Mutation
+    // testing removed the guard that used to be here and nothing failed,
+    // because nothing could.
+    let Some(length) = text::first_letter::first_letter_len(&runs[index].text) else {
+        return false;
+    };
+
+    let rest = runs[index].text.split_off(length);
+    let mut tail = runs[index].clone();
+    tail.text = rest;
+    runs[index].style = style.clone();
+    if !tail.text.is_empty() {
+        runs.insert(index + 1, tail);
+    }
+    true
 }
 
 /// The inline run for one of an element's generated boxes, if it has one.
@@ -5304,6 +5364,162 @@ mod tests {
             line_start("body { margin: 0 } .f { float: left; width: 100px; margin-right: 20px }")
                 - line_start("body { margin: 0 } .f { float: left; width: 100px }"),
             20.0
+        );
+    }
+
+    /// Every glyph on the page as `(character, font size, x)`.
+    ///
+    /// A `::first-letter` box is a run of its own in a size of its own, so
+    /// this is how a test sees whether the split happened and where.
+    fn glyphs(rendered: &Rendered) -> Vec<(String, f32, f32)> {
+        content_boxes(rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|text| text.lines.iter())
+            .flat_map(|line| {
+                line.glyphs
+                    .iter()
+                    .map(|g| (line.text[g.start..g.end].to_owned(), g.font_size, g.x))
+            })
+            .collect()
+    }
+
+    /// The text of every glyph drawn at `::first-letter` size.
+    fn first_letter_text(rendered: &Rendered) -> String {
+        glyphs(rendered)
+            .into_iter()
+            .filter(|&(_, size, _)| size >= 36.0)
+            .map(|(text, _, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn a_first_letter_rule_gives_the_first_letter_its_own_box() {
+        let rendered = run(
+            "<body><div>Test</div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        let sizes: Vec<f32> = glyphs(&rendered)
+            .into_iter()
+            .map(|(_, size, _)| size)
+            .collect();
+        assert!(
+            sizes.iter().any(|&size| size >= 36.0),
+            "nothing on the line was given the first-letter size: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().any(|&size| size < 36.0),
+            "the whole line took the first-letter size: {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn punctuation_around_the_first_letter_goes_with_it() {
+        // §5.12.2, and the shape of the 339 tests in the suite that assert it
+        // one Unicode codepoint at a time: `)T)est` puts `)T)` in the box.
+        let big = |markup: &str| {
+            let rendered = run(
+                &format!("<body><div>{markup}</div></body>"),
+                "body { margin: 0 } div:first-letter { font-size: 36px }",
+                600.0,
+            );
+            first_letter_text(&rendered)
+        };
+        assert_eq!(big(")T)est"), ")T)");
+        assert_eq!(big("Test"), "T");
+    }
+
+    #[test]
+    fn a_block_with_no_first_letter_rule_is_one_run_as_before() {
+        // The property is rare and the split is not free: a page that never
+        // mentions it must not pay for it, and must not be re-shaped by it.
+        let plain = run("<body><div>Test</div></body>", "body { margin: 0 }", 600.0);
+        let styled = run(
+            "<body><div>Test</div></body>",
+            "body { margin: 0 } p:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(glyphs(&plain), glyphs(&styled));
+    }
+
+    #[test]
+    fn the_first_letter_is_the_first_letter_of_the_first_line() {
+        // A block whose first child is a block does not have its first letter
+        // in its first stretch of inline content — it has none there at all.
+        // Offering the style only to the first stretch would lose it.
+        let rendered = run(
+            "<body><div><p>First</p>second</div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        let big: String = first_letter_text(&rendered);
+        assert_eq!(
+            big, "F",
+            "the first letter of the first line, not of the block"
+        );
+    }
+
+    #[test]
+    fn only_the_first_stretch_of_a_block_gets_the_first_letter() {
+        // A block with a block child has its inline content in two stretches,
+        // laid out separately. The style is offered to each in turn so that a
+        // block starting with a block still finds its letter — which means the
+        // stretch that takes it has to say so, or every stretch takes one.
+        let rendered = run(
+            "<body><div>one<p>mid</p>two</div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(
+            first_letter_text(&rendered),
+            "o",
+            "more than the first stretch was given a first letter"
+        );
+    }
+
+    #[test]
+    fn an_image_at_the_head_of_the_line_has_no_first_letter() {
+        let rendered = run(
+            r#"<body><div><img src="x.png" width="20" height="20">Text</div></body>"#,
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(first_letter_text(&rendered), "");
+    }
+
+    #[test]
+    fn the_rule_nearest_the_text_is_the_one_that_applies() {
+        // With `::first-letter` on both a div and the paragraph inside it, the
+        // paragraph's is the one written about the text it lands on. The div's
+        // would otherwise arrive later and overwrite it.
+        let rendered = run(
+            "<body><div><p>First</p></div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px } \
+             p:first-letter { font-size: 48px }",
+            600.0,
+        );
+        let sizes: Vec<f32> = glyphs(&rendered)
+            .into_iter()
+            .filter(|&(_, size, _)| size >= 36.0)
+            .map(|(_, size, _)| size)
+            .collect();
+        assert_eq!(sizes, vec![48.0], "the ancestor's rule won");
+    }
+
+    #[test]
+    fn a_first_letter_does_not_reach_into_a_table_cell() {
+        // §5.12.2 says so outright: "the first letter of a table-cell or
+        // inline-block cannot be the first letter of an ancestor element".
+        let rendered = run(
+            "<body><div><table><tr><td>First</td></tr></table></div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(
+            first_letter_text(&rendered),
+            "",
+            "the box reached into the cell"
         );
     }
 

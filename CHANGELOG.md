@@ -16,6 +16,38 @@ record for everything earlier.
 
 ## Unreleased
 
+**`::first-letter`.** The single largest absence the conformance suite was
+measuring: 339 of its 4821 tests — 7% of the whole — are one family,
+`first-letter-punctuation`, sweeping character by character through which
+punctuation a first letter drags along with it. All of them failed, and none of
+them was really about punctuation: the pseudo-element was not implemented at
+all.
+
+It is now, and the punctuation rule with it. §5.12.2 does not say "the first
+character": it says the first letter together with any preceding or following
+punctuation — Unicode's `Ps`, `Pe`, `Pi`, `Pf` and `Po` classes — so `")T)est"`
+puts `")T)"` in the box, and a combining accent stays with the letter it sits
+on. The class tables are generated and vendored rather than taken as a
+dependency, at four kilobytes for a question asked about some five hundred
+codepoints; that they will age is written down where they live.
+
+Two things about it were not obvious and were checked rather than assumed.
+**The box goes on the first letter of the first formatted line, which need not
+be in the element the rule matched**: with `<div><p>First</p>…`, `div` styles
+the paragraph's `F`. Headless Chromium settled that one after a test written
+from the spec disagreed with the implementation. And **the rule nearest the
+text wins** — a `::first-letter` on both a div and its paragraph is the
+paragraph's, or an ancestor's would arrive later and overwrite it.
+
+**2385 of 4821 reference tests to 2736**, 49.5% to 56.8%, with 351 newly
+passing and none newly failing.
+
+One gap worth naming rather than leaving to be found: the box takes the
+pseudo-element's style whole, so with `<p><b>Bold</b>…` the first letter loses
+the `<b>`. CSS 2.1 makes the box a child of the innermost inline box around the
+letter; getting that right needs the cascade run again with a different parent,
+at a point where layout has no cascade.
+
 **`inline-block` is laid out.** It was the largest thing CSS 2.1 asks for that
 this engine did not do, and the quietest: an inline-block was laid out as plain
 `inline`, so its width, height, border and background were dropped and an empty
