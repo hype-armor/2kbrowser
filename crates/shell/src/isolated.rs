@@ -131,6 +131,9 @@ fn mode_of(page: &crate::render::Page) -> Mode {
         layout::RenderMode::Document { unsupported_share } => Mode::Document {
             unsupported_share: *unsupported_share,
         },
+        layout::RenderMode::DocumentFrame { containers } => Mode::DocumentFrame {
+            containers: *containers as u32,
+        },
         layout::RenderMode::RequiresScripting => Mode::RequiresScripting,
     }
 }

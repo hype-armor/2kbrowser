@@ -149,6 +149,14 @@ so a page built on inline-blocks is re-rendered as a document and told so
 rather than coming out subtly wrong in silence (ADR-0009). It is a share and
 not a switch, so a navigation bar of them does not move an article.
 
+A page can also fall back because its *frame* is unsupported while its prose is
+not — a Wikipedia article is the case, where the text is ordinary flow and the
+columns and navigation rows around it are not. No share can see that, since by
+volume such a page is almost entirely correct, so a second signal counts the
+containers that would have arranged a row of blocks and now stack them instead.
+Every page in the corpus that should keep its author's layout scores zero of
+those; a Wikipedia article scores sixteen.
+
 **Forms are drawn but do not work.** Every control has a box now — text and
 password fields, buttons, checkboxes, radios, `<textarea>`, `<select>` and the
 rule around a `<fieldset>` — sized in the era's own units, since `size`, `cols`

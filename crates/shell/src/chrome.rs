@@ -467,6 +467,11 @@ pub fn status(state: &State<'_>) -> Option<String> {
             "rendered as a document — {}% needs newer layout",
             (unsupported_share * 100.0).round() as u32
         )),
+        // The frame case says "built from", not a percentage: there is no
+        // share to quote, and quoting a small one would read as "mostly fine".
+        RenderMode::DocumentFrame { .. } => {
+            Some("rendered as a document — page frame needs newer layout".to_owned())
+        }
         RenderMode::RequiresScripting => {
             Some("rendered as a document — needs JavaScript".to_owned())
         }

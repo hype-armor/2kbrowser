@@ -30,6 +30,12 @@ pub enum Mode {
         /// Fraction of the page that could not be laid out as authored.
         unsupported_share: f32,
     },
+    /// The document fallback, because the page's *frame* needs layout we do
+    /// not implement even though its text does not.
+    DocumentFrame {
+        /// How many containers would have laid their children out in a row.
+        containers: u32,
+    },
     /// The document fallback, because the page needs scripting.
     RequiresScripting,
 }
@@ -43,6 +49,10 @@ impl Mode {
                 writer.f32(*unsupported_share);
             }
             Mode::RequiresScripting => writer.tag(2),
+            Mode::DocumentFrame { containers } => {
+                writer.tag(3);
+                writer.u32(*containers);
+            }
         }
     }
 
@@ -53,6 +63,9 @@ impl Mode {
                 unsupported_share: reader.f32()?,
             }),
             2 => Ok(Mode::RequiresScripting),
+            3 => Ok(Mode::DocumentFrame {
+                containers: reader.u32()?,
+            }),
             _ => Err(WireError::Unknown),
         }
     }
