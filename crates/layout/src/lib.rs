@@ -34,6 +34,14 @@ pub type IntrinsicSizes = std::collections::HashMap<NodeId, (f32, f32)>;
 /// for a broken image with no dimensions given.
 const BROKEN_IMAGE_SIZE: (f32, f32) = (20.0, 20.0);
 
+/// The size §10.3.2 and §10.4 give a replaced element that has no intrinsic
+/// dimensions at all: the largest 2:1 rectangle no taller than 150px.
+///
+/// Every browser's empty `<iframe>`. Not used for an image, which has a
+/// smaller default of its own — a broken picture and an empty frame are
+/// different things and a reader can tell them apart on sight.
+const DEFAULT_REPLACED_SIZE: (f32, f32) = (300.0, 150.0);
+
 /// The containing block that absolutely positioned descendants resolve against.
 ///
 /// Boxes are stored parent-relative, but an absolutely positioned element is
@@ -156,6 +164,11 @@ fn relative_shift(style: &ComputedStyle, containing: (f32, f32)) -> (f32, f32) {
 pub fn replaced_size(
     style: &ComputedStyle,
     intrinsic: Option<(f32, f32)>,
+    // §10.3.2/§10.4's defaults for an element with *no* intrinsic dimensions,
+    // where it has any. Deliberately not an intrinsic size: 300x150 is a pair
+    // of independent defaults and not a 2:1 ratio, so an `<iframe>` given a
+    // height of one inch is 300px wide and not 192.
+    defaults: Option<(f32, f32)>,
     attr_width: Option<Length>,
     attr_height: Option<Length>,
     available_width: f32,
@@ -184,10 +197,10 @@ pub fn replaced_size(
         (Some(w), Some(h), _) => (w, h),
         (Some(w), None, Some((iw, ih))) if iw > 0.0 => (w, w * ih / iw),
         (None, Some(h), Some((iw, ih))) if ih > 0.0 => (h * iw / ih, h),
-        (Some(w), None, None) => (w, w),
-        (None, Some(h), None) => (h, h),
+        (Some(w), None, None) => (w, defaults.map_or(w, |(_, h)| h)),
+        (None, Some(h), None) => (defaults.map_or(h, |(w, _)| w), h),
         (None, None, Some(size)) => size,
-        (None, None, None) => BROKEN_IMAGE_SIZE,
+        (None, None, None) => defaults.unwrap_or(BROKEN_IMAGE_SIZE),
         (Some(w), None, Some(_)) => (w, w),
         (None, Some(h), Some(_)) => (h, h),
     };
@@ -217,7 +230,23 @@ pub fn replaced_size(
 /// Whether an element is a replaced element this engine lays out as a box of
 /// intrinsic size rather than from its children.
 fn is_replaced(doc: &Document, node: NodeId) -> bool {
-    doc.element(node).is_some_and(|e| e.local_name() == "img")
+    doc.element(node)
+        .is_some_and(|e| matches!(e.local_name(), "img" | "iframe"))
+}
+
+/// The §10.3.2 defaults for a replaced element with no intrinsic dimensions,
+/// where this one has any.
+///
+/// An `<iframe>` has none — this engine does not load the document inside one
+/// (ADR-0003 rules out the scripting such documents assume, and a frame's
+/// content is separate work) — so it takes the 300x150 empty frame every
+/// browser draws in its place. An image keeps its own smaller default: a
+/// broken picture and an empty frame are different things, and a reader can
+/// tell them apart on sight.
+fn replaced_defaults(doc: &Document, node: NodeId) -> Option<(f32, f32)> {
+    doc.element(node)
+        .is_some_and(|element| element.local_name() == "iframe")
+        .then_some(DEFAULT_REPLACED_SIZE)
 }
 
 /// Reads a presentational width/height attribute, which the era's markup used
@@ -1491,6 +1520,7 @@ fn subtree_widths(
         let (width, _) = replaced_size(
             style,
             intrinsic.get(&node).copied(),
+            replaced_defaults(doc, node),
             size_attr(doc, node, "width"),
             size_attr(doc, node, "height"),
             available,
@@ -1939,6 +1969,7 @@ fn layout_block(
         let (image_width, image_height) = replaced_size(
             style,
             intrinsic.get(&node).copied(),
+            replaced_defaults(doc, node),
             size_attr(doc, node, "width"),
             size_attr(doc, node, "height"),
             available_width,
@@ -3631,6 +3662,7 @@ fn gather_one(
             None => replaced_size(
                 style,
                 intrinsic.get(&child).copied(),
+                replaced_defaults(doc, child),
                 size_attr(doc, child, "width"),
                 size_attr(doc, child, "height"),
                 available_width,
@@ -5629,6 +5661,60 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_iframe_is_the_box_every_browser_draws() {
+        // §10.3.2 and §10.4: a replaced element with no intrinsic dimensions
+        // is 300x150. This engine loads no document into an `<iframe>`, so
+        // that is every one of them — and a frame that laid out as nothing at
+        // all left a hole in a page that was built around it.
+        let rendered = run(
+            "<body><iframe></iframe></body>",
+            "body { margin: 0 } iframe { border: none }",
+            600.0,
+        );
+        let frame = replaced_boxes(&rendered);
+        assert_eq!(frame.len(), 1, "the iframe is not a box");
+        assert_eq!((frame[0].rect.width, frame[0].rect.height), (300.0, 150.0));
+    }
+
+    #[test]
+    fn the_iframe_default_is_two_sizes_and_not_a_ratio() {
+        // The trap: 300x150 is a pair of independent defaults, not a 2:1
+        // intrinsic ratio. An iframe an inch tall is 300px wide, not 192 —
+        // modelling the default as an intrinsic size gets this exactly wrong
+        // and looks right on the both-auto case that is easiest to test.
+        let sized = |css_text: &str| {
+            let rendered = run(
+                "<body><iframe></iframe></body>",
+                &format!("body {{ margin: 0 }} iframe {{ border: none; {css_text} }}"),
+                600.0,
+            );
+            let frame = replaced_boxes(&rendered);
+            (frame[0].rect.width, frame[0].rect.height)
+        };
+        assert_eq!(sized("height: 96px"), (300.0, 96.0));
+        assert_eq!(sized("width: 96px"), (96.0, 150.0));
+    }
+
+    #[test]
+    fn an_image_that_never_loaded_keeps_its_own_smaller_default() {
+        // A broken picture and an empty frame are different things, and a
+        // reader can tell them apart on sight. Giving an image the frame's
+        // 300x150 would put a large hole in every page with a missing image.
+        let rendered = run(
+            r#"<body><img src="nothing.png"></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let image = replaced_boxes(&rendered);
+        assert_eq!(image.len(), 1);
+        assert!(
+            image[0].rect.width < 100.0,
+            "a broken image took the frame default: {:?}",
+            image[0].rect
+        );
+    }
+
+    #[test]
     fn an_inline_element_wrapping_a_block_still_lays_the_block_out() {
         // `<font>…<hr>…</font>` is ordinary markup. Skipped when gathering
         // inline runs and never reached by the block walk, the `<hr>`
@@ -6513,12 +6599,13 @@ mod tests {
             max_width: Length::Px(300.0),
             ..ComputedStyle::default()
         };
-        let (width, height) = replaced_size(&style, Some((1200.0, 400.0)), None, None, 1000.0);
+        let (width, height) =
+            replaced_size(&style, Some((1200.0, 400.0)), None, None, None, 1000.0);
         assert_eq!(width, 300.0);
         assert_eq!(height, 100.0, "the 3:1 ratio should have been kept");
 
         // One already inside the bound is left exactly alone.
-        let (width, height) = replaced_size(&style, Some((120.0, 40.0)), None, None, 1000.0);
+        let (width, height) = replaced_size(&style, Some((120.0, 40.0)), None, None, None, 1000.0);
         assert_eq!((width, height), (120.0, 40.0));
     }
 
@@ -6890,7 +6977,7 @@ mod tests {
     fn an_image_uses_its_intrinsic_size_when_nothing_is_declared() {
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((80.0, 40.0)), None, None, 500.0),
+            replaced_size(&style, Some((80.0, 40.0)), None, None, None, 500.0),
             (80.0, 40.0)
         );
     }
@@ -6903,6 +6990,7 @@ mod tests {
             replaced_size(
                 &style,
                 Some((100.0, 50.0)),
+                None,
                 Some(Length::Px(200.0)),
                 None,
                 500.0
@@ -6913,6 +7001,7 @@ mod tests {
             replaced_size(
                 &style,
                 Some((100.0, 50.0)),
+                None,
                 None,
                 Some(Length::Px(25.0)),
                 500.0
@@ -6928,6 +7017,7 @@ mod tests {
             replaced_size(
                 &style,
                 Some((100.0, 50.0)),
+                None,
                 Some(Length::Px(30.0)),
                 Some(Length::Px(300.0)),
                 500.0
@@ -6945,6 +7035,7 @@ mod tests {
         let (width, _) = replaced_size(
             &style,
             Some((100.0, 100.0)),
+            None,
             Some(Length::Px(999.0)),
             None,
             500.0,
@@ -6960,6 +7051,7 @@ mod tests {
             replaced_size(
                 &style,
                 None,
+                None,
                 Some(Length::Px(120.0)),
                 Some(Length::Px(60.0)),
                 500.0
@@ -6967,7 +7059,7 @@ mod tests {
             (120.0, 60.0)
         );
         assert_eq!(
-            replaced_size(&style, None, None, None, 500.0),
+            replaced_size(&style, None, None, None, None, 500.0),
             BROKEN_IMAGE_SIZE
         );
     }
@@ -7011,6 +7103,7 @@ mod tests {
             replaced_size(
                 &style,
                 Some((1.0, 1.0)),
+                None,
                 Some(Length::Percent(100.0)),
                 Some(Length::Px(50.0)),
                 500.0
@@ -7021,6 +7114,7 @@ mod tests {
             replaced_size(
                 &style,
                 Some((1.0, 1.0)),
+                None,
                 Some(Length::Percent(50.0)),
                 None,
                 500.0
@@ -7042,6 +7136,7 @@ mod tests {
             replaced_size(
                 &style,
                 Some((100.0, 50.0)),
+                None,
                 None,
                 Some(Length::Percent(50.0)),
                 500.0
