@@ -16,6 +16,23 @@ record for everything earlier.
 
 ## Unreleased
 
+**An `<iframe>` is a box.** It was not a replaced element here at all, so one
+laid out as nothing and left a hole in a page built around it. It is 300x150
+now — §10.3.2 and §10.4's size for a replaced element with no intrinsic
+dimensions, which is every iframe here, since this engine loads no document
+into one.
+
+The trap in that pair of numbers is that they are *two defaults and not a 2:1
+ratio*. Modelling them as an intrinsic size looks right on the both-auto case
+and is wrong the moment one axis is given: an iframe an inch tall came out
+192px wide instead of 300. The distinction is now in the signature.
+
+**3180 of 4821 reference tests to 3188**, with 9 newly passing and 1 newly
+failing. The one is `inline-replaced-height-005`, which was passing by
+accident: its iframe asks for a percentage height this engine cannot resolve,
+and the box used to collapse to the 20x20 broken-image default, which happened
+to be small enough to hide behind the green square the test checks against.
+
 **Counters.** `counter-reset`, `counter-increment`, `counter()` and
 `counters()` (§12.4), with the self-nesting scope the spec describes — an
 instance created by a reset covers the element, its *following siblings*, and
