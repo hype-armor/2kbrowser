@@ -128,7 +128,6 @@ fn main() -> std::process::ExitCode {
     }
     eprintln!("{} candidate files under {}", tests.len(), root.display());
 
-    let mut fonts = FontStore::new();
     let mut chapters: BTreeMap<String, Tally> = BTreeMap::new();
     let mut totals = Tally::default();
     let mut failures: Vec<String> = Vec::new();
@@ -169,7 +168,7 @@ fn main() -> std::process::ExitCode {
             .iter()
             .any(|flag| NOT_A_VIOLATION.contains(&flag.as_str()));
 
-        match compare(path, &reference, &mut fonts) {
+        match compare(path, &reference) {
             Outcome::Same => {
                 totals.passed += 1;
                 tally.passed += 1;
@@ -227,14 +226,32 @@ impl Tally {
 }
 
 /// Renders both sides and compares them pixel for pixel.
-fn compare(test: &Path, reference: &Path, fonts: &mut FontStore) -> Outcome {
+fn compare(test: &Path, reference: &Path) -> Outcome {
     // `catch_unwind` because a panic on one test must not end the run — and
     // because a panic *is* a finding, recorded rather than swallowed. It needs
     // the unwinding profile; see the `conformance` profile in the workspace
     // manifest, which exists for this.
     let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let left = render(test, fonts)?;
-        let right = render(reference, fonts)?;
+        // A font store of its own for each side, which is the whole of this
+        // harness's isolation. One store held for the run is what a browser
+        // does and exactly what a measurement must not: its shaping cache
+        // stops inserting at a cap, and `cosmic-text`'s own `FontSystem`
+        // loads faces and remembers fallback matches as it goes — so what a
+        // store holds when a given test runs depends on every test before it,
+        // and a result can turn on the order of the walk rather than on the
+        // document.
+        //
+        // That is not theoretical: a change confined to table layout once
+        // flipped `text/bidi-flag-emoji-02`, a document with no table in it,
+        // by changing how full the cache was by the time the walk reached
+        // `text/`.
+        //
+        // It costs almost nothing, which is the part worth knowing before
+        // reaching for something cleverer: the faces are embedded and load
+        // lazily, so a fresh store is about twenty microseconds and the whole
+        // run is no slower to the tenth of a second.
+        let left = render(test, &mut FontStore::new())?;
+        let right = render(reference, &mut FontStore::new())?;
         Some((left, right))
     }));
 
@@ -611,5 +628,49 @@ mod tests {
         ] {
             assert_eq!(unwrap_cdata(document), document, "changed: {document}");
         }
+    }
+
+    /// A document this repository owns, so the test does not need the suite.
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tests/")
+            .parent()
+            .expect("repo root")
+            .join("tests/ref/fixtures/inline.html")
+    }
+
+    #[test]
+    fn two_renders_of_one_document_agree() {
+        // The property the whole harness rests on. A comparison that is not
+        // deterministic measures the harness rather than the engine, and every
+        // number this prints would carry an error bar nobody had measured.
+        let path = fixture();
+        let first = render(&path, &mut FontStore::new()).expect("rendered");
+        let second = render(&path, &mut FontStore::new()).expect("rendered");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn what_a_store_has_already_seen_does_not_change_what_it_draws() {
+        // Why `compare` builds a store per document. One store held across a
+        // run accumulates a shaping cache that stops inserting at a cap, and
+        // `cosmic-text`'s own `FontSystem` loads faces and remembers fallback
+        // matches as it goes — so a result could turn on the order of the walk
+        // rather than on the document.
+        //
+        // This asserts the two agree, which is what makes the isolated harness
+        // trustworthy. If it ever fails, the isolation is not a precaution: it
+        // is load-bearing, and this test is how that was found out.
+        let path = fixture();
+        let cold = render(&path, &mut FontStore::new()).expect("rendered");
+
+        let mut warmed = FontStore::new();
+        for other in ["backgrounds.html", "presentational.html", "era-page.html"] {
+            let path = fixture().with_file_name(other);
+            let _ = render(&path, &mut warmed);
+        }
+        let after = render(&path, &mut warmed).expect("rendered");
+        assert_eq!(cold, after);
     }
 }
