@@ -2583,4 +2583,50 @@ mod canvas_background_tests {
         // The body's own tile is not propagated, so it still paints normally.
         assert_eq!(tiles(&list), 1);
     }
+
+    #[test]
+    fn a_propagated_background_colour_is_not_painted_over_the_canvas_again() {
+        // §14.2's other half, and the one that was wrong. The colour reached
+        // the canvas *and* stayed on the anonymous root box, which is as tall
+        // as the content rather than as tall as the window — so it laid an
+        // opaque rectangle over the top of whatever the canvas held. Invisible
+        // while the canvas held only the same colour; it cost the whole lower
+        // part of a `no-repeat` background image taller than the page's text.
+        let (list, _) = list_for(
+            r#"<body style="background: #00ff00 url(tile.gif) no-repeat"><p>x</p></body>"#,
+        );
+        assert_eq!(
+            list.canvas,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "the colour did not reach the canvas"
+        );
+        let fills = list
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(item, DisplayItem::Rect { color, .. }
+                    if !color.is_transparent())
+            })
+            .count();
+        assert_eq!(fills, 0, "the canvas colour was painted a second time");
+    }
+
+    #[test]
+    fn an_ordinary_background_colour_is_still_painted() {
+        // The guard above is on the canvas box alone, so it must not have
+        // taken every background with it.
+        let (list, _) = list_for(r#"<body><p style="background: #00ff00">x</p></body>"#);
+        assert!(
+            list.items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Rect { color, .. }
+                    if !color.is_transparent())),
+            "a paragraph's background went missing"
+        );
+    }
 }

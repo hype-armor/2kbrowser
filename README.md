@@ -104,7 +104,7 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3225 of 4821 reference tests pass,
+The CSS 2.1 suite has been run against it: **3226 of 4821 reference tests pass,
 66.9%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
