@@ -12,7 +12,18 @@
   .panel { background: #ff0000 }
 }
 
-/* Does not apply: a feature query is CSS 3. */
+/* Applies: the viewport is wider than this, and the width is a number this
+   browser knows rather than a guess. */
 @media screen and (min-width: 1px) {
-  .panel { border-width: 20px }
+  .panel { border-width: 8px }
+}
+
+/* Does not apply: the viewport is wider than 200px. */
+@media screen and (max-width: 200px) {
+  .panel { background: #ff0000 }
+}
+
+/* Does not apply: a feature that cannot be measured is still answered no. */
+@media screen and (orientation: portrait) {
+  .panel { background: #ff0000 }
 }

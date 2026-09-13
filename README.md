@@ -59,18 +59,34 @@ centred on the grid line between them, which is what a Wikipedia infobox or
 wikitable is built out of; table captions, which sit outside the table's
 border box on whichever side `caption-side` names; `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
-it can still ask to be visible and come back out; images,
+it can still ask to be visible and come back out; `text-transform`,
+`letter-spacing`, `text-indent` on a block's first line, `min-height` and
+`max-height` — applied in the order §10.7 gives them, so a box asked for both
+at once takes the minimum — `clip`, where every side of the `rect()` is an
+offset from the box's top-left corner rather than an inset from the far edges,
+the one thing about that property which is easy to get backwards — and
+`z-index`, so that two overlapping positioned boxes land in the order their
+author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
 framesets; quirks-mode value parsing; the presentational attributes the era's
-markup actually used (`bgcolor`, `align`, `<font>`, `border`); list markers;
+markup actually used (`bgcolor`, `align`, `<font>`, `border`, and `width` on an
+image — including `width="100%"`, which is how a page drew a rule across a
+column or held a layout open with a spacer GIF); list markers;
 text decorations; tiled background images; every CSS 2.1 border style —
 dotted and dashed runs stretched to start and end flush with the corners rather
 than leaving half a dash there, and `double`, `groove`, `ridge`, `inset` and
 `outset` lit from above and to the left, which is what made the era's grey
-buttons look like buttons; external stylesheets, including
-`@import` chains and `@media` blocks; and legacy
+buttons look like buttons; the `font` shorthand, which is how the era's
+stylesheets actually set type — `font: bold 12px Arial` — and which until
+recently parsed as nothing at all, taking the line height down with it;
+generated content, where `::before` and `::after`
+take a string or an `attr()` and bracket the element's own content — in both
+spellings, since CSS 2.1 writes one colon and the era's pages use it;
+external stylesheets, including
+`@import` chains and `@media` blocks — width queries included, so a page's
+desktop rules apply at a desktop width instead of being dropped; and legacy
 character encodings, which most of the surviving old web needs — a page in
 windows-1252 read as UTF-8 is replacement characters where every accented
 letter and curly quote should be.
@@ -85,68 +101,131 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **1451 of 4821 reference tests pass,
-30.1%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **3188 of 4821 reference tests pass,
+66.1%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
-an engine that ignores a property draws both sides the same way — but the
-failures are largely real: on a random sample of 150 of them, headless Chromium
-renders 140 identically. `cargo run --profile conformance -p conformance` does
-it; the suite is not vendored.
+an engine that ignores a property draws both sides the same way.
+`cargo run --profile conformance -p conformance` does it; the suite is not
+vendored.
 
-The figure moves in small amounts and is worth reading that way. Collapsed
-borders were worth **eight** tests, seven of them named for the thing they
-test — and a rise of eight is the weakest evidence in this file, which is why
-the reference tests below carry committed baselines instead.
+The figure usually moves in small amounts and is worth reading that way.
+Collapsed borders were worth **eight** tests, seven of them named for the thing
+they test — and a rise of eight is the weakest evidence in this file, which is
+why the reference tests below carry committed baselines instead.
 
-The first run of that reported 20.6%, and the number was wrong three times over
-before it was worth anything — see PLAN.md, because the harness's own bugs are
-more instructive than the figure.
+It has twice moved by a lot, and both times the cause was the harness rather
+than the engine. The first run reported 20.6% and was wrong three times over
+before it was worth anything. Then 30.4% became 35.5% when the suite's
+stylesheets started reaching the engine at all: almost every test here is
+XHTML, wrapping its CSS in `<![CDATA[ … ]]>`, and read as HTML — which is how
+this browser reads everything, and how every browser read XHTML served as
+`text/html` — that wrapper makes CSS error recovery swallow the whole
+stylesheet. Chromium does the same with the same bytes; it differs only because
+a `.xht` file off disk sends it down its XML parser.
 
-Known to be missing or wrong, rather than hidden: `overflow` is understood
+The half of that worth dwelling on is not the 590 tests that started passing.
+It is the **342 that started failing** — pairs with the wrapper on *both* sides,
+where two lost stylesheets left two pages of unstyled prose matching each other
+perfectly. They had been counted green from the beginning. A reftest cannot
+tell "identical" from "identically blank", so nothing here would ever have
+found them; they turned up only because a fix aimed at something else made them
+move. See PLAN.md — the harness's own bugs have been more instructive than the
+figure every time.
+
+Known to be missing or wrong, rather than hidden: an inline box paints no
+background, padding or border, so a highlighted phrase or a tinted `<code>`
+comes out as plain text (issue #46) — "the box model with borders and
+backgrounds" above means *block* boxes; `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
-not clipped; an invalid selector does not invalidate its rule, so
+not clipped — it is drawn, and the canvas is now grown to hold it, which it was
+not until a `height: 0` box turned out to be losing its text off the bottom
+edge; an invalid selector does not invalidate its rule, so
 `[1digit], div { color: red }` styles the `div` where a browser would style
 nothing; a caption wider than its table, which overhangs it rather than
 widening a wrapper box this engine does not have, so the table sits a little
-left of where a browser puts it; `empty-cells`, which is parsed by nobody here and so is ignored in the
+left of where a browser puts it; a float, which grows the block
+that contains it instead of hanging out below its bottom edge as §10.6.3 says
+(issue #41), so a container wraps its float where a browser lets it overhang;
+`empty-cells`, which is parsed by nobody here and so is ignored in the
 separated model where it applies — it is correctly ignored in the collapsing
 one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to
 the wider of them rather than mitring it diagonally as browsers do; fixed
-table layout; and `inline-block`,
-which is recognised and then laid out as though it were plain `inline` — an
-empty one with a width and a height collapses to nothing at all. That last one
-now counts as layout this engine does not implement, alongside flex and grid,
-so a page built on inline-blocks is re-rendered as a document and told so
-rather than coming out subtly wrong in silence (ADR-0009). It is a share and
-not a switch, so a navigation bar of them does not move an article.
+table layout; raising or lowering *text* off the baseline, so a `<sub>` or a
+`<sup>` sits level with the words around it; and `::first-letter` taking the
+pseudo-element's style whole, so with `<p><b>Bold</b>…` the first letter loses
+the `<b>` — the box should inherit from the innermost inline element around the
+letter, which needs the cascade where layout cannot reach it.
 
-**Forms are not drawn.** `<input>` of every type, `<textarea>` and `<button>`
-have no widget here, so a search box is not a box — it is nothing at all, and a
-login form is a column of labels. `<fieldset>` draws no border and `<legend>` no
-notch in it. A `<select>` at least shows the one option it is open on rather
-than running every option together into the surrounding sentence, which is what
-it used to do, but it has no dropdown around it. Nothing can be typed into or
-submitted regardless, since forms were never on the M2 list; what is worth
-saying plainly is that this makes some pages *look* broken rather than merely
-inert.
+`::first-line` is the one CSS 2.1 pseudo-element still absent. It is a
+different shape of problem from the other three: how much text is on the first
+line is not known until the line has been broken, and the style applied to it
+changes where it breaks.
+
+`inline-block` used to head this list. It is laid out now: sized by its own
+content (§10.3.9), placed on the line as one atom, and hung from the baseline of
+its own last line (§10.8.1), with `vertical-align` deciding where on the line it
+hangs. It no longer counts as layout this engine cannot do, so a page built on
+inline-blocks keeps the author's layout instead of falling back to a document
+(ADR-0009). What is still missing around it: an inline box's own border and
+padding take up no room on the line, so text after a bordered `<span>` does not
+wrap where it should; and an `<iframe>` has no intrinsic size, so one with
+`width: auto` comes out empty rather than 300x150.
+
+A page can also fall back because its *frame* is unsupported while its prose is
+not — a Wikipedia article is the case, where the text is ordinary flow and the
+columns and navigation rows around it are not. No share can see that, since by
+volume such a page is almost entirely correct, so a second signal counts the
+containers that would have arranged a row of blocks and now stack them instead.
+Every page in the corpus that should keep its author's layout scores zero of
+those; a Wikipedia article scores sixteen.
+
+**Forms are drawn but do not work.** Every control has a box now — text and
+password fields, buttons, checkboxes, radios, `<textarea>`, `<select>` and the
+rule around a `<fieldset>` — sized in the era's own units, since `size`, `cols`
+and `rows` count characters and lines rather than pixels, and a field follows
+the font it is set in. A password field shows bullets and never its value.
+**Nothing can be typed into, clicked, or submitted**, and that is the stopping
+point rather than an oversight: a control that draws correctly makes the page
+read correctly, and interaction is separate work with a separate risk. Two
+things a browser draws and this does not: a radio button is square, because the
+rasteriser has rectangles and no rounded primitive, and a `<legend>` sits above
+its group rather than breaking the rule it is written into.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `text-indent`, `letter-spacing`, `word-spacing`,
-`text-transform`, `font-variant`, `outline`, `min-height`, `max-height`,
-`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
-`z-index` — so overlapping positioned boxes paint in document order rather than
-in the order asked for — `position: fixed`, which behaves as `absolute` and so
-scrolls with the page, the second value of `border-spacing`, `direction` and
-everything else about right-to-left text, and generated content in all its
-forms: `:before`, `:after`, `content`, counters and `quotes`.
+this file used to admit: `word-spacing`, `font-variant`, `outline`,
+`text-align: justify`, `list-style-position`, `list-style-image`,
+`clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
+page, the system font keywords (`font: menu` and its siblings), which name a
+font of the host platform's that this engine has no way to ask for and so
+leave the page's own styling standing, the second value of `border-spacing`, `direction` and everything else
+about right-to-left text, and the parts of generated content still out of
+scope: `open-quote` and its family, which needs the nesting depth of quotation
+marks, and `url()` in `content`, which needs an image fetched for a box that is
+not an element. Each of those drops the whole declaration rather than showing
+part of what the author asked for, which would look deliberate.
+
+`counter()` and `counters()` came off that list. Counters are kept now, with
+the self-nesting scope §12.4.1 describes — an instance created by
+`counter-reset` covers the element, its **following siblings**, and all of
+their descendants, which is the part of that sentence easiest to read past.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have
 found them. The conformance suite cannot: a reftest passes when its two sides
 render alike, and content missing from both sides still matches. The reference
 baselines cannot either, since they only cover what somebody thought to write a
-fixture for. A gap list is only as good as the last time somebody looked.
+fixture for. Both are good at catching a rendering that *changed*; neither can
+find one that was never there.
+
+So the list above is now checked rather than remembered. `cargo run -p gaps`
+renders each property twice — once with the declaration and once without — and
+reports the ones that change nothing, alongside the elements that put nothing
+on the canvas. Every row carries the answer this file claims, and CI fails when
+they disagree in **either** direction: a property that starts working makes
+this list untrue just as surely as one that stops, and the point is that the
+list cannot go quietly stale again. It needs no browser, because "did this
+declaration change any pixel" is not a question that needs one.
 
 A document rendering also drops runs of line breaks, keeping one. Using
 `<br><br><br><br>` as a margin is how a great deal of the era's markup did its

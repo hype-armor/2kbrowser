@@ -79,6 +79,9 @@ pub struct PageRenderer {
     /// Whether the reader asked for the document fallback on a page that did
     /// not need one. Remembered for the same reason as `force_authored`.
     force_document: bool,
+    /// The zoom this page was rendered at, so a band matches the page it is
+    /// part of. Remembered for the same reason as the overrides.
+    zoom: f32,
 }
 
 impl Default for PageRenderer {
@@ -94,6 +97,7 @@ impl PageRenderer {
             fonts: FontStore::new(),
             page: None,
             force_authored: false,
+            zoom: 1.0,
             force_document: false,
         }
     }
@@ -127,6 +131,9 @@ fn mode_of(page: &crate::render::Page) -> Mode {
         layout::RenderMode::Document { unsupported_share } => Mode::Document {
             unsupported_share: *unsupported_share,
         },
+        layout::RenderMode::DocumentFrame { containers } => Mode::DocumentFrame {
+            containers: *containers as u32,
+        },
         layout::RenderMode::RequiresScripting => Mode::RequiresScripting,
     }
 }
@@ -138,11 +145,12 @@ fn links_of(page: &crate::render::Page) -> Vec<Link> {
         .into_iter()
         .enumerate()
         .flat_map(|(group, link)| {
-            let url = link.url;
+            let (url, jump_to) = (link.url, link.jump_to);
             link.rects.into_iter().map(move |rect| Link {
                 rect,
                 url: url.clone(),
                 group: group as u32,
+                jump_to,
             })
         })
         .collect()
@@ -173,6 +181,7 @@ impl Render for PageRenderer {
             path,
             force_authored,
             force_document,
+            zoom,
         } = request
         else {
             return Err("expected a render request".to_owned());
@@ -191,40 +200,25 @@ impl Render for PageRenderer {
         // assumed away. The author's layout wins, because it is the one that
         // shows the page as written; a reader given the wrong one of these can
         // at least see what they were denied.
-        let page = if *force_authored {
-            crate::render::render_as_authored_with(
-                &html,
-                *width,
-                *top,
-                *height,
-                &mut self.fonts,
-                &mut loader,
-                base,
-            )
-        } else if *force_document {
-            crate::render::render_as_document_with(
-                &html,
-                *width,
-                *top,
-                *height,
-                &mut self.fonts,
-                &mut loader,
-                base,
-            )
-        } else {
-            crate::render::render_with_base_and_loader(
-                &html,
-                *width,
-                *top,
-                *height,
-                &mut self.fonts,
-                &mut loader,
-                base,
-            )
-        };
+        let page = crate::render::render_sized(
+            &html,
+            *width,
+            *top,
+            *height,
+            crate::render::Settings {
+                fill_height: false,
+                force_authored: *force_authored,
+                force_document: *force_document,
+                zoom: *zoom,
+            },
+            &mut self.fonts,
+            &mut loader,
+            base,
+        );
 
         self.force_authored = *force_authored;
         self.force_document = *force_document && !*force_authored;
+        self.zoom = *zoom;
         let rendered = Rendered {
             pixels: page.pixmap.data().to_vec(),
             width: page.pixmap.width(),
@@ -283,6 +277,16 @@ impl Render for PageRenderer {
             None => Vec::new(),
         }
     }
+
+    fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<layout::Rect>, String) {
+        match &self.page {
+            Some(page) => {
+                let selection = page.select(from, to);
+                (selection.rects, selection.text)
+            }
+            None => (Vec::new(), String::new()),
+        }
+    }
 }
 
 /// Runs this process as a renderer child, reading from stdin and writing to
@@ -335,6 +339,7 @@ mod tests {
             path: String::new(),
             force_authored: false,
             force_document: false,
+            zoom: 1.0,
         }
     }
 
@@ -359,6 +364,7 @@ mod tests {
                 path,
                 force_authored: authored,
                 force_document: document,
+                zoom: 1.0,
             },
             other => other,
         }
@@ -558,6 +564,7 @@ mod tests {
                     path: at,
                     force_authored: false,
                     force_document: true,
+                    zoom: 1.0,
                 },
                 &mut fetch,
             )
@@ -644,6 +651,7 @@ mod tests {
                     path: at,
                     force_authored: false,
                     force_document: false,
+                    zoom: 1.0,
                 },
                 &mut no_fetch,
             )
@@ -713,6 +721,7 @@ mod tests {
                     path: at,
                     force_authored: false,
                     force_document: false,
+                    zoom: 1.0,
                 },
                 &mut fetch,
             )
@@ -771,6 +780,7 @@ mod tests {
                     path: at,
                     force_authored: false,
                     force_document: false,
+                    zoom: 1.0,
                 },
                 &mut fetch,
             )

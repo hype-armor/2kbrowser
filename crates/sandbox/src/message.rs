@@ -30,6 +30,12 @@ pub enum Mode {
         /// Fraction of the page that could not be laid out as authored.
         unsupported_share: f32,
     },
+    /// The document fallback, because the page's *frame* needs layout we do
+    /// not implement even though its text does not.
+    DocumentFrame {
+        /// How many containers would have laid their children out in a row.
+        containers: u32,
+    },
     /// The document fallback, because the page needs scripting.
     RequiresScripting,
 }
@@ -43,6 +49,10 @@ impl Mode {
                 writer.f32(*unsupported_share);
             }
             Mode::RequiresScripting => writer.tag(2),
+            Mode::DocumentFrame { containers } => {
+                writer.tag(3);
+                writer.u32(*containers);
+            }
         }
     }
 
@@ -53,6 +63,9 @@ impl Mode {
                 unsupported_share: reader.f32()?,
             }),
             2 => Ok(Mode::RequiresScripting),
+            3 => Ok(Mode::DocumentFrame {
+                containers: reader.u32()?,
+            }),
             _ => Err(WireError::Unknown),
         }
     }
@@ -73,6 +86,13 @@ pub struct Link {
     /// URL would be wrong: two different links on a page may lead to the same
     /// place.
     pub group: u32,
+    /// Where on this page it goes, for a link that does not leave it.
+    ///
+    /// A fragment link is a place on the page already open rather than a page
+    /// to fetch, and the answer is in the box tree — which lives on this side
+    /// of the boundary. Sent with the link so that following one costs no
+    /// round trip.
+    pub jump_to: Option<f32>,
 }
 
 fn write_rect(writer: &mut Writer, rect: &Rect) {
@@ -170,6 +190,9 @@ pub enum ToChild {
         /// reads whatever arrives, and `render` gives `force_authored`
         /// precedence rather than trusting a stranger to have kept the rule.
         force_document: bool,
+        /// How much bigger than its own pixels to draw the page. 1.0 is the
+        /// page as written.
+        zoom: f32,
     },
     /// Paint a different band of the page already held.
     ///
@@ -181,6 +204,17 @@ pub enum ToChild {
         top: u32,
         /// How many rows to paint.
         height: u32,
+    },
+    /// What lies between two points of the page already held.
+    ///
+    /// Asked of the child rather than worked out by the parent for the same
+    /// reason find is: the text and where it sits are in the box tree, which
+    /// never crosses the boundary. Only the two points do.
+    Select {
+        /// Where the drag started, in canvas coordinates.
+        from: (f32, f32),
+        /// Where it is now.
+        to: (f32, f32),
     },
     /// The answers to a [`ToParent::Fetch`], one per URL and in the same order.
     ///
@@ -220,6 +254,7 @@ impl ToChild {
                 path,
                 force_authored,
                 force_document,
+                zoom,
             } => {
                 writer.tag(0);
                 writer.bytes(body);
@@ -237,10 +272,18 @@ impl ToChild {
                 writer.str(path);
                 writer.some(*force_authored);
                 writer.some(*force_document);
+                writer.f32(*zoom);
             }
             ToChild::Find { query } => {
                 writer.tag(2);
                 writer.str(query);
+            }
+            ToChild::Select { from, to } => {
+                writer.tag(4);
+                writer.f32(from.0);
+                writer.f32(from.1);
+                writer.f32(to.0);
+                writer.f32(to.1);
             }
             ToChild::Band { top, height } => {
                 writer.tag(3);
@@ -292,6 +335,7 @@ impl ToChild {
                     path: reader.str()?,
                     force_authored: reader.some()?,
                     force_document: reader.some()?,
+                    zoom: reader.f32()?,
                 }
             }
             1 => {
@@ -321,6 +365,10 @@ impl ToChild {
             3 => ToChild::Band {
                 top: reader.u32()?,
                 height: reader.u32()?,
+            },
+            4 => ToChild::Select {
+                from: (reader.f32()?, reader.f32()?),
+                to: (reader.f32()?, reader.f32()?),
             },
             _ => return Err(WireError::Unknown),
         };
@@ -363,6 +411,13 @@ pub enum ToParent {
     Matches {
         /// One rectangle per match, in document order.
         rects: Vec<Rect>,
+    },
+    /// What a [`ToChild::Select`] drag covers.
+    Selected {
+        /// One rectangle per line it touches, to draw the highlight with.
+        rects: Vec<Rect>,
+        /// The text itself, for the clipboard.
+        text: String,
     },
 }
 
@@ -439,6 +494,10 @@ impl ToParent {
                     write_rect(&mut writer, &link.rect);
                     writer.str(&link.url);
                     writer.u32(link.group);
+                    writer.some(link.jump_to.is_some());
+                    if let Some(top) = link.jump_to {
+                        writer.f32(top);
+                    }
                 }
                 writer.some(page.can_toggle_layout);
                 writer.u32(page.images_loaded);
@@ -454,6 +513,14 @@ impl ToParent {
                 for rect in rects {
                     write_rect(&mut writer, rect);
                 }
+            }
+            ToParent::Selected { rects, text } => {
+                writer.tag(4);
+                writer.u32(rects.len() as u32);
+                for rect in rects {
+                    write_rect(&mut writer, rect);
+                }
+                writer.str(text);
             }
         }
         writer.finish()
@@ -502,6 +569,7 @@ impl ToParent {
                         rect: read_rect(&mut reader)?,
                         url: reader.str()?,
                         group: reader.u32()?,
+                        jump_to: reader.some()?.then(|| reader.f32()).transpose()?,
                     });
                 }
                 let can_toggle_layout = reader.some()?;
@@ -548,6 +616,20 @@ impl ToParent {
                 }
                 ToParent::Matches { rects }
             }
+            4 => {
+                // A count, not a plain `u32`: bounded by the bytes left, so a
+                // claim of four billion lines cannot reserve for four billion
+                // lines.
+                let count = reader.count()?;
+                let mut rects = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    rects.push(read_rect(&mut reader)?);
+                }
+                ToParent::Selected {
+                    rects,
+                    text: reader.str()?,
+                }
+            }
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;
@@ -579,6 +661,7 @@ mod tests {
                 },
                 url: "https://example.com/".to_owned(),
                 group: 0,
+                jump_to: Some(920.0),
             }],
             can_toggle_layout: true,
             images_loaded: 3,
@@ -602,6 +685,7 @@ mod tests {
             path: "/a.html".to_owned(),
             force_authored: true,
             force_document: false,
+            zoom: 1.0,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
     }
@@ -630,6 +714,7 @@ mod tests {
                 path: "/a.html".to_owned(),
                 force_authored,
                 force_document,
+                zoom: 1.0,
             };
             let decoded = ToChild::decode(&message.encode());
             assert_eq!(decoded, Ok(message), "{force_authored} {force_document}");
@@ -648,6 +733,7 @@ mod tests {
             path: String::new(),
             force_authored: false,
             force_document: false,
+            zoom: 1.0,
         };
         assert_eq!(ToChild::decode(&message.encode()), Ok(message));
     }
@@ -670,6 +756,7 @@ mod tests {
                 path,
                 force_authored: false,
                 force_document: false,
+                zoom: 1.0,
             };
             assert_eq!(ToChild::decode(&message.encode()), Ok(message), "{url}");
         }
@@ -752,6 +839,7 @@ mod tests {
                 path: "/".to_owned(),
                 force_authored: false,
                 force_document: true,
+                zoom: 1.0,
             }
             .encode(),
             ToParent::Rendered(Box::new(rendered(3, 2))).encode(),

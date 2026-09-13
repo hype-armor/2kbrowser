@@ -253,8 +253,12 @@ fn compare(test: &Path, reference: &Path, fonts: &mut FontStore) -> Outcome {
 
 /// One document, rendered to raw pixels.
 fn render(path: &Path, fonts: &mut FontStore) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
-    let (html, ..) = net::encoding::decode_document(&bytes, None);
+    // Through `read`, and not `std::fs::read` directly, so that what is
+    // rendered is what was inspected for `rel="match"` and flags. It read the
+    // file itself once, which meant the CDATA unwrapping below reached the
+    // metadata pass and never the pixels: the fix changed the number by
+    // exactly nothing, which is the only reason it was caught.
+    let html = read(path)?;
     // With the file's own location as the base, so the `support/` images and
     // stylesheets these tests lean on actually resolve.
     let url = net::file_url(path);
@@ -385,7 +389,73 @@ fn collect(directory: &Path, out: &mut Vec<PathBuf>) {
 fn read(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let (text, ..) = net::encoding::decode_document(&bytes, None);
-    Some(text)
+    Some(unwrap_cdata(&text))
+}
+
+/// Removes the XML CDATA wrapper the suite writes its stylesheets inside.
+///
+/// Nearly every test here is XHTML, and the XHTML idiom for a stylesheet is
+/// `<style type="text/css"><![CDATA[ … ]]></style>`. Read as XML that wrapper
+/// is markup and the CSS inside it is the style element's text. Read as HTML it
+/// is not: the whole thing is the element's text, so the stylesheet begins with
+/// `<![CDATA[`, and CSS error recovery treats the `[` as opening a block that
+/// swallows every rule up to the matching `]`. **The entire stylesheet is
+/// lost** — not the first rule, all of them.
+///
+/// This engine parses everything as HTML and has no XML parser, which is a
+/// scope decision and not an oversight: XHTML on the real web was served as
+/// `text/html` and parsed as HTML by every browser that met it. Chromium
+/// behaves exactly as this engine does when the same bytes are served as HTML —
+/// checked, not assumed — and only differs here because a `.xht` file off disk
+/// makes it use its XML parser instead.
+///
+/// So this is the harness's problem rather than the engine's, and unwrapping is
+/// the honest fix. What it buys is a *measurement*, not a rendering claim:
+/// nothing here says this browser can parse XHTML, only that the suite's CSS
+/// now reaches the engine it is meant to be testing.
+///
+/// It was worth chasing because it distorted the number in both directions, and
+/// the second one silently. Across the suite, 1609 failures had the wrapper on
+/// exactly one side — the test's stylesheet applied and the reference's did not,
+/// or the reverse — and those pairs could not have matched whatever the engine
+/// did. Worse, 432 pairs had it on *both* sides, where two stylesheets are lost
+/// and two pages of unstyled prose match each other perfectly. Those were being
+/// counted as passes. A test that passes because neither side rendered is the
+/// most expensive kind of green there is.
+fn unwrap_cdata(text: &str) -> String {
+    // Only inside a `<style>` element. A CDATA section anywhere else is the
+    // suite's business and not this engine's to reinterpret, and rewriting
+    // document text wholesale would be a licence to hide real parsing gaps.
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<style") {
+        let (before, after) = rest.split_at(start);
+        out.push_str(before);
+        let Some(open_end) = after.find('>') else {
+            out.push_str(after);
+            return out;
+        };
+        let (open_tag, body) = after.split_at(open_end + 1);
+        out.push_str(open_tag);
+        let Some(close) = body.to_ascii_lowercase().find("</style") else {
+            out.push_str(body);
+            return out;
+        };
+        let (content, tail) = body.split_at(close);
+        // The wrapper is stripped only as a matched pair. A lone `<![CDATA[`
+        // is malformed, and the engine should meet it exactly as it stands.
+        match (content.find("<![CDATA["), content.rfind("]]>")) {
+            (Some(open), Some(shut)) if open + "<![CDATA[".len() <= shut => {
+                out.push_str(&content[..open]);
+                out.push_str(&content[open + "<![CDATA[".len()..shut]);
+                out.push_str(&content[shut + "]]>".len()..]);
+            }
+            _ => out.push_str(content),
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Which chapter a test belongs to, taken from its directory.
@@ -466,5 +536,80 @@ fn report(chapters: &BTreeMap<String, Tally>, totals: &Tally, failures: &[String
             listing.display()
         ),
         Err(error) => eprintln!("could not write {}: {error}", listing.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape the suite writes, and the one that cost 2041 tests
+    /// their meaning.
+    #[test]
+    fn the_cdata_wrapper_comes_off_a_stylesheet() {
+        let unwrapped = unwrap_cdata(
+            "<head><style type=\"text/css\"><![CDATA[\n  div { color: red }\n]]></style></head>",
+        );
+        assert!(
+            !unwrapped.contains("CDATA") && !unwrapped.contains("]]>"),
+            "the wrapper survived: {unwrapped}"
+        );
+        assert!(
+            unwrapped.contains("div { color: red }"),
+            "the rules did not: {unwrapped}"
+        );
+        assert!(
+            unwrapped.contains("<style type=\"text/css\">") && unwrapped.contains("</style>"),
+            "the element itself was damaged: {unwrapped}"
+        );
+    }
+
+    #[test]
+    fn a_document_without_the_wrapper_is_returned_unchanged() {
+        // The suite is a mix: rewriting what needs no rewriting is how a
+        // measurement tool starts measuring itself.
+        for document in [
+            "<style>p { color: blue }</style>",
+            "<p>no style element at all</p>",
+            "<style>a { content: \"]]>\" }</style>",
+            "",
+        ] {
+            assert_eq!(unwrap_cdata(document), document, "changed: {document}");
+        }
+    }
+
+    #[test]
+    fn every_style_element_is_unwrapped_and_not_only_the_first() {
+        let unwrapped = unwrap_cdata(
+            "<style><![CDATA[ a { color: red } ]]></style>\
+             <p>between</p>\
+             <style><![CDATA[ b { color: blue } ]]></style>",
+        );
+        assert!(!unwrapped.contains("CDATA"), "a later one survived");
+        assert!(unwrapped.contains("a { color: red }") && unwrapped.contains("b { color: blue }"));
+        assert!(
+            unwrapped.contains("<p>between</p>"),
+            "content between was lost"
+        );
+    }
+
+    #[test]
+    fn a_cdata_section_outside_a_style_element_is_left_alone() {
+        // Only stylesheets are the harness's business. Rewriting document text
+        // wholesale would let a real parsing gap hide behind the measurement.
+        let document = "<body><![CDATA[ not a stylesheet ]]></body>";
+        assert_eq!(unwrap_cdata(document), document);
+    }
+
+    #[test]
+    fn an_unmatched_wrapper_is_left_exactly_as_it_stands() {
+        // Malformed markup is the engine's to meet, not the harness's to tidy.
+        for document in [
+            "<style><![CDATA[ p { color: red }</style>",
+            "<style> p { color: red } ]]></style>",
+            "<style><style>",
+        ] {
+            assert_eq!(unwrap_cdata(document), document, "changed: {document}");
+        }
     }
 }

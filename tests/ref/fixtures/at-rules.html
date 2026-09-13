@@ -14,8 +14,11 @@
     every override a site relies on.</p>
 
     <p>A <code>@media print</code> block would hide this text entirely if it
-    applied, and a feature query would put a twenty-pixel border round this
-    panel. Neither does.</p>
+    applied, and it does not. A <code>min-width</code> query that the viewport
+    satisfies puts the eight-pixel border round this panel; a
+    <code>max-width</code> one it does not satisfy, and an
+    <code>orientation</code> query that cannot be measured, would both paint it
+    red.</p>
   </div>
 </body>
 </html>

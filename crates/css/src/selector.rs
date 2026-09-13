@@ -1,10 +1,16 @@
 //! Selector parsing and matching.
 //!
 //! Scope is the CSS 2.1 subset: type, class, id, universal, and attribute
-//! selectors, combined into compounds and joined by descendant or child
-//! combinators. Pseudo-classes, sibling combinators, and pseudo-elements are
-//! not here; a selector using one is dropped whole rather than matched
-//! partially, since matching too broadly is the worse failure.
+//! selectors, combined into compounds and joined by descendant, child, or
+//! adjacent sibling combinators, optionally addressing the `::before`,
+//! `::after` or `::first-letter` pseudo-elements. Pseudo-classes are not here,
+//! nor is `::first-line`, the one pseudo-element whose extent is not known
+//! until the line has been broken; a selector using one is dropped whole
+//! rather than matched partially, since matching too broadly is the worse
+//! failure.
+//!
+//! The general sibling combinator `~` is deliberately absent: it is CSS 3, and
+//! the scope boundary is what gives this project a finish line (PLAN.md §2).
 //!
 //! Selectors are split on whitespace to find combinators, so an attribute test
 //! written with spaces around its operator (`[title = "x"]`) does not parse.
@@ -13,6 +19,26 @@
 
 use dom::{Document, NodeId};
 
+/// A pseudo-element: a box a stylesheet addresses that the document does not
+/// contain as an element.
+///
+/// `::first-line` is the one CSS 2.1 defines that is not here. It is a
+/// different shape of problem from the other three: how much text is on the
+/// first line is not known until the line has been broken, and the style
+/// applied to it changes where it breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PseudoElement {
+    /// `::before` — generated content at the start of the element.
+    Before,
+    /// `::after` — generated content at its end.
+    After,
+    /// `::first-letter` — the first letter of the first line, restyled.
+    ///
+    /// Unlike the other two it invents no content: it takes a piece of text
+    /// that is already there and gives it a box of its own.
+    FirstLetter,
+}
+
 /// How two compounds in a selector relate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Combinator {
@@ -20,6 +46,8 @@ pub enum Combinator {
     Descendant,
     /// `a > b` — matches only the immediate parent.
     Child,
+    /// `a + b` — matches the element immediately before, among siblings.
+    AdjacentSibling,
 }
 
 /// An `[attribute]` test, per CSS 2.1 §5.8.
@@ -122,6 +150,13 @@ pub struct Selector {
     /// `(combinator to previous compound, compound)`. The first entry's
     /// combinator is unused.
     pub parts: Vec<(Combinator, Compound)>,
+    /// The pseudo-element this selector addresses, if any.
+    ///
+    /// `matches` answers for the *originating* element either way — the
+    /// pseudo-element has no node of its own to match against. It is the
+    /// cascade that keeps the two apart, by only letting a rule with a
+    /// pseudo-element style that pseudo-element.
+    pub pseudo: Option<PseudoElement>,
 }
 
 /// CSS specificity, compared lexicographically.
@@ -179,6 +214,15 @@ impl Selector {
                     }
                     current = parent;
                 }
+                Combinator::AdjacentSibling => {
+                    let Some(previous) = preceding_element(doc, current) else {
+                        return false;
+                    };
+                    if !compound.matches(doc, previous) {
+                        return false;
+                    }
+                    current = previous;
+                }
                 Combinator::Descendant => {
                     // Walk up until an ancestor matches. Taking the first match
                     // is not strictly correct for all selectors — backtracking
@@ -200,6 +244,72 @@ impl Selector {
         }
         true
     }
+}
+
+/// The element immediately before `node` among its parent's children.
+///
+/// Text and comments are stepped over, which is what CSS 2.1 §5.7 means by
+/// "preceding sibling element": the two divs in
+/// `<div>a</div>\n<div>b</div>` are adjacent, and the whitespace between them
+/// — which every hand-written page has — must not separate them.
+fn preceding_element(doc: &Document, node: NodeId) -> Option<NodeId> {
+    let parent = doc.node(node).parent?;
+    let siblings = doc.children(parent);
+    let index = siblings.iter().position(|&child| child == node)?;
+    siblings[..index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|&sibling| doc.element(sibling).is_some())
+}
+
+/// Rewrites a selector so every combinator stands alone between spaces.
+///
+/// `a>b` and `a+b` are as valid as their spaced forms, and the parser wants one
+/// shape rather than three. Anything inside `[…]` is copied through untouched:
+/// `>` and `+` are ordinary characters in an attribute value, and splitting on
+/// one would tear `[title="a+b"]` in half and drop the rule.
+fn space_combinators(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut in_brackets = false;
+    let mut quote: Option<char> = None;
+    for c in input.chars() {
+        match (quote, c) {
+            (Some(open), c) => {
+                out.push(c);
+                if c == open {
+                    quote = None;
+                }
+            }
+            (None, '"' | '\'') if in_brackets => {
+                quote = Some(c);
+                out.push(c);
+            }
+            (None, '[') => {
+                in_brackets = true;
+                out.push(c);
+            }
+            (None, ']') => {
+                in_brackets = false;
+                out.push(c);
+            }
+            (None, '(') => {
+                in_brackets = true;
+                out.push(c);
+            }
+            (None, ')') => {
+                in_brackets = false;
+                out.push(c);
+            }
+            (None, '>' | '+') if !in_brackets => {
+                out.push(' ');
+                out.push(c);
+                out.push(' ');
+            }
+            (None, c) => out.push(c),
+        }
+    }
+    out
 }
 
 /// Parses a comma-separated selector list.
@@ -229,36 +339,112 @@ impl Selector {
 /// both the suite and the reference baselines, because it can move rendering
 /// on real pages in either direction.
 pub fn parse_selector_list(input: &str) -> Vec<Selector> {
-    input
-        .split(',')
+    split_top_level(input)
+        .into_iter()
         .filter_map(|s| parse_selector(s.trim()))
         .collect()
 }
 
-fn parse_selector(input: &str) -> Option<Selector> {
-    let mut parts: Vec<(Combinator, Compound)> = Vec::new();
-    let mut combinator = Combinator::Descendant;
-
-    for token in input.split_whitespace() {
-        if token == ">" {
-            combinator = Combinator::Child;
-            continue;
-        }
-        // `a > b` may also arrive unspaced as `a>b`.
-        for (index, piece) in token.split('>').enumerate() {
-            if index > 0 {
-                combinator = Combinator::Child;
+/// Splits a selector list on its *top-level* commas.
+///
+/// Not `split(',')`, which is what this used to be, because a comma inside
+/// `:is(…)`, `:not(…)` or an attribute value is not a separator. Splitting on
+/// it tears one selector into fragments, and a fragment can be a perfectly
+/// valid selector that matches far more than the original ever did.
+///
+/// That is not hypothetical. Wikipedia ships
+/// `… .mw-collapsible:not(.mw-made-collapsible) > :is(p,table,thead + tbody)
+/// { display: none }`, and splitting it on every comma leaves a bare `table`
+/// — which matched **every table on the page** and hid all of them, the
+/// infobox included. The pseudo-classes themselves were already handled
+/// correctly: a compound containing one is rejected and its selector dropped.
+/// The list simply never reached that check in one piece.
+fn split_top_level(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (index, c) in input.char_indices() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                out.push(&input[start..index]);
+                start = index + c.len_utf8();
             }
-            if piece.is_empty() {
-                continue;
-            }
-            let compound = parse_compound(piece)?;
-            parts.push((combinator, compound));
-            combinator = Combinator::Descendant;
+            (None, _) => {}
         }
     }
+    out.push(&input[start..]);
+    out
+}
 
-    (!parts.is_empty()).then_some(Selector { parts })
+/// Splits a trailing `::before`/`::after` off a selector.
+///
+/// Both spellings are accepted. CSS 2.1 writes one colon and CSS 2.2 onwards
+/// writes two, and the era's pages use the single-colon form, so refusing it
+/// would miss the markup this engine exists for.
+fn split_pseudo(input: &str) -> (&str, Option<PseudoElement>) {
+    let lowered = input.trim_end().to_ascii_lowercase();
+    for (suffix, pseudo) in [
+        ("::first-letter", PseudoElement::FirstLetter),
+        ("::before", PseudoElement::Before),
+        ("::after", PseudoElement::After),
+        (":first-letter", PseudoElement::FirstLetter),
+        (":before", PseudoElement::Before),
+        (":after", PseudoElement::After),
+    ] {
+        if let Some(rest) = lowered.strip_suffix(suffix) {
+            // A bare `::before` with nothing in front of it is `*::before`.
+            let head = if rest.trim().is_empty() {
+                "*"
+            } else {
+                &input[..rest.len()]
+            };
+            return (head, Some(pseudo));
+        }
+    }
+    (input, None)
+}
+
+fn parse_selector(input: &str) -> Option<Selector> {
+    let (input, pseudo) = split_pseudo(input);
+    let spaced = space_combinators(input);
+    let mut parts: Vec<(Combinator, Compound)> = Vec::new();
+    let mut combinator = Combinator::Descendant;
+    // Whether `combinator` was written rather than implied by whitespace, so
+    // that `a > > b` and a selector ending in one are rejected instead of
+    // quietly matching `a > b`. Both are invalid, and a rule that applies a
+    // colour the author never asked for is the failure worth avoiding.
+    let mut explicit = false;
+
+    for token in spaced.split_whitespace() {
+        let written = match token {
+            ">" => Some(Combinator::Child),
+            "+" => Some(Combinator::AdjacentSibling),
+            _ => None,
+        };
+        if let Some(written) = written {
+            if explicit {
+                return None;
+            }
+            combinator = written;
+            explicit = true;
+            continue;
+        }
+        let compound = parse_compound(token)?;
+        parts.push((combinator, compound));
+        combinator = Combinator::Descendant;
+        explicit = false;
+    }
+
+    if explicit {
+        return None;
+    }
+    (!parts.is_empty()).then_some(Selector { parts, pseudo })
 }
 
 fn parse_compound(input: &str) -> Option<Compound> {
@@ -405,6 +591,50 @@ mod tests {
     }
 
     #[test]
+    fn a_comma_inside_a_pseudo_class_is_not_a_separator() {
+        // The bug this pins cost Wikipedia every table on the page.
+        // `… :is(p,table,thead + tbody) { display: none }` split on every
+        // comma leaves a bare `table`, which is a valid selector matching far
+        // more than the original ever did — and the rule hid the lot.
+        let list = ".x:not(.y) > :is(p,table,thead + tbody)";
+        assert!(
+            parse_selector_list(list).is_empty(),
+            "a fragment escaped: {:?}",
+            parse_selector_list(list)
+        );
+    }
+
+    #[test]
+    fn a_comma_inside_an_attribute_value_is_not_a_separator() {
+        let doc = dom::parse(r#"<body><p title="a,b">x</p><p>y</p></body>"#);
+        assert_eq!(matching(&doc, "[title=\"a,b\"]"), 1);
+    }
+
+    #[test]
+    fn a_selector_list_still_splits_on_its_own_commas() {
+        let doc = dom::parse("<body><p>x</p><div>y</div><span>z</span></body>");
+        assert_eq!(matching(&doc, "p, div"), 2);
+        assert_eq!(matching(&doc, "p,div,span"), 3);
+    }
+
+    #[test]
+    fn an_unsupported_selector_in_a_list_drops_only_itself() {
+        // The valid ones beside it still apply: dropping the whole list would
+        // lose styling a browser shows.
+        let doc = dom::parse("<body><p>x</p><div>y</div></body>");
+        assert_eq!(matching(&doc, "p:hover, div"), 1);
+    }
+
+    #[test]
+    fn a_combinator_inside_a_pseudo_class_is_not_one() {
+        // `>` and `+` inside `:is(…)` belong to the pseudo-class, and the
+        // whole selector is dropped for containing one — not torn apart.
+        for list in [":is(a > b)", ":is(a + b)", ".x:not(a > b)"] {
+            assert!(parse_selector_list(list).is_empty(), "{list}");
+        }
+    }
+
+    #[test]
     fn matches_type_class_and_id() {
         let doc = doc();
         assert_eq!(matching(&doc, "p"), 2);
@@ -453,5 +683,78 @@ mod tests {
             .filter(|&n| doc.element(n).is_some())
             .count();
         assert_eq!(matching(&doc, "*"), elements);
+    }
+
+    /// The shape the CSS 2.1 suite's shared references are built on, and the
+    /// reason 432 failures had a sibling combinator on one side of them.
+    #[test]
+    fn an_adjacent_sibling_matches_only_the_element_right_after() {
+        let doc =
+            dom::parse("<body><div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div></body>");
+        let matched: Vec<_> = doc
+            .descendants(doc.root())
+            .into_iter()
+            .filter(|&n| {
+                parse_selector_list("div + div")
+                    .iter()
+                    .any(|s| s.matches(&doc, n))
+            })
+            .filter_map(|n| doc.element(n).and_then(|e| e.id().map(str::to_owned)))
+            .collect();
+        assert_eq!(
+            matched,
+            vec!["b", "c"],
+            "the first div has nothing before it"
+        );
+    }
+
+    #[test]
+    fn whitespace_between_siblings_does_not_separate_them() {
+        // Every hand-written page has a newline between its elements. Reading
+        // that as a sibling is what makes `div + div` match nothing at all.
+        let doc = dom::parse("<body><div></div>\n  <!-- c -->\n  <p></p></body>");
+        assert_eq!(matching(&doc, "div + p"), 1);
+    }
+
+    #[test]
+    fn a_sibling_combinator_needs_the_same_parent() {
+        let doc = dom::parse("<body><section><div></div></section><p></p></body>");
+        assert_eq!(matching(&doc, "div + p"), 0, "they are not siblings");
+    }
+
+    #[test]
+    fn combinators_parse_spaced_or_not() {
+        let doc = dom::parse("<body><div></div><p></p></body>");
+        for selector in ["div + p", "div+p", "div  +  p"] {
+            assert_eq!(matching(&doc, selector), 1, "{selector} did not match");
+        }
+    }
+
+    #[test]
+    fn a_combinator_inside_an_attribute_value_is_not_one() {
+        // `+` and `>` are ordinary characters in a value. Splitting on one
+        // tears the test in half and drops the rule.
+        let doc = dom::parse("<body><p title=\"a+b\">x</p><p title=\"a>b\">y</p></body>");
+        assert_eq!(matching(&doc, "[title=\"a+b\"]"), 1);
+        assert_eq!(matching(&doc, "[title=\"a>b\"]"), 1);
+    }
+
+    #[test]
+    fn chained_combinators_still_read_right_to_left() {
+        let doc = dom::parse("<body><div><h1></h1><p></p></div><div><p></p></div></body>");
+        // Only the `p` that follows an `h1` inside a div.
+        assert_eq!(matching(&doc, "div > h1 + p"), 1);
+    }
+
+    #[test]
+    fn a_doubled_combinator_drops_the_rule() {
+        // Invalid CSS. Matching it anyway applies styling the author never
+        // wrote, which is the failure worth avoiding (CSS 2.1 4.1.7).
+        for selector in ["div + + p", "div +", "div >"] {
+            assert!(
+                parse_selector_list(selector).is_empty(),
+                "{selector} parsed"
+            );
+        }
     }
 }

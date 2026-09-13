@@ -4,6 +4,8 @@
 //! machines with no display server, so the window is a thin consumer of this
 //! rather than the only way to produce output.
 
+use std::collections::HashMap;
+
 use css::Stylesheet;
 use layout::{IntrinsicSizes, RenderMode};
 use net::{Fetcher, Origin, RequestKind};
@@ -121,11 +123,6 @@ impl Page {
             }
             let hit = frame.layout.hit_test(x - frame.rect.x, y - frame.rect.y)?;
             let (_, href) = frame.doc.enclosing_link(hit)?;
-            // A fragment alone is a destination within this document, not a
-            // navigation; there is nothing to fetch.
-            if href.starts_with('#') {
-                return None;
-            }
             return Some(net::resolve(&frame.origin, &frame.path, href));
         }
         None
@@ -146,6 +143,32 @@ impl Page {
             }));
         }
         out
+    }
+
+    /// What lies between two points on the canvas, and where it is.
+    ///
+    /// Only within one frame — the one the drag started in. A selection that
+    /// ran from a frameset's sidebar into its article would be two documents'
+    /// text with nothing to say where one ended, which is not what anyone
+    /// means by dragging across a page.
+    pub fn select(&self, from: (f32, f32), to: (f32, f32)) -> layout::Selection {
+        for frame in self.frames.iter().rev() {
+            let inside = from.0 >= frame.rect.x
+                && from.0 < frame.rect.x + frame.rect.width
+                && from.1 >= frame.rect.y
+                && from.1 < frame.rect.y + frame.rect.height;
+            if !inside {
+                continue;
+            }
+            let local = |(x, y): (f32, f32)| (x - frame.rect.x, y - frame.rect.y);
+            let mut selection = frame.layout.select(local(from), local(to));
+            for rect in &mut selection.rects {
+                rect.x += frame.rect.x;
+                rect.y += frame.rect.y;
+            }
+            return selection;
+        }
+        layout::Selection::default()
     }
 
     /// Every link rectangle on the canvas, with the URL it leads to.
@@ -178,13 +201,26 @@ impl Page {
                 let Some((link, href)) = frame.doc.enclosing_link(node) else {
                     continue;
                 };
-                if link != node || href.starts_with('#') {
+                if link != node {
                     continue;
                 }
+                // The whole subtree, not the `<a>` alone. An inline link
+                // generates no box of its own and is found through the text
+                // spans that name it — and a span names the element the text
+                // is *directly* in. Wikipedia writes
+                // `<a href="#cite_note-1"><span class="mw-reflink-text">[1]</span></a>`,
+                // so asking only about the anchor came back with nothing at
+                // all: no rectangle, so no entry in the link list, so no
+                // cursor, no keyboard focus, and nothing under the pointer for
+                // a click to land on (#52). The window hit-tests against this
+                // list, not against the box tree — the box tree is in another
+                // process — so a link missing from it is a link that does not
+                // work.
                 let rects: Vec<layout::Rect> = frame
-                    .layout
-                    .rects_for(node)
+                    .doc
+                    .descendants(node)
                     .into_iter()
+                    .flat_map(|inside| frame.layout.rects_for(inside))
                     .map(|mut rect| {
                         rect.x += frame.rect.x;
                         rect.y += frame.rect.y;
@@ -197,6 +233,7 @@ impl Page {
                 out.push(Link {
                     rects,
                     url: net::resolve(&frame.origin, &frame.path, href),
+                    jump_to: jump_to(frame, href),
                 });
             }
         }
@@ -211,6 +248,55 @@ pub struct Link {
     pub rects: Vec<layout::Rect>,
     /// The absolute URL it leads to.
     pub url: String,
+    /// Where on this page it goes, for a link that does not leave it.
+    ///
+    /// `href="#Etymology"` is not a page to fetch; it is a place on the page
+    /// already open. These were being dropped on the floor — left out of the
+    /// link list entirely, so they took no cursor, took no keyboard focus, and
+    /// did nothing at all when clicked. On Wikipedia that is "Jump to
+    /// content", every entry in the contents, and every footnote marker in the
+    /// article (#52).
+    ///
+    /// Carried on the link rather than looked up when it is followed, because
+    /// the answer is in the box tree and by then the box tree is in another
+    /// process. It costs one optional float per link and saves a round trip
+    /// per click.
+    ///
+    /// `None` for a link that leaves the page, and also for a fragment naming
+    /// something this page does not have — a stale anchor is a link to
+    /// nowhere, and the honest thing is to do nothing rather than to guess.
+    pub jump_to: Option<f32>,
+}
+
+/// Where a fragment link lands on the canvas, if it is one and it lands.
+fn jump_to(frame: &Frame, href: &str) -> Option<f32> {
+    let name = href.strip_prefix('#')?;
+    // `href="#"` names the document itself — HTML calls the top of the page
+    // the indicated part when the fragment is empty. It is a common enough
+    // spelling of "back to the top" that treating it as a link to nowhere
+    // would leave a visibly dead link on the page.
+    if name.is_empty() {
+        return Some(frame.rect.y);
+    }
+    let target = frame.doc.fragment_target(name)?;
+    // The topmost edge of everything under the target, for the same reason the
+    // link's own rectangles are gathered that way: an inline element generates
+    // no box, and its text belongs to whatever is directly around it. A
+    // Wikipedia footnote's back-link points at
+    // `<sup id="cite_ref-1"><a>…</a></sup>`, and asking the `<sup>` alone
+    // about its geometry comes back with none.
+    //
+    // The minimum rather than the first: an anchor that wrapped across lines
+    // has a rectangle per line, and landing on its last one would put the
+    // start of it above the window.
+    let top = frame
+        .doc
+        .descendants(target)
+        .into_iter()
+        .flat_map(|inside| frame.layout.rects_for(inside))
+        .map(|rect| rect.y)
+        .reduce(f32::min)?;
+    Some(frame.rect.y + top)
 }
 
 impl Link {
@@ -507,19 +593,37 @@ pub fn render_as_authored_with(
 }
 
 /// How to render, beyond the document itself.
-#[derive(Debug, Clone, Copy, Default)]
-struct Settings {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Settings {
     /// Fill the canvas to the height given rather than shrinking to content.
-    fill_height: bool,
+    pub(crate) fill_height: bool,
     /// Use the author's layout whatever classification decided.
-    force_authored: bool,
+    pub(crate) force_authored: bool,
     /// Use the document fallback whatever classification decided.
     ///
     /// The other direction of `force_authored`, and not reachable by inverting
     /// it: a page that classifies as `Authored` has no fallback to return to,
     /// so asking for one is a different request rather than the absence of
     /// this one.
-    force_document: bool,
+    pub(crate) force_document: bool,
+    /// How much bigger than its own pixels the page is drawn.
+    ///
+    /// 1.0 is the page as written. It is applied in the cascade, where every
+    /// pixel length is computed — so the text is *shaped* at the zoomed size
+    /// rather than a finished rendering being blown up, and the viewport keeps
+    /// its real width so the text reflows to the window (#55).
+    pub(crate) zoom: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            fill_height: false,
+            force_authored: false,
+            force_document: false,
+            zoom: 1.0,
+        }
+    }
 }
 
 #[expect(
@@ -527,7 +631,7 @@ struct Settings {
     reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
               nothing else would use"
 )]
-fn render_sized(
+pub(crate) fn render_sized(
     html: &str,
     width: u32,
     band_top: u32,
@@ -558,8 +662,8 @@ fn render_sized(
         );
     }
 
-    let author_sheets = collect_stylesheets(&doc, loader, base);
-    let styles = css::cascade::cascade(&doc, &author_sheets);
+    let author_sheets = collect_stylesheets(&doc, loader, base, width as f32);
+    let styles = css::cascade::cascade_at(&doc, &author_sheets, settings.zoom);
 
     // Classify before laying out: if the page needs layout we do not implement,
     // producing the wrong layout first and discarding it would be wasted work.
@@ -588,9 +692,23 @@ fn render_sized(
         // Re-render as a document. The author's sheets are dropped entirely —
         // keeping them would reintroduce exactly the layout that failed — and
         // the reader sheet is applied over the UA defaults instead.
-        RenderMode::Document { .. } | RenderMode::RequiresScripting => {
+        //
+        // Their colours go too, and that needs saying separately: a sheet is
+        // not the only place an author writes one. Wikipedia's taxobox carries
+        // its pale bands in a `style` attribute on each row, which survived
+        // the sheet being dropped and left near-white text on near-white
+        // backgrounds — a reading view less legible than the page it was
+        // rescuing.
+        RenderMode::Document { .. }
+        | RenderMode::DocumentFrame { .. }
+        | RenderMode::RequiresScripting => {
             let reader = Stylesheet::parse(css::ua::READER_STYLESHEET);
-            let mut styles = css::cascade::cascade(&doc, &[reader]);
+            let mut styles = css::cascade::cascade_as(
+                &doc,
+                &[reader],
+                settings.zoom,
+                css::cascade::Colours::Readers,
+            );
             // The author's furniture goes with the author's layout. Without
             // this the navigation, the sidebar and the footer no longer sit
             // beside the article — they stack above and below it, so a reading
@@ -613,8 +731,6 @@ fn render_sized(
     if let Some(body) = doc.find_element("body") {
         styles.keep_off_the_edges(body, PAGE_GUTTER, width as f32);
     }
-    let styles = styles;
-
     // Images are loaded whichever way the page is being rendered. They used to
     // be dropped on the document fallback, on the grounds that a rendering
     // which has discarded the author's layout should not spend requests on
@@ -638,6 +754,16 @@ fn render_sized(
         .filter(|(key, _)| key.slot == paint::ImageSlot::Content)
         .map(|(key, image)| (key.node, (image.width(), image.height())))
         .collect();
+
+    if !matches!(mode, RenderMode::Authored) {
+        hide_missing_images(&doc, &intrinsic, &mut styles);
+        // After the images and not before: the boxes this finds are mostly
+        // the ones the line above just emptied.
+        hide_empty_boxes(&doc, &mut styles);
+    }
+    // Settled: everything that patches a computed style after the cascade has
+    // had its turn, and the rest of the pipeline reads.
+    let styles = styles;
 
     let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
     let list = build_display_list(&laid_out);
@@ -981,6 +1107,164 @@ fn collapse_blank_lines(doc: &dom::Document, styles: &mut css::cascade::StyleMap
     }
 }
 
+/// Hides boxes that have nothing left to draw, in a document rendering.
+///
+/// The counterpart to [`hide_missing_images`], and it runs second because it
+/// depends on it. A picture on a Wikipedia article arrives wrapped in three
+/// or four sized `<div>`s, and the taxobox at the top of the page stacks six
+/// of those inside a table: hide the images and 850 pixels of empty scaffold
+/// are still standing, each box holding the height its inline `style` asked
+/// for around nothing at all. Hiding the pictures without this only moves the
+/// hole.
+///
+/// The rule is about content rather than cause, which is what makes it safe
+/// to apply to a whole document: an element is hidden when its subtree holds
+/// no text and nothing that draws by itself. Already-hidden descendants do
+/// not count — that is the point, since what makes these boxes empty is
+/// precisely what [`slop::extract`] and `hide_missing_images` hid.
+///
+/// Only on the fallback, and for the same reason as the images: a rendering
+/// that has kept the author's stylesheet has to keep the boxes it sizes, and
+/// a rendering that threw the sheet away has already decided that the
+/// author's arrangement was not serving the reader.
+///
+/// Bottom-up in reverse document order, so each element reads an answer its
+/// children have already written instead of walking its own subtree. On an
+/// article whose tables nest five deep that is the difference between a pass
+/// and a page-load.
+fn hide_empty_boxes(doc: &dom::Document, styles: &mut css::cascade::StyleMap) {
+    let mut draws: HashMap<dom::NodeId, bool> = HashMap::new();
+    for node in doc.descendants(doc.root()).into_iter().rev() {
+        let drawn = draws_something(doc, styles, node, &draws);
+        draws.insert(node, drawn);
+        // The root and the body are the page itself. Hiding them turns an
+        // article that happens to be all pictures into a blank window, with
+        // nothing left underneath to explain where it went.
+        if !drawn
+            && doc
+                .element(node)
+                .is_some_and(|element| may_go(element.local_name()))
+        {
+            styles.hide(node);
+        }
+    }
+}
+
+/// Whether an empty element of this name may be taken out of the flow.
+///
+/// Emptiness is not on its own a licence to remove something. An element can
+/// hold a place as well as hold content, and these hold places:
+///
+/// * A cell keeps a column in line. `<td></td>` is ordinary in a data table,
+///   and dropping it slides every later cell in that row one column left —
+///   which puts the wrong numbers under the headings, silently.
+/// * A list item keeps the count. Dropping an empty one renumbers every item
+///   after it.
+///
+/// The root and the body are not on the list, and not because they are safe
+/// to drop: layout reads the body's style and then lays out its children
+/// whatever its `display` says, so hiding it does nothing at all. An entry
+/// here would be a comment claiming a danger the code cannot have.
+fn may_go(local_name: &str) -> bool {
+    !matches!(
+        local_name,
+        "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "col"
+            | "colgroup"
+            | "caption"
+            | "li"
+            | "dt"
+            | "dd"
+    )
+}
+
+/// Whether this node puts ink on the page, given what its children have
+/// already answered.
+///
+/// Text, or an element that draws on its own account. The list is short and
+/// errs towards keeping things: a false "yes" costs an empty box, a false
+/// "no" deletes something the reader came for.
+fn draws_something(
+    doc: &dom::Document,
+    styles: &css::cascade::StyleMap,
+    node: dom::NodeId,
+    draws: &HashMap<dom::NodeId, bool>,
+) -> bool {
+    /// Elements that draw with no text of their own.
+    const SELF_DRAWING: &[&str] = &[
+        "img", "hr", "canvas", "svg", "video", "audio", "iframe", "object", "embed", "input",
+        "textarea", "select", "button",
+    ];
+    if styles
+        .get(node)
+        .is_some_and(|style| style.display == css::style::Display::None)
+    {
+        return false;
+    }
+    if let Some(text) = doc.text(node) {
+        return !text.trim().is_empty();
+    }
+    let Some(element) = doc.element(node) else {
+        return false;
+    };
+    // A `<br>` puts no ink anywhere and is still the whole of what its author
+    // wrote — an address, a verse, a signature. It counts.
+    if element.local_name() == "br" {
+        return true;
+    }
+    if SELF_DRAWING.contains(&element.local_name()) {
+        return true;
+    }
+    doc.children(node)
+        .iter()
+        .any(|child| draws.get(child).copied().unwrap_or(false))
+}
+
+/// Hides images that are not going to be drawn, in a document rendering.
+///
+/// This is where the reading view's empty gaps came from. Every large blank
+/// band on a Wikipedia article — 312 pixels, 294, 282, on down — was an
+/// `<img>` holding open the box its `width` and `height` attributes asked
+/// for, with no picture in it. Wikipedia serves its images from a different
+/// host, third-party requests are refused (ADR-0006), and an article is
+/// mostly photographs: the reader was scrolling past holes.
+///
+/// A browser rendering the page as authored has to keep the hole. The
+/// author's layout is built around a box of that size, and Chromium reserves
+/// it too — a broken image with dimensions is 250x290 of nothing there as
+/// well. A document rendering has already given that up: it threw away the
+/// author's sheet precisely because their layout was not serving the reader,
+/// and a gap reserved for a picture that does not exist is the clearest case
+/// of it. So this only runs on the fallback, and `Authored` keeps Chromium's
+/// behaviour, gaps and all.
+///
+/// "Not going to be drawn" is decided after the fetch, so it means failed or
+/// refused rather than still coming: `intrinsic` holds every image that
+/// loaded and decoded, and layout is about to size the rest from thin air.
+///
+/// The caption stays. It is text, the reader can still learn what the picture
+/// showed, and losing it as well would be a second, quieter kind of hole.
+fn hide_missing_images(
+    doc: &dom::Document,
+    intrinsic: &IntrinsicSizes,
+    styles: &mut css::cascade::StyleMap,
+) {
+    for node in doc.descendants(doc.root()) {
+        let is_image = doc
+            .element(node)
+            .is_some_and(|element| element.local_name() == "img");
+        if is_image && !intrinsic.contains_key(&node) {
+            styles.hide(node);
+        }
+    }
+}
+
 /// How deeply `@import` may nest before we stop following it.
 ///
 /// A stylesheet can import itself, directly or through a cycle, and a browser
@@ -998,6 +1282,7 @@ fn push_with_imports(
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
     depth: usize,
+    viewport_width: f32,
 ) {
     if depth < MAX_IMPORT_DEPTH
         && let Some((origin, path)) = base
@@ -1015,10 +1300,11 @@ fn push_with_imports(
             };
             push_with_imports(
                 sheets,
-                Stylesheet::parse(&resource.text()),
+                Stylesheet::parse_at(&resource.text(), viewport_width),
                 loader,
                 Some((&sheet_origin, &sheet_path)),
                 depth + 1,
+                viewport_width,
             );
         }
     }
@@ -1047,6 +1333,9 @@ fn collect_stylesheets(
     doc: &dom::Document,
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
+    // The width the page is being rendered at, which decides which `@media`
+    // blocks contribute any rules at all.
+    viewport_width: f32,
 ) -> Vec<Stylesheet> {
     let mut sheets = Vec::new();
 
@@ -1056,9 +1345,9 @@ fn collect_stylesheets(
         };
         match element.local_name() {
             "style" => {
-                let sheet = Stylesheet::parse(&doc.text_content(node));
+                let sheet = Stylesheet::parse_at(&doc.text_content(node), viewport_width);
                 // A `<style>` block's imports resolve against the document.
-                push_with_imports(&mut sheets, sheet, loader, base, 0);
+                push_with_imports(&mut sheets, sheet, loader, base, 0, viewport_width);
             }
             // An external stylesheet is how a site of this era shared one look
             // across every page; skipping them leaves those pages unstyled.
@@ -1076,7 +1365,7 @@ fn collect_stylesheets(
                 if let Some(resource) = loader.load(&url, Some(origin), RequestKind::Subresource)
                     && let Ok((sheet_origin, sheet_path)) = net::parse_url(&url)
                 {
-                    let sheet = Stylesheet::parse(&resource.text());
+                    let sheet = Stylesheet::parse_at(&resource.text(), viewport_width);
                     // An imported sheet's URLs resolve against the sheet that
                     // imported it, not against the document.
                     push_with_imports(
@@ -1085,6 +1374,7 @@ fn collect_stylesheets(
                         loader,
                         Some((&sheet_origin, &sheet_path)),
                         0,
+                        viewport_width,
                     );
                 }
             }
@@ -1155,6 +1445,37 @@ mod tests {
             .iter()
             .filter(|pixel| pixel[0] < 80 && pixel[1] > 150 && pixel[2] < 80)
             .count()
+    }
+
+    #[test]
+    fn the_document_fallback_paints_none_of_the_colours_in_the_markup() {
+        // Dropping the author's sheet does not drop the colours in their
+        // markup. Wikipedia's taxobox carries its bands inline, on every row,
+        // and they came through onto the dark reader page as pale strips with
+        // near-white text on them — a reading view less legible than the page
+        // it was rescuing.
+        let html = "<body><p style=\"background-color: rgb(0,255,0)\">A paragraph.</p></body>";
+        let mut fonts = FontStore::new();
+        let as_document = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut DirectLoader::default(),
+            None,
+        );
+        let as_authored = render_as_authored(html, 900, 4000, &mut fonts, None);
+
+        assert_eq!(
+            green_pixels(&as_document),
+            0,
+            "the reading view painted the author's background"
+        );
+        assert!(
+            green_pixels(&as_authored) > 0,
+            "the authored rendering lost it"
+        );
     }
 
     #[test]
@@ -1235,6 +1556,267 @@ mod tests {
         assert!(
             rows_with_green.abs_diff(expected_rows) <= 2,
             "{widest}x{rows_with_green} is not the 15:2 image scaled down"
+        );
+    }
+
+    /// A loader that fetches nothing, like a page whose images are all on
+    /// another host and refused (ADR-0006).
+    struct NoImages;
+
+    impl Loader for NoImages {
+        fn load(
+            &mut self,
+            _url: &str,
+            _document: Option<&Origin>,
+            _kind: RequestKind,
+        ) -> Option<Loaded> {
+            None
+        }
+    }
+
+    /// Height of a page rendered as a document, with `loader` for its images.
+    fn document_height(html: &str, loader: &mut dyn Loader) -> f32 {
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        render_as_document_with(html, 900, 0, 4000, &mut fonts, loader, Some((&origin, &at)))
+            .content_height
+    }
+
+    #[test]
+    fn a_document_rendering_does_not_hold_a_gap_open_for_an_image_that_never_arrived() {
+        // Every large blank band in the reading view of a Wikipedia article
+        // was one of these: an `<img>` whose `width` and `height` attributes
+        // reserved a box, with nothing in it because the picture is on
+        // another host and third-party requests are refused. The article was
+        // holes.
+        let html = "<body><p>before</p><img src=\"gone.png\" width=\"250\" height=\"290\"><p>after</p></body>";
+        let gap = document_height(html, &mut NoImages);
+        let no_image = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+
+        assert!(
+            (gap - no_image).abs() < 1.0,
+            "the missing image still holds {}px open",
+            gap - no_image
+        );
+    }
+
+    #[test]
+    fn a_document_rendering_keeps_the_gap_for_an_image_that_did_arrive() {
+        // The other half, and the one that matters: the rule is "there is no
+        // picture", not "pictures are noise". An image that loaded is the
+        // content of the article and takes exactly the room it always did.
+        let html = "<body><p>before</p><img src=\"here.png\" width=\"250\" height=\"290\"><p>after</p></body>";
+        let mut green = GreenImages {
+            png: green_png(250, 290),
+        };
+        let shown = document_height(html, &mut green);
+        let no_image = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+
+        assert!(
+            shown - no_image > 280.0,
+            "the image only added {}px",
+            shown - no_image
+        );
+    }
+
+    #[test]
+    fn a_document_rendering_drops_the_scaffolding_left_around_a_missing_image() {
+        // Hiding the picture alone only moves the hole. A Wikipedia photograph
+        // arrives inside three or four `<div>`s carrying its size in an inline
+        // style, and the taxobox stacks six of those in a table: 850 pixels of
+        // empty frame around nothing.
+        let html = "<body><p>before</p>\
+            <div style=\"height: 300px\"><div style=\"height: 290px\">\
+            <img src=\"gone.png\" width=\"250\" height=\"290\"></div></div>\
+            <p>after</p></body>";
+        let scaffold = document_height(html, &mut NoImages);
+        let no_image = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+
+        assert!(
+            (scaffold - no_image).abs() < 1.0,
+            "the empty frame still holds {}px open",
+            scaffold - no_image
+        );
+    }
+
+    #[test]
+    fn an_empty_box_next_to_a_caption_goes_without_taking_the_caption_with_it() {
+        // The caption is text and the reader can still learn what the picture
+        // showed. Losing it as well would be a second, quieter hole — and it
+        // is the case that tells "hide what draws nothing" apart from "hide
+        // the figure".
+        let html = "<body><figure><div style=\"height: 290px\">\
+            <img src=\"gone.png\" width=\"250\" height=\"290\"></div>\
+            <figcaption>A cat, asleep.</figcaption></figure></body>";
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut NoImages,
+            Some((&origin, &at)),
+        );
+
+        assert!(
+            page.content_height < 120.0,
+            "the empty frame is still {}px tall",
+            page.content_height
+        );
+        assert!(
+            page.content_height > 20.0,
+            "the caption went with the picture"
+        );
+    }
+
+    #[test]
+    fn a_page_rendered_as_authored_keeps_the_box_a_missing_image_asked_for() {
+        // Deliberately Chromium's behaviour, which reserves the full box for a
+        // broken image that gave its dimensions. The author's layout is built
+        // around it, and a rendering that kept their stylesheet has to keep
+        // their boxes; it is giving the sheet up that earns the right to
+        // close the gap.
+        let html = "<body><p>before</p><img src=\"gone.png\" width=\"250\" height=\"290\"><p>after</p></body>";
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_authored_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut NoImages,
+            Some((&origin, &at)),
+        );
+
+        assert!(
+            page.content_height > 280.0,
+            "the box is only {}px tall",
+            page.content_height
+        );
+    }
+
+    /// Where the words of a page ended up, left to right and top to bottom.
+    fn document_text(html: &str) -> Vec<String> {
+        document_words(html)
+            .into_iter()
+            .map(|(_, _, word)| word)
+            .collect()
+    }
+
+    /// The same, keeping each line's baseline and left edge.
+    fn document_words(html: &str) -> Vec<(i32, i32, String)> {
+        let (origin, at) = net::parse_url("https://example.com/p.html").expect("parses");
+        let mut fonts = FontStore::new();
+        let page = render_as_document_with(
+            html,
+            900,
+            0,
+            4000,
+            &mut fonts,
+            &mut NoImages,
+            Some((&origin, &at)),
+        );
+        let mut placed: Vec<(i32, i32, String)> = Vec::new();
+        collect_text(&page.frames[0].layout.root, 0.0, 0.0, &mut placed);
+        placed.sort();
+        placed
+    }
+
+    fn collect_text(box_: &layout::LayoutBox, x: f32, y: f32, out: &mut Vec<(i32, i32, String)>) {
+        let (x, y) = (x + box_.rect.x, y + box_.rect.y);
+        if let Some(text) = &box_.text {
+            for line in &text.lines {
+                if line.text.trim().is_empty() {
+                    continue;
+                }
+                let left = line.glyphs.first().map_or(0.0, |glyph| glyph.x);
+                out.push((
+                    (y + line.baseline) as i32,
+                    (x + left) as i32,
+                    line.text.trim().to_owned(),
+                ));
+            }
+        }
+        for child in &box_.children {
+            collect_text(child, x, y, out);
+        }
+    }
+
+    #[test]
+    fn a_wrapper_holding_only_a_newline_is_holding_nothing() {
+        // What separates a box with nothing in it from a box with a line of
+        // text in it is a `trim`, and almost every wrapper on a real page is
+        // this case: markup is indented, so an "empty" div holds a newline
+        // and two spaces. Without the trim the pass finds nearly nothing.
+        let bare = document_height("<body><p>before</p><p>after</p></body>", &mut NoImages);
+        let indented = document_height(
+            "<body><p>before</p><div style=\"height: 290px\">\n  \n</div><p>after</p></body>",
+            &mut NoImages,
+        );
+
+        assert!(
+            (indented - bare).abs() < 1.0,
+            "the whitespace held {}px open",
+            indented - bare
+        );
+    }
+
+    #[test]
+    fn an_empty_cell_keeps_its_column_in_line() {
+        // Emptiness is not on its own a licence to remove something. `<td></td>`
+        // is ordinary in a data table, and taking it out slides every later
+        // cell in that row one column left — which files the wrong numbers
+        // under the headings and says nothing about having done it.
+        let html = "<body><table>\
+            <tr><td>top left</td><td>top right</td></tr>\
+            <tr><td></td><td>bottom right</td></tr></table></body>";
+        let words = document_words(html);
+        let column = |wanted: &str| {
+            words
+                .iter()
+                .find(|(_, _, word)| word.contains(wanted))
+                .unwrap_or_else(|| panic!("{wanted} is not on the page: {words:?}"))
+                .1
+        };
+
+        assert!(
+            column("top left") < column("top right"),
+            "the two columns are in one place: {words:?}"
+        );
+        assert_eq!(
+            column("bottom right"),
+            column("top right"),
+            "the empty cell was dropped and the row slid a column left: {words:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_item_keeps_the_count() {
+        // Same reason as the cell, counted differently: drop an empty item and
+        // every item after it is renumbered, so a list of six references
+        // silently becomes a list of five with the wrong numbers on them.
+        let gapped = document_text("<body><ol><li>one</li><li></li><li>three</li></ol></body>");
+        let marker = |words: &[String], word: &str| {
+            let at = words
+                .iter()
+                .position(|found| found.contains(word))
+                .unwrap_or_else(|| panic!("{word} is not on the page: {words:?}"));
+            words[..at]
+                .iter()
+                .rev()
+                .find(|found| found.ends_with('.'))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        assert_eq!(marker(&gapped, "one"), "1.", "{gapped:?}");
+        assert_eq!(
+            marker(&gapped, "three"),
+            "3.",
+            "the empty item was dropped and the third was renumbered: {gapped:?}"
         );
     }
 
@@ -1678,29 +2260,159 @@ mod link_geometry_tests {
     }
 
     #[test]
-    fn a_fragment_link_is_not_a_navigation() {
-        // It names a destination inside this document. There is nothing to
-        // fetch, and treating it as a fetch reloads the page for no reason.
+    fn a_link_whose_text_is_wrapped_in_a_span_is_still_somewhere_to_click() {
+        // The window hit-tests against this list and not against the box tree,
+        // because the box tree is in another process — so a link with no
+        // rectangle in it is a link that does not work: no cursor, no keyboard
+        // focus, nothing under the pointer for a click to land on (#52).
+        //
+        // An inline link generates no box of its own and is found through the
+        // text spans naming it, and a span names the element its text is
+        // *directly* in. Wikipedia writes every footnote marker as
+        // `<a href="…"><span>[1]</span></a>`, and there are 951 of them on one
+        // article.
         let (page, _) = page_at(
-            "frag.html",
-            r##"<body><p><a href="#section">jump</a></p></body>"##,
+            "nested.html",
+            r#"<body><p><a href="b.html"><span><b>there</b></span></a></p></body>"#,
         );
-        assert!(
-            page.links().is_empty(),
-            "a fragment is not a link to follow"
+        let link = page.link_groups().pop().expect("the link is on the page");
+
+        assert!(!link.rects.is_empty(), "the link has no geometry");
+        let bounds = link.bounds();
+        assert_eq!(
+            page.link_at(
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0
+            ),
+            Some(link.url.clone()),
+            "the rectangle is not where the link actually is"
+        );
+    }
+
+    #[test]
+    fn a_fragment_can_name_something_whose_text_is_wrapped_up_too() {
+        // The other end of the same problem. A Wikipedia footnote's back-link
+        // points at `<sup id="cite_ref-1"><a>…</a></sup>`, and asking the
+        // `<sup>` alone where it is comes back with nothing.
+        let (page, _) = page_at(
+            "wrapped-target.html",
+            r##"<body><p><a href="#marker">back</a></p>
+                <p style="height: 300px">spacer</p>
+                <sup id="marker"><span>[1]</span></sup></body>"##,
         );
 
-        let rects = page.frames[0].layout.rects_for(
-            page.frames[0]
-                .doc
-                .find_element("a")
-                .expect("the anchor exists"),
+        assert!(
+            page.link_groups()[0].jump_to.is_some_and(|top| top > 100.0),
+            "the wrapped target was not found: {:?}",
+            page.link_groups()[0].jump_to
         );
-        let rect = rects.first().expect("it still has geometry");
-        assert_eq!(
-            page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
-            None
+    }
+
+    #[test]
+    fn a_fragment_link_goes_to_a_place_on_the_page_rather_than_nowhere() {
+        // It names a destination inside this document, so there is nothing to
+        // fetch — and for want of anywhere else to put that, these were being
+        // left out of the link list altogether. They took no cursor, took no
+        // keyboard focus, and did nothing at all when clicked. The Wikipedia
+        // article I was testing against has 690 of them: "Jump to content",
+        // every line of the contents, and every footnote marker (#52).
+        let (page, _) = page_at(
+            "frag.html",
+            r##"<body><p><a href="#section">jump</a></p>
+                <p style="height: 400px">spacer</p>
+                <h2 id="section">Section</h2></body>"##,
         );
+        let link = page.link_groups().pop().expect("the fragment is a link");
+        let heading = page.frames[0]
+            .doc
+            .find_element("h2")
+            .expect("the heading exists");
+        let top = page.frames[0].layout.rects_for(heading)[0].y;
+
+        assert_eq!(link.jump_to, Some(top));
+        assert!(top > 100.0, "the spacer did not push the heading down");
+    }
+
+    #[test]
+    fn a_bare_hash_goes_back_to_the_top() {
+        // HTML calls the top of the page the indicated part when the fragment
+        // is empty, and `href="#"` is a common enough spelling of "back to the
+        // top" that treating it as a link to nowhere leaves a visibly dead
+        // link on the page.
+        let (page, _) = page_at(
+            "top.html",
+            r##"<body><p style="height: 400px">spacer</p>
+                <p><a href="#">back to the top</a></p></body>"##,
+        );
+
+        assert_eq!(page.link_groups()[0].jump_to, Some(0.0));
+    }
+
+    #[test]
+    fn a_target_that_wraps_is_scrolled_to_its_first_line_and_not_its_last() {
+        // Landing on the last line of the destination puts the start of it
+        // above the window, which is the one place the reader was told to
+        // look.
+        let (page, _) = page_at(
+            "wrapping-target.html",
+            &format!(
+                r##"<body><p><a href="#long">down</a></p>
+                    <p style="height: 200px">spacer</p>
+                    <p><span id="long">{}</span></p></body>"##,
+                "a destination long enough to take several lines ".repeat(8)
+            ),
+        );
+        let target = page.frames[0]
+            .doc
+            .find_element("span")
+            .expect("the target exists");
+        let rects = page.frames[0].layout.rects_for(target);
+        let (first, last) = (rects[0].y, rects[rects.len() - 1].y);
+
+        assert!(last > first, "the target did not wrap: {rects:?}");
+        assert_eq!(page.link_groups()[0].jump_to, Some(first));
+    }
+
+    #[test]
+    fn a_fragment_naming_nothing_on_the_page_goes_nowhere() {
+        // A stale anchor is a link to nowhere. Doing nothing is the honest
+        // answer; scrolling to the top instead would look like the page had
+        // jumped for no reason.
+        let (page, _) = page_at(
+            "stale.html",
+            r##"<body><p><a href="#gone">jump</a></p></body>"##,
+        );
+
+        assert_eq!(page.link_groups()[0].jump_to, None);
+    }
+
+    #[test]
+    fn an_old_pages_named_anchor_is_a_destination_too() {
+        // `<a name="top">` is how a page written before `id` was universal
+        // marks its own sections, and the era this browser is for is full of
+        // them.
+        let (page, _) = page_at(
+            "named.html",
+            r##"<body><p><a href="#top">up</a></p>
+                <p style="height: 300px">spacer</p>
+                <a name="top">here</a></body>"##,
+        );
+
+        assert!(
+            page.link_groups()[0].jump_to.is_some_and(|top| top > 100.0),
+            "the named anchor was not found: {:?}",
+            page.link_groups()[0].jump_to
+        );
+    }
+
+    #[test]
+    fn a_link_that_leaves_the_page_has_nowhere_on_it_to_go() {
+        let (page, _) = page_at(
+            "away.html",
+            r#"<body><p><a href="b.html">there</a></p></body>"#,
+        );
+
+        assert_eq!(page.link_groups()[0].jump_to, None);
     }
 
     #[test]

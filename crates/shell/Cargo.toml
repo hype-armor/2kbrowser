@@ -10,6 +10,7 @@ name = "2kbrowser"
 path = "src/main.rs"
 
 [dependencies]
+arboard = { version = "3", default-features = false }
 sandbox = { path = "../sandbox" }
 css = { path = "../css" }
 dom = { path = "../dom" }

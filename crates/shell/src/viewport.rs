@@ -25,6 +25,13 @@ pub struct Link {
     pub rects: Vec<Rect>,
     /// Where it leads, already absolute.
     pub url: String,
+    /// Where on this page it goes, for a link that does not leave it.
+    ///
+    /// A fragment link — `href="#Etymology"` — names a place on the page
+    /// already open rather than a page to fetch. `None` for a link that goes
+    /// somewhere else, and for a fragment naming something the page does not
+    /// have.
+    pub jump_to: Option<f32>,
 }
 
 impl Link {
@@ -69,6 +76,7 @@ pub struct Viewport {
     page: Rendered,
     force_authored: bool,
     force_document: bool,
+    zoom: f32,
 }
 
 impl Viewport {
@@ -80,6 +88,7 @@ impl Viewport {
         band_height: u32,
         force_authored: bool,
         force_document: bool,
+        zoom: f32,
     ) -> Result<Self, Error> {
         let (session, page) = renderer.open(
             document.body.clone(),
@@ -91,6 +100,7 @@ impl Viewport {
             document.path.clone(),
             force_authored,
             force_document,
+            zoom,
         )?;
         Ok(Self {
             session,
@@ -98,6 +108,7 @@ impl Viewport {
             page,
             force_authored,
             force_document,
+            zoom,
         })
     }
 
@@ -247,6 +258,9 @@ impl Viewport {
             sandbox::Mode::Document { unsupported_share } => RenderMode::Document {
                 unsupported_share: *unsupported_share,
             },
+            sandbox::Mode::DocumentFrame { containers } => RenderMode::DocumentFrame {
+                containers: *containers as usize,
+            },
             sandbox::Mode::RequiresScripting => RenderMode::RequiresScripting,
         }
     }
@@ -263,6 +277,7 @@ impl Viewport {
                     out.push(Link {
                         rects: vec![link.rect],
                         url: link.url.clone(),
+                        jump_to: link.jump_to,
                     });
                 }
             }
@@ -277,16 +292,34 @@ impl Viewport {
     /// be absurd — but it is also all the parent *can* do, since the box tree it
     /// would hit-test against is on the other side.
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.wire_link_at(x, y).map(|link| link.url.as_str())
+    }
+
+    /// The same, with where on this page the link goes if it does not leave
+    /// it — so a caller can tell a page to fetch from a place to scroll to.
+    pub fn target_at(&self, x: f32, y: f32) -> Option<(&str, Option<f32>)> {
+        self.wire_link_at(x, y)
+            .map(|link| (link.url.as_str(), link.jump_to))
+    }
+
+    fn wire_link_at(&self, x: f32, y: f32) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
-        self.page
-            .links
-            .iter()
-            .rev()
-            .find(|link| {
-                let rect = link.rect;
-                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-            })
-            .map(|link| link.url.as_str())
+        self.page.links.iter().rev().find(|link| {
+            let rect = link.rect;
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        })
+    }
+
+    /// What lies between two points, asked of the child holding the page.
+    ///
+    /// Empty when the child cannot answer, which is the same answer as "there
+    /// is nothing there" and is what the caller would do with an error anyway:
+    /// a selection is a thing on the screen, and the honest way to say it
+    /// failed is not to draw one.
+    pub fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<Rect>, String) {
+        self.session
+            .select(from, to)
+            .unwrap_or_else(|_| (Vec::new(), String::new()))
     }
 
     /// Where `query` appears, asked of the child holding the page.
@@ -316,6 +349,7 @@ impl Viewport {
             self.document.path.clone(),
             self.force_authored,
             self.force_document,
+            self.zoom,
         )?;
         Ok(())
     }
@@ -355,9 +389,32 @@ impl Viewport {
         width: u32,
         max_height: u32,
     ) -> Result<(), Error> {
+        self.set_view(authored, document, self.zoom, width, max_height)
+    }
+
+    /// Everything the reader has chosen about how this page is shown, pushed
+    /// across together.
+    ///
+    /// One call because each of them costs a re-render, and setting two in a
+    /// row would pay for it twice — with the page visibly laid out the wrong
+    /// way in between.
+    pub fn set_view(
+        &mut self,
+        authored: bool,
+        document: bool,
+        zoom: f32,
+        width: u32,
+        max_height: u32,
+    ) -> Result<(), Error> {
         self.force_authored = authored;
         self.force_document = document;
+        self.zoom = zoom;
         self.resize(width, max_height)
+    }
+
+    /// The zoom this page is being drawn at. 1.0 is the page as written.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
     }
 }
 
@@ -388,6 +445,7 @@ mod tests {
                     out.push(Link {
                         rects: vec![link.rect],
                         url: link.url.clone(),
+                        jump_to: link.jump_to,
                     });
                 }
             }
@@ -400,6 +458,7 @@ mod tests {
             rect: rect(at, at, 10.0, 5.0),
             url: url.to_owned(),
             group,
+            jump_to: None,
         }
     }
 
@@ -445,6 +504,7 @@ mod tests {
         let link = Link {
             rects: vec![rect(10.0, 0.0, 20.0, 5.0), rect(0.0, 10.0, 15.0, 5.0)],
             url: "https://example.com/".to_owned(),
+            jump_to: None,
         };
         let bounds = link.bounds();
         assert_eq!((bounds.x, bounds.y), (0.0, 0.0));

@@ -794,6 +794,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             path: "/a/b.html".to_owned(),
             force_authored: false,
             force_document: false,
+            zoom: 1.0,
         }
         .encode(),
         sandbox::ToChild::Band {
@@ -848,6 +849,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                 },
                 url: "https://example.com/next.html".to_owned(),
                 group: 0,
+                jump_to: None,
             }],
             can_toggle_layout: true,
             images_loaded: 2,

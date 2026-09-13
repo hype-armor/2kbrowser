@@ -4,13 +4,15 @@ use std::collections::HashMap;
 
 use dom::{Document, ElementData, NodeId};
 
+use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Edges, FontStack, FontStyle, GenericFamily, MEDIUM_BORDER,
-    NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position, parse_background_repeat,
-    parse_border_collapse, parse_border_style, parse_caption_side, parse_clear, parse_display,
-    parse_float, parse_list_style_type, parse_overflow, parse_position, parse_text_decoration,
-    parse_vertical_align, parse_visibility,
+    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, ListStyleType,
+    MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position,
+    parse_background_repeat, parse_border_collapse, parse_border_style, parse_caption_side,
+    parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type, parse_overflow,
+    parse_position, parse_text_decoration, parse_text_transform, parse_vertical_align,
+    parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -35,12 +37,26 @@ pub enum Origin {
 #[derive(Debug, Clone, Default)]
 pub struct StyleMap {
     styles: HashMap<NodeId, ComputedStyle>,
+    /// Styles for the boxes a stylesheet asks for that the document does not
+    /// contain. Kept beside the element styles rather than in them because a
+    /// pseudo-element is a box, with its own colour, font and display, and
+    /// folding it into its originator's style would flatten that.
+    pseudos: HashMap<(NodeId, PseudoElement), ComputedStyle>,
 }
 
 impl StyleMap {
     /// The computed style for a node, if it is a styled element.
     pub fn get(&self, node: NodeId) -> Option<&ComputedStyle> {
         self.styles.get(&node)
+    }
+
+    /// The style for one of a node's generated boxes, if it generates one.
+    ///
+    /// Absent unless the cascade gave it `content`, since a pseudo-element
+    /// without content generates no box at all (§12.1) — so a caller can take
+    /// the presence of a style here as "this box exists".
+    pub fn pseudo(&self, node: NodeId, which: PseudoElement) -> Option<&ComputedStyle> {
+        self.pseudos.get(&(node, which))
     }
 
     /// Takes a node out of the flow, exactly as `display: none` does.
@@ -102,69 +118,300 @@ struct Precedence {
     order: usize,
 }
 
+/// Whose colours a rendering uses where the author has named one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Colours {
+    /// The author's, wherever they wrote them.
+    Authors,
+    /// The sheets': a colour written into the markup is ignored, and the
+    /// stylesheets decide.
+    ///
+    /// For the document fallback, where this is not a preference but a
+    /// correctness problem. That rendering drops the author's sheet and
+    /// applies the reader's, which paints a dark page — and dropping a sheet
+    /// does not drop the colours in the markup. Wikipedia's taxobox carries
+    /// its bands as `<tr style="background-color: rgb(235,235,210)">` on
+    /// every row, so the reading view came out as pale strips of near-white
+    /// text on near-white: less legible than the page it was rescuing.
+    ///
+    /// Both properties and not only the background, because they are legible
+    /// only as a pair: an author's dark `color` left standing over the
+    /// reader's dark page is the same bug upside down.
+    ///
+    /// Only `style` and presentational attributes are ignored — the sheets
+    /// handed in still apply in full. On this path the author has none, and
+    /// the one sheet there is belongs to the reader.
+    Readers,
+}
+
 /// Resolves computed styles for the whole document.
 ///
 /// Sheets are applied in the order given, after the user-agent sheet.
 pub fn cascade(doc: &Document, author_sheets: &[Stylesheet]) -> StyleMap {
+    cascade_as(doc, author_sheets, 1.0, Colours::Authors)
+}
+
+/// The same, at a zoom factor.
+///
+/// Zoom multiplies every pixel length as it is computed — the font sizes, the
+/// margins, the borders — and then nothing downstream knows about it. A glyph
+/// shaped at twice the size is twice as sharp, where a rendering scaled up
+/// afterwards is twice as blurry; and because the viewport keeps its real
+/// width, text reflows to the window instead of running off the side of it.
+/// That is what a browser means by zoom, as against a magnifying glass.
+pub fn cascade_at(doc: &Document, author_sheets: &[Stylesheet], zoom: f32) -> StyleMap {
+    cascade_as(doc, author_sheets, zoom, Colours::Authors)
+}
+
+/// The whole of it: at a zoom, and saying whose colours win.
+///
+/// The document fallback wants both at once — a reader who has zoomed in is
+/// still reading on the reader's page.
+pub fn cascade_as(
+    doc: &Document,
+    author_sheets: &[Stylesheet],
+    zoom: f32,
+    colours: Colours,
+) -> StyleMap {
     let ua = Stylesheet::parse(crate::ua::UA_STYLESHEET);
     let mut map = StyleMap::default();
-    let root_style = ComputedStyle::default();
-    // Quirks mode is a property of the document, decided by its doctype, and
-    // changes how values parse (ADR-0004).
-    let quirks = doc.is_quirks();
+    // The root carries the zoomed default, so an element that says nothing
+    // about its font size inherits one that has already been scaled — and with
+    // it every `em` measured against it. Most text on most pages is this case:
+    // without it, zoom would move the headings and leave the prose alone.
+    //
+    // The line height is not set here, and deliberately: the UA sheet gives
+    // `body` a unitless `line-height: 1.2`, which resolves against each
+    // element's own font size — already zoomed — so everything inside the body
+    // is covered, and there is nothing outside it. A second scaling here was
+    // dead code, and mutation testing said so.
+    let root_style = ComputedStyle {
+        font_size: DEFAULT_FONT_SIZE * zoom,
+        ..ComputedStyle::default()
+    };
+    let rules = Rules {
+        ua: &ua,
+        sheets: author_sheets,
+        // Quirks mode is a property of the document, decided by its doctype,
+        // and changes how values parse (ADR-0004).
+        quirks: doc.is_quirks(),
+        zoom,
+        colours,
+    };
+    let mut counters = Counters::default();
     style_subtree(
         doc,
         doc.root(),
         &root_style,
-        &ua,
-        author_sheets,
-        quirks,
+        &rules,
+        &mut counters,
+        0,
         &mut map,
     );
+    resolve_first_letters(doc, &mut map);
     map
+}
+
+/// Moves each `::first-letter` style onto the element whose line the first
+/// letter is actually on.
+///
+/// §5.12.2 puts the box on the block's first *formatted line*, and with
+/// `<div><p>First</p>…` that line belongs to the paragraph, not to the div. A
+/// drop cap on an article whose first child is a paragraph would otherwise
+/// land on whatever text happened to follow the paragraph, or on nothing.
+///
+/// A post-pass rather than part of the cascade because the walk needs the
+/// children's computed styles to know which of them is a block, and the
+/// cascade computes a parent before its children by construction.
+fn resolve_first_letters(doc: &Document, out: &mut StyleMap) {
+    let originators: Vec<NodeId> = out
+        .pseudos
+        .keys()
+        .filter(|(_, which)| *which == PseudoElement::FirstLetter)
+        .map(|&(node, _)| node)
+        .collect();
+    for node in originators {
+        let holder = first_line_holder(doc, out, node, 0);
+        // An element that has its own `::first-letter` keeps it: with a rule on
+        // both a div and the paragraph inside it, the paragraph's is the one
+        // written about the text it lands on.
+        if holder == node
+            || out
+                .pseudos
+                .contains_key(&(holder, PseudoElement::FirstLetter))
+        {
+            continue;
+        }
+        if let Some(style) = out.pseudos.remove(&(node, PseudoElement::FirstLetter)) {
+            out.pseudos
+                .insert((holder, PseudoElement::FirstLetter), style);
+        }
+    }
+}
+
+/// The element holding the first formatted line of `node`'s content.
+///
+/// Descends through first children that are blocks and stops at the first one
+/// with inline content of its own. Stops early at a box that starts a
+/// formatting context of its own — §5.12.2: "the first letter of a table-cell
+/// or inline-block cannot be the first letter of an ancestor element" — and
+/// skips anything out of flow, which is not on the line at all.
+fn first_line_holder(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize) -> NodeId {
+    /// Deep enough for any real document; a bound rather than a judgement.
+    const MAX_DEPTH: usize = 24;
+    if depth >= MAX_DEPTH {
+        return node;
+    }
+    for &child in doc.children(node) {
+        if let Some(text) = doc.text(child) {
+            if text.trim().is_empty() {
+                continue;
+            }
+            return node;
+        }
+        let Some(style) = styles.get(child) else {
+            continue;
+        };
+        if style.display == Display::None
+            || style.position.is_out_of_flow()
+            || style.float != Float::None
+        {
+            continue;
+        }
+        if style.display.is_inline() || style.display != Display::Block {
+            return node;
+        }
+        return first_line_holder(doc, styles, child, depth + 1);
+    }
+    node
+}
+
+/// What the cascade works from, fixed for the whole of one document.
+struct Rules<'a> {
+    /// The user-agent sheet.
+    ua: &'a Stylesheet,
+    /// The sheets handed in: the author's, or the reader's on a document
+    /// rendering.
+    sheets: &'a [Stylesheet],
+    /// Whether the document is in quirks mode.
+    quirks: bool,
+    /// How much bigger than its own pixels the page is drawn.
+    zoom: f32,
+    /// Whose colours win where the markup names one.
+    colours: Colours,
+}
+
+/// Whether a property names a colour the reader's sheet should be choosing.
+///
+/// Backgrounds and foregrounds together, because they are only legible as a
+/// pair. Not borders: a border the reader cannot see against the page is a
+/// line missing, not a line of text lost, and leaving them alone keeps a
+/// table's rules visible where the author drew them.
+fn names_a_colour(name: &str) -> bool {
+    matches!(
+        name,
+        "color" | "background" | "background-color" | "background-image"
+    )
 }
 
 fn style_subtree(
     doc: &Document,
     node: NodeId,
     parent_style: &ComputedStyle,
-    ua: &Stylesheet,
-    author: &[Stylesheet],
-    quirks: bool,
+    rules: &Rules,
+    counters: &mut Counters,
+    depth: usize,
     out: &mut StyleMap,
 ) {
     let style = if doc.element(node).is_some() {
-        let computed = compute(doc, node, parent_style, ua, author, quirks);
+        let computed = compute(doc, node, parent_style, rules, counters, None);
         out.styles.insert(node, computed.clone());
+        // §12.4: the element's own counter operations happen before anything
+        // reads a counter, so a `::before` on the element numbering itself
+        // sees the value this element just set.
+        step_counters(&computed, counters, depth);
+        // §12.1: a pseudo-element generates a box only when `content` gives it
+        // one. Computing the style and then throwing it away when there is no
+        // content keeps that decision in one place, and lets every later stage
+        // read "a style exists here" as "this box exists".
+        for which in [PseudoElement::Before, PseudoElement::After] {
+            let generated = compute(doc, node, &computed, rules, counters, Some(which));
+            if generated.content.is_some() {
+                out.pseudos.insert((node, which), generated);
+            }
+        }
+        // §5.12.2's box is gated differently, because it invents nothing:
+        // `::first-letter` restyles text that is already on the page, so
+        // `content` cannot say whether it exists. What says so is whether a
+        // stylesheet addressed it at all. Comparing the computed style against
+        // the element's own would be the other way to ask, and it would answer
+        // "yes" for a rule that changes nothing — a box laid out, and a run
+        // split, for no visible reason.
+        if addresses(doc, node, rules, PseudoElement::FirstLetter) {
+            let first = compute(
+                doc,
+                node,
+                &computed,
+                rules,
+                counters,
+                Some(PseudoElement::FirstLetter),
+            );
+            out.pseudos
+                .insert((node, PseudoElement::FirstLetter), first);
+        }
         computed
     } else {
         parent_style.clone()
     };
 
     for &child in doc.children(node) {
-        style_subtree(doc, child, &style, ua, author, quirks, out);
+        style_subtree(doc, child, &style, rules, counters, depth + 1, out);
     }
+    // Every counter this element's children created goes out of scope here:
+    // §12.4.1 ends a reset's scope with the element it was written on, and
+    // with it the following siblings that shared it.
+    counters.leave(depth);
+}
+
+/// Whether any rule in scope addresses `which` on this node.
+///
+/// Only asked for the pseudo-elements that have no `content` to gate them.
+fn addresses(doc: &Document, node: NodeId, rules: &Rules, which: PseudoElement) -> bool {
+    std::iter::once(rules.ua)
+        .chain(rules.sheets.iter())
+        .flat_map(|sheet| sheet.rules.iter())
+        .any(|rule| {
+            rule.selectors
+                .iter()
+                .any(|selector| selector.pseudo == Some(which) && selector.matches(doc, node))
+        })
 }
 
 fn compute(
     doc: &Document,
     node: NodeId,
     parent: &ComputedStyle,
-    ua: &Stylesheet,
-    author: &[Stylesheet],
-    quirks: bool,
+    rules: &Rules,
+    counters: &Counters,
+    pseudo: Option<PseudoElement>,
 ) -> ComputedStyle {
+    let (quirks, zoom) = (rules.quirks, rules.zoom);
     let mut matched: Vec<(Precedence, &Declaration)> = Vec::new();
     let mut order = 0usize;
 
-    for (sheet, origin) in
-        std::iter::once((ua, Origin::UserAgent)).chain(author.iter().map(|s| (s, Origin::Author)))
+    for (sheet, origin) in std::iter::once((rules.ua, Origin::UserAgent))
+        .chain(rules.sheets.iter().map(|s| (s, Origin::Author)))
     {
         for rule in &sheet.rules {
             let best = rule
                 .selectors
                 .iter()
-                .filter(|selector| selector.matches(doc, node))
+                // A rule addressing `::before` styles that box and nothing
+                // else, and a rule addressing no pseudo-element styles the
+                // element and not its generated boxes. `matches` answers for
+                // the originating element in both cases, so this is the only
+                // thing keeping them apart.
+                .filter(|selector| selector.pseudo == pseudo && selector.matches(doc, node))
                 .map(|selector| selector.specificity())
                 .max();
             if let Some(specificity) = best {
@@ -187,7 +434,14 @@ fn compute(
     // Presentational attributes, which carry most of the era's styling. They
     // sit below author CSS so a stylesheet can always override them, and above
     // the UA sheet so they actually take effect.
-    let hints = presentational_hints(doc, node);
+    // Both these and the `style` attribute belong to the *element*. A
+    // `bgcolor` is not also a request to paint the box `::before` generates,
+    // so a pseudo-element takes neither.
+    let hints = if pseudo.is_none() {
+        presentational_hints(doc, node)
+    } else {
+        Vec::new()
+    };
     for declaration in &hints {
         order += 1;
         matched.push((
@@ -204,6 +458,7 @@ fn compute(
     // A `style` attribute applies to this element alone and beats every rule.
     let inline = doc
         .element(node)
+        .filter(|_| pseudo.is_none())
         .and_then(|element| element.attr("style"))
         .map(crate::parse_style_attribute)
         .unwrap_or_default();
@@ -220,13 +475,28 @@ fn compute(
         ));
     }
 
+    if rules.colours == Colours::Readers {
+        matched.retain(|(precedence, declaration)| {
+            !matches!(precedence.origin, Origin::Presentational | Origin::Inline)
+                || !names_a_colour(&declaration.name)
+        });
+    }
+
     matched.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut style = ComputedStyle::inherit_from(parent);
     // The UA sheet gives `display: block` to block-level elements; everything
     // else starts inline, which is the CSS initial value.
     for (_, declaration) in matched {
-        apply(&mut style, declaration, parent, quirks);
+        apply(
+            &mut style,
+            declaration,
+            parent,
+            quirks,
+            zoom,
+            doc.element(node),
+            counters,
+        );
     }
 
     // §16.3: an ancestor's decoration is drawn across this element's text too,
@@ -236,6 +506,45 @@ fn compute(
     style.text_decoration.underline |= parent.text_decoration.underline;
     style.text_decoration.line_through |= parent.text_decoration.line_through;
     style.text_decoration.overline |= parent.text_decoration.overline;
+
+    // §9.7: an absolutely positioned box is not a float, whatever `float`
+    // says. Both properties take the box out of normal flow and each has its
+    // own machinery for placing it, so a box that claims both gets placed
+    // twice and drawn twice — which is exactly what
+    // `position-absolute-008.xht` does, with `float: right` and
+    // `position: absolute` on one div.
+    //
+    // Applied here rather than in layout because it is a rule about the
+    // *computed value*, and because layout asks about `float` from several
+    // places that would each have to remember to ask about `position` first.
+    if style.position.is_out_of_flow() {
+        style.float = Float::None;
+    }
+
+    // §9.7: a floated or absolutely positioned box is block-level whatever
+    // `display` said. `float: left` beside `display: inline-block` is not a
+    // contradiction an author has to notice — it is how a floated box with a
+    // shrink-to-fit width gets written — and reading the `display` literally
+    // put the box on a line instead of against the containing block's edge.
+    //
+    // The table displays are in the spec's table too, and for a sharper
+    // reason: a floated `table-row` is no longer part of any table, so a box
+    // that stayed a row would be collected into a grid that no longer contains
+    // it and then never laid out at all. `table` itself is the one row of that
+    // table that maps to itself.
+    if style.float != Float::None || style.position.is_out_of_flow() {
+        style.display = match style.display {
+            Display::Inline
+            | Display::InlineBlock
+            | Display::TableRow
+            | Display::TableRowGroup
+            | Display::TableCell
+            | Display::TableColumn
+            | Display::TableColumnGroup
+            | Display::TableCaption => Display::Block,
+            display => display,
+        };
+    }
 
     style
 }
@@ -287,12 +596,25 @@ fn apply(
     declaration: &Declaration,
     parent: &ComputedStyle,
     quirks: bool,
+    zoom: f32,
+    // The originating element, for the one property that reads the document
+    // rather than only its own value: `content: attr(href)`.
+    element: Option<&ElementData>,
+    // The counters in scope here, for `content: counter(n)`.
+    counters: &Counters,
 ) {
     let values = &declaration.value;
     let Some(first) = values.first() else { return };
     // Shadow the strict parsers so every property below picks up the
     // quirks-mode forms without each having to remember to ask.
-    let parse_length = |raw: &Raw| parse_length_quirky(raw, quirks);
+    // Zoom is applied here, at the one place every property's lengths come
+    // through, rather than at each of the forty that use them. Shadowing was
+    // already the trick for quirks mode, and the same shadow carries this.
+    let parse_length = |raw: &Raw| parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom));
+    // For the properties CSS 2.1 forbids a negative value on. A negative one
+    // there is invalid, and an invalid declaration is dropped rather than
+    // clamped — the property keeps whatever it already had.
+    let parse_size = |raw: &Raw| parse_length(raw).filter(|length| !length.is_negative());
     let parse_color = |raw: &Raw| parse_color_quirky(raw, quirks);
 
     match declaration.name.as_str() {
@@ -373,9 +695,28 @@ fn apply(
                 style.background_position = parsed;
             }
         }
+        // §15.8. Era stylesheets are full of this — `font: bold 12px Arial`
+        // was how a page set its type — and until now it parsed as nothing at
+        // all, so both the size and the line height silently stayed at their
+        // defaults. That is why a table cell with `font: 20px/1 Ahem` came out
+        // a few pixels short and let the row's background show through.
+        //
+        // A shorthand resets every property it covers, including the ones it
+        // does not mention: `font: 12px serif` after `font-weight: bold` is
+        // not bold. Assigning only the parts that were written is the usual
+        // way to get this wrong.
+        "font" => {
+            if let Some(font) = parse_font_shorthand(values, parent, zoom) {
+                style.font_style = font.style;
+                style.font_weight = font.weight;
+                style.font_size = font.size;
+                style.line_height = font.line_height.unwrap_or(font.size * NORMAL_LINE_HEIGHT);
+                style.font_family = font.family;
+            }
+        }
         // font-size resolves em and % against the *parent's* size, not its own.
         "font-size" => {
-            if let Some(size) = parse_font_size(first, parent.font_size) {
+            if let Some(size) = parse_font_size(first, parent.font_size, zoom) {
                 style.font_size = size;
                 if style.line_height == parent.line_height {
                     style.line_height = size * NORMAL_LINE_HEIGHT;
@@ -462,9 +803,98 @@ fn apply(
             }
         }
         "border-spacing" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.border_spacing = length;
             }
+        }
+        "text-transform" => {
+            if let Raw::Ident(name) = first
+                && let Some(transform) = parse_text_transform(name)
+            {
+                style.text_transform = transform;
+            }
+        }
+        // `normal` is zero rather than a value of its own: CSS 2.1 gives it no
+        // meaning beyond "no extra space", and a separate variant would be a
+        // second way to spell the same number.
+        //
+        // `word-spacing` is deliberately *not* handled alongside it. The two
+        // look like a pair and are not implemented as one, and naming it here
+        // to do nothing with it would make the gap invisible to the next
+        // reader — it stays in the README's list until it is really done.
+        "letter-spacing" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("normal")) {
+                style.letter_spacing = 0.0;
+            } else if let Some(length) = parse_length(first) {
+                // Resolved here because it is a used length by the time text is
+                // shaped, and shaping is where it has to arrive.
+                style.letter_spacing = length.to_px(style.font_size, 0.0);
+            }
+        }
+        "text-indent" => {
+            if let Some(length) = parse_length(first) {
+                style.text_indent = length;
+            }
+        }
+        // §12.2. Resolved to text here rather than carried as a value list:
+        // every form in scope is known at this point — `attr()` needs the
+        // originating element and `counter()` needs the counters in scope, and
+        // layout has neither.
+        "content" => {
+            style.content = parse_content(element, counters, values);
+        }
+        "counter-reset" => {
+            if let Some(list) = parse_counters(values, 0) {
+                style.counter_reset = list;
+            }
+        }
+        "counter-increment" => {
+            if let Some(list) = parse_counters(values, 1) {
+                style.counter_increment = list;
+            }
+        }
+        // §11.1.2. `parse_clip` answers with a nested option: the outer one
+        // is "did this parse", the inner is "is it `auto`" — and `auto` has
+        // to be able to switch off a clip an earlier rule set.
+        "clip" => {
+            if let Some(clip) = parse_clip(values) {
+                style.clip = clip;
+            }
+        }
+        "min-height" => {
+            if let Some(length) = parse_size(first) {
+                style.min_height = length;
+            }
+        }
+        "max-height" => {
+            // `none` is the initial value and the way an author takes a cap
+            // back off, which a page does by overriding an earlier rule. It
+            // is a keyword rather than a length, so it has to be matched
+            // before parsing one — the same shape as `max-width` above.
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("none")) {
+                style.max_height = Length::Auto;
+            } else if let Some(length) = parse_size(first) {
+                style.max_height = length;
+            }
+        }
+        // §10.4. `auto` is not a value `min-width` takes in CSS 2.1 — the
+        // initial value is `0` — but `Auto` is how "no bound" is spelled here,
+        // and a zero floor and no floor are the same floor. `parse_size`
+        // rather than `parse_length`, because a negative floor is one of the
+        // values §10.4 forbids outright.
+        "min-width" => {
+            if let Some(length) = parse_size(first) {
+                style.min_width = length;
+            }
+        }
+        // §9.9. `auto` is the initial value and means "no new stacking context
+        // and paint in tree order", which is what `None` stands for.
+        "z-index" => {
+            style.z_index = match first {
+                Raw::Number(n) => Some(*n as i32),
+                Raw::Ident(name) if name.eq_ignore_ascii_case("auto") => None,
+                _ => style.z_index,
+            };
         }
         "visibility" => {
             if let Raw::Ident(name) = first
@@ -530,10 +960,10 @@ fn apply(
                 style.clear = clear;
             }
         }
-        "margin" => style.margin = parse_edges(values, quirks),
-        "padding" => style.padding = parse_edges(values, quirks),
+        "margin" => style.margin = parse_edges(values, quirks, zoom, false),
+        "padding" => style.padding = parse_edges(values, quirks, zoom, true),
         "width" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.width = length;
             }
         }
@@ -542,21 +972,21 @@ fn apply(
         "max-width" => {
             if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("none")) {
                 style.max_width = Length::Auto;
-            } else if let Some(length) = parse_length(first) {
+            } else if let Some(length) = parse_size(first) {
                 style.max_width = length;
             }
         }
         "height" => {
-            if let Some(length) = parse_length(first) {
+            if let Some(length) = parse_size(first) {
                 style.height = length;
             }
         }
         // `border: 1px solid red` sets width, style, and colour on all four
         // sides from whichever components are present.
         "border" => {
-            let parsed = parse_border_shorthand(values);
+            let parsed = parse_border_shorthand(values, zoom);
             for side in border_sides(&mut style.border) {
-                apply_border_shorthand(side, &parsed);
+                apply_border_shorthand(side, &parsed, zoom);
             }
         }
         "border-width" => {
@@ -594,17 +1024,17 @@ fn apply(
         }
         name => {
             if let Some(side) = name.strip_prefix("margin-") {
-                set_edge(&mut style.margin, side, first, quirks);
+                set_edge(&mut style.margin, side, first, quirks, zoom, false);
             } else if let Some(side) = name.strip_prefix("padding-") {
-                set_edge(&mut style.padding, side, first, quirks);
+                set_edge(&mut style.padding, side, first, quirks, zoom, true);
             } else if let Some(rest) = name.strip_prefix("border-") {
-                apply_border_longhand(&mut style.border, rest, values);
+                apply_border_longhand(&mut style.border, rest, values, zoom);
             }
         }
     }
 }
 
-fn parse_font_size(raw: &Raw, parent_size: f32) -> Option<f32> {
+fn parse_font_size(raw: &Raw, parent_size: f32, zoom: f32) -> Option<f32> {
     if let Raw::Ident(name) = raw {
         // The CSS 2.1 absolute-size keywords, as scale factors from medium.
         let factor = match name.as_str() {
@@ -619,12 +1049,324 @@ fn parse_font_size(raw: &Raw, parent_size: f32) -> Option<f32> {
             "larger" => return Some(parent_size * 1.2),
             _ => return None,
         };
-        return Some(DEFAULT_FONT_SIZE * factor);
+        return Some(DEFAULT_FONT_SIZE * zoom * factor);
     }
-    match parse_length(raw)? {
+    match parse_length(raw)?.scaled(zoom) {
         Length::Auto => None,
         length => Some(length.to_px(parent_size, parent_size)),
     }
+}
+
+/// Everything a `font` shorthand sets.
+struct FontShorthand {
+    style: FontStyle,
+    weight: u16,
+    size: f32,
+    /// `None` where the shorthand wrote no `/ line-height`, which means
+    /// `normal` rather than "leave the old one".
+    line_height: Option<f32>,
+    family: FontStack,
+}
+
+/// Parses `font: [ style || variant || weight ]? size [ / line-height ]? family`.
+///
+/// The size and the family are required; anything before the size is optional
+/// and may come in any order. A shorthand missing either is invalid and must
+/// change nothing at all, which is why this returns an `Option` rather than
+/// filling in defaults.
+///
+/// `small-caps` is accepted and then discarded. `font-variant` is not
+/// implemented here, and rejecting the whole declaration over it would throw
+/// away the size and family too — the page would lose styling it should have,
+/// to no one's benefit.
+///
+/// The system font keywords — `font: menu`, `caption`, `status-bar` — need no
+/// case of their own, though it is tempting to write one. CSS 2.1 §15.8 says
+/// they take a platform widget's font, which cannot be asked for here; and
+/// none of them is a valid font size, so each fails the required-size check
+/// and leaves the page's own styling exactly where it was. A special case for
+/// them was written first and deleted: it read as load-bearing and changed
+/// nothing, which is worse than its absence.
+fn parse_font_shorthand(
+    values: &[Raw],
+    parent: &ComputedStyle,
+    zoom: f32,
+) -> Option<FontShorthand> {
+    let mut style = FontStyle::Normal;
+    let mut weight = 400;
+    let mut index = 0;
+
+    // The optional prefix. `normal` is legal for all three of style, variant
+    // and weight, so it is consumed without deciding which one it meant —
+    // correct, because each already sits at the value `normal` names.
+    while let Some(value) = values.get(index) {
+        match value {
+            Raw::Ident(name) => match name.as_str() {
+                "normal" | "small-caps" => {}
+                "italic" | "oblique" => style = FontStyle::Italic,
+                "bold" => weight = 700,
+                "bolder" => weight = (parent.font_weight + 300).min(900),
+                "lighter" => weight = parent.font_weight.saturating_sub(300),
+                _ => break,
+            },
+            Raw::Number(number) if (100.0..=900.0).contains(number) => {
+                weight = (*number as u16).clamp(100, 900);
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+
+    let size = parse_font_size(values.get(index)?, parent.font_size, zoom)?;
+    index += 1;
+
+    let mut line_height = None;
+    if matches!(values.get(index), Some(Raw::Slash)) {
+        index += 1;
+        line_height = Some(match values.get(index)? {
+            // Resolved against this shorthand's own size, not the parent's:
+            // `font: 20px/1.5 serif` is a 30px line whatever the parent is.
+            Raw::Number(number) => size * number,
+            Raw::Ident(name) if name == "normal" => size * NORMAL_LINE_HEIGHT,
+            other => parse_length(other)?.scaled(zoom).to_px(size, size),
+        });
+        index += 1;
+    }
+
+    let rest = values.get(index..).unwrap_or_default();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(FontShorthand {
+        style,
+        weight,
+        size,
+        line_height,
+        family: parse_font_family(rest),
+    })
+}
+
+/// Parses `content`, resolving it to the text it stands for.
+///
+/// In scope: strings and `attr()`, which concatenate — that is how a page
+/// writes `content: "[" attr(href) "]"`.
+///
+/// Out of scope, and dropping the whole declaration rather than half of it:
+/// `counter()`, `counters()`, `open-quote` and its family, and `url()`. Each
+/// needs machinery this does not have — a counter state, the `quotes`
+/// property, an image load — and a pseudo-element showing *part* of what the
+/// author asked for is worse than one showing nothing, because it looks
+/// deliberate.
+///
+/// `none` and `normal` need no case of their own, though writing one is the
+/// obvious thing to do. Neither is a string or an `attr()`, so both fall to
+/// the rejection below and drop the declaration, which is exactly what they
+/// mean. A branch for them was written first and deleted when a mutation
+/// showed it changed nothing.
+/// The counters in scope at one point of a document-order walk (§12.4.1).
+///
+/// A counter is *self-nesting*: `counter-reset` on an element creates an
+/// instance whose scope is that element, its following siblings, and all of
+/// their descendants. Several instances of one name can therefore be live at
+/// once — that is what `counters()` prints, and what makes a nested ordered
+/// list read `2.1.3` rather than `3`.
+///
+/// Each instance remembers the depth it was created at, which is the whole
+/// bookkeeping: an instance created at depth *d* dies when the walk leaves the
+/// element at depth *d - 1*, because that is where its scope ends.
+#[derive(Debug, Default)]
+pub struct Counters {
+    instances: Vec<Instance>,
+}
+
+#[derive(Debug)]
+struct Instance {
+    name: String,
+    value: i32,
+    depth: usize,
+}
+
+impl Counters {
+    /// Applies an element's `counter-reset` at `depth`.
+    fn reset(&mut self, name: &str, value: i32, depth: usize) {
+        // A sibling's instance at this same depth is *replaced*, not nested
+        // inside: two `<li>`s that each reset a counter are one counter that
+        // keeps being set back, not two counters.
+        if let Some(existing) = self
+            .instances
+            .iter_mut()
+            .rev()
+            .find(|instance| instance.name == name)
+            && existing.depth == depth
+        {
+            existing.value = value;
+            return;
+        }
+        self.instances.push(Instance {
+            name: name.to_owned(),
+            value,
+            depth,
+        });
+    }
+
+    /// Applies an element's `counter-increment`.
+    ///
+    /// §12.4.1: incrementing a counter that was never reset acts as though the
+    /// root had reset it to zero, which is what makes `counter-increment`
+    /// usable on its own.
+    fn increment(&mut self, name: &str, delta: i32, depth: usize) {
+        match self
+            .instances
+            .iter_mut()
+            .rev()
+            .find(|instance| instance.name == name)
+        {
+            Some(instance) => instance.value = instance.value.saturating_add(delta),
+            None => self.instances.push(Instance {
+                name: name.to_owned(),
+                value: delta,
+                depth,
+            }),
+        }
+    }
+
+    /// Drops every instance whose scope ended when the walk left `depth`.
+    fn leave(&mut self, depth: usize) {
+        self.instances.retain(|instance| instance.depth <= depth);
+    }
+
+    /// The innermost instance's value, for `counter()`.
+    fn value(&self, name: &str) -> i32 {
+        self.instances
+            .iter()
+            .rev()
+            .find(|instance| instance.name == name)
+            .map_or(0, |instance| instance.value)
+    }
+
+    /// Every instance's value, outermost first, for `counters()`.
+    fn nested(&self, name: &str) -> Vec<i32> {
+        self.instances
+            .iter()
+            .filter(|instance| instance.name == name)
+            .map(|instance| instance.value)
+            .collect()
+    }
+}
+
+/// Applies an element's own `counter-reset` and `counter-increment`.
+///
+/// Reset before increment, which is the order §12.4 gives and is visible
+/// whenever one element does both.
+fn step_counters(style: &ComputedStyle, counters: &mut Counters, depth: usize) {
+    for (name, value) in &style.counter_reset {
+        counters.reset(name, *value, depth);
+    }
+    for (name, delta) in &style.counter_increment {
+        counters.increment(name, *delta, depth);
+    }
+}
+
+/// Parses `counter-reset` / `counter-increment`: names, each optionally
+/// followed by an integer.
+///
+/// `none` is the initial value and clears the list. An unreadable value drops
+/// the declaration rather than half of it, since a counter list that is partly
+/// applied numbers a document in a way nobody wrote.
+fn parse_counters(values: &[Raw], default: i32) -> Option<Vec<(String, i32)>> {
+    if let [Raw::Ident(single)] = values
+        && single.eq_ignore_ascii_case("none")
+    {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<(String, i32)> = Vec::new();
+    for value in values {
+        match value {
+            Raw::Ident(name) => {
+                if name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("inherit") {
+                    return None;
+                }
+                out.push((name.clone(), default));
+            }
+            Raw::Number(number) => {
+                let last = out.last_mut()?;
+                last.1 = *number as i32;
+            }
+            _ => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn parse_content(
+    element: Option<&ElementData>,
+    counters: &Counters,
+    values: &[Raw],
+) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for value in values {
+        match value {
+            Raw::Str(text) => out.push_str(text),
+            // §12.4.3. `counter(n)` prints the innermost instance;
+            // `counters(n, sep)` prints every one in scope, outermost first,
+            // which is how a nested list numbers itself `2.1.3`.
+            Raw::Function(name, args) if name == "counter" || name == "counters" => {
+                // Split on the commas the tokeniser keeps, so an argument is
+                // an argument rather than whatever happens to be at an index.
+                let arguments: Vec<&[Raw]> = args.split(|raw| matches!(raw, Raw::Comma)).collect();
+                let nested = name == "counters";
+                let [Raw::Ident(counter)] = arguments.first()? else {
+                    return None;
+                };
+                // `counters()` takes a separator and `counter()` does not; both
+                // then take an optional list-style saying how to spell the
+                // number. Anything else is not this function.
+                let (separator, style) = match (nested, arguments.as_slice()) {
+                    (false, [_]) => (String::new(), ListStyleType::Decimal),
+                    (false, [_, [Raw::Ident(style)]]) => {
+                        (String::new(), crate::style::parse_list_style_type(style)?)
+                    }
+                    (true, [_, [Raw::Str(separator)]]) => {
+                        (separator.clone(), ListStyleType::Decimal)
+                    }
+                    (true, [_, [Raw::Str(separator)], [Raw::Ident(style)]]) => (
+                        separator.clone(),
+                        crate::style::parse_list_style_type(style)?,
+                    ),
+                    _ => return None,
+                };
+                let values = if nested {
+                    counters.nested(counter)
+                } else {
+                    vec![counters.value(counter)]
+                };
+                let printed: Vec<String> = values
+                    .into_iter()
+                    .map(|value| style.counter(value.max(0) as usize))
+                    .collect();
+                out.push_str(&printed.join(&separator));
+            }
+            Raw::Function(name, args) if name == "attr" => {
+                // A missing attribute is the empty string, not a failure:
+                // §12.2 says so, and it is what makes `content: attr(title)`
+                // safe to write across a whole document.
+                let attribute = match args.first() {
+                    Some(Raw::Ident(name)) => name.clone(),
+                    Some(Raw::Str(name)) => name.clone(),
+                    _ => return None,
+                };
+                let value = element
+                    .and_then(|element| element.attr(&attribute))
+                    .unwrap_or_default();
+                out.push_str(value);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn parse_font_family(values: &[Raw]) -> FontStack {
@@ -652,10 +1394,16 @@ fn parse_font_family(values: &[Raw]) -> FontStack {
 }
 
 /// Parses the one-to-four value `margin`/`padding` shorthand.
-fn parse_edges(values: &[Raw], quirks: bool) -> Edges {
+///
+/// `non_negative` is set for padding and clear for margin, which is the one
+/// place the two differ: a negative margin is legal and useful — it is how the
+/// era pulled a box back over its neighbour — and a negative padding is
+/// invalid, so the declaration is dropped rather than clamped.
+fn parse_edges(values: &[Raw], quirks: bool, zoom: f32, non_negative: bool) -> Edges {
     let lengths: Vec<Length> = values
         .iter()
-        .filter_map(|raw| parse_length_quirky(raw, quirks))
+        .filter_map(|raw| parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom)))
+        .filter(|length| !(non_negative && length.is_negative()))
         .collect();
     match lengths.len() {
         1 => Edges::all(lengths[0]),
@@ -1056,7 +1804,7 @@ struct BorderShorthand {
 }
 
 /// Reads `1px solid red` in any order, since CSS does not fix one.
-fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
+fn parse_border_shorthand(values: &[Raw], zoom: f32) -> BorderShorthand {
     let mut out = BorderShorthand::default();
     for raw in values {
         if let Raw::Ident(name) = raw {
@@ -1068,15 +1816,15 @@ fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
             }
             match name.as_str() {
                 "thin" => {
-                    out.width = Some(Length::Px(1.0));
+                    out.width = Some(Length::Px(1.0 * zoom));
                     continue;
                 }
                 "medium" => {
-                    out.width = Some(Length::Px(MEDIUM_BORDER));
+                    out.width = Some(Length::Px(MEDIUM_BORDER * zoom));
                     continue;
                 }
                 "thick" => {
-                    out.width = Some(Length::Px(5.0));
+                    out.width = Some(Length::Px(5.0 * zoom));
                     continue;
                 }
                 _ => {}
@@ -1085,23 +1833,23 @@ fn parse_border_shorthand(values: &[Raw]) -> BorderShorthand {
         if let Some(color) = parse_color(raw) {
             out.color = Some(color);
         } else if let Some(length) = parse_length(raw) {
-            out.width = Some(length);
+            out.width = Some(length.scaled(zoom));
         }
     }
     out
 }
 
-fn apply_border_shorthand(side: &mut BorderSide, parsed: &BorderShorthand) {
+fn apply_border_shorthand(side: &mut BorderSide, parsed: &BorderShorthand, zoom: f32) {
     // The shorthand resets omitted components to their initial values, which is
     // why `border: solid` produces a medium border rather than keeping whatever
     // width an earlier rule set.
-    side.width = parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER));
+    side.width = parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER * zoom));
     side.style = parsed.style.unwrap_or_default();
     side.color = parsed.color;
 }
 
 /// Handles `border-top`, `border-left-width`, and friends.
-fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
+fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw], zoom: f32) {
     let (side_name, property) = match rest.split_once('-') {
         Some((side, property)) => (side, Some(property)),
         None => (rest, None),
@@ -1117,10 +1865,10 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
 
     match property {
         // `border-top: 1px solid red`
-        None => apply_border_shorthand(side, &parse_border_shorthand(values)),
+        None => apply_border_shorthand(side, &parse_border_shorthand(values, zoom), zoom),
         Some("width") => {
             if let Some(width) = parse_length(first) {
-                side.width = width;
+                side.width = width.scaled(zoom);
             }
         }
         Some("style") => {
@@ -1139,10 +1887,13 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw]) {
     }
 }
 
-fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool) {
-    let Some(length) = parse_length_quirky(raw, quirks) else {
+fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool, zoom: f32, non_negative: bool) {
+    let Some(length) = parse_length_quirky(raw, quirks).map(|it| it.scaled(zoom)) else {
         return;
     };
+    if non_negative && length.is_negative() {
+        return;
+    }
     match side {
         "top" => edges.top = length,
         "right" => edges.right = length,
@@ -1166,6 +1917,602 @@ mod tests {
         let map = cascade(&doc, &sheets);
         let node = doc.find_element(tag).expect("element present");
         map.get(node).expect("element styled").clone()
+    }
+
+    fn zoomed_style_of(html: &str, css: &str, tag: &str, zoom: f32) -> ComputedStyle {
+        style_from(html, css, tag, zoom, Colours::Authors)
+    }
+
+    fn reader_style_of(html: &str, css: &str, tag: &str) -> ComputedStyle {
+        style_from(html, css, tag, 1.0, Colours::Readers)
+    }
+
+    fn style_from(html: &str, css: &str, tag: &str, zoom: f32, colours: Colours) -> ComputedStyle {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css)];
+        let map = cascade_as(&doc, &sheets, zoom, colours);
+        let node = doc.find_element(tag).expect("element present");
+        map.get(node).expect("element styled").clone()
+    }
+
+    #[test]
+    fn zoom_multiplies_every_pixel_the_page_asked_for() {
+        let css = "p { font-size: 20px; margin: 10px; padding-left: 4px; \
+                   border: 2px solid red; width: 300px }";
+        let plain = zoomed_style_of("<p>x</p>", css, "p", 1.0);
+        let doubled = zoomed_style_of("<p>x</p>", css, "p", 2.0);
+
+        assert_eq!(doubled.font_size, plain.font_size * 2.0);
+        assert_eq!(doubled.margin.top, Length::Px(20.0));
+        assert_eq!(doubled.padding.left, Length::Px(8.0));
+        assert_eq!(doubled.border.top.width, Length::Px(4.0));
+        assert_eq!(doubled.width, Length::Px(600.0));
+    }
+
+    #[test]
+    fn a_percentage_is_left_alone_because_its_basis_is_already_zoomed() {
+        // Scaling it too would apply the zoom twice: a column half the width
+        // of the window is half the width of the window at any zoom, which is
+        // what page zoom means as against a magnifying glass.
+        let doubled = zoomed_style_of("<p>x</p>", "p { width: 50% }", "p", 2.0);
+
+        assert_eq!(doubled.width, Length::Percent(50.0));
+    }
+
+    #[test]
+    fn an_em_is_left_alone_because_the_font_size_is_already_zoomed() {
+        let doubled = zoomed_style_of("<p>x</p>", "p { margin: 2em }", "p", 2.0);
+
+        assert_eq!(doubled.margin.top, Length::Em(2.0));
+        assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0);
+    }
+
+    #[test]
+    fn a_page_that_names_no_size_is_zoomed_by_what_it_inherits() {
+        // Most text on most pages sets no font size at all. If the root's
+        // default were not scaled, zoom would move the headings and leave the
+        // prose exactly where it was.
+        let doubled = zoomed_style_of("<body><p>x</p></body>", "", "p", 2.0);
+
+        assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0);
+        assert_eq!(
+            doubled.line_height,
+            DEFAULT_FONT_SIZE * 2.0 * NORMAL_LINE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn the_named_border_widths_and_font_sizes_are_zoomed_too() {
+        // `medium` and `x-large` are pixel lengths spelled as words, and a
+        // word is exactly as easy to forget as a number.
+        let doubled = zoomed_style_of(
+            "<p>x</p>",
+            "p { border: medium solid red; font-size: x-large }",
+            "p",
+            2.0,
+        );
+
+        assert_eq!(doubled.border.top.width, Length::Px(MEDIUM_BORDER * 2.0));
+        assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0 * 1.5);
+    }
+
+    #[test]
+    fn zooming_out_is_the_same_rule_the_other_way() {
+        let halved = zoomed_style_of("<p>x</p>", "p { font-size: 20px; margin: 10px }", "p", 0.5);
+
+        assert_eq!(halved.font_size, 10.0);
+        assert_eq!(halved.margin.top, Length::Px(5.0));
+    }
+
+    #[test]
+    fn a_reading_view_ignores_the_colours_written_into_the_markup() {
+        // Dropping the author's sheet does not drop the colours in their
+        // markup, and on a dark reader page what is left is a pale band with
+        // near-white text on it. Wikipedia's taxobox writes exactly this, on
+        // every row.
+        let html = r##"<body><table><tr style="background-color: rgb(235,235,210)">
+            <td bgcolor="#e9e9c8"><font color="#333">Conservation status</font></td>
+            </tr></table></body>"##;
+        let sheet = "body { color: #eee; background-color: #1c1b22 }";
+
+        for tag in ["tr", "td", "font"] {
+            let reading = reader_style_of(html, sheet, tag);
+            assert_eq!(
+                reading.background_color,
+                Color::TRANSPARENT,
+                "<{tag}> kept a background from the markup"
+            );
+            assert_eq!(
+                reading.color,
+                Color::rgb(0xee, 0xee, 0xee),
+                "<{tag}> kept a foreground from the markup"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authored_rendering_keeps_them() {
+        // The other half, and the one that keeps this a fallback behaviour
+        // rather than a policy: a page rendered as its author wrote it is
+        // rendered as its author wrote it.
+        let html = r#"<body><table><tr style="background-color: rgb(235,235,210)">
+            <td>x</td></tr></table></body>"#;
+        let authored = style_of(html, "body { color: #eee }", "tr");
+
+        assert_eq!(authored.background_color, Color::rgb(235, 235, 210));
+    }
+
+    #[test]
+    fn the_sheets_colours_still_apply_in_a_reading_view() {
+        // What is ignored is the markup, not the cascade. The reader sheet is
+        // handed in through the same slot the author's would use, and the
+        // whole point of the reading view is that its colours win.
+        let style = reader_style_of(
+            "<body><p>x</p></body>",
+            "body { background-color: #1c1b22 } p { color: #eee }",
+            "p",
+        );
+
+        assert_eq!(style.color, Color::rgb(0xee, 0xee, 0xee));
+    }
+
+    #[test]
+    fn a_reading_view_keeps_everything_in_the_markup_that_is_not_a_colour() {
+        // Narrow on purpose. A `style` attribute is not all colour, and an
+        // element hidden inline has to stay hidden — dropping that would
+        // *reveal* content the page had put away, which is a worse failure
+        // than an ugly one.
+        let style = reader_style_of(
+            r#"<body><p style="background-color: red; display: none; text-align: right">x</p></body>"#,
+            "body { color: #eee }",
+            "p",
+        );
+
+        assert_eq!(style.display, Display::None);
+        assert_eq!(style.text_align, TextAlign::Right);
+        assert_eq!(style.background_color, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn a_reading_view_leaves_the_borders_where_the_author_drew_them() {
+        // A border the reader cannot make out is a line missing; a paragraph
+        // the reader cannot make out is the article missing. Only the second
+        // is worth overriding an author for, so the rule stops at the two
+        // properties that cause it.
+        for declaration in [
+            "border: 1px solid rgb(200,200,160)",
+            "border-style: solid; border-color: rgb(200,200,160)",
+        ] {
+            let style = reader_style_of(
+                &format!(
+                    r#"<body><table><tr><td style="{declaration}">x</td></tr></table></body>"#
+                ),
+                "body { color: #eee }",
+                "td",
+            );
+
+            assert_eq!(
+                style.border.top.color,
+                Some(Color::rgb(200, 200, 160)),
+                "{declaration}"
+            );
+        }
+    }
+
+    /// The declaration era stylesheets are full of, which parsed as nothing
+    /// at all until it was noticed making table rows a few pixels short.
+    #[test]
+    fn the_font_shorthand_sets_size_line_height_and_family() {
+        let style = style_of("<p>x</p>", "p { font: 20px/1.5 Georgia, serif }", "p");
+        assert_eq!(style.font_size, 20.0);
+        assert_eq!(style.line_height, 30.0);
+        assert_eq!(style.font_family.families, vec!["georgia".to_owned()]);
+        assert_eq!(style.font_family.generic, GenericFamily::Serif);
+    }
+
+    #[test]
+    fn the_font_shorthand_takes_style_and_weight_in_any_order() {
+        for css in [
+            "p { font: italic bold 20px serif }",
+            "p { font: bold italic 20px serif }",
+            "p { font: italic small-caps bold 20px serif }",
+        ] {
+            let style = style_of("<p>x</p>", css, "p");
+            assert_eq!(style.font_style, FontStyle::Italic, "{css}");
+            assert_eq!(style.font_weight, 700, "{css}");
+            assert_eq!(style.font_size, 20.0, "{css}");
+        }
+    }
+
+    #[test]
+    fn the_font_shorthand_resets_what_it_does_not_mention() {
+        // The usual way to get a shorthand wrong is to assign only the parts
+        // that were written. `font` covers weight, style and line height, so
+        // all three go back to their initial values here.
+        let style = style_of(
+            "<p>x</p>",
+            "p { font-weight: bold; font-style: italic; line-height: 40px; font: 20px serif }",
+            "p",
+        );
+        assert_eq!(style.font_weight, 400, "weight survived the shorthand");
+        assert_eq!(style.font_style, FontStyle::Normal, "style survived it");
+        assert_eq!(
+            style.line_height,
+            20.0 * NORMAL_LINE_HEIGHT,
+            "line-height survived it"
+        );
+    }
+
+    #[test]
+    fn a_font_shorthand_without_a_size_or_family_changes_nothing() {
+        // Both are required. An invalid shorthand must leave the earlier
+        // declaration standing rather than half-applying itself.
+        // `font: nonsense serif` matters more than the others: a family does
+        // follow, so only the required-size check stands between an invalid
+        // shorthand and it half-applying itself at a made-up size.
+        for bad in [
+            "font: serif",
+            "font: 20px",
+            "font: bold",
+            "font: 20px/1.5",
+            "font: nonsense serif",
+        ] {
+            let css = format!("p {{ font-size: 11px; font-family: monospace; {bad} }}");
+            let style = style_of("<p>x</p>", &css, "p");
+            assert_eq!(style.font_size, 11.0, "{bad} changed the size");
+            assert_eq!(
+                style.font_family.generic,
+                GenericFamily::Monospace,
+                "{bad} changed the family"
+            );
+        }
+    }
+
+    #[test]
+    fn a_system_font_keyword_leaves_the_page_alone() {
+        // There is no way to ask this platform for its menu font, and a guess
+        // dressed up as the system's answer is worse than doing nothing.
+        let style = style_of(
+            "<p>x</p>",
+            "p { font-size: 11px; font-family: monospace; font: menu }",
+            "p",
+        );
+        assert_eq!(style.font_size, 11.0);
+        assert_eq!(style.font_family.generic, GenericFamily::Monospace);
+    }
+
+    #[test]
+    fn the_font_shorthands_line_height_resolves_against_its_own_size() {
+        // `20px/1.5` is a 30px line whatever the parent's size is — the
+        // shorthand's own size is the one in force by the time the slash is
+        // read.
+        let style = style_of(
+            "<div><p>x</p></div>",
+            "div { font-size: 40px } p { font: 20px/1.5 serif }",
+            "p",
+        );
+        assert_eq!(style.font_size, 20.0);
+        assert_eq!(style.line_height, 30.0);
+    }
+
+    #[test]
+    fn a_slash_is_not_swallowed_as_an_unknown_token() {
+        // Before `Raw::Slash` existed the separator arrived as an unmodelled
+        // token, which is how the whole declaration came to be dropped.
+        let style = style_of("<p>x</p>", "p { font: 20px/10px serif }", "p");
+        assert_eq!(style.line_height, 10.0);
+    }
+
+    fn content_of(html: &str, css: &str, tag: &str, which: PseudoElement) -> Option<String> {
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[Stylesheet::parse(css)]);
+        let node = doc.find_element(tag).expect("element present");
+        map.pseudo(node, which)
+            .and_then(|style| style.content.clone())
+    }
+
+    #[test]
+    fn a_pseudo_element_gets_its_own_style_and_content() {
+        let doc = dom::parse("<p>x</p>");
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "p { color: #000000 } p::before { content: \"hi\"; color: #ff0000 }",
+            )],
+        );
+        let node = doc.find_element("p").expect("p");
+        let before = map
+            .pseudo(node, PseudoElement::Before)
+            .expect("a before box");
+        assert_eq!(before.content.as_deref(), Some("hi"));
+        assert_eq!(before.color, Color::rgb(255, 0, 0));
+        assert_eq!(
+            map.get(node).expect("the element").color,
+            Color::rgb(0, 0, 0),
+            "the pseudo-element's colour leaked onto its originator"
+        );
+    }
+
+    #[test]
+    fn both_spellings_of_the_pseudo_element_are_accepted() {
+        // CSS 2.1 writes one colon, CSS 2.2 onwards writes two, and the era's
+        // pages use the single-colon form.
+        for css in [
+            "p::before { content: \"x\" }",
+            "p:before { content: \"x\" }",
+        ] {
+            assert_eq!(
+                content_of("<p>y</p>", css, "p", PseudoElement::Before).as_deref(),
+                Some("x"),
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_content_means_no_box() {
+        // §12.1, and the style has to be *absent* rather than merely
+        // contentless: every later stage reads "a style is here" as "this box
+        // exists".
+        for css in [
+            "p::before { color: red }",
+            "p::before { content: none }",
+            "p::before { content: normal }",
+        ] {
+            let doc = dom::parse("<p>y</p>");
+            let map = cascade(&doc, &[Stylesheet::parse(css)]);
+            let node = doc.find_element("p").expect("p");
+            assert!(map.pseudo(node, PseudoElement::Before).is_none(), "{css}");
+        }
+    }
+
+    #[test]
+    fn content_concatenates_strings_and_attributes() {
+        assert_eq!(
+            content_of(
+                r#"<p title="T">y</p>"#,
+                r#"p::before { content: "[" attr(title) "]" }"#,
+                "p",
+                PseudoElement::Before
+            )
+            .as_deref(),
+            Some("[T]")
+        );
+    }
+
+    #[test]
+    fn a_missing_attribute_is_the_empty_string_and_not_a_failure() {
+        // §12.2 says so, and it is what makes `content: attr(title)` safe to
+        // write across a whole document.
+        assert_eq!(
+            content_of(
+                "<p>y</p>",
+                "p::before { content: attr(title) }",
+                "p",
+                PseudoElement::Before
+            )
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    /// The generated content of every `::before` in the document, in order.
+    fn all_before(html: &str, css: &str) -> Vec<String> {
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[Stylesheet::parse(css)]);
+        doc.descendants(doc.root())
+            .into_iter()
+            .filter_map(|node| map.pseudo(node, PseudoElement::Before))
+            .filter_map(|style| style.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_counter_counts() {
+        assert_eq!(
+            all_before(
+                "<body><ol><li>a</li><li>b</li><li>c</li></ol></body>",
+                "ol { counter-reset: c } li { counter-increment: c } \
+                 li::before { content: counter(c) }",
+            ),
+            ["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn a_counter_nobody_reset_still_counts_from_zero() {
+        // §12.4.1: incrementing a counter with no reset acts as though the root
+        // had reset it, which is what makes `counter-increment` usable alone.
+        assert_eq!(
+            all_before(
+                "<body><p>a</p><p>b</p></body>",
+                "p { counter-increment: c } p::before { content: counter(c) }",
+            ),
+            ["1", "2"]
+        );
+    }
+
+    #[test]
+    fn counters_prints_every_instance_in_scope() {
+        // The self-nesting rule, and the reason `counters()` exists: a nested
+        // list numbers itself `1`, `1.1`, `1.2`, `2` rather than `1 1 2 2`.
+        assert_eq!(
+            all_before(
+                "<body><ol><li>one<ol><li>a</li><li>b</li></ol></li><li>two</li></ol></body>",
+                "ol { counter-reset: s } li { counter-increment: s } \
+                 li::before { content: counters(s, \".\") }",
+            ),
+            ["1", "1.1", "1.2", "2"]
+        );
+    }
+
+    #[test]
+    fn a_counters_scope_is_the_element_its_siblings_after_it_and_their_descendants() {
+        // §12.4.1, which is easy to read as "the element and its descendants"
+        // and is not that. The reset is on the first paragraph, so the second
+        // paragraph — its following sibling — shares the counter, and the
+        // paragraph in the next div does not: it is neither a descendant of
+        // the first nor a sibling of it, so it starts again from zero.
+        assert_eq!(
+            all_before(
+                "<body><div><p class=one>a</p><p>b</p></div><div><p>c</p></div></body>",
+                ".one { counter-reset: c 10 } p { counter-increment: c } \
+                 p::before { content: counter(c) }",
+            ),
+            ["11", "12", "1"]
+        );
+        // And with the reset a level up, the *second div* is a following
+        // sibling of the first, so its paragraph is inside the scope after
+        // all. This is the pair that makes the rule unambiguous.
+        assert_eq!(
+            all_before(
+                "<body><div class=one><p>a</p></div><div><p>b</p></div></body>",
+                ".one { counter-reset: c 10 } p { counter-increment: c } \
+                 p::before { content: counter(c) }",
+            ),
+            ["11", "12"]
+        );
+    }
+
+    #[test]
+    fn a_following_sibling_shares_the_scope_rather_than_nesting_in_it() {
+        // A reset's scope covers the element *and its following siblings*, so
+        // two paragraphs that each reset the same counter are one counter set
+        // back twice, not two counters.
+        assert_eq!(
+            all_before(
+                "<body><p>a</p><p>b</p></body>",
+                "p { counter-reset: c 5; counter-increment: c } \
+                 p::before { content: counters(c, \".\") }",
+            ),
+            ["6", "6"]
+        );
+    }
+
+    #[test]
+    fn counter_prints_the_innermost_instance_and_counters_prints_them_all() {
+        // The pair that tells the two functions apart. With a nested list live
+        // at two depths, `counter()` is the inner number alone.
+        let markup = "<body><ol><li>one<ol><li>a</li><li>b</li></ol></li><li>two</li></ol></body>";
+        let sheet = "ol { counter-reset: s } li { counter-increment: s }";
+        assert_eq!(
+            all_before(
+                markup,
+                &format!("{sheet} li::before {{ content: counter(s) }}")
+            ),
+            ["1", "1", "2", "2"],
+            "counter() did not take the innermost instance"
+        );
+        assert_eq!(
+            all_before(
+                markup,
+                &format!("{sheet} li::before {{ content: counters(s, \".\") }}")
+            ),
+            ["1", "1.1", "1.2", "2"]
+        );
+    }
+
+    #[test]
+    fn a_counter_can_be_spelled_in_another_list_style() {
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 7 } p::before { content: counter(c, upper-roman) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("VII")
+        );
+        // And the number carries no full stop of its own: that belongs to a
+        // list marker, and `content` writes its own punctuation.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 3 } p::before { content: counter(c) \". \" }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("3. ")
+        );
+    }
+
+    #[test]
+    fn reset_happens_before_increment_on_one_element() {
+        // §12.4's order, and visible only when one element does both.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 10; counter-increment: c 5 } \
+                 p::before { content: counter(c) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn a_content_form_out_of_scope_drops_the_whole_declaration() {
+        // A pseudo-element showing *part* of what the author asked for is
+        // worse than one showing nothing: it looks deliberate.
+        for css in [
+            "p::before { content: open-quote }",
+            "p::before { content: \"a\" url(x.png) }",
+            // `counters()` without a separator is not `counters()`.
+            "p::before { content: counters(x) }",
+        ] {
+            assert_eq!(
+                content_of("<p>y</p>", css, "p", PseudoElement::Before),
+                None,
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_without_a_pseudo_element_does_not_style_one() {
+        let doc = dom::parse("<p>x</p>");
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "p { background-color: #ff0000; color: #00ff00 } p::before { content: \"x\" }",
+            )],
+        );
+        let node = doc.find_element("p").expect("p");
+        let before = map
+            .pseudo(node, PseudoElement::Before)
+            .expect("a before box");
+        assert_eq!(
+            before.color,
+            Color::rgb(0, 255, 0),
+            "an inherited property should come across"
+        );
+        assert_eq!(
+            before.background_color,
+            Color::TRANSPARENT,
+            "a non-inherited property came across from the element's own rule"
+        );
+    }
+
+    #[test]
+    fn a_presentational_attribute_does_not_reach_the_generated_box() {
+        let doc = dom::parse(r##"<body bgcolor="#ff0000"><p>x</p></body>"##);
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse("body::before { content: \"x\" }")],
+        );
+        let node = doc.find_element("body").expect("body");
+        let before = map
+            .pseudo(node, PseudoElement::Before)
+            .expect("a before box");
+        assert_eq!(
+            before.background_color,
+            Color::TRANSPARENT,
+            "a `bgcolor` painted the box `::before` generates"
+        );
     }
 
     #[test]
@@ -1912,6 +3259,46 @@ mod tests {
     }
 
     #[test]
+    fn a_float_makes_a_table_box_block_level() {
+        // §9.7's table. A floated row is no longer part of any table, so a box
+        // that kept `display: table-row` would be looked for in a grid that no
+        // longer contains it. `table` is the one entry that maps to itself.
+        let display = |declaration: &str| {
+            style_of(
+                "<body><div id=t>x</div></body>",
+                &format!("#t {{ {declaration} }}"),
+                "div",
+            )
+            .display
+        };
+        for value in [
+            "table-row",
+            "table-row-group",
+            "table-cell",
+            "table-caption",
+            "table-column",
+            "inline-block",
+            "inline",
+        ] {
+            assert_eq!(
+                display(&format!("display: {value}; float: left")),
+                Display::Block,
+                "float left `display: {value}`"
+            );
+            assert_eq!(
+                display(&format!("display: {value}; position: absolute")),
+                Display::Block,
+                "absolute `display: {value}`"
+            );
+        }
+        assert_eq!(
+            display("display: table; float: left"),
+            Display::Table,
+            "a floated table is still a table"
+        );
+    }
+
+    #[test]
     fn valign_sets_a_cells_vertical_alignment() {
         let cell = |markup: &str| standards_style_of(markup, "", "td").vertical_align;
         assert_eq!(
@@ -2007,6 +3394,46 @@ mod tests {
                 .border_collapse,
             BorderCollapse::Separate
         );
+    }
+
+    #[test]
+    fn letter_spacing_is_resolved_to_pixels_against_the_element_own_size() {
+        // Stored in pixels rather than as a length, because shaping is where it
+        // has to arrive and shaping has no containing block to ask.
+        let style = standards_style_of(
+            "<p>x</p>",
+            "p { font-size: 20px; letter-spacing: 0.5em }",
+            "p",
+        );
+        assert!(
+            (style.letter_spacing - 10.0).abs() < 0.01,
+            "got {}",
+            style.letter_spacing
+        );
+
+        let normal = standards_style_of("<p>x</p>", "p { letter-spacing: normal }", "p");
+        assert_eq!(normal.letter_spacing, 0.0, "`normal` is no extra space");
+    }
+
+    #[test]
+    fn word_spacing_is_still_not_implemented() {
+        // It sits beside `letter-spacing` in every stylesheet and is *not*
+        // implemented, and this asserts the gap rather than leaving somebody to
+        // assume the pair came together. Delete this test when it does.
+        let style = standards_style_of("<p>x</p>", "p { word-spacing: 20px }", "p");
+        assert_eq!(
+            style.letter_spacing, 0.0,
+            "word-spacing leaked into letter-spacing"
+        );
+    }
+
+    #[test]
+    fn z_index_is_an_integer_or_auto() {
+        let of = |css: &str| standards_style_of("<p>x</p>", css, "p").z_index;
+        assert_eq!(of("p { z-index: 3 }"), Some(3));
+        assert_eq!(of("p { z-index: -2 }"), Some(-2));
+        assert_eq!(of("p { z-index: auto }"), None, "auto is not a number");
+        assert_eq!(of(""), None, "the initial value");
     }
 
     #[test]

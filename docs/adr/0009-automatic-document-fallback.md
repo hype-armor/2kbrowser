@@ -45,6 +45,40 @@ element count — one flex container wrapping the whole page matters, fifty flex
 containers in a footer do not. Initial threshold 40%, tuned against a corpus, and
 recorded where it can be changed deliberately.
 
+**2b. Too modern in its frame.** Amended after pointing the browser at
+Wikipedia, which the share above cannot see and which no proportional measure
+can. An article's prose really is ordinary flow: by volume the page is
+overwhelmingly correct, and every share — of text, of boxes, of misplaced
+blocks — reports it as fine. What is wrong is the structure *around* the prose,
+which is a handful of containers holding almost no text.
+
+So there is a second signal, and it is a count rather than a share, which is a
+deliberate departure from the paragraph above. A container is counted when it
+uses layout we do not implement **and holds two or more block-level children**:
+those children are meant to sit side by side and will instead stack down the
+page, which changes the page's shape rather than its contents. A container
+holding one block, or holding only inline content, changes nothing when it is
+ignored and is not counted.
+
+Measured rather than guessed, which is what the "needs a corpus" note below
+asked for. Row-forming containers at a 1000px viewport:
+
+| page                         | rows | unsupported containers |
+|------------------------------|------|------------------------|
+| `example.com`                |    0 |                      0 |
+| `info.cern.ch`               |    0 |                      0 |
+| `news.ycombinator.com`       |    0 |                      0 |
+| `motherfuckingwebsite.com`   |    0 |                      0 |
+| `gnu.org`                    |    0 |                      8 |
+| this repository's `era-page` |    0 |                      0 |
+| **Wikipedia, an article**    | **16** |                **484** |
+
+Every page that should keep its author's layout scores zero — `gnu.org`
+included, which has eight flex containers and not one of them a row. The
+threshold is **4**: well clear of zero, well under sixteen. Six pages is a small
+corpus and this will want revisiting with a larger one, which is the same
+caveat the share carries.
+
 **3. No content without JavaScript.** The document has near-zero text content
 and a non-trivial number of `<script>` elements — an SPA shell such as an empty
 `<div id="root">`. Reader mode cannot help; there is nothing to extract. Show an

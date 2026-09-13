@@ -1,0 +1,50 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  .bar { height: 8px; background: #2222cc; margin: 0; }
+  .bar + .bar { background: #ff9900; }
+  p + p { color: #008000; }
+  h4 + p { font-weight: bold; }
+  h4 { font-size: 13px; margin: 6px 0 2px 0; }
+  li + li { color: #990000; }
+  td + td { background: #ddeeff; }
+  table { border-collapse: collapse; }
+  td { border: 1px solid #888888; padding: 2px 6px; }
+  /* A combinator inside an attribute value is not one. */
+  [title="a+b"] { color: #800080; }
+  /* Chained: only the paragraph that follows a heading inside a section. */
+  section > h4 + p { text-decoration: underline; }
+</style></head><body>
+
+<h3>Only the second bar and after are orange</h3>
+<div class="bar"></div>
+<div class="bar"></div>
+<div class="bar"></div>
+
+<h3>The first paragraph keeps the body colour</h3>
+<p>first, black</p>
+<p>second, green</p>
+<p>third, green</p>
+
+<h3>Whitespace and comments between siblings do not separate them</h3>
+<h4>a heading</h4>
+
+<!-- a comment sits between -->
+
+<p>bold, because it follows the heading</p>
+
+<h3>Nesting matters: not a sibling if the parent differs</h3>
+<div><p>inside its own div, so black</p></div>
+<div><p>also black</p></div>
+
+<h3>Lists and table cells</h3>
+<ul><li>one, black</li><li>two, red</li><li>three, red</li></ul>
+<table><tr><td>first</td><td>tinted</td><td>tinted</td></tr></table>
+
+<h3>A plus sign in an attribute value is just a character</h3>
+<p title="a+b">purple, matched by its title</p>
+
+<h3>Chained combinators</h3>
+<section><h4>heading in a section</h4><p>bold and underlined</p></section>
+
+</body></html>

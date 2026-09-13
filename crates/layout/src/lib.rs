@@ -7,10 +7,12 @@
 
 pub mod classify;
 pub mod floats;
+pub mod forms;
 pub mod frameset;
 pub mod table;
 
 use css::cascade::StyleMap;
+use css::selector::PseudoElement;
 use css::style::{
     BorderCollapse, CaptionSide, ComputedStyle, Display, Float, Overflow, Position, TextAlign,
     VerticalAlign, WhiteSpace,
@@ -32,6 +34,14 @@ pub type IntrinsicSizes = std::collections::HashMap<NodeId, (f32, f32)>;
 /// for a broken image with no dimensions given.
 const BROKEN_IMAGE_SIZE: (f32, f32) = (20.0, 20.0);
 
+/// The size §10.3.2 and §10.4 give a replaced element that has no intrinsic
+/// dimensions at all: the largest 2:1 rectangle no taller than 150px.
+///
+/// Every browser's empty `<iframe>`. Not used for an image, which has a
+/// smaller default of its own — a broken picture and an empty frame are
+/// different things and a reader can tell them apart on sight.
+const DEFAULT_REPLACED_SIZE: (f32, f32) = (300.0, 150.0);
+
 /// The containing block that absolutely positioned descendants resolve against.
 ///
 /// Boxes are stored parent-relative, but an absolutely positioned element is
@@ -45,6 +55,15 @@ pub struct ContainingBlock {
     offset: (f32, f32),
     /// The containing block's content size.
     size: (f32, f32),
+    /// The containing block's height, where it has a definite one.
+    ///
+    /// §10.5 turns on this and nothing else: a percentage `height` resolves
+    /// against the containing block's height only when that height does not
+    /// itself depend on the content. Otherwise the percentage computes to
+    /// `auto`. `size.1` cannot answer it — that is a number whatever its
+    /// provenance, and for a normal-flow block it is a width standing in for a
+    /// height it does not know.
+    definite_height: Option<f32>,
 }
 
 impl ContainingBlock {
@@ -53,6 +72,10 @@ impl ContainingBlock {
         Self {
             offset: (0.0, 0.0),
             size: (width, height),
+            // The initial containing block is the viewport, whose height is
+            // as definite as a height gets: `height: 100%` on the root fills
+            // the window.
+            definite_height: Some(height),
         }
     }
 
@@ -62,14 +85,28 @@ impl ContainingBlock {
         Self {
             offset: (self.offset.0 + dx, self.offset.1 + dy),
             size: self.size,
+            definite_height: self.definite_height,
+        }
+    }
+
+    /// This containing block with a definite height of `height`.
+    fn with_definite_height(self, height: Option<f32>) -> Self {
+        Self {
+            definite_height: height,
+            ..self
         }
     }
 
     /// A box establishing itself as the containing block for its descendants.
+    ///
+    /// Its height is definite: a positioned box has been sized by the time it
+    /// becomes a containing block, so a percentage height inside it has a
+    /// real number to resolve against.
     fn establish(size: (f32, f32)) -> Self {
         Self {
             offset: (0.0, 0.0),
             size,
+            definite_height: Some(size.1),
         }
     }
 }
@@ -127,18 +164,32 @@ fn relative_shift(style: &ComputedStyle, containing: (f32, f32)) -> (f32, f32) {
 pub fn replaced_size(
     style: &ComputedStyle,
     intrinsic: Option<(f32, f32)>,
-    attr_width: Option<f32>,
-    attr_height: Option<f32>,
+    // §10.3.2/§10.4's defaults for an element with *no* intrinsic dimensions,
+    // where it has any. Deliberately not an intrinsic size: 300x150 is a pair
+    // of independent defaults and not a 2:1 ratio, so an `<iframe>` given a
+    // height of one inch is 300px wide and not 192.
+    defaults: Option<(f32, f32)>,
+    attr_width: Option<Length>,
+    attr_height: Option<Length>,
     available_width: f32,
 ) -> (f32, f32) {
     let font_size = style.font_size;
     // CSS wins over the presentational attribute, which is only a fallback.
     let width = match style.width {
-        Length::Auto => attr_width,
+        Length::Auto => attr_width.map(|length| length.to_px(font_size, available_width)),
         length => Some(length.to_px(font_size, available_width)),
     };
     let height = match style.height {
-        Length::Auto => attr_height,
+        // A percentage *height* is a different matter from a percentage width.
+        // It resolves against the containing block's height, which is `auto`
+        // for nearly every box on a page of this era, and CSS 2.1 §10.5 says
+        // such a percentage computes to `auto` in turn. Reading it against the
+        // width instead — the only basis to hand — would stretch an image to a
+        // fraction of the page's *width*, which is not a small error.
+        Length::Auto => attr_height.and_then(|length| match length {
+            Length::Percent(_) => None,
+            length => Some(length.to_px(font_size, available_width)),
+        }),
         length => Some(length.to_px(font_size, available_width)),
     };
 
@@ -146,10 +197,10 @@ pub fn replaced_size(
         (Some(w), Some(h), _) => (w, h),
         (Some(w), None, Some((iw, ih))) if iw > 0.0 => (w, w * ih / iw),
         (None, Some(h), Some((iw, ih))) if ih > 0.0 => (h * iw / ih, h),
-        (Some(w), None, None) => (w, w),
-        (None, Some(h), None) => (h, h),
+        (Some(w), None, None) => (w, defaults.map_or(w, |(_, h)| h)),
+        (None, Some(h), None) => (defaults.map_or(h, |(w, _)| w), h),
         (None, None, Some(size)) => size,
-        (None, None, None) => BROKEN_IMAGE_SIZE,
+        (None, None, None) => defaults.unwrap_or(BROKEN_IMAGE_SIZE),
         (Some(w), None, Some(_)) => (w, w),
         (None, Some(h), Some(_)) => (h, h),
     };
@@ -179,19 +230,52 @@ pub fn replaced_size(
 /// Whether an element is a replaced element this engine lays out as a box of
 /// intrinsic size rather than from its children.
 fn is_replaced(doc: &Document, node: NodeId) -> bool {
-    doc.element(node).is_some_and(|e| e.local_name() == "img")
+    doc.element(node)
+        .is_some_and(|e| matches!(e.local_name(), "img" | "iframe"))
+}
+
+/// The §10.3.2 defaults for a replaced element with no intrinsic dimensions,
+/// where this one has any.
+///
+/// An `<iframe>` has none — this engine does not load the document inside one
+/// (ADR-0003 rules out the scripting such documents assume, and a frame's
+/// content is separate work) — so it takes the 300x150 empty frame every
+/// browser draws in its place. An image keeps its own smaller default: a
+/// broken picture and an empty frame are different things, and a reader can
+/// tell them apart on sight.
+fn replaced_defaults(doc: &Document, node: NodeId) -> Option<(f32, f32)> {
+    doc.element(node)
+        .is_some_and(|element| element.local_name() == "iframe")
+        .then_some(DEFAULT_REPLACED_SIZE)
 }
 
 /// Reads a presentational width/height attribute, which the era's markup used
 /// far more than CSS.
-fn size_attr(doc: &Document, node: NodeId, name: &str) -> Option<f32> {
+/// A `width` or `height` presentational attribute, as a length.
+///
+/// A percentage is not a curiosity here. `<img width="100%">` is how the era
+/// drew a rule across a column, how a spacer GIF held a layout open, and how
+/// a banner filled the page — and this used to return `None` for one, on the
+/// grounds that percentages "were rare and ambiguous". They were neither.
+/// HTML's rendering rules map `width="N%"` onto `width: N%`, and the CSS 2.1
+/// suite's own references lean on it: `<img src="1x1-green.png" width="100%"
+/// height="50">` is how several of them draw the green bar a test must match,
+/// so the *reference* came out a 50px square and the test failed for having
+/// been right.
+fn size_attr(doc: &Document, node: NodeId, name: &str) -> Option<Length> {
     let value = doc.element(node)?.attr(name)?.trim();
-    // Percentages in these attributes are not supported; they were rare and
-    // ambiguous, and treating them as pixels would be worse than ignoring them.
-    if value.ends_with('%') {
-        return None;
+    if let Some(number) = value.strip_suffix('%') {
+        let percent = number.trim().parse::<f32>().ok().filter(|v| *v >= 0.0)?;
+        return Some(Length::Percent(percent));
     }
-    value.parse::<f32>().ok().filter(|v| *v >= 0.0)
+    // A bare number is pixels, and a trailing `px` is not legal in the
+    // attribute — `width="100px"` is what an author writes when they mean the
+    // CSS property, and browsers read it as no width at all.
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| *v >= 0.0)
+        .map(Length::Px)
 }
 
 /// A rectangle in CSS pixels, with the origin at the top left of the canvas.
@@ -267,6 +351,8 @@ fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.display == Display::TableCell
+        || style.display == Display::TableCaption
+        || style.display == Display::InlineBlock
         || style.overflow != Overflow::Visible
 }
 
@@ -376,6 +462,64 @@ impl Layout {
         out
     }
 
+    /// What lies between two points on the page.
+    ///
+    /// The points are where a drag started and where it is now, in either
+    /// order — a reader selecting upwards is selecting, not doing nothing. The
+    /// range runs in reading order between them and covers whole lines in
+    /// between, which is what selection means everywhere and is not what a
+    /// rectangle between the two points would give.
+    pub fn select(&self, from: (f32, f32), to: (f32, f32)) -> Selection {
+        let mut lines = Vec::new();
+        placed_lines(&self.root, 0.0, 0.0, &mut lines);
+        // Reading order: down the page, then across. Tree order is nearly this
+        // and not exactly — a float is laid out before the text beside it.
+        lines.sort_by(|a, b| {
+            a.top
+                .partial_cmp(&b.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    a.origin_x
+                        .partial_cmp(&b.origin_x)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        if lines.is_empty() {
+            return Selection::default();
+        }
+
+        let (start, end) = {
+            let (a, b) = (caret_at(&lines, from), caret_at(&lines, to));
+            if a <= b { (a, b) } else { (b, a) }
+        };
+
+        let mut out = Selection::default();
+        for (index, placed) in lines.iter().enumerate().take(end.line + 1).skip(start.line) {
+            let text = &placed.line.text;
+            let from = if index == start.line { start.offset } else { 0 };
+            let to = if index == end.line {
+                end.offset
+            } else {
+                text.len()
+            };
+            if from >= to {
+                continue;
+            }
+            if let Some(rect) = span_rect(placed.line, from, to, placed.origin_x, placed.origin_y) {
+                out.rects.push(rect);
+            }
+            if !out.text.is_empty() {
+                // Where the page broke the line. The source's own newlines are
+                // already gone — whitespace collapsed on the way in — so this
+                // is the only place one can come from, and text copied out of
+                // a paragraph reads as it looked.
+                out.text.push('\n');
+            }
+            out.text.push_str(&text[from..to]);
+        }
+        out
+    }
+
     /// Every rectangle belonging to `node`, in canvas coordinates.
     ///
     /// A link wrapping onto three lines has three, which is what drawing a
@@ -420,6 +564,100 @@ fn hit_test_box(box_: &LayoutBox, x: f32, y: f32, offset_x: f32, offset_y: f32) 
     // specific answer and has already had its chance.
     let inside = x >= left && x < left + box_.rect.width && y >= top && y < top + box_.rect.height;
     if inside { box_.node } else { None }
+}
+
+/// Text on the page between two points, and where it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Selection {
+    /// One rectangle per line the selection touches, to draw the highlight.
+    pub rects: Vec<Rect>,
+    /// What is selected, with a newline where the page broke the line.
+    ///
+    /// Copied as it reads rather than as it was written: the whitespace is
+    /// already collapsed, so what comes out is what is on the screen.
+    pub text: String,
+}
+
+/// One line of text on the page, with where it sits.
+struct PlacedLine<'a> {
+    line: &'a text::Line,
+    /// Left edge of the line's own text, alignment already applied.
+    origin_x: f32,
+    origin_y: f32,
+    top: f32,
+    bottom: f32,
+}
+
+/// Where a point falls in the page's text: which line, and how far into it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Caret {
+    line: usize,
+    offset: usize,
+}
+
+/// Every line of text on the page, in reading order.
+fn placed_lines<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<PlacedLine<'a>>) {
+    let left = x + box_.rect.x;
+    let top = y + box_.rect.y;
+    if let Some(text) = &box_.text {
+        let content_x = left + box_.content_origin.0;
+        let content_y = top + box_.content_origin.1;
+        for line in &text.lines {
+            let Some(first) = line.glyphs.first() else {
+                continue;
+            };
+            let line_top = content_y + first.y - line.baseline;
+            out.push(PlacedLine {
+                line,
+                origin_x: content_x
+                    + line_offset(box_.style.text_align, line.width, box_.content_width),
+                origin_y: content_y,
+                top: line_top,
+                bottom: line_top + line.baseline * 1.25,
+            });
+        }
+    }
+    for child in &box_.children {
+        placed_lines(child, left, top, out);
+    }
+}
+
+/// Which byte of a line a point is nearest, measured to the middle of each
+/// glyph so that clicking the left half of a letter puts the caret before it.
+fn offset_at(placed: &PlacedLine, x: f32) -> usize {
+    let line = placed.line;
+    for (index, glyph) in line.glyphs.iter().enumerate() {
+        let right = line.glyphs.get(index + 1).map_or(line.width, |next| next.x);
+        if x < placed.origin_x + (glyph.x + right) / 2.0 {
+            return glyph.start;
+        }
+    }
+    line.text.len()
+}
+
+/// Where a point falls among `lines`, which are in reading order.
+///
+/// A point off the end of a line belongs to that line, and a point in the gap
+/// between two lines belongs to the one above — which is what makes dragging
+/// down the left-hand margin select whole lines rather than nothing.
+fn caret_at(lines: &[PlacedLine], (x, y): (f32, f32)) -> Caret {
+    let mut last = Caret { line: 0, offset: 0 };
+    for (index, placed) in lines.iter().enumerate() {
+        if y < placed.top {
+            return last;
+        }
+        if y < placed.bottom {
+            return Caret {
+                line: index,
+                offset: offset_at(placed, x),
+            };
+        }
+        last = Caret {
+            line: index,
+            offset: placed.line.text.len(),
+        };
+    }
+    last
 }
 
 fn collect_matches(
@@ -611,16 +849,119 @@ pub fn layout(
         _ => None,
     };
 
+    // Not `height.outer()` alone. That is the root box's own height, and
+    // content is allowed to be taller than the box holding it — `overflow`
+    // defaults to `visible` and CSS 2.1 §11.1.1 says such content is still
+    // painted. Sizing the canvas by the root box cuts it off, and being cut
+    // off is indistinguishable from never having been drawn: a page whose last
+    // element overflowed simply lost it, silently.
+    let height = height.outer().max(ink_bottom(&root, 0.0));
+
     Layout {
         root,
-        height: height.outer(),
+        height,
         canvas_background,
         canvas_image,
     }
 }
 
+/// The lowest point on the page anything actually reaches.
+///
+/// A box's own height is not that point. A block with `height: 0` and text in
+/// it, a float taller than its container, a positioned box placed past the
+/// bottom — each draws below the edge of what holds it, and `overflow:
+/// visible` says each must still be drawn. Rectangles here are relative to the
+/// parent, so the offset is carried down rather than read off the box.
+///
+/// Text is measured separately from the box, and that is the case that matters:
+/// a box's rectangle can be shorter than the lines inside it, which is exactly
+/// what `height: 0` produces.
+fn ink_bottom(box_: &LayoutBox, offset_y: f32) -> f32 {
+    let top = offset_y + box_.rect.y;
+    let mut bottom = top + box_.rect.height;
+    // `overflow: hidden` all but ends the question here (CSS 2.1 §11.1.1).
+    // What hangs out of this box is clipped, and clipped content is not part
+    // of the page: it cannot be scrolled to, because there is nothing to
+    // scroll to.
+    //
+    // This is how a page gets a mile of blank space under it. A dropdown
+    // written without scripting is `height: 0; overflow: hidden` until it is
+    // opened, and the menu inside it is as tall as its list — so the page
+    // carried hundreds of pixels of menu it never drew and could never show.
+    //
+    // "All but", because of what escapes: an absolutely positioned box is
+    // clipped by this one only if this one is its containing block, and a
+    // static box is nobody's containing block. Chromium agrees, and so does
+    // the reader — a tooltip anchored to the page, inside a clipped wrapper,
+    // is on the page.
+    if box_.style.overflow == Overflow::Clipped {
+        return bottom.max(escaping_bottom(box_, top));
+    }
+    if let Some(text) = &box_.text {
+        bottom = bottom.max(top + box_.content_origin.1 + text.height);
+    }
+    for child in &box_.children {
+        bottom = bottom.max(ink_bottom(child, top));
+    }
+    bottom
+}
+
+/// How far down content reaches that a clipping box does not clip.
+///
+/// An absolutely positioned box is clipped by an ancestor only when that
+/// ancestor is its containing block — the nearest positioned one (§10.1). So
+/// the walk goes down through *static* descendants looking for absolutely
+/// positioned boxes, and stops at the first positioned one it meets: that box
+/// is the containing block for everything below it, and it is inside the clip.
+///
+/// A positioned clipper clips everything under it and never calls this.
+fn escaping_bottom(clipper: &LayoutBox, top: f32) -> f32 {
+    if clipper.style.position != Position::Static {
+        return f32::MIN;
+    }
+    let mut bottom = f32::MIN;
+    for child in &clipper.children {
+        bottom = bottom.max(match child.style.position {
+            // Anchored outside the clip, so it is drawn and scrolled to in
+            // full — and so is everything under it.
+            Position::Absolute | Position::Fixed => ink_bottom(child, top),
+            // Still static, so still nobody's containing block: keep looking.
+            Position::Static => escaping_bottom(child, top + child.rect.y),
+            // A positioned box is the containing block for anything below it,
+            // and it is inside the clip.
+            Position::Relative => f32::MIN,
+        });
+    }
+    bottom
+}
+
 /// Gap between a list marker and the item's content edge.
 const MARKER_GAP: f32 = 0.4;
+
+/// A shaping width wide enough that no line ever breaks at it.
+///
+/// Used where the caller wants one line whatever its length, and will decide
+/// for itself what to do with the part that does not fit.
+const UNWRAPPED: f32 = 1.0e6;
+
+/// Cuts a form control's label off at the edge of its box.
+///
+/// A control clips, and nothing else in this engine does: an over-long value
+/// stops at the field's border instead of being drawn through it and across
+/// whatever sits beside it. Doing it here, on the shaped label, keeps paint
+/// free of a clip path it would need for this one case.
+///
+/// Glyphs go whole, so one straddling the edge is kept rather than cut through
+/// — at a text field's size that is a fraction of a character of overhang. The
+/// line's text is left intact so a search still matches what the field holds.
+fn clip_label(label: &mut text::TextLayout, width: f32) {
+    for line in &mut label.lines {
+        line.glyphs.retain(|glyph| glyph.x < width);
+        line.decorations.retain(|run| run.x < width);
+        line.width = line.width.min(width);
+    }
+    label.width = label.width.min(width);
+}
 
 /// The number this list item counts as.
 ///
@@ -704,6 +1045,176 @@ fn marker_box(
     })
 }
 
+/// Where a line's atomic boxes go.
+///
+/// The box being filled, together with the two numbers needed to place
+/// anything on a line inside it: where its content starts, and the width lines
+/// were broken at — which is what an aligned line measures its shift against.
+struct LineBoxes<'a> {
+    origin: (f32, f32),
+    content_width: f32,
+    parent: &'a mut LayoutBox,
+}
+
+/// Inline-block boxes, already laid out, keyed by the node each belongs to.
+///
+/// An inline-block is a block container sized by its own content that sits on a
+/// line. The line breaker cannot leave room for one without knowing how big it
+/// is, and the only way to know is to lay it out — so it is laid out first, and
+/// the whole box is kept rather than measured now and built again later.
+type InlineBlocks = std::collections::HashMap<NodeId, LayoutBox>;
+
+/// Lays out every inline-block among `children`, and inside any inline element
+/// among them, so the line breaker has sizes to place.
+///
+/// Walks the same shapes [`gather_one`] does, and stops at the same places: a
+/// replaced element and a form control are atomic already, and an inline-block
+/// lays its own descendants out, including any inline-blocks among them.
+fn layout_inline_blocks(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    children: &[NodeId],
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
+    out: &mut InlineBlocks,
+) {
+    for &child in children {
+        let Some(style) = styles.get(child) else {
+            continue;
+        };
+        if style.display == Display::None || !is_inline_child(doc, styles, child, style) {
+            continue;
+        }
+        if is_replaced(doc, child) || forms::control_of(doc, child).is_some() {
+            continue;
+        }
+        if style.display == Display::InlineBlock {
+            let box_ =
+                layout_inline_block(doc, styles, fonts, child, style, intrinsic, available_width);
+            out.insert(child, box_);
+            continue;
+        }
+        layout_inline_blocks(
+            doc,
+            styles,
+            fonts,
+            doc.children(child),
+            intrinsic,
+            available_width,
+            out,
+        );
+    }
+}
+
+/// Lays one inline-block out on its own, at the width §10.3.9 gives it.
+///
+/// The box comes back positioned within its own *margin* box — its rect already
+/// offset by its left and top margins — because that is the box the line makes
+/// room for, and moving it onto the line is then a single translation.
+fn layout_inline_block(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available_width: f32,
+) -> LayoutBox {
+    let font_size = style.font_size;
+    let margin = style.margin.left.to_px(font_size, available_width)
+        + style.margin.right.to_px(font_size, available_width);
+
+    // §10.3.9: an `auto` width shrinks to fit. As wide as the content would
+    // like, no wider than the room left on the line, and never narrower than
+    // the widest thing in it that cannot be broken — which is what keeps a
+    // one-word label from being squeezed to nothing in a narrow column.
+    //
+    // `layout_block` derives an auto width from what it is given, so the room
+    // it is handed *is* the answer. A declared width it works out itself, and
+    // is given the real available width so percentages inside resolve against
+    // the containing block rather than against the box.
+    let effective = match style.width {
+        Length::Auto => {
+            let room = (available_width - margin).max(0.0);
+            let (min, max) = subtree_widths(doc, styles, fonts, node, style, intrinsic, room, 0);
+            min.max(room).min(max.max(min)) + margin
+        }
+        _ => available_width,
+    };
+
+    let mut holder = LayoutBox {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: effective,
+            height: 0.0,
+        },
+        style: ComputedStyle::default(),
+        text: None,
+        content_origin: (0.0, 0.0),
+        content_width: effective,
+        children: Vec::new(),
+        replaced: None,
+        node: None,
+    };
+    let consumed = layout_block(
+        doc,
+        styles,
+        fonts,
+        node,
+        style,
+        intrinsic,
+        0.0,
+        0.0,
+        effective,
+        // An inline-block establishes a formatting context of its own, so no
+        // float declared outside it reaches in.
+        FloatContext::new(effective),
+        ContainingBlock::establish((effective, 0.0)),
+        &mut holder,
+    );
+    let mut box_ = match holder.children.pop() {
+        Some(box_) => box_,
+        // Unreachable: `layout_block` always pushes exactly one box. Returning
+        // an empty box rather than panicking keeps a layout bug from taking the
+        // whole page down with it.
+        None => holder,
+    };
+
+    // The margin box is what goes on the line, so the height the line is told
+    // about includes margins that do not collapse with anything — an
+    // inline-block keeps its own (§8.3.1, and `keeps_its_childrens_margins`).
+    box_.rect.y = consumed.margin_top;
+    box_
+}
+
+/// Distance from the top of `box_` to the baseline of its last line box.
+///
+/// §10.8.1: an inline-block lines up with the text beside it on the baseline of
+/// its own last line, not on its bottom edge — so a caption under a thumbnail
+/// sits level with the sentence it is part of. `None` when there is no line box
+/// to align on, in which case the caller falls back to the bottom margin edge,
+/// which is the same rule and the reason an empty spacer sits *on* the line.
+fn last_baseline(box_: &LayoutBox) -> Option<f32> {
+    let mut found = box_.text.as_ref().and_then(|text| {
+        let line = text.lines.last()?;
+        Some(box_.content_origin.1 + line.y + line.baseline)
+    });
+    for child in &box_.children {
+        // Out-of-flow boxes are not in the line-box run: an absolutely
+        // positioned footnote at the bottom of one of these must not drag the
+        // whole box down relative to the text beside it.
+        if child.style.position.is_out_of_flow() || child.style.float != Float::None {
+            continue;
+        }
+        if let Some(inner) = last_baseline(child) {
+            found = Some(child.rect.y + inner);
+        }
+    }
+    found
+}
+
 /// Turns the line breaker's placements into real child boxes.
 ///
 /// An inline image is still a box: it can carry a border, padding, and a
@@ -711,19 +1222,34 @@ fn marker_box(
 /// than painting the placements directly means all of that goes through the
 /// ordinary box-painting path instead of being special-cased.
 fn emit_replaced_boxes(
+    doc: &Document,
     styles: &StyleMap,
+    fonts: &mut FontStore,
     layout: &TextLayout,
     style: &ComputedStyle,
-    origin: (f32, f32),
-    content_width: f32,
-    parent: &mut LayoutBox,
+    blocks: &InlineBlocks,
+    into: LineBoxes<'_>,
 ) {
+    let LineBoxes {
+        origin,
+        content_width,
+        parent,
+    } = into;
     for line in &layout.lines {
         // The same shift paint applies to the line's glyphs, so a centred line
         // carries its images along with its text.
         let dx = line_offset(style.text_align, line.width, content_width);
         for placed in &line.replaced {
             let node = NodeId(placed.id);
+            // An inline-block was laid out whole before the line was
+            // broken; placing it is moving it, not building it again.
+            if let Some(box_) = blocks.get(&node) {
+                let mut box_ = box_.clone();
+                box_.rect.x += origin.0 + dx + placed.x;
+                box_.rect.y += origin.1 + placed.y;
+                parent.children.push(box_);
+                continue;
+            }
             let Some(child_style) = styles.get(node) else {
                 continue;
             };
@@ -735,6 +1261,69 @@ fn emit_replaced_boxes(
             let top = child_style.border.top.used_width(font_size)
                 + child_style.padding.top.to_px(font_size, content_width);
 
+            // A control is painted from its own border and background rather
+            // than from decoded bytes, so it carries no image — and its label,
+            // where it has one, is shaped into the box now that the box's
+            // width is finally known.
+            let control = forms::control_of(doc, node);
+            let inner = (placed.width - left - right).max(0.0);
+            let label = control
+                .and_then(|control| Some((control, forms::label_of(doc, node, control)?)))
+                .map(|(control, text)| {
+                    let single_line = forms::is_single_line(doc, node, control);
+                    // A list box and a textarea hold their lines apart with
+                    // newlines, so the label is shaped preformatted or they
+                    // would collapse into one run-on line — which is the bug
+                    // that made a `<select>` read as `United KingdomFrance`
+                    // before any of this existed.
+                    let mut label_style = child_style.clone();
+                    if !single_line {
+                        label_style.white_space = WhiteSpace::Pre;
+                    }
+                    let runs = [InlineRun::text(text, label_style.clone())];
+                    // A field that clips is shaped with nothing to break at,
+                    // so the value stays on one line and is cut at the border
+                    // rather than wrapping out of the box.
+                    let shaping_width = if single_line { UNWRAPPED } else { inner };
+                    let mut label = fonts.layout_runs(&runs, &label_style, shaping_width);
+                    clip_label(&mut label, inner);
+                    label
+                });
+
+            // A checked box needs a mark, and the rasteriser draws rectangles:
+            // a filled inner square reads as "checked" and is what a small
+            // checkbox mostly comes down to at this size anyway. The radio gets
+            // the same square, which is the divergence named in `forms`.
+            let checked = matches!(
+                control,
+                Some(forms::Control::Checkbox | forms::Control::Radio)
+            ) && doc
+                .element(node)
+                .is_some_and(|element| element.attr("checked").is_some());
+            let mut children = Vec::new();
+            if checked {
+                let inset = (placed.width * 0.25).max(1.0);
+                let mark = ComputedStyle {
+                    background_color: child_style.color,
+                    ..ComputedStyle::default()
+                };
+                children.push(LayoutBox {
+                    rect: Rect {
+                        x: inset,
+                        y: inset,
+                        width: (placed.width - inset * 2.0).max(1.0),
+                        height: (placed.height - inset * 2.0).max(1.0),
+                    },
+                    style: mark,
+                    text: None,
+                    content_origin: (0.0, 0.0),
+                    content_width: 0.0,
+                    children: Vec::new(),
+                    replaced: None,
+                    node: None,
+                });
+            }
+
             parent.children.push(LayoutBox {
                 rect: Rect {
                     x: origin.0 + dx + placed.x,
@@ -743,15 +1332,79 @@ fn emit_replaced_boxes(
                     height: placed.height,
                 },
                 style: child_style.clone(),
-                text: None,
+                text: label,
                 content_origin: (left, top),
-                content_width: (placed.width - left - right).max(0.0),
-                children: Vec::new(),
-                replaced: Some(node),
+                content_width: inner,
+                children,
+                replaced: control.is_none().then_some(node),
                 node: Some(node),
             });
         }
     }
+}
+
+/// Sorts the floats a block has to place into those declared before any in-flow
+/// block child and those declared after, so each is placed at the height it
+/// actually appears.
+///
+/// Descends through inline elements, because a float inside one belongs to this
+/// block all the same — `<span><div style="float: left">…</div></span>` is
+/// ordinary markup, and §9.7 makes that div block-level wherever it sits. Not
+/// descending is not merely inexact: the float is reached by nothing, neither
+/// gathered as an inline run nor walked as a block child, and disappears.
+fn collect_floats(
+    doc: &Document,
+    styles: &StyleMap,
+    children: &[NodeId],
+    early: &mut Vec<(NodeId, ComputedStyle)>,
+    late: &mut Vec<(NodeId, ComputedStyle)>,
+    seen_in_flow: &mut bool,
+) {
+    for &child in children {
+        let Some(child_style) = styles.get(child) else {
+            continue;
+        };
+        if child_style.display == Display::None {
+            continue;
+        }
+        if child_style.float != Float::None {
+            let into = if *seen_in_flow {
+                &mut *late
+            } else {
+                &mut *early
+            };
+            into.push((child, child_style.clone()));
+        } else if is_inline_child(doc, styles, child, child_style) {
+            // An inline-block places its own floats, in its own formatting
+            // context; a form control has no children to look inside.
+            if child_style.display != Display::InlineBlock
+                && forms::control_of(doc, child).is_none()
+            {
+                collect_floats(doc, styles, doc.children(child), early, late, seen_in_flow);
+            }
+        } else if !child_style.display.is_table_internal() {
+            *seen_in_flow = true;
+        }
+    }
+}
+
+/// Whether a table-internal box will be laid out by some table above it.
+///
+/// §17.2.1 says a `display: table-cell` with no table around it gets one:
+/// anonymous boxes are generated until the structure is legal. This engine
+/// does not generate them, and a box nobody lays out is a box that vanishes —
+/// so an orphan is treated as an ordinary block instead, which is what it
+/// mostly looks like once a table has been wrapped around it on its own.
+///
+/// The check is "is there a table above me", not "is my parent a table",
+/// because `build_grid` descends through plain wrappers: a `<tr>` inside a
+/// `<div>` inside a `<table>` is collected, and is therefore not an orphan.
+fn inside_a_table(doc: &Document, styles: &StyleMap, node: NodeId) -> bool {
+    doc.ancestors(node).any(|ancestor| {
+        styles
+            .get(ancestor)
+            .is_some_and(|style| style.display == Display::Table)
+    })
 }
 
 /// Whether an inline element has a block-level element inside it.
@@ -775,6 +1428,20 @@ fn contains_block(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize)
             if style.display == Display::None || style.position.is_out_of_flow() {
                 return false;
             }
+            // A float does not split the inline box around it either: it is
+            // taken out of the flow and placed against an edge, and the text
+            // beside it carries on across the line it came from. §9.7 gives it
+            // `display: block`, so without this every floated `<span>` inside a
+            // paragraph would read as a block child and break the line.
+            if style.float != Float::None {
+                return false;
+            }
+            // An inline-block is a block container, but it is *atomic*: it goes
+            // on the line whole, so a block inside one never reaches the inline
+            // box around it and never splits it.
+            if style.display == Display::InlineBlock {
+                return false;
+            }
             if !style.display.is_inline() {
                 return true;
             }
@@ -787,6 +1454,22 @@ fn contains_block(doc: &Document, styles: &StyleMap, node: NodeId, depth: usize)
 ///
 /// An inline element wrapping a block one does not: see [`contains_block`].
 fn is_inline_child(doc: &Document, styles: &StyleMap, node: NodeId, style: &ComputedStyle) -> bool {
+    // A form control is atomic: its children are never laid out, so what they
+    // are cannot decide how it is laid out. Asking `contains_block` about them
+    // is not merely pointless but wrong — a `<select multiple>` gives its
+    // options `display: block` so they stack inside the control, and reading
+    // that as "this element contains a block" turned the whole control into a
+    // block box that filled the line.
+    if forms::control_of(doc, node).is_some() {
+        return style.display.is_inline();
+    }
+    // An inline-block is atomic for the same reason a control is: what is
+    // inside it is laid out by the box itself and cannot decide where the box
+    // goes. It is the case that makes the difference visible, because unlike a
+    // control it usually *does* hold blocks.
+    if style.display == Display::InlineBlock {
+        return true;
+    }
     style.display.is_inline() && !contains_block(doc, styles, node, 0)
 }
 
@@ -837,6 +1520,7 @@ fn subtree_widths(
         let (width, _) = replaced_size(
             style,
             intrinsic.get(&node).copied(),
+            replaced_defaults(doc, node),
             size_attr(doc, node, "width"),
             size_attr(doc, node, "height"),
             available,
@@ -853,15 +1537,28 @@ fn subtree_widths(
 
     // The box's own inline content, then every block child, whichever is
     // widest — they stack, so the container must fit the widest of them.
-    let runs = collect_inline_runs(doc, styles, node, style, intrinsic, available);
+    let runs = collect_inline_runs(
+        doc,
+        styles,
+        node,
+        style,
+        intrinsic,
+        &InlineBlocks::new(),
+        available,
+    );
     let (mut min, mut max) = fonts.intrinsic_widths(&runs, style);
 
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
             continue;
         };
+        // An inline-block is measured here rather than among the runs: it is
+        // atomic, so its own content decides how wide it wants to be. Taking
+        // the widest rather than the sum understates a row of them, which
+        // costs a column too little width and never too much.
         if child_style.display == Display::None
-            || is_inline_child(doc, styles, child, child_style)
+            || (is_inline_child(doc, styles, child, child_style)
+                && child_style.display != Display::InlineBlock)
             || child_style.display.is_table_internal()
             || child_style.position.is_out_of_flow()
         {
@@ -1050,25 +1747,57 @@ fn flush_inline(
     context: &FloatContext,
     content_top: f32,
     parent: &mut LayoutBox,
+    // Generated content bracketing the holder's own. Only ever passed on the
+    // first and last stretch respectively, which is what keeps a `::before`
+    // from reappearing above every block child.
+    generated: (Option<InlineRun>, Option<InlineRun>),
+    // The `::first-letter` style, taken by whichever stretch turns out to hold
+    // the first letter. Offered to each in turn rather than only to the first,
+    // because a block whose first child is a block has its first letter
+    // further down the page than its first stretch.
+    first_letter: &mut Option<&ComputedStyle>,
 ) -> f32 {
-    if pending.is_empty() {
+    let (lead, tail) = generated;
+    // Not `pending.is_empty()` alone: an element whose content is entirely
+    // block-level still gets its generated boxes, and they arrive here with
+    // nothing pending beside them.
+    if pending.is_empty() && lead.is_none() && tail.is_none() {
         return 0.0;
     }
     let children = std::mem::take(pending);
-    let runs = inline_runs_for(
+    let mut blocks = InlineBlocks::new();
+    layout_inline_blocks(
+        doc,
+        styles,
+        fonts,
+        &children,
+        intrinsic,
+        content_width,
+        &mut blocks,
+    );
+    let mut runs = Vec::new();
+    runs.extend(lead);
+    runs.extend(inline_runs_for(
         doc,
         styles,
         &children,
         style,
         holder,
         intrinsic,
+        &blocks,
         content_width,
-    );
+    ));
+    runs.extend(tail);
     if !runs
         .iter()
         .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
     {
         return 0.0;
+    }
+    if let Some(style) = *first_letter
+        && apply_first_letter(&mut runs, style)
+    {
+        *first_letter = None;
     }
 
     // Floats are seen from where this stretch actually starts, so text after a
@@ -1108,12 +1837,17 @@ fn flush_inline(
     if let Some(laid_out) = &anonymous.text {
         let laid_out = laid_out.clone();
         emit_replaced_boxes(
+            doc,
             styles,
+            fonts,
             &laid_out,
             style,
-            (0.0, 0.0),
-            content_width,
-            &mut anonymous,
+            &blocks,
+            LineBoxes {
+                origin: (0.0, 0.0),
+                content_width,
+                parent: &mut anonymous,
+            },
         );
     }
     parent.children.push(anonymous);
@@ -1197,6 +1931,15 @@ fn layout_block(
         Length::Auto => outer_width,
         bound => outer_width.min(bound.to_px(font_size, available_width) + surround),
     };
+    // §10.4 again, and after the maximum rather than before it: where the two
+    // bounds cross, the minimum wins. A box told to be at most 100px and at
+    // least 200px is 200px wide — which looks like a mistake in the stylesheet
+    // and is what the specification asks for, because the author who wrote a
+    // floor meant the content to fit.
+    let outer_width = match style.min_width {
+        Length::Auto => outer_width,
+        bound => outer_width.max(bound.to_px(font_size, available_width) + surround),
+    };
     let content_width = (outer_width - surround).max(0.0);
 
     // CSS 2.1 §10.3.3. An auto margin beside a definite width takes the space
@@ -1226,6 +1969,7 @@ fn layout_block(
         let (image_width, image_height) = replaced_size(
             style,
             intrinsic.get(&node).copied(),
+            replaced_defaults(doc, node),
             size_attr(doc, node, "width"),
             size_attr(doc, node, "height"),
             available_width,
@@ -1286,13 +2030,28 @@ fn layout_block(
         styles.get(child).is_some_and(|child_style| {
             child_style.display != Display::None
                 && !is_inline_child(doc, styles, child, child_style)
-                && !child_style.display.is_table_internal()
+                && !(child_style.display.is_table_internal() && inside_a_table(doc, styles, child))
                 && child_style.float == Float::None
                 && !child_style.position.is_out_of_flow()
         })
     });
+    let mut blocks = InlineBlocks::new();
     let runs = if all_inline {
-        collect_inline_runs(doc, styles, node, style, intrinsic, content_width)
+        layout_inline_blocks(
+            doc,
+            styles,
+            fonts,
+            doc.children(node),
+            intrinsic,
+            content_width,
+            &mut blocks,
+        );
+        let mut runs =
+            collect_inline_runs(doc, styles, node, style, intrinsic, &blocks, content_width);
+        if let Some(first) = styles.pseudo(node, PseudoElement::FirstLetter) {
+            apply_first_letter(&mut runs, first);
+        }
+        runs
     } else {
         Vec::new()
     };
@@ -1313,25 +2072,14 @@ fn layout_block(
     let mut early: Vec<(NodeId, ComputedStyle)> = Vec::new();
     let mut late: Vec<(NodeId, ComputedStyle)> = Vec::new();
     let mut seen_in_flow = false;
-    for &child in doc.children(node) {
-        let Some(child_style) = styles.get(child) else {
-            continue;
-        };
-        if child_style.display == Display::None {
-            continue;
-        }
-        if child_style.float != Float::None {
-            if seen_in_flow {
-                late.push((child, child_style.clone()));
-            } else {
-                early.push((child, child_style.clone()));
-            }
-        } else if !is_inline_child(doc, styles, child, child_style)
-            && !child_style.display.is_table_internal()
-        {
-            seen_in_flow = true;
-        }
-    }
+    collect_floats(
+        doc,
+        styles,
+        doc.children(node),
+        &mut early,
+        &mut late,
+        &mut seen_in_flow,
+    );
     for (child, child_style) in &early {
         place_float(
             doc,
@@ -1374,12 +2122,17 @@ fn layout_block(
         };
         content_height = layout.height;
         emit_replaced_boxes(
+            doc,
             styles,
+            fonts,
             &layout,
             style,
-            (padding_left + border_left, padding_top + border_top),
-            content_width,
-            &mut box_,
+            &blocks,
+            LineBoxes {
+                origin: (padding_left + border_left, padding_top + border_top),
+                content_width,
+                parent: &mut box_,
+            },
         );
         box_.text = Some(layout);
     }
@@ -1535,7 +2288,53 @@ fn layout_block(
     let mut cursor_y = padding_top + border_top + content_height;
     // Inline children seen since the last block child. Flushed as an anonymous
     // box when a block child arrives, and again at the end.
+    // This box's own height, where it has a definite one — what a child's
+    // percentage height resolves against (§10.5). A percentage here is itself
+    // definite only if the chain above it was, which is what stops a
+    // percentage resolving against nothing at all.
+    let own_definite_height = match style.height {
+        Length::Auto => None,
+        Length::Percent(percent) => containing
+            .definite_height
+            .map(|basis| basis * percent / 100.0),
+        length => Some(length.to_px(style.font_size, available_width)),
+    };
+    // Clamped, because what a child resolves its percentage against is the
+    // *used* height and not the declared one. A box with `height: 4em;
+    // max-height: 2em` is two ems tall, and a child asking for 50% of it wants
+    // one em rather than two — `absolute-non-replaced-max-001` in the suite is
+    // exactly this, with a black square that comes out four times too big.
+    //
+    // §10.7's order, the maximum and then the minimum, so a box given both
+    // takes the minimum. Both bound the content box, which is what this is.
+    // A percentage bound resolves against a height that is not known here, so
+    // those are no bound rather than a guess — the same rule the used height
+    // itself follows a few hundred lines below.
+    let own_definite_height = own_definite_height.map(|height| {
+        let mut height = height;
+        if let Length::Px(_) | Length::Em(_) = style.max_height {
+            height = height.min(style.max_height.to_px(style.font_size, 0.0));
+        }
+        if let Length::Px(_) | Length::Em(_) = style.min_height {
+            height = height.max(style.min_height.to_px(style.font_size, 0.0));
+        }
+        height
+    });
+
     let mut pending: Vec<NodeId> = Vec::new();
+    // §12.1: the generated boxes bracket the element's content, so they go on
+    // the first and last stretch of it and nowhere else. `all_inline` has its
+    // own path through `collect_inline_runs`; these are for the mixed case,
+    // where content is collected in stretches between the block children.
+    // §5.12.2 applies to a block container, and this is one. Held as an option
+    // so the first stretch that actually has a letter in it takes it.
+    let mut first_letter = styles.pseudo(node, PseudoElement::FirstLetter);
+    let mut lead = (!all_inline)
+        .then(|| generated_run(styles, node, PseudoElement::Before))
+        .flatten();
+    let tail = (!all_inline)
+        .then(|| generated_run(styles, node, PseudoElement::After))
+        .flatten();
     // The bottom margin of the last in-flow block placed, kept so the next
     // one's top margin can collapse into it (§8.3.1). `None` means there is
     // nothing to collapse with — either nothing has been placed yet, or
@@ -1573,7 +2372,7 @@ fn layout_block(
             continue;
         }
         if child_style.display == Display::None
-            || child_style.display.is_table_internal()
+            || (child_style.display.is_table_internal() && inside_a_table(doc, styles, child))
             // Floated children were placed above, out of the normal flow.
             || child_style.float != Float::None
         {
@@ -1602,6 +2401,8 @@ fn layout_block(
             &context,
             padding_top + border_top,
             &mut box_,
+            (lead.take(), None),
+            &mut first_letter,
         );
         cursor_y += flushed;
         if flushed > 0.0 {
@@ -1674,7 +2475,14 @@ fn layout_block(
         // than it would have without the collapse.
         cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
         let child_context = context.translated(0.0, cursor_y - into_context, content_width);
-        let child_containing = containing.descend(padding_left + border_left, cursor_y);
+        // A normal-flow child's containing block is *this* box, so the
+        // definite height it may resolve a percentage against is this box's,
+        // not an ancestor's. Carrying the ancestor's down instead would let
+        // `height: 50%` find a basis through a chain of auto-height parents
+        // that CSS 2.1 says stops at the first one.
+        let child_containing = containing
+            .descend(padding_left + border_left, cursor_y)
+            .with_definite_height(own_definite_height);
         let consumed = layout_block(
             doc,
             styles,
@@ -1744,6 +2552,34 @@ fn layout_block(
         trailing_bottom = Some(consumed.margin_bottom);
     }
 
+    // Floats declared after the last block child. Nothing further comes along
+    // to trigger the drain inside the loop, so without this they are laid out
+    // nowhere and never appear — a float at the end of a container simply
+    // vanished, which is most of what `float: left` is used for on a page that
+    // ends with one.
+    //
+    // Placed before the trailing inline flush so that text after them wraps
+    // around them, which is the ordinary case. A float written *after* some
+    // trailing text is placed a little too high by this, since the drain
+    // inside the loop only ever compares against block children; that is the
+    // same granularity the rest of this function works at, and it is a far
+    // smaller error than not drawing the float at all.
+    for (float_node, float_style) in std::mem::take(&mut late) {
+        place_float(
+            doc,
+            styles,
+            fonts,
+            float_node,
+            &float_style,
+            intrinsic,
+            content_width,
+            cursor_y - padding_top - border_top,
+            (padding_left + border_left, padding_top + border_top),
+            &mut context,
+            &mut box_,
+        );
+    }
+
     // Trailing inline content, after the last block child.
     let trailing = flush_inline(
         doc,
@@ -1758,6 +2594,11 @@ fn layout_block(
         &context,
         padding_top + border_top,
         &mut box_,
+        // `lead` is still here when every child was block-level and the loop
+        // never flushed anything, which is the case that would otherwise drop
+        // a `::before` entirely.
+        (lead.take(), tail),
+        &mut first_letter,
     );
     cursor_y += trailing;
     if trailing > 0.0 {
@@ -1794,16 +2635,55 @@ fn layout_block(
     let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
         + padding_bottom
         + border_bottom;
+    let surround = padding_top + padding_bottom + border_top + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
-        length => {
-            length.to_px(font_size, available_width)
-                + padding_top
-                + padding_bottom
-                + border_top
-                + border_bottom
-        }
+        // §10.5: a percentage height resolves against the containing block's
+        // height, and where that height is not itself definite the percentage
+        // computes to `auto`. Resolving it against the *width* instead — which
+        // is what `to_px` does when handed `available_width`, and what this
+        // used to do — is how `height: 100%` on Wikipedia's logo became a
+        // 1000-pixel-tall empty box that pushed the entire article off the
+        // screen. A percentage of a width is not a height.
+        Length::Percent(percent) => match containing.definite_height {
+            Some(basis) => basis * percent / 100.0 + surround,
+            None => content_end,
+        },
+        length => length.to_px(font_size, available_width) + surround,
     };
+    // §10.7: the used height is capped at `max-height` first, and raised to
+    // `min-height` after — that order is the spec's, and it is what makes
+    // `min-height` win when an author asks for both at once. Content taller
+    // than the cap overflows rather than being clipped, which is the same
+    // thing this engine does everywhere else and is why the canvas is sized
+    // from what is drawn rather than from the boxes.
+    //
+    // A percentage is treated as no bound, for the reason given below.
+    if let Length::Px(_) | Length::Em(_) = style.max_height {
+        let ceiling = style.max_height.to_px(font_size, 0.0)
+            + padding_top
+            + padding_bottom
+            + border_top
+            + border_bottom;
+        box_.rect.height = box_.rect.height.min(ceiling);
+    }
+
+    // The used height is then raised to `min-height`, whether it came
+    // from a declared height or from the content. Like `height` it bounds the
+    // *content* box, so the surround is added back on — the same shape as
+    // `max-width` above, and wrong in the same visible way if it is not.
+    //
+    // A percentage resolves against the containing block's *height*, which is
+    // not known here and is `auto` for most of the era's markup anyway; those
+    // are treated as no bound rather than guessed at.
+    if let Length::Px(_) | Length::Em(_) = style.min_height {
+        let floor = style.min_height.to_px(font_size, 0.0)
+            + padding_top
+            + padding_bottom
+            + border_top
+            + border_bottom;
+        box_.rect.height = box_.rect.height.max(floor);
+    }
 
     // Absolutely positioned children, now that this block's size is known.
     // A positioned box becomes the containing block for its own descendants;
@@ -1842,8 +2722,15 @@ fn layout_block(
         let available = child_containing.size.0;
         let width_basis = match child_style.width {
             Length::Auto => {
-                let runs =
-                    collect_inline_runs(doc, styles, child, &child_style, intrinsic, content_width);
+                let runs = collect_inline_runs(
+                    doc,
+                    styles,
+                    child,
+                    &child_style,
+                    intrinsic,
+                    &InlineBlocks::new(),
+                    content_width,
+                );
                 let (min, max) = fonts.intrinsic_widths(&runs, &child_style);
                 let surround = child_style
                     .padding
@@ -2545,17 +3432,93 @@ fn collect_inline_runs(
     node: NodeId,
     inherited: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
     available_width: f32,
 ) -> Vec<InlineRun> {
-    inline_runs_for(
+    let mut runs = Vec::new();
+    // §12.1: `::before` and `::after` are boxes at the very start and very end
+    // of the element's content, so they bracket the children rather than
+    // joining them. Done here rather than in `inline_runs_for` because that
+    // one also collects a *stretch* of inline children between two blocks,
+    // and a pseudo-element attached to every stretch would appear several
+    // times over.
+    if let Some(before) = generated_run(styles, node, PseudoElement::Before) {
+        runs.push(before);
+    }
+    runs.extend(inline_runs_for(
         doc,
         styles,
         doc.children(node),
         inherited,
         node,
         intrinsic,
+        blocks,
         available_width,
-    )
+    ));
+    if let Some(after) = generated_run(styles, node, PseudoElement::After) {
+        runs.push(after);
+    }
+    runs
+}
+
+/// Gives the `::first-letter` box its own run, split out of the first run that
+/// has a letter in it. Answers whether it found one.
+///
+/// §5.12.2. The split is by bytes rather than by characters because the first
+/// letter is not one character: `")T)"` is three, `"e\u{0301}"` is two, and
+/// `text::first_letter::first_letter_len` is what knows the difference.
+///
+/// **The box takes the pseudo-element's style whole**, which is exact when the
+/// block's first text is its own — every case in the suite, and the ordinary
+/// one on a page — and wrong in one way worth naming: with `<p><b>Bold</b>…`
+/// the first letter loses the `<b>`. CSS 2.1 makes the box a child of the
+/// innermost inline box around the letter, so it should inherit from the `<b>`
+/// and take the `::first-letter` declarations over the top. That needs the
+/// cascade run again with a different parent, at a point where layout has no
+/// cascade, so it is a gap rather than an oversight.
+fn apply_first_letter(runs: &mut Vec<InlineRun>, style: &ComputedStyle) -> bool {
+    let Some(index) = runs
+        .iter()
+        .position(|run| run.replaced.is_some() || !run.text.trim().is_empty())
+    else {
+        return false;
+    };
+    // An image at the head of the line needs no special case: a replaced run
+    // carries no text, and a run with no letter in it yields no box. Mutation
+    // testing removed the guard that used to be here and nothing failed,
+    // because nothing could.
+    let Some(length) = text::first_letter::first_letter_len(&runs[index].text) else {
+        return false;
+    };
+
+    let rest = runs[index].text.split_off(length);
+    let mut tail = runs[index].clone();
+    tail.text = rest;
+    runs[index].style = style.clone();
+    if !tail.text.is_empty() {
+        runs.insert(index + 1, tail);
+    }
+    true
+}
+
+/// The inline run for one of an element's generated boxes, if it has one.
+///
+/// A style in the pseudo table means the cascade gave it `content`, which is
+/// what decides whether the box exists at all — so there is nothing to check
+/// here beyond whether the style is present.
+fn generated_run(styles: &StyleMap, node: NodeId, which: PseudoElement) -> Option<InlineRun> {
+    let style = styles.pseudo(node, which)?;
+    let content = style.content.clone()?;
+    // A column box renders no content — §17.2 gives `table-column` and
+    // `table-column-group` a box that sizes a column and draws its own
+    // background, and nothing inside it. So a pseudo-element given one of
+    // those displays has its content dropped rather than shown somewhere
+    // else, which is what the suite checks by putting the word FAIL in it.
+    let boxless = matches!(
+        style.display,
+        Display::None | Display::TableColumn | Display::TableColumnGroup
+    );
+    (!boxless).then(|| InlineRun::text(content, style.clone()))
 }
 
 /// Collects inline runs from a specific list of siblings.
@@ -2563,6 +3526,10 @@ fn collect_inline_runs(
 /// Taking a slice rather than a parent is what lets a block container with
 /// mixed content lay out each stretch of inline children where it actually
 /// sits, instead of hoisting every one of them above the block children.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
 fn inline_runs_for(
     doc: &Document,
     styles: &StyleMap,
@@ -2570,6 +3537,7 @@ fn inline_runs_for(
     inherited: &ComputedStyle,
     holder: NodeId,
     intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
     available_width: f32,
 ) -> Vec<InlineRun> {
     let mut runs = Vec::new();
@@ -2581,6 +3549,7 @@ fn inline_runs_for(
             inherited,
             holder,
             intrinsic,
+            blocks,
             available_width,
             &mut runs,
         );
@@ -2621,13 +3590,20 @@ fn gather_one(
     inherited: &ComputedStyle,
     holder: NodeId,
     intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
     available_width: f32,
     out: &mut Vec<InlineRun>,
 ) {
     if let Some(text) = doc.text(child) {
         // Text belongs to the nearest element that wraps it, not to the text
         // node: `<a>go</a>` must hit the anchor, which is what has the href.
-        out.push(InlineRun::text(text, inherited.clone()).from_element(holder.0));
+        //
+        // §16.5's transform is applied here, before shaping, because it changes
+        // how wide the text is — uppercase is wider than what it replaces in
+        // every face bundled here, and a line measured lowercase would wrap in
+        // the wrong place and then be drawn in capitals over the top.
+        let transformed = inherited.text_transform.apply(text);
+        out.push(InlineRun::text(transformed, inherited.clone()).from_element(holder.0));
         return;
     }
     let Some(style) = styles.get(child) else {
@@ -2661,14 +3637,37 @@ fn gather_one(
     // it: an icon beside a link, a spacer between words. It becomes an atomic
     // box the line breaker can place, keyed by node so paint can find the
     // decoded image again.
-    if is_replaced(doc, child) {
-        let (width, height) = replaced_size(
-            style,
-            intrinsic.get(&child).copied(),
-            size_attr(doc, child, "width"),
-            size_attr(doc, child, "height"),
-            available_width,
-        );
+    // A form control is the same shape of thing: a box on the line with no
+    // inline content to look inside. It differs only in where its picture comes
+    // from — its own border and background rather than decoded bytes — which is
+    // settled when the box is emitted, not here.
+    let control = forms::control_of(doc, child);
+    if is_replaced(doc, child) || control.is_some() {
+        let (width, height) = match control {
+            Some(control) => {
+                let label = forms::label_of(doc, child, control);
+                let (w, h) = forms::intrinsic_size(doc, child, style, control, label.as_deref());
+                // A declared width or height still wins, as it does for an
+                // image: `<input style="width: 300px">` is a wide field.
+                match (style.width, style.height) {
+                    (Length::Auto, Length::Auto) => (w, h),
+                    (Length::Auto, height) => (w, height.to_px(style.font_size, h)),
+                    (width, Length::Auto) => (width.to_px(style.font_size, available_width), h),
+                    (width, height) => (
+                        width.to_px(style.font_size, available_width),
+                        height.to_px(style.font_size, h),
+                    ),
+                }
+            }
+            None => replaced_size(
+                style,
+                intrinsic.get(&child).copied(),
+                replaced_defaults(doc, child),
+                size_attr(doc, child, "width"),
+                size_attr(doc, child, "height"),
+                available_width,
+            ),
+        };
         // CSS `width` is the content width, so the box the line has to make
         // room for is that plus the border and padding around it. Leaving them
         // out lets a bordered image overlap the text beside it.
@@ -2686,12 +3685,53 @@ fn gather_one(
                 id: child.0,
                 width: width + horizontal,
                 height: height + vertical,
+                baseline: height + vertical,
             },
             style.clone(),
         ));
         return;
     }
 
+    // An inline-block was laid out before the line was built, so what is left
+    // is to reserve its margin box and record where it aligns. It is asked
+    // *after* the replaced branch above, because `display: inline-block` on an
+    // image does not make it a block container: it is still sized from its own
+    // pixels, and routing it here instead made it disappear.
+    //
+    // Absent from the map means this pass is measuring rather than laying out —
+    // `subtree_widths` has no boxes to hand out and measures inline-blocks
+    // itself.
+    if style.display == Display::InlineBlock {
+        if let Some(box_) = blocks.get(&child) {
+            let font_size = style.font_size;
+            let margin_left = style.margin.left.to_px(font_size, available_width);
+            let margin_right = style.margin.right.to_px(font_size, available_width);
+            let margin_bottom = style.margin.bottom.to_px(font_size, available_width);
+            let height = box_.rect.y + box_.rect.height + margin_bottom;
+            out.push(InlineRun::replaced(
+                text::ReplacedInline {
+                    id: child.0,
+                    width: box_.rect.width + margin_left + margin_right,
+                    height,
+                    // §10.8.1: on the baseline of its own last line, or on its
+                    // bottom margin edge when it has no line to offer.
+                    baseline: last_baseline(box_).map_or(height, |baseline| box_.rect.y + baseline),
+                },
+                style.clone(),
+            ));
+        }
+        return;
+    }
+
+    // §12.1 again, one level in: a `::before` on an inline element inside the
+    // block is part of the same line, and nothing else reaches it.
+    // `collect_inline_runs` brackets the block's own generated boxes, and this
+    // brackets every inline element below it — which is where they usually
+    // are, since the elements a stylesheet numbers or labels are spans and
+    // anchors far more often than they are the container.
+    if let Some(before) = generated_run(styles, child, PseudoElement::Before) {
+        out.push(before);
+    }
     for &grandchild in doc.children(child) {
         gather_one(
             doc,
@@ -2700,9 +3740,13 @@ fn gather_one(
             style,
             child,
             intrinsic,
+            blocks,
             available_width,
             out,
         );
+    }
+    if let Some(after) = generated_run(styles, child, PseudoElement::After) {
+        out.push(after);
     }
 }
 
@@ -2752,6 +3796,132 @@ pub fn line_offset(align: TextAlign, line_width: f32, content_width: f32) -> f32
 
 #[cfg(test)]
 mod tests {
+
+    /// A page, its layout, and a way to select across it.
+    fn page_for(html: &str, width: f32) -> (Document, StyleMap, Layout) {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css::ua::UA_STYLESHEET)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        let layout = layout(&doc, &styles, &mut fonts, &Default::default(), width);
+        (doc, styles, layout)
+    }
+
+    #[test]
+    fn a_drag_across_a_line_selects_what_it_crossed() {
+        let (_, _, out) = page_for("<body><p>hello there world</p></body>", 800.0);
+        let all = out.select((0.0, 0.0), (800.0, 10_000.0));
+        assert_eq!(all.text, "hello there world");
+
+        // Halfway across the line it actually drew, which must be some of it
+        // and not all of it.
+        let line = all.rects[0];
+        let half = out.select(
+            (0.0, 0.0),
+            (line.x + line.width / 2.0, line.y + line.height / 2.0),
+        );
+        assert!(
+            all.text.starts_with(&half.text) && half.text.len() < all.text.len(),
+            "{:?} is not a prefix of {:?}",
+            half.text,
+            all.text
+        );
+        assert!(!half.text.is_empty(), "nothing was selected");
+    }
+
+    #[test]
+    fn dragging_backwards_selects_the_same_thing() {
+        // A reader selecting upwards is selecting, not doing nothing.
+        let (_, _, out) = page_for("<body><p>hello there world</p></body>", 800.0);
+        let forwards = out.select((0.0, 0.0), (800.0, 10_000.0));
+        let backwards = out.select((800.0, 10_000.0), (0.0, 0.0));
+
+        assert_eq!(forwards.text, backwards.text);
+        assert_eq!(forwards.rects.len(), backwards.rects.len());
+    }
+
+    #[test]
+    fn a_selection_across_lines_covers_the_ones_in_between_whole() {
+        // Not the rectangle between the two points: selection means everything
+        // in reading order, which is what makes dragging down the left margin
+        // take whole lines.
+        let (_, _, out) = page_for(
+            "<body><p>first line here</p><p>second line here</p><p>third line here</p></body>",
+            800.0,
+        );
+        let all = out.select((0.0, 0.0), (800.0, 10_000.0));
+        assert_eq!(
+            all.text,
+            "first line here\nsecond line here\nthird line here"
+        );
+        assert_eq!(all.rects.len(), 3, "one rectangle per line");
+    }
+
+    #[test]
+    fn a_line_break_on_the_page_is_a_line_break_in_what_is_copied() {
+        // The source's own newlines are gone by now — whitespace collapsed on
+        // the way in — so a wrapped paragraph copied out reads as it looked.
+        let (_, _, out) = page_for(
+            &format!("<body><p>{}</p></body>", "a word ".repeat(40)),
+            200.0,
+        );
+        let all = out.select((0.0, 0.0), (800.0, 10_000.0));
+
+        assert!(all.text.contains('\n'), "a wrapped paragraph came out flat");
+        assert!(all.rects.len() > 1, "one rectangle for several lines");
+    }
+
+    #[test]
+    fn a_click_past_the_middle_of_a_letter_takes_the_letter() {
+        // Where the caret goes decides which letter a drag includes, and
+        // measuring to the *start* of each glyph rather than its middle loses
+        // the one the pointer is plainly on top of.
+        let (_, _, out) = page_for("<body><p>abcdef</p></body>", 800.0);
+        let line = out.select((0.0, 0.0), (800.0, 10_000.0)).rects[0];
+        let letter = line.width / 6.0;
+        let middle = line.y + line.height / 2.0;
+
+        // Just past the middle of the first letter: that letter is in.
+        let over = out.select((line.x, middle), (line.x + letter * 0.6, middle));
+        assert_eq!(over.text, "a");
+        // Just short of it: nothing yet.
+        let under = out.select((line.x, middle), (line.x + letter * 0.4, middle));
+        assert_eq!(under.text, "");
+    }
+
+    #[test]
+    fn dragging_down_the_margin_takes_whole_lines() {
+        // A point in the gap between two lines belongs to the one above, which
+        // is what makes a drag down the left-hand margin select the lines it
+        // passes rather than nothing at all.
+        let (_, _, out) = page_for(
+            "<body><p>first line here</p><p>second line here</p><p>third line here</p></body>",
+            800.0,
+        );
+        let rects = out.select((0.0, 0.0), (800.0, 10_000.0)).rects;
+        // Down the far-left edge, stopping between the second line and the
+        // third.
+        let gap = rects[1].y + rects[1].height + 1.0;
+        let down = out.select((0.0, 0.0), (0.0, gap));
+
+        assert_eq!(down.text, "first line here\nsecond line here");
+    }
+
+    #[test]
+    fn selecting_nothing_selects_nothing() {
+        let (_, _, out) = page_for("<body><p>hello</p></body>", 800.0);
+        let empty = out.select((0.0, 0.0), (0.0, 0.0));
+
+        assert_eq!(empty.text, "");
+        assert!(empty.rects.is_empty());
+    }
+
+    #[test]
+    fn a_page_with_no_text_has_nothing_to_select() {
+        let (_, _, out) = page_for("<body><hr></body>", 800.0);
+
+        assert_eq!(out.select((0.0, 0.0), (800.0, 800.0)), Selection::default());
+    }
     use super::*;
     use css::Stylesheet;
 
@@ -2788,6 +3958,58 @@ mod tests {
     fn content_boxes(rendered: &Rendered) -> Vec<&LayoutBox> {
         let body = rendered.layout.root.children.first().expect("body box");
         boxes(body)
+    }
+
+    #[test]
+    fn generated_content_brackets_the_elements_own_content() {
+        let rendered = run(
+            "<body><p>middle</p></body>",
+            "body { margin: 0 } p::before { content: \"A\" } p::after { content: \"Z\" }",
+            600.0,
+        );
+        let text = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter().map(|line| line.text.clone()))
+            .collect::<String>();
+        assert_eq!(text.trim(), "AmiddleZ");
+    }
+
+    #[test]
+    fn generated_content_appears_once_around_mixed_content() {
+        // The element's inline children are collected in stretches between its
+        // block children. Attaching the generated boxes to each stretch rather
+        // than to the element would repeat them.
+        let rendered = run(
+            "<body><div>one<p>block</p>two</div></body>",
+            "body { margin: 0 } div::before { content: \"A\" }",
+            600.0,
+        );
+        let count = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter())
+            .filter(|line| line.text.contains('A'))
+            .count();
+        assert_eq!(count, 1, "the generated box was emitted {count} times");
+    }
+
+    #[test]
+    fn a_column_display_generates_no_content_box() {
+        // §17.2: a column box sizes a column and draws its own background,
+        // and renders nothing inside it.
+        for display in ["table-column", "table-column-group", "none"] {
+            let css = format!(
+                "body {{ margin: 0 }} p::before {{ content: \"FAIL\"; display: {display} }}"
+            );
+            let rendered = run("<body><p>ok</p></body>", &css, 600.0);
+            let text = content_boxes(&rendered)
+                .into_iter()
+                .filter_map(|b| b.text.as_ref())
+                .flat_map(|t| t.lines.iter().map(|line| line.text.clone()))
+                .collect::<String>();
+            assert!(!text.contains("FAIL"), "{display} drew its content");
+        }
     }
 
     #[test]
@@ -3072,6 +4294,377 @@ mod tests {
             .into_iter()
             .find(|b| b.style.display == Display::Table)
             .expect("a table box")
+    }
+
+    #[test]
+    fn a_percentage_height_against_an_auto_parent_is_auto() {
+        // §10.5. The parent's height depends on its content, so there is
+        // nothing for the percentage to be a percentage *of*, and it computes
+        // to `auto`. Resolving it against the width instead is how
+        // `height: 100%` on Wikipedia's logo became a 1000-pixel empty box
+        // that pushed the article off the screen.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #inner { height: 100% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        // Not merely "small": `auto` means the content's height, so a box
+        // with one line in it is one line tall. Collapsing it to zero would
+        // satisfy a looser assertion and lose the text.
+        let line = run("<body><div>x</div></body>", "body { margin: 0 }", 1000.0);
+        assert_eq!(
+            inner.rect.height,
+            content_boxes(&line)[0].rect.height,
+            "a percentage against an auto parent should be the content height"
+        );
+    }
+
+    #[test]
+    fn a_percentage_height_chains_through_a_parent_that_has_one() {
+        // The middle box's own height is a percentage, and a definite one,
+        // so the inner box resolves against *it* rather than finding nothing.
+        let rendered = run(
+            "<body><div id=outer><div id=mid><div id=inner>x</div></div></div></body>",
+            "body { margin: 0 } #outer { height: 400px } #mid { height: 50% } \
+             #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        assert_eq!(inner.rect.height, 100.0, "half of half of 400");
+    }
+
+    #[test]
+    fn a_percentage_height_resolves_against_a_parent_that_has_one() {
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { height: 400px } #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        assert_eq!(inner.rect.height, 200.0);
+    }
+
+    #[test]
+    fn a_definite_height_does_not_reach_past_an_auto_parent() {
+        // The chain stops at the first auto ancestor: the inner box's
+        // containing block is the middle one, which has no definite height of
+        // its own, so the outer 400px is not what 50% means here.
+        let rendered = run(
+            "<body><div id=outer><div id=mid><div id=inner>x</div></div></div></body>",
+            "body { margin: 0 } #outer { height: 400px } #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+        assert!(
+            inner.rect.height < 100.0,
+            "the percentage found a basis through an auto parent: {}",
+            inner.rect.height
+        );
+    }
+
+    #[test]
+    fn a_percentage_resolves_against_the_height_a_bound_left_behind() {
+        // What a child resolves against is the *used* height, not the declared
+        // one. This only became reachable when `max-height` arrived: a box
+        // told `height: 400px; max-height: 200px` is 200 tall, and a child
+        // asking for half of it wants 100 rather than 200.
+        //
+        // `absolute-non-replaced-max-001` in the suite is exactly this, and
+        // caught it — the black square came out four times its area.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { height: 400px; max-height: 200px } \
+             #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+
+        assert_eq!(inner.rect.height, 100.0);
+    }
+
+    #[test]
+    fn a_percentage_resolves_against_a_floor_the_same_way() {
+        // §10.7's other half, and the order matters: the maximum is applied
+        // first and the minimum second, so a box given both takes the minimum
+        // — and a child measures itself against that.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { height: 50px; max-height: 100px; min-height: 300px } \
+             #inner { height: 50% }",
+            1000.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.is_some())
+            .expect("the inner box");
+
+        assert_eq!(inner.rect.height, 150.0);
+    }
+
+    #[test]
+    fn a_negative_height_is_invalid_and_leaves_the_earlier_one_standing() {
+        // The earlier declaration has to be one the invalid value would
+        // visibly replace: with `height: 0` first, dropping and accepting
+        // both land on zero and the test cannot tell them apart.
+        for bad in ["-1%", "-1px", "-1em"] {
+            let css = format!("body {{ margin: 0 }} div {{ height: 50px; height: {bad} }}");
+            let rendered = run("<body><div></div></body>", &css, 1000.0);
+            assert_eq!(
+                content_boxes(&rendered)[0].rect.height,
+                50.0,
+                "{bad} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn min_height_raises_a_box_that_would_be_shorter() {
+        // §10.7, and it bounds the content box like `height` does — so the
+        // padding and border are added back on rather than absorbed, which is
+        // the same shape as `max-width` and visibly wrong if it is not.
+        let rendered = run(
+            "<body><div>short</div></body>",
+            "body { margin: 0 } div { min-height: 120px; padding: 10px; border: 5px solid }",
+            600.0,
+        );
+        let box_ = siblings(&rendered).first().expect("the div");
+        assert!(
+            (box_.rect.height - (120.0 + 20.0 + 10.0)).abs() < 0.01,
+            "got {:?}",
+            box_.rect
+        );
+    }
+
+    #[test]
+    fn max_height_caps_a_box_that_would_be_taller() {
+        let rendered = run(
+            "<body><div>one<br>two<br>three<br>four</div></body>",
+            "body { margin: 0 } div { max-height: 30px }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.height, 30.0);
+    }
+
+    #[test]
+    fn max_height_does_not_stretch_a_shorter_box() {
+        let rendered = run(
+            "<body><div>one line</div></body>",
+            "body { margin: 0 } div { max-height: 300px }",
+            600.0,
+        );
+        let height = content_boxes(&rendered)[0].rect.height;
+        assert!(
+            height < 300.0,
+            "a cap is not a height: the box grew to {height}"
+        );
+    }
+
+    #[test]
+    fn max_height_none_takes_an_earlier_cap_back_off() {
+        // How a page overrides a cap set by a rule above it. `none` is a
+        // keyword, not a length, so parsing one is not enough to see it.
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { height: 96px; max-height: 0; max-height: none }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.height, 96.0);
+    }
+
+    #[test]
+    fn a_negative_bound_is_invalid_and_leaves_the_box_alone() {
+        // CSS 2.1 forbids a negative value here, and an invalid declaration is
+        // dropped rather than clamped to zero — the box keeps the height it
+        // had. Clamping instead collapses a one-inch square to nothing, which
+        // is what four of the suite's `max-height` tests check for directly.
+        for bound in [
+            "max-height: -1px",
+            "min-height: -1px",
+            "width: -1px",
+            "height: -1px",
+        ] {
+            let css = format!("body {{ margin: 0 }} div {{ height: 96px; width: 96px; {bound} }}");
+            let rendered = run("<body><div></div></body>", &css, 600.0);
+            let rect = content_boxes(&rendered)[0].rect;
+            assert_eq!((rect.width, rect.height), (96.0, 96.0), "{bound}");
+        }
+    }
+
+    #[test]
+    fn a_negative_padding_is_invalid_but_a_negative_margin_is_not() {
+        // The one place the two edges differ. A negative margin is legal and
+        // was how the era pulled a box back over its neighbour; a negative
+        // padding is invalid and the declaration goes.
+        let padded = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { padding: 10px; padding-top: -5px }",
+            600.0,
+        );
+        assert_eq!(
+            content_boxes(&padded)[0].style.padding.top,
+            css::Length::Px(10.0),
+            "a negative padding was accepted"
+        );
+        let pulled = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { margin-top: -5px }",
+            600.0,
+        );
+        assert_eq!(
+            content_boxes(&pulled)[0].style.margin.top,
+            css::Length::Px(-5.0),
+            "a negative margin was rejected"
+        );
+    }
+
+    #[test]
+    fn min_height_wins_when_both_bounds_apply() {
+        // §10.7 applies the maximum first and the minimum second, so a box
+        // asked to be at most 10px and at least 60px is 60px. Applying them
+        // the other way round gives 10px and looks just as deliberate.
+        let rendered = run(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { max-height: 10px; min-height: 60px }",
+            600.0,
+        );
+        assert_eq!(content_boxes(&rendered)[0].rect.height, 60.0);
+    }
+
+    #[test]
+    fn max_height_bounds_the_content_box_and_not_the_border_box() {
+        // The same shape as `max-width` and `min-height`: the bound is on the
+        // content box, so padding and border are added back on. Getting this
+        // wrong is a few pixels and is plainly visible on a bordered box.
+        let rendered = run(
+            "<body><div>one<br>two<br>three</div></body>",
+            "body { margin: 0 } div { max-height: 20px; padding: 5px; border: 2px solid black }",
+            600.0,
+        );
+        assert_eq!(
+            content_boxes(&rendered)[0].rect.height,
+            20.0 + 10.0 + 4.0,
+            "the cap swallowed the padding and border"
+        );
+    }
+
+    #[test]
+    fn a_percentage_max_height_is_no_bound() {
+        // It resolves against the containing block's height, which is `auto`
+        // for nearly every box here. Chromium leaves such a box unbounded too.
+        let rendered = run(
+            "<body><div>one<br>two<br>three<br>four</div></body>",
+            "body { margin: 0 } div { max-height: 25% }",
+            600.0,
+        );
+        assert!(
+            content_boxes(&rendered)[0].rect.height > 40.0,
+            "a percentage was treated as a bound"
+        );
+    }
+
+    #[test]
+    fn min_height_does_not_shrink_a_taller_box() {
+        // It is a floor, not a height. A box whose content already exceeds it
+        // must be left alone, or the property becomes `height` under a
+        // different name.
+        let sheet = "body { margin: 0 } div { min-height: 10px }";
+        let tall = run(
+            "<body><div>one<br>two<br>three<br>four<br>five</div></body>",
+            sheet,
+            600.0,
+        );
+        let plain = run(
+            "<body><div>one<br>two<br>three<br>four<br>five</div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert_eq!(
+            siblings(&tall).first().expect("div").rect.height,
+            siblings(&plain).first().expect("div").rect.height
+        );
+    }
+
+    #[test]
+    fn text_indent_moves_the_first_line_and_only_the_first() {
+        // §16.4. The indent comes out of the first line's own width rather than
+        // the block's, which is why it cannot be an offset applied at paint
+        // time: it changes where the text wraps.
+        let rendered = run(
+            "<body><p>the first line of this paragraph is indented and the rest              of it is not, which takes several lines to show</p></body>",
+            "body { margin: 0 } p { text-indent: 40px; width: 200px; margin: 0 }",
+            600.0,
+        );
+        let text = siblings(&rendered)
+            .iter()
+            .find_map(|b| b.text.as_ref())
+            .expect("the paragraph's text");
+        assert!(text.lines.len() > 1, "needs to wrap to prove anything");
+        // A line carries no offset of its own — `push_line` folds it into the
+        // glyph positions — so the leftmost glyph is where the line starts.
+        let starts_at = |line: &text::Line| {
+            line.glyphs
+                .iter()
+                .map(|glyph| glyph.x)
+                .fold(f32::MAX, f32::min)
+        };
+        let first = starts_at(&text.lines[0]);
+        assert!(
+            (first - 40.0).abs() < 1.0,
+            "first line starts at {first}, not at the 40px indent"
+        );
+        for line in &text.lines[1..] {
+            let at = starts_at(line);
+            assert!(
+                at < 1.0,
+                "a later line starts at {at}, so the indent was not the first line's alone"
+            );
+        }
+    }
+
+    #[test]
+    fn text_transform_changes_what_is_measured_not_only_what_is_drawn() {
+        // Applied before shaping, because uppercase is wider in every bundled
+        // face. A transform done at paint time would wrap the line at the
+        // lowercase width and then draw capitals past the edge.
+        let plain = run(
+            "<body><p>make me shout</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let shouted = run(
+            "<body><p>make me shout</p></body>",
+            "body { margin: 0 } p { margin: 0; text-transform: uppercase }",
+            600.0,
+        );
+        let width = |r: &Rendered| {
+            siblings(r)
+                .iter()
+                .find_map(|b| b.text.as_ref())
+                .expect("text")
+                .width
+        };
+        assert!(
+            width(&shouted) > width(&plain),
+            "uppercase measured {} against {}",
+            width(&shouted),
+            width(&plain)
+        );
     }
 
     #[test]
@@ -3841,6 +5434,286 @@ mod tests {
         );
     }
 
+    /// Every glyph on the page as `(character, font size, x)`.
+    ///
+    /// A `::first-letter` box is a run of its own in a size of its own, so
+    /// this is how a test sees whether the split happened and where.
+    fn glyphs(rendered: &Rendered) -> Vec<(String, f32, f32)> {
+        content_boxes(rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|text| text.lines.iter())
+            .flat_map(|line| {
+                line.glyphs
+                    .iter()
+                    .map(|g| (line.text[g.start..g.end].to_owned(), g.font_size, g.x))
+            })
+            .collect()
+    }
+
+    /// The text of every glyph drawn at `::first-letter` size.
+    fn first_letter_text(rendered: &Rendered) -> String {
+        glyphs(rendered)
+            .into_iter()
+            .filter(|&(_, size, _)| size >= 36.0)
+            .map(|(text, _, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn a_first_letter_rule_gives_the_first_letter_its_own_box() {
+        let rendered = run(
+            "<body><div>Test</div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        let sizes: Vec<f32> = glyphs(&rendered)
+            .into_iter()
+            .map(|(_, size, _)| size)
+            .collect();
+        assert!(
+            sizes.iter().any(|&size| size >= 36.0),
+            "nothing on the line was given the first-letter size: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().any(|&size| size < 36.0),
+            "the whole line took the first-letter size: {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn punctuation_around_the_first_letter_goes_with_it() {
+        // §5.12.2, and the shape of the 339 tests in the suite that assert it
+        // one Unicode codepoint at a time: `)T)est` puts `)T)` in the box.
+        let big = |markup: &str| {
+            let rendered = run(
+                &format!("<body><div>{markup}</div></body>"),
+                "body { margin: 0 } div:first-letter { font-size: 36px }",
+                600.0,
+            );
+            first_letter_text(&rendered)
+        };
+        assert_eq!(big(")T)est"), ")T)");
+        assert_eq!(big("Test"), "T");
+    }
+
+    #[test]
+    fn a_block_with_no_first_letter_rule_is_one_run_as_before() {
+        // The property is rare and the split is not free: a page that never
+        // mentions it must not pay for it, and must not be re-shaped by it.
+        let plain = run("<body><div>Test</div></body>", "body { margin: 0 }", 600.0);
+        let styled = run(
+            "<body><div>Test</div></body>",
+            "body { margin: 0 } p:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(glyphs(&plain), glyphs(&styled));
+    }
+
+    #[test]
+    fn the_first_letter_is_the_first_letter_of_the_first_line() {
+        // A block whose first child is a block does not have its first letter
+        // in its first stretch of inline content — it has none there at all.
+        // Offering the style only to the first stretch would lose it.
+        let rendered = run(
+            "<body><div><p>First</p>second</div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        let big: String = first_letter_text(&rendered);
+        assert_eq!(
+            big, "F",
+            "the first letter of the first line, not of the block"
+        );
+    }
+
+    #[test]
+    fn only_the_first_stretch_of_a_block_gets_the_first_letter() {
+        // A block with a block child has its inline content in two stretches,
+        // laid out separately. The style is offered to each in turn so that a
+        // block starting with a block still finds its letter — which means the
+        // stretch that takes it has to say so, or every stretch takes one.
+        let rendered = run(
+            "<body><div>one<p>mid</p>two</div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(
+            first_letter_text(&rendered),
+            "o",
+            "more than the first stretch was given a first letter"
+        );
+    }
+
+    #[test]
+    fn an_image_at_the_head_of_the_line_has_no_first_letter() {
+        let rendered = run(
+            r#"<body><div><img src="x.png" width="20" height="20">Text</div></body>"#,
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(first_letter_text(&rendered), "");
+    }
+
+    #[test]
+    fn the_rule_nearest_the_text_is_the_one_that_applies() {
+        // With `::first-letter` on both a div and the paragraph inside it, the
+        // paragraph's is the one written about the text it lands on. The div's
+        // would otherwise arrive later and overwrite it.
+        let rendered = run(
+            "<body><div><p>First</p></div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px } \
+             p:first-letter { font-size: 48px }",
+            600.0,
+        );
+        let sizes: Vec<f32> = glyphs(&rendered)
+            .into_iter()
+            .filter(|&(_, size, _)| size >= 36.0)
+            .map(|(_, size, _)| size)
+            .collect();
+        assert_eq!(sizes, vec![48.0], "the ancestor's rule won");
+    }
+
+    #[test]
+    fn a_first_letter_does_not_reach_into_a_table_cell() {
+        // §5.12.2 says so outright: "the first letter of a table-cell or
+        // inline-block cannot be the first letter of an ancestor element".
+        let rendered = run(
+            "<body><div><table><tr><td>First</td></tr></table></div></body>",
+            "body { margin: 0 } div:first-letter { font-size: 36px }",
+            600.0,
+        );
+        assert_eq!(
+            first_letter_text(&rendered),
+            "",
+            "the box reached into the cell"
+        );
+    }
+
+    #[test]
+    fn a_table_element_is_spaced_and_a_display_table_box_is_not() {
+        // §17.6.1's initial value is zero. The two pixels every era table has
+        // are the UA sheet's rule for the `table` *element*, and applying them
+        // as the initial value gave every `display: table` box a gap nobody
+        // asked for — 2px per edge, plainly visible, and wrong on exactly the
+        // tables the suite is built out of.
+        let width = |markup: &str, css_text: &str| {
+            let rendered = run(markup, css_text, 600.0);
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.style.display == Display::Table)
+                .expect("a table box")
+                .rect
+                .width
+        };
+        let markup = width(
+            "<body><table><tr><td>a</td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0; width: 40px }",
+        );
+        let styled = width(
+            "<body><div id=t><div class=r><div class=c>a</div></div></div></body>",
+            "body { margin: 0 } #t { display: table } .r { display: table-row } \
+             .c { display: table-cell; padding: 0; width: 40px }",
+        );
+        assert!(
+            markup > styled,
+            "the element and the display value were spaced alike: {markup} against {styled}"
+        );
+        assert_eq!(markup - styled, 4.0, "two pixels on each side");
+    }
+
+    #[test]
+    fn a_table_cell_with_no_table_around_it_is_still_drawn() {
+        // §17.2.1 wraps an orphan in anonymous table boxes. This engine does
+        // not generate them, and a box nobody lays out is a box that vanishes
+        // — so an orphan falls back to being an ordinary block, which is close
+        // to what a table wrapped around one on its own looks like.
+        let rendered = run(
+            "<body><div><span class=c>cell</span></div></body>",
+            "body { margin: 0 } .c { display: table-cell; background: #ff0000 }",
+            600.0,
+        );
+        let cell = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
+        assert!(cell.is_some(), "the orphan cell vanished");
+    }
+
+    #[test]
+    fn a_generated_box_on_an_inline_element_reaches_the_line() {
+        // `collect_inline_runs` brackets the *block's* generated boxes. A
+        // `::before` on a span inside it was reached by nothing at all — and a
+        // span is where a stylesheet usually puts one, so every numbered list
+        // built out of `counter()` on inline elements came out blank.
+        let rendered = run(
+            "<body><p>before <span>x</span> after</p></body>",
+            "body { margin: 0 } span::before { content: \"[\" } \
+             span::after { content: \"]\" }",
+            600.0,
+        );
+        let text: String = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter())
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(text, "before [x] after");
+    }
+
+    #[test]
+    fn an_empty_iframe_is_the_box_every_browser_draws() {
+        // §10.3.2 and §10.4: a replaced element with no intrinsic dimensions
+        // is 300x150. This engine loads no document into an `<iframe>`, so
+        // that is every one of them — and a frame that laid out as nothing at
+        // all left a hole in a page that was built around it.
+        let rendered = run(
+            "<body><iframe></iframe></body>",
+            "body { margin: 0 } iframe { border: none }",
+            600.0,
+        );
+        let frame = replaced_boxes(&rendered);
+        assert_eq!(frame.len(), 1, "the iframe is not a box");
+        assert_eq!((frame[0].rect.width, frame[0].rect.height), (300.0, 150.0));
+    }
+
+    #[test]
+    fn the_iframe_default_is_two_sizes_and_not_a_ratio() {
+        // The trap: 300x150 is a pair of independent defaults, not a 2:1
+        // intrinsic ratio. An iframe an inch tall is 300px wide, not 192 —
+        // modelling the default as an intrinsic size gets this exactly wrong
+        // and looks right on the both-auto case that is easiest to test.
+        let sized = |css_text: &str| {
+            let rendered = run(
+                "<body><iframe></iframe></body>",
+                &format!("body {{ margin: 0 }} iframe {{ border: none; {css_text} }}"),
+                600.0,
+            );
+            let frame = replaced_boxes(&rendered);
+            (frame[0].rect.width, frame[0].rect.height)
+        };
+        assert_eq!(sized("height: 96px"), (300.0, 96.0));
+        assert_eq!(sized("width: 96px"), (96.0, 150.0));
+    }
+
+    #[test]
+    fn an_image_that_never_loaded_keeps_its_own_smaller_default() {
+        // A broken picture and an empty frame are different things, and a
+        // reader can tell them apart on sight. Giving an image the frame's
+        // 300x150 would put a large hole in every page with a missing image.
+        let rendered = run(
+            r#"<body><img src="nothing.png"></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let image = replaced_boxes(&rendered);
+        assert_eq!(image.len(), 1);
+        assert!(
+            image[0].rect.width < 100.0,
+            "a broken image took the frame default: {:?}",
+            image[0].rect
+        );
+    }
+
     #[test]
     fn an_inline_element_wrapping_a_block_still_lays_the_block_out() {
         // `<font>…<hr>…</font>` is ordinary markup. Skipped when gathering
@@ -3855,6 +5728,401 @@ mod tests {
             .into_iter()
             .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
         assert!(rule.is_some(), "the rule inside the font element vanished");
+    }
+
+    /// Every inline-block box on the page, in document order.
+    fn inline_blocks(rendered: &Rendered) -> Vec<&LayoutBox> {
+        content_boxes(rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::InlineBlock)
+            .collect()
+    }
+
+    #[test]
+    fn an_inline_block_is_as_wide_as_its_content_and_no_wider() {
+        // §10.3.9. The whole difference between an inline-block and a block:
+        // one fills the line, the other takes what it needs.
+        let rendered = run(
+            "<body><div><span class=\"ib\">hi</span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 1, "the inline-block is not a box at all");
+        assert!(
+            ib[0].rect.width > 0.0 && ib[0].rect.width < 200.0,
+            "shrink-to-fit gave {:?}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn a_narrow_line_squeezes_an_inline_block_but_not_below_its_longest_word() {
+        // The other half of §10.3.5: available width caps it, the widest
+        // unbreakable thing in it floors it.
+        let rendered = run(
+            "<body><div><span class=\"ib\">antidisestablishmentarianism</span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block }",
+            20.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert!(
+            ib[0].rect.width > 20.0,
+            "squeezed below its longest word: {:?}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn an_empty_inline_block_still_takes_up_the_room_it_was_given() {
+        // The spacer that used to vanish. Laid out as a plain inline, an empty
+        // inline-block has no text and so contributed nothing at all — which is
+        // the silent failure that kept it out of `is_supported_layout`.
+        let rendered = run(
+            "<body><div><span class=\"ib\"></span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block; width: 40px; height: 12px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 1, "the empty inline-block vanished");
+        assert_eq!((ib[0].rect.width, ib[0].rect.height), (40.0, 12.0));
+    }
+
+    #[test]
+    fn two_inline_blocks_sit_side_by_side_until_the_line_runs_out() {
+        let row = |width: f32| {
+            let rendered = run(
+                "<body><div><span class=\"ib\">a</span><span class=\"ib\">b</span></div></body>",
+                "body { margin: 0 } .ib { display: inline-block; width: 60px; height: 10px }",
+                width,
+            );
+            let ib = inline_blocks(&rendered);
+            assert_eq!(ib.len(), 2);
+            (ib[0].rect, ib[1].rect)
+        };
+
+        let (first, second) = row(600.0);
+        assert_eq!(first.y, second.y, "both belong on the same line");
+        assert!(
+            second.x >= first.x + first.width,
+            "they overlap: {first:?} then {second:?}"
+        );
+
+        let (first, second) = row(80.0);
+        assert!(
+            second.y >= first.y + first.height,
+            "a line with room for one kept both: {first:?} then {second:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_block_lays_its_own_blocks_out_inside_itself() {
+        // The thing that makes it a block *container*: children stack, and the
+        // block inside does not split the line around it the way a block inside
+        // a plain inline element does.
+        let rendered = run(
+            "<body><p>before <span class=\"ib\"><b>one</b><b>two</b></span> after</p></body>",
+            "body { margin: 0 } .ib { display: inline-block } b { display: block }",
+            600.0,
+        );
+        let stacked: Vec<&LayoutBox> = inline_blocks(&rendered)
+            .into_iter()
+            .flat_map(|ib| boxes(ib))
+            .filter(|b| b.style.display == Display::Block && b.text.is_some())
+            .collect();
+        assert_eq!(stacked.len(), 2, "the blocks inside were not laid out");
+        assert!(
+            stacked[1].rect.y >= stacked[0].rect.y + stacked[0].rect.height,
+            "they did not stack: {:?} then {:?}",
+            stacked[0].rect,
+            stacked[1].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_lines_up_on_the_baseline_of_its_last_line() {
+        // §10.8.1. Two inline-blocks of different heights, each holding one
+        // line: their text must sit level with each other and with the text
+        // beside them, rather than their bottom edges lining up.
+        let rendered = run(
+            "<body><p>x<span class=\"tall\">y</span><span class=\"short\">z</span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .tall, .short { display: inline-block } \
+             .tall { padding-top: 30px } .short { padding-top: 0 }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 2);
+        let baseline = |b: &LayoutBox| b.rect.y + last_baseline(b).expect("a line to align on");
+        assert!(
+            (baseline(ib[0]) - baseline(ib[1])).abs() < 0.5,
+            "their text is not level: {:?} against {:?}",
+            ib[0].rect,
+            ib[1].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_with_no_line_in_it_sits_on_the_baseline() {
+        // The other half of §10.8.1: with no line box of its own, an
+        // inline-block aligns on its bottom margin edge, like an image. An
+        // empty spacer that hung below the text instead would drag every line
+        // holding one out of position.
+        let rendered = run(
+            "<body><p>text<span class=\"ib\"></span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .ib { display: inline-block; width: 10px; height: 40px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        let line = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.text.as_ref().is_some_and(|t| !t.lines.is_empty()))
+            .expect("a line of text");
+        let text_baseline =
+            line.rect.y + line.content_origin.1 + line.text.as_ref().unwrap().lines[0].baseline;
+        assert!(
+            (ib[0].rect.y + ib[0].rect.height - text_baseline).abs() < 0.5,
+            "the spacer does not sit on the baseline: {:?} against {text_baseline}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_with_room_takes_its_preferred_width_not_its_smallest() {
+        // The other end of §10.3.5. Shrinking to the *minimum* would be
+        // shrink-to-fit too, by a reading that puts every inline-block one word
+        // wide and several lines tall.
+        let rendered = run(
+            "<body><div><span class=\"ib\">one two three four</span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        let lines = ib[0]
+            .children
+            .iter()
+            .chain(std::iter::once(ib[0]))
+            .filter_map(|b| b.text.as_ref())
+            .map(|t| t.lines.len())
+            .sum::<usize>();
+        assert_eq!(lines, 1, "it wrapped where there was room not to");
+    }
+
+    #[test]
+    fn an_inline_block_holding_a_block_still_sits_on_the_line() {
+        // An inline element containing a block is laid out as a block here,
+        // because an inline box cannot contain one. An inline-block can: it is
+        // atomic, and the text before it belongs on the same line.
+        let rendered = run(
+            "<body><p>before <span class=\"ib\"><b>x</b></span></p></body>",
+            "body { margin: 0 } .ib { display: inline-block } b { display: block }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert_eq!(ib.len(), 1);
+        assert!(
+            ib[0].rect.x > 0.0,
+            "it was pushed onto a line of its own: {:?}",
+            ib[0].rect
+        );
+    }
+
+    #[test]
+    fn an_inline_block_keeps_its_childs_top_margin_inside_it() {
+        // §8.3.1: an inline-block establishes a formatting context, so a first
+        // child's margin does not escape through its top edge the way it does
+        // through an ordinary block's.
+        let rendered = run(
+            "<body><div><span class=\"ib\"><p>x</p></span></div></body>",
+            "body { margin: 0 } .ib { display: inline-block } \
+             p { margin: 0; margin-top: 20px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        let inner = ib[0].children.first().expect("the paragraph inside");
+        assert!(
+            inner.rect.y >= 20.0,
+            "the margin escaped the inline-block: {:?}",
+            inner.rect
+        );
+    }
+
+    #[test]
+    fn a_line_grows_to_fit_a_box_aligned_to_its_top_or_bottom() {
+        // A `top`- or `bottom`-aligned box is hung from the line box rather
+        // than from the baseline, so it cannot be accounted for as ascent — but
+        // the line still has to be tall enough to hold it.
+        let height = |align: &str| {
+            let rendered = run(
+                "<body><p>text<span class=\"ib\"></span></p><hr></body>",
+                &format!(
+                    "body {{ margin: 0 }} p {{ margin: 0 }} hr {{ margin: 0 }} \
+                     .ib {{ display: inline-block; width: 10px; height: 60px; \
+                            vertical-align: {align} }}"
+                ),
+                600.0,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.style.display == Display::Block && b.node.is_some())
+                .map(|b| b.rect.height)
+                .expect("the paragraph")
+        };
+        for align in ["top", "bottom"] {
+            assert!(
+                height(align) >= 60.0,
+                "a {align}-aligned box overflowed its line: {}",
+                height(align)
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_makes_room_for_what_hangs_below_its_baseline() {
+        // A tall box fixes where the baseline is; a second box whose own
+        // baseline is near its top then hangs a long way below it. Counting
+        // only the tallest thing on the line leaves that overhang outside the
+        // line box, and the next line is drawn through it.
+        let rendered = run(
+            "<body><p><span class=\"tall\"></span><span class=\"hang\">x</span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .tall, .hang { display: inline-block } \
+             .tall { width: 10px; height: 60px } \
+             .hang { padding-bottom: 30px }",
+            600.0,
+        );
+        let paragraph = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Block && b.node.is_some())
+            .expect("the paragraph");
+        assert!(
+            paragraph.rect.height >= 80.0,
+            "the overhang fell outside the line: {:?}",
+            paragraph.rect
+        );
+    }
+
+    #[test]
+    fn a_floated_inline_block_is_a_float_and_not_a_box_on_the_line() {
+        // §9.7: `float` makes a box block-level whatever `display` said.
+        // `float: left; display: inline-block` is how a shrink-to-fit float
+        // gets written, and reading the `display` literally put the box on a
+        // line instead of against the containing block's edge.
+        let rendered = run(
+            "<body><div id=\"outer\"><span class=\"ib\">a</span><span class=\"f\">b</span></div></body>",
+            "body { margin: 0 } #outer { width: 300px } \
+             .ib, .f { display: inline-block; width: 100px; height: 20px } \
+             .f { float: left }",
+            600.0,
+        );
+        assert_eq!(
+            inline_blocks(&rendered).len(),
+            1,
+            "the floated one is still on the line"
+        );
+    }
+
+    #[test]
+    fn a_float_inside_an_inline_element_is_still_placed() {
+        // `<span><div style="float: left">…</div></span>`. The float is out of
+        // flow, so it must not break the line around it — and it must not be
+        // lost either, which is what happens if nothing descends to find it.
+        let rendered = run(
+            "<body><p>before <span><i class=\"f\"></i></span> after</p></body>",
+            "body { margin: 0 } .f { float: left; width: 30px; height: 30px; background: #ff0000 }",
+            600.0,
+        );
+        let float = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
+        assert!(float.is_some(), "the float inside the span vanished");
+        let lines: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.as_ref().is_some_and(|t| !t.lines.is_empty()))
+            .collect();
+        assert_eq!(lines.len(), 1, "the float broke the paragraph into pieces");
+    }
+
+    #[test]
+    fn vertical_align_decides_where_an_inline_block_hangs_on_the_line() {
+        // §10.8.1. One short box beside a tall one whose own baseline sits well
+        // above its bottom edge, so the four placements are four different
+        // places: at the line's top, on the baseline, straddling it, and at the
+        // line's bottom.
+        let placed = |align: &str| {
+            let rendered = run(
+                "<body><p><span class=\"tall\">x</span><span class=\"ib\"></span></p></body>",
+                &format!(
+                    "body {{ margin: 0 }} p {{ margin: 0 }} \
+                     .tall, .ib {{ display: inline-block; width: 10px }} \
+                     .tall {{ padding-top: 40px }} \
+                     .ib {{ height: 10px; vertical-align: {align} }}"
+                ),
+                600.0,
+            );
+            let ib = inline_blocks(&rendered);
+            assert_eq!(ib.len(), 2);
+            ib[1].rect.y
+        };
+        let top = placed("top");
+        let baseline = placed("baseline");
+        let middle = placed("middle");
+        let bottom = placed("bottom");
+        assert_eq!(top, 0.0, "top did not reach the top of the line");
+        assert!(
+            baseline < middle && middle < bottom,
+            "baseline {baseline}, middle {middle}, bottom {bottom} are not in order"
+        );
+        assert!(
+            top < baseline,
+            "top {top} is not above the baseline placement {baseline}"
+        );
+    }
+
+    #[test]
+    fn a_cell_still_centres_its_content_without_being_told_to() {
+        // The initial value of `vertical-align` is `baseline`, which an
+        // inline-block needs and a cell must not have. A cell's `middle` comes
+        // from the UA sheet instead — and this is the assertion that the two
+        // did not get swapped.
+        let rendered = run(
+            "<body><table><tr><td>short</td><td>a<br>b<br>c<br>d</td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0 }",
+            600.0,
+        );
+        let cells: Vec<&LayoutBox> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .collect();
+        assert!(
+            cells[0].content_origin.1 > 0.0,
+            "the short cell was not centred"
+        );
+    }
+
+    #[test]
+    fn margins_on_an_inline_block_hold_it_away_from_what_is_beside_it() {
+        // An inline-block's margins are its own: they neither collapse with a
+        // child's nor vanish the way an inline element's vertical ones do.
+        let rendered = run(
+            "<body><div><span class=\"ib\">a</span><span class=\"ib\">b</span></div></body>",
+            "body { margin: 0 } \
+             .ib { display: inline-block; width: 20px; height: 10px; margin: 5px }",
+            600.0,
+        );
+        let ib = inline_blocks(&rendered);
+        assert!(
+            ib[1].rect.x - (ib[0].rect.x + ib[0].rect.width) >= 10.0,
+            "the two margins between them were lost: {:?} then {:?}",
+            ib[0].rect,
+            ib[1].rect
+        );
+        assert!(
+            ib[0].rect.y >= 5.0,
+            "the top margin was lost: {:?}",
+            ib[0].rect
+        );
     }
 
     #[test]
@@ -4205,6 +6473,68 @@ mod tests {
     }
 
     #[test]
+    fn a_float_after_the_last_block_is_still_placed() {
+        // Floats declared after the first in-flow block are held back and
+        // placed when the next block arrives. A float with no block after it
+        // was never placed at all — it vanished, which is most of what
+        // `float: left` is for on a page that ends with one.
+        let rendered = run(
+            r#"<body><p>text</p><div id="f"></div></body>"#,
+            "body { margin: 0 } div { float: left; width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let floated: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .collect();
+        assert_eq!(floated.len(), 1, "the trailing float was dropped");
+        assert!(
+            floated[0].rect.y > 0.0,
+            "it must sit below the paragraph, not at the top: {:?}",
+            floated[0].rect
+        );
+        assert!(
+            rendered.layout.height >= 60.0,
+            "the page is too short to hold it: {}",
+            rendered.layout.height
+        );
+    }
+
+    #[test]
+    fn a_trailing_float_is_placed_once_and_not_twice() {
+        // The drain inside the loop and the drain after it must not both fire
+        // for the same float.
+        let rendered = run(
+            r#"<body><p>one</p><div id="f"></div><p>two</p></body>"#,
+            "body { margin: 0 } div { float: left; width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let floated = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .count();
+        assert_eq!(floated, 1, "the float was placed twice");
+    }
+
+    #[test]
+    fn an_absolutely_positioned_box_is_not_also_a_float() {
+        // §9.7: `position: absolute` makes `float` compute to `none`. Both
+        // take the box out of flow and each has its own way of placing it, so
+        // a box claiming both was placed twice and drawn twice.
+        let rendered = run(
+            r#"<body><p>one</p><div id="f"></div></body>"#,
+            "body { margin: 0 } div { float: right; position: absolute; top: 0; \
+             width: 40px; height: 60px; background: #ccc }",
+            600.0,
+        );
+        let boxes: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.rect.width == 40.0 && b.rect.height == 60.0)
+            .collect();
+        assert_eq!(boxes.len(), 1, "the box was drawn twice: {boxes:?}");
+    }
+
+    #[test]
     fn clear_pushes_a_block_below_the_float() {
         let cleared = run(
             "<body><div class=\"f\">side</div><p class=\"c\">after</p></body>",
@@ -4269,12 +6599,13 @@ mod tests {
             max_width: Length::Px(300.0),
             ..ComputedStyle::default()
         };
-        let (width, height) = replaced_size(&style, Some((1200.0, 400.0)), None, None, 1000.0);
+        let (width, height) =
+            replaced_size(&style, Some((1200.0, 400.0)), None, None, None, 1000.0);
         assert_eq!(width, 300.0);
         assert_eq!(height, 100.0, "the 3:1 ratio should have been kept");
 
         // One already inside the bound is left exactly alone.
-        let (width, height) = replaced_size(&style, Some((120.0, 40.0)), None, None, 1000.0);
+        let (width, height) = replaced_size(&style, Some((120.0, 40.0)), None, None, None, 1000.0);
         assert_eq!((width, height), (120.0, 40.0));
     }
 
@@ -4318,6 +6649,77 @@ mod tests {
         assert_eq!(width_of("width: 800px; max-width: 300px", 1000.0), 300.0);
         // And a bound wider than the space available does not widen anything.
         assert_eq!(width_of("max-width: 900px", 400.0), 400.0);
+    }
+
+    /// Width of the one 10px-tall box on a page, which is how these ask.
+    fn bounded_width(css: &str, available: f32) -> f32 {
+        let rendered = run(
+            "<body><div class=\"b\"></div></body>",
+            &format!("body {{ margin: 0 }} .b {{ height: 10px; {css} }}"),
+            available,
+        );
+        content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.rect.height == 10.0)
+            .expect("the box")
+            .rect
+            .width
+    }
+
+    #[test]
+    fn min_width_raises_a_box_that_would_be_narrower() {
+        // §10.4, and absent until now on the grounds that nothing needed it.
+        // Wikipedia's stylesheet asks for it 33 times, and 27 WPT tests went
+        // from failing to passing when it arrived.
+        assert_eq!(bounded_width("width: 10px; min-width: 300px", 800.0), 300.0);
+        // One already above the floor is left exactly alone. Getting this
+        // backwards would make every floored box the same size.
+        assert_eq!(
+            bounded_width("width: 600px; min-width: 100px", 800.0),
+            600.0
+        );
+    }
+
+    #[test]
+    fn a_negative_floor_is_dropped_rather_than_obeyed() {
+        // §10.4 forbids a negative value here, and an invalid declaration is
+        // dropped rather than clamped: the box keeps the width it already had.
+        // Free with `parse_size`, which arrived with `max-height`, and worth
+        // pinning because using the plain length parser would look right until
+        // a stylesheet said `min-width: -1px`.
+        assert_eq!(bounded_width("width: 60px; min-width: -1px", 800.0), 60.0);
+    }
+
+    #[test]
+    fn min_width_wins_where_it_crosses_max_width() {
+        // §10.4 applies the maximum and *then* the minimum, so where the two
+        // cross the floor is what survives. It looks like a mistake in the
+        // stylesheet and is what the specification asks for: the author who
+        // wrote a floor meant the content to fit. Chromium gives 200 here too.
+        assert_eq!(
+            bounded_width("width: 10px; max-width: 50px; min-width: 200px", 800.0),
+            200.0
+        );
+    }
+
+    #[test]
+    fn min_width_measures_the_content_box_like_width_does() {
+        // The same shape as `max-width`: CSS 2.1 sizes the *content* box, so
+        // padding and border grow the box outwards past the floor rather than
+        // eating into it. 200 of content and 50 of padding is 250 of box, which
+        // is what Chromium lays out.
+        assert_eq!(
+            bounded_width("width: 100px; min-width: 200px; padding: 0 25px", 800.0),
+            250.0
+        );
+    }
+
+    #[test]
+    fn a_floor_below_the_width_already_taken_changes_nothing() {
+        // A percentage floor resolves against the containing block's width, so
+        // a box filling its container is already past a floor of less than all
+        // of it.
+        assert_eq!(bounded_width("min-width: 40%", 100.0), 100.0);
     }
 
     #[test]
@@ -4575,7 +6977,7 @@ mod tests {
     fn an_image_uses_its_intrinsic_size_when_nothing_is_declared() {
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((80.0, 40.0)), None, None, 500.0),
+            replaced_size(&style, Some((80.0, 40.0)), None, None, None, 500.0),
             (80.0, 40.0)
         );
     }
@@ -4585,11 +6987,25 @@ mod tests {
         // `<img width="200">` on a 2:1 image must not squash it.
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((100.0, 50.0)), Some(200.0), None, 500.0),
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                None,
+                Some(Length::Px(200.0)),
+                None,
+                500.0
+            ),
             (200.0, 100.0)
         );
         assert_eq!(
-            replaced_size(&style, Some((100.0, 50.0)), None, Some(25.0), 500.0),
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                None,
+                None,
+                Some(Length::Px(25.0)),
+                500.0
+            ),
             (50.0, 25.0)
         );
     }
@@ -4598,7 +7014,14 @@ mod tests {
     fn both_declared_dimensions_win_over_the_ratio() {
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((100.0, 50.0)), Some(30.0), Some(300.0), 500.0),
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                None,
+                Some(Length::Px(30.0)),
+                Some(Length::Px(300.0)),
+                500.0
+            ),
             (30.0, 300.0)
         );
     }
@@ -4609,7 +7032,14 @@ mod tests {
             width: Length::Px(64.0),
             ..ComputedStyle::default()
         };
-        let (width, _) = replaced_size(&style, Some((100.0, 100.0)), Some(999.0), None, 500.0);
+        let (width, _) = replaced_size(
+            &style,
+            Some((100.0, 100.0)),
+            None,
+            Some(Length::Px(999.0)),
+            None,
+            500.0,
+        );
         assert_eq!(width, 64.0);
     }
 
@@ -4618,11 +7048,18 @@ mod tests {
         // A broken image must not collapse the layout around it.
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, None, Some(120.0), Some(60.0), 500.0),
+            replaced_size(
+                &style,
+                None,
+                None,
+                Some(Length::Px(120.0)),
+                Some(Length::Px(60.0)),
+                500.0
+            ),
             (120.0, 60.0)
         );
         assert_eq!(
-            replaced_size(&style, None, None, None, 500.0),
+            replaced_size(&style, None, None, None, None, 500.0),
             BROKEN_IMAGE_SIZE
         );
     }
@@ -4646,12 +7083,66 @@ mod tests {
     }
 
     #[test]
-    fn a_percentage_size_attribute_is_ignored_rather_than_read_as_pixels() {
+    fn a_percentage_size_attribute_is_a_percentage_and_not_pixels() {
         let doc = dom::parse(r#"<body><img src="x.png" width="50%"></body>"#);
         assert_eq!(
             size_attr(&doc, doc.find_element("img").expect("img"), "width"),
-            None,
-            "50% must not be read as 50px"
+            Some(Length::Percent(50.0)),
+            "50% must be half the containing block, and never 50px"
+        );
+    }
+
+    #[test]
+    fn a_percentage_width_attribute_fills_that_share_of_the_line() {
+        // `<img width="100%">` is how the era drew a rule across a column and
+        // how the CSS 2.1 suite's own references draw a green bar. Ignoring it
+        // left a 1x1 image at its intrinsic size — a single pixel where the
+        // page wanted a band.
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(
+                &style,
+                Some((1.0, 1.0)),
+                None,
+                Some(Length::Percent(100.0)),
+                Some(Length::Px(50.0)),
+                500.0
+            ),
+            (500.0, 50.0)
+        );
+        assert_eq!(
+            replaced_size(
+                &style,
+                Some((1.0, 1.0)),
+                None,
+                Some(Length::Percent(50.0)),
+                None,
+                500.0
+            ),
+            (250.0, 250.0),
+            "with no height, a square image keeps its ratio"
+        );
+    }
+
+    #[test]
+    fn a_percentage_height_attribute_is_auto() {
+        // It resolves against the containing block's *height*, which is `auto`
+        // for nearly every box on a page of this era — §10.5 makes such a
+        // percentage `auto` in turn. The only basis to hand is the width, and
+        // using it would size an image to a fraction of the page's width in
+        // the vertical direction, which is not a small error.
+        let style = ComputedStyle::default();
+        assert_eq!(
+            replaced_size(
+                &style,
+                Some((100.0, 50.0)),
+                None,
+                None,
+                Some(Length::Percent(50.0)),
+                500.0
+            ),
+            (100.0, 50.0),
+            "the image keeps its intrinsic size"
         );
     }
 
@@ -4882,6 +7373,334 @@ mod tests {
         assert_eq!(line_offset(TextAlign::Right, 100.0, 500.0), 400.0);
         // A line wider than its box never produces a negative offset.
         assert_eq!(line_offset(TextAlign::Center, 700.0, 500.0), 0.0);
+    }
+
+    /// The box drawn for the first control on the page.
+    fn control_box(rendered: &Rendered) -> &LayoutBox {
+        content_boxes(rendered)
+            .into_iter()
+            .find(|b| b.style.border.left.used_width(b.style.font_size) > 0.0)
+            .expect("a control box")
+    }
+
+    #[test]
+    fn a_control_is_a_box_on_the_line_and_not_a_block() {
+        // The bug this pins: a `<select multiple>` gives its options
+        // `display: block`, and reading that as "contains a block" laid the
+        // control out as a block box filling the whole line.
+        let rendered = run(
+            r#"<body><p>Pick: <select multiple size="3"><option>Alpha</option>
+               <option>Beta</option></select></p></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let control = control_box(&rendered);
+        assert!(
+            control.rect.width < 200.0,
+            "a list box filled the line: {:?}",
+            control.rect
+        );
+        assert!(
+            control.rect.x > 0.0,
+            "a list box was not placed after the text beside it: {:?}",
+            control.rect
+        );
+    }
+
+    #[test]
+    fn a_value_too_long_for_its_field_is_cut_at_the_border() {
+        let rendered = run(
+            r#"<body><input type="text" size="8" value="far more text than eight characters"></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let control = control_box(&rendered);
+        let label = control.text.as_ref().expect("a shaped value");
+        assert_eq!(label.lines.len(), 1, "the value wrapped out of the field");
+        assert!(
+            label.width <= control.content_width,
+            "the value ran past the field: {} in {}",
+            label.width,
+            control.content_width
+        );
+        // Cut, not merely measured short: the glyphs beyond the edge are gone.
+        let last = label.lines[0]
+            .glyphs
+            .last()
+            .expect("some of the value is shown");
+        assert!(
+            last.x < control.content_width,
+            "a glyph was left outside the field at x={}",
+            last.x
+        );
+    }
+
+    #[test]
+    fn a_textarea_keeps_the_lines_it_was_given() {
+        let rendered = run(
+            "<body><textarea rows=\"3\" cols=\"20\">one\ntwo\nthree</textarea></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let control = control_box(&rendered);
+        let label = control.text.as_ref().expect("a shaped value");
+        assert_eq!(
+            label.lines.len(),
+            3,
+            "a textarea collapsed its lines into one"
+        );
+    }
+
+    #[test]
+    fn a_textarea_shows_the_spacing_it_was_typed_with() {
+        // A textarea is preformatted: the spaces between two words are as many
+        // as were typed. Shaping its value like ordinary flow text collapses
+        // them to one, and columns lined up with spaces — which is how the
+        // era's forms held their shape — fall apart.
+        let width = |value: &str| {
+            let html = format!("<body><textarea cols=\"40\">{value}</textarea></body>");
+            let rendered = run(&html, "body { margin: 0 }", 600.0);
+            control_box(&rendered)
+                .text
+                .as_ref()
+                .expect("a shaped value")
+                .lines[0]
+                .width
+        };
+        assert!(
+            width("a    b") > width("a b") + 2.0,
+            "a textarea collapsed the spacing inside its value: {} vs {}",
+            width("a    b"),
+            width("a b")
+        );
+    }
+
+    #[test]
+    fn a_checked_box_draws_a_mark_and_an_unchecked_one_does_not() {
+        let checked = run(
+            r#"<body><input type="checkbox" checked></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        let empty = run(
+            r#"<body><input type="checkbox"></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert_eq!(control_box(&checked).children.len(), 1, "no tick was drawn");
+        assert!(
+            control_box(&empty).children.is_empty(),
+            "an unchecked box was ticked"
+        );
+    }
+
+    #[test]
+    fn a_hidden_input_takes_no_room() {
+        let rendered = run(
+            r#"<body><p>before<input type="hidden" value="x">after</p></body>"#,
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            content_boxes(&rendered).into_iter().all(|b| b
+                .style
+                .border
+                .left
+                .used_width(b.style.font_size)
+                == 0.0),
+            "a hidden input was drawn"
+        );
+    }
+
+    #[test]
+    fn a_page_is_tall_enough_for_content_that_overflows_its_box() {
+        // `height: 0` with text in it is not an empty box: `overflow`
+        // defaults to `visible`, so the text is still drawn — below the box.
+        // Sizing the canvas by the box alone cuts it off, and being cut off
+        // looks exactly like never having been drawn.
+        let rendered = run(
+            "<body><div style=\"height: 0\">text below the box</div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            rendered.layout.height > 5.0,
+            "the page ended at the box's own edge: {}",
+            rendered.layout.height
+        );
+    }
+
+    #[test]
+    fn a_page_with_nothing_overflowing_is_not_made_taller() {
+        // The floor is the root box. Growing past it without cause would pad
+        // every page with blank canvas and move every committed baseline.
+        let rendered = run("<body><p>one line</p></body>", "body { margin: 0 }", 600.0);
+        assert_eq!(
+            rendered.layout.height, rendered.layout.root.rect.height,
+            "the page grew past the root box with nothing overflowing it"
+        );
+    }
+
+    #[test]
+    fn a_child_reaching_below_its_parent_extends_the_page() {
+        // The spacer above matters: rectangles are relative to the parent, so
+        // an overflow measured without carrying the offset down reports 60
+        // here rather than 160, and is right only when the overflow happens
+        // to begin at the very top of the page.
+        let rendered = run(
+            "<body><div style=\"height: 100px\"></div>\
+             <div style=\"height: 4px\"><div style=\"height: 60px\"></div></div></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            rendered.layout.height >= 160.0,
+            "an overflowing child was cut off: {}",
+            rendered.layout.height
+        );
+    }
+
+    #[test]
+    fn clipping_a_label_leaves_what_fits() {
+        let mut label = text::TextLayout {
+            lines: vec![text::Line {
+                glyphs: Vec::new(),
+                replaced: Vec::new(),
+                spans: Vec::new(),
+                decorations: Vec::new(),
+                text: String::new(),
+                width: 200.0,
+                y: 0.0,
+                baseline: 10.0,
+            }],
+            height: 12.0,
+            width: 200.0,
+        };
+        clip_label(&mut label, 50.0);
+        assert_eq!(label.width, 50.0);
+        assert_eq!(label.lines[0].width, 50.0);
+
+        // A label already inside its box is left exactly as it was.
+        let mut narrow = label.clone();
+        clip_label(&mut narrow, 500.0);
+        assert_eq!(narrow.width, 50.0, "clipping widened a label");
+    }
+}
+
+#[cfg(test)]
+mod clipped_overflow_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// How tall the page is, which is how far it can be scrolled.
+    fn height(html: &str) -> f32 {
+        let doc = dom::parse(html);
+        let sheets = [Stylesheet::parse(css::ua::UA_STYLESHEET)];
+        let styles = css::cascade::cascade(&doc, &sheets);
+        let mut fonts = FontStore::new();
+        layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 800.0).height
+    }
+
+    #[test]
+    fn content_clipped_out_of_sight_is_not_somewhere_to_scroll() {
+        // CSS 2.1 §11.1.1: `overflow: hidden` clips, and offers no way to
+        // reach what it clipped. A page that can be scrolled to it is a page
+        // with a mile of blank space under it — which is what a dropdown
+        // written without scripting leaves behind, since it is `height: 0;
+        // overflow: hidden` with its whole menu inside.
+        let clipped = height(
+            "<body style=\"margin: 0\"><div style=\"height: 2000px\">spacer</div>\
+             <div style=\"position: absolute; height: 0; overflow: hidden\">\
+             <div style=\"height: 3000px\">menu</div></div></body>",
+        );
+        let visible = height(
+            "<body style=\"margin: 0\"><div style=\"height: 2000px\">spacer</div>\
+             <div style=\"position: absolute; height: 0\">\
+             <div style=\"height: 3000px\">menu</div></div></body>",
+        );
+
+        assert_eq!(clipped, 2000.0);
+        // The same page without the clip keeps every pixel of the overflow —
+        // the menu starts where the spacer ends and runs 3000px on from there
+        // — which is what makes the first number mean something.
+        assert_eq!(visible, 5000.0);
+    }
+
+    #[test]
+    fn a_box_anchored_outside_the_clip_is_not_clipped_by_it() {
+        // §10.1: an absolutely positioned box is clipped by an ancestor only
+        // when that ancestor is its containing block, and a static box is
+        // nobody's containing block. Chromium reaches 2000 here too, and the
+        // reader is right to expect it: a tooltip anchored to the page, inside
+        // a clipped wrapper, is on the page.
+        let escaped = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"height: 10px; overflow: hidden\">\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">out</div>\
+             </div></body>",
+        );
+
+        assert_eq!(escaped, 2000.0);
+    }
+
+    #[test]
+    fn a_box_escapes_from_however_deep_inside_the_clip_it_sits() {
+        // The walk has to go *through* static boxes, not only look at the
+        // clipper's own children: a static wrapper is nobody's containing
+        // block either, so a box below one is still anchored to the page.
+        // Chromium reaches 2000 here too.
+        let escaped = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"height: 10px; overflow: hidden\"><div><div>\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">out</div>\
+             </div></div></div></body>",
+        );
+
+        assert_eq!(escaped, 2000.0);
+    }
+
+    #[test]
+    fn a_relative_box_inside_the_clip_anchors_what_is_under_it() {
+        // And the walk has to stop there. The relative wrapper is the
+        // containing block for the box below it, and the wrapper is inside the
+        // clip — so the box is measured from it and clipped with it. Chromium
+        // stops at 1010 here as well.
+        let anchored = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"height: 10px; overflow: hidden\">\
+             <div style=\"position: relative\">\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">in</div>\
+             </div></div></body>",
+        );
+
+        assert_eq!(anchored, 1010.0);
+    }
+
+    #[test]
+    fn a_positioned_clipper_clips_what_it_anchors() {
+        // The other half of the same rule. Make the wrapper `relative` and it
+        // becomes the containing block, so the box inside is measured from it
+        // and clipped by it — which is Wikipedia's dropdown exactly.
+        let anchored = height(
+            "<body style=\"margin: 0\"><div style=\"height: 1000px\">spacer</div>\
+             <div style=\"position: relative; height: 10px; overflow: hidden\">\
+             <div style=\"position: absolute; top: 1500px; height: 500px\">in</div>\
+             </div></body>",
+        );
+
+        assert_eq!(anchored, 1010.0);
+    }
+
+    #[test]
+    fn a_clipping_box_still_takes_its_own_room() {
+        // Only what hangs *out* of it is gone. The box is in its parent's flow
+        // and as tall as it says it is.
+        let sized = height(
+            "<body style=\"margin: 0\"><div style=\"height: 300px; overflow: hidden\">\
+             <div style=\"height: 3000px\">tall</div></div></body>",
+        );
+
+        assert_eq!(sized, 300.0);
     }
 }
 

@@ -32,10 +32,15 @@ browser="$here/target/release/2kbrowser"
 display=":88"
 width=800
 height=900
-# The bar owns the top of the window, so a document coordinate is this far down
-# the screen. `window.rs` pins this against what `draw` does; what it cannot
-# pin is that the number here matches the browser being run.
-chrome=46
+# The chrome owns the top of the window, so a document coordinate is this far
+# down the screen. `window.rs` pins this against what `draw` does; what it
+# cannot pin is that the numbers here match the browser being run.
+#
+# Two rows, from `chrome.rs`: the tab strip, which is always drawn because it
+# carries the new-tab button, and the URL bar under it.
+strip=28
+bar=46
+chrome=$((strip + bar))
 # The right-hand controls, from `chrome.rs`: PADDING, then the save control,
 # then the layout toggle beside it. Same caveat as `chrome` above — these are
 # pinned against `controls()` by its own tests, and repeated here because a
@@ -48,7 +53,9 @@ toggle=96
 # told a number.
 scrollbar=8
 toggle_x=$((width - padding - bookmark - toggle / 2))
-toggle_y=$((chrome / 2))
+# Down the middle of the URL bar, which is below the strip rather than at the
+# top of the window.
+toggle_y=$((strip + bar / 2))
 
 fail() {
     echo "FAIL: $*" >&2
@@ -204,7 +211,7 @@ stop
 #    document coordinate, so a browser that forgot to subtract it would follow
 #    a link from up here.
 start
-after=$(click_and_read "$click_x" $((chrome / 2)))
+after=$(click_and_read "$click_x" $((strip + bar / 2)))
 case "$after" in
     *Departure*) echo "ok: clicking the chrome did not follow a link" ;;
     *) fail "a click on the bar navigated to: $after" ;;

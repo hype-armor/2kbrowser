@@ -17,10 +17,12 @@ pub enum Display {
     Inline,
     /// Inline-level box with a block container inside.
     ///
-    /// Parsed and cascaded, and **not laid out**: it is treated as plain
-    /// `inline`, so a width, a height, a border and a background on one are all
-    /// dropped, and an empty one collapses to nothing at all. Counted as
-    /// unsupported layout for that reason — see [`Display::is_supported_layout`].
+    /// Laid out: the box is sized by its own content, placed on a line as one
+    /// atom, and aligned on the baseline of its own last line (§10.3.9,
+    /// §10.8.1). It was for a long time the one unimplemented thing here that
+    /// failed *silently* — laid out as a plain inline, so its width, height,
+    /// border and background were dropped and an empty spacer vanished — which
+    /// is why it is called out here rather than left to the enum.
     InlineBlock,
     /// A list item; laid out as a block for now.
     ListItem,
@@ -32,6 +34,25 @@ pub enum Display {
     TableRowGroup,
     /// A table cell. A block container in its own right.
     TableCell,
+    /// `table-column` and `table-column-group`.
+    ///
+    /// A column box sizes a column and paints its own background; §17.2 gives
+    /// it no content of its own, and anything inside it is not rendered. This
+    /// engine does not lay out column boxes at all — a table's widths come
+    /// from its cells — so the variant exists to say "generates no content
+    /// box", which is the part that is observable. Mapping these to `Block`,
+    /// as the catch-all below used to, made a `::before` with
+    /// `display: table-column` draw its content, and the suite puts the word
+    /// FAIL in exactly that place.
+    TableColumn,
+    /// `table-column-group` — a band of columns.
+    ///
+    /// Apart from `TableColumn` because a group's extent is its `table-column`
+    /// children where it has any, and its own `span` where it has none; the
+    /// grid cannot tell those two apart from one variant.
+    TableColumnGroup,
+    /// `table-caption` — a table's heading, outside its border box (§17.4).
+    TableCaption,
     /// Generates no box at all.
     None,
     /// `flex` or `inline-flex` — recognised, not implemented (ADR-0004).
@@ -47,21 +68,17 @@ impl Display {
     /// path: the page is still rendered, just as a document rather than with
     /// the author's layout.
     ///
-    /// `InlineBlock` is here alongside flex and grid, and it is the one that
-    /// reads as a mistake. The difference between it and them is only that it
-    /// *nearly* works: an inline-block is laid out as a plain inline, so its
-    /// content still appears and only its box is lost. That made it the one
-    /// unimplemented thing here that failed **silently** — no fallback, no
-    /// notice, just a page that is subtly wrong and an empty spacer that
-    /// vanishes. Being nearly right is not a reason to say nothing; it is the
-    /// case ADR-0009 was written for.
+    /// `InlineBlock` used to be here alongside flex and grid, because it was
+    /// laid out as a plain inline and so failed silently — the content still
+    /// appeared and only the box was lost. It is laid out properly now, so a
+    /// page built out of inline-blocks no longer falls back to document mode.
     ///
     /// This is a share, not a switch: the classifier weighs how much of the
-    /// page's text sits under unsupported layout, so a navigation bar built
-    /// from inline-blocks does not push an article into document mode, and a
-    /// page whose body depends on them does.
+    /// page's text sits under unsupported layout, so one flex container in a
+    /// navigation bar does not push an article into document mode, and a page
+    /// whose body depends on them does.
     pub fn is_supported_layout(self) -> bool {
-        !matches!(self, Display::Flex | Display::Grid | Display::InlineBlock)
+        !matches!(self, Display::Flex | Display::Grid)
     }
 
     /// Whether the box participates in inline layout.
@@ -71,10 +88,19 @@ impl Display {
 
     /// Whether the box is internal table structure, laid out by the table
     /// rather than by normal block flow.
+    ///
+    /// A caption is here too. It is not *inside* the table's border box —
+    /// §17.4 makes it a sibling — but it is the table that places it, and a
+    /// block walk that laid it out as an ordinary child would draw it twice.
     pub fn is_table_internal(self) -> bool {
         matches!(
             self,
-            Display::TableRow | Display::TableRowGroup | Display::TableCell
+            Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableCell
+                | Display::TableColumn
+                | Display::TableColumnGroup
+                | Display::TableCaption
         )
     }
 
@@ -93,8 +119,12 @@ impl Display {
                 Display::TableRowGroup
             }
             "table-cell" => Display::TableCell,
-            // Column and caption boxes are not implemented; treating them as
-            // blocks keeps their content visible rather than dropping it.
+            "table-column" => Display::TableColumn,
+            "table-column-group" => Display::TableColumnGroup,
+            "table-caption" => Display::TableCaption,
+            // Nothing else in CSS 2.1 begins with `table`, so this catches a
+            // misspelling rather than a value. A block keeps its content
+            // visible, which is the better of the two ways to be wrong.
             name if name.starts_with("table") => Display::Block,
             _ => return None,
         };
@@ -183,23 +213,28 @@ pub fn parse_text_decoration(words: &[String]) -> TextDecoration {
     out
 }
 
-/// The `vertical-align` property, restricted to the values a table cell uses.
+/// The `vertical-align` property, restricted to its keyword values.
 ///
-/// Only the cell case is modelled. Vertical alignment *within a line box* — a
-/// superscript, an image raised off the baseline — is a different mechanism in
-/// a different place, and the era's markup reaches for `valign` on cells far
-/// more than for either.
+/// Two mechanisms share one property. In a table cell it aligns the cell's
+/// content within the row; on an atomic inline box — an image, an inline-block
+/// — it decides where the box hangs on the line. Raising and lowering *text*
+/// (a superscript, a `<sub>`) is the part still not modelled: that needs a
+/// baseline shift applied to a run's glyphs, which is a different place again.
+///
+/// A cell's `middle` comes from the UA sheet rather than from this enum's
+/// default, because the two contexts disagree about what "not stated" means:
+/// CSS's initial value is `baseline`, which is what an inline-block must get,
+/// and what a cell must not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerticalAlign {
-    /// Align the content's top with the cell's.
+    /// Align the box's or content's top with the line box's or cell's.
     Top,
-    /// Centre it in the cell. The default for a cell, and the reason a short
-    /// column looks centred against a long one unless told otherwise.
-    #[default]
+    /// Centre it: in the cell, or against the middle of the parent's text.
     Middle,
-    /// Align the content's bottom with the cell's.
+    /// Align the box's or content's bottom with the line box's or cell's.
     Bottom,
-    /// Align the first line's baseline with the row's.
+    /// Sit on the baseline — the initial value, and for a cell the row's.
+    #[default]
     Baseline,
 }
 
@@ -487,13 +522,86 @@ impl ListStyleType {
             ListStyleType::Circle => "\u{25e6}".to_owned(),
             ListStyleType::Square => "\u{25aa}".to_owned(),
             ListStyleType::None => String::new(),
-            ListStyleType::Decimal => format!("{ordinal}."),
-            ListStyleType::LowerAlpha => format!("{}.", alphabetic(ordinal, 'a')),
-            ListStyleType::UpperAlpha => format!("{}.", alphabetic(ordinal, 'A')),
-            ListStyleType::LowerRoman => format!("{}.", roman(ordinal).to_lowercase()),
-            ListStyleType::UpperRoman => format!("{}.", roman(ordinal)),
+            _ => format!("{}.", self.counter(ordinal)),
         }
     }
+
+    /// The same ordinal as a bare counter value, with no trailing stop.
+    ///
+    /// §12.4.3's `counter()` prints the number and nothing else: the full stop
+    /// in a list marker is the marker's, not the number's, and
+    /// `content: counter(chapter) ". "` writes its own.
+    ///
+    /// A bullet type has no number to print, so it prints nothing — which is
+    /// what §12.4.3 says `counter(n, disc)` does.
+    pub fn counter(self, ordinal: usize) -> String {
+        match self {
+            ListStyleType::Disc
+            | ListStyleType::Circle
+            | ListStyleType::Square
+            | ListStyleType::None => String::new(),
+            ListStyleType::Decimal => format!("{ordinal}"),
+            ListStyleType::LowerAlpha => alphabetic(ordinal, 'a'),
+            ListStyleType::UpperAlpha => alphabetic(ordinal, 'A'),
+            ListStyleType::LowerRoman => roman(ordinal).to_lowercase(),
+            ListStyleType::UpperRoman => roman(ordinal),
+        }
+    }
+}
+
+/// The four offsets of a `clip: rect(…)`.
+///
+/// Every one is measured from the *top-left* of the border box, including
+/// `right` and `bottom` — they are not insets from the far edges, which is
+/// the trap in this property and the reason it is worth a type of its own.
+/// CSS 2.1 §11.1.2 is explicit about it, and later specifications kept the
+/// shape for compatibility rather than because anyone liked it.
+///
+/// `None` on a side is `auto`: that edge of the clip is the border edge, so
+/// the side does not clip.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipRect {
+    /// Distance down from the border box's top edge.
+    pub top: Option<Length>,
+    /// Distance right from the border box's *left* edge.
+    pub right: Option<Length>,
+    /// Distance down from the border box's *top* edge.
+    pub bottom: Option<Length>,
+    /// Distance right from the border box's left edge.
+    pub left: Option<Length>,
+}
+
+/// Parses `clip: rect(t, r, b, l)`, or `auto`.
+///
+/// Both separators are accepted. CSS 2.1 specifies commas and notes that
+/// implementations also took spaces, which the era's pages duly used.
+pub fn parse_clip(values: &[Raw]) -> Option<Option<ClipRect>> {
+    if let [Raw::Ident(name)] = values {
+        return (name == "auto").then_some(None);
+    }
+    let [Raw::Function(name, args)] = values else {
+        return None;
+    };
+    if name != "rect" {
+        return None;
+    }
+    let sides: Vec<Option<Length>> = args
+        .iter()
+        .filter(|arg| !matches!(arg, Raw::Comma))
+        .map(|arg| match arg {
+            Raw::Ident(name) if name == "auto" => Some(None),
+            other => crate::value::parse_length(other).map(Some),
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [top, right, bottom, left] = sides.as_slice() else {
+        return None;
+    };
+    Some(Some(ClipRect {
+        top: *top,
+        right: *right,
+        bottom: *bottom,
+        left: *left,
+    }))
 }
 
 /// Parses a `list-style-type` keyword.
@@ -711,6 +819,67 @@ pub fn parse_clear(name: &str) -> Option<Clear> {
         "left" => Some(Clear::Left),
         "right" => Some(Clear::Right),
         "both" => Some(Clear::Both),
+        _ => None,
+    }
+}
+
+/// The `text-transform` property (CSS 2.1 §16.5).
+///
+/// Applied to the text before it is shaped rather than at paint time, because
+/// it changes how wide the text is: `uppercase` is wider than what it replaced
+/// in every face here, so a line that was measured lowercase would wrap in the
+/// wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextTransform {
+    /// Left as written. The initial value.
+    #[default]
+    None,
+    /// Every character uppercased.
+    Uppercase,
+    /// Every character lowercased.
+    Lowercase,
+    /// The first letter of each word uppercased, the rest left alone.
+    Capitalize,
+}
+
+impl TextTransform {
+    /// Applies the transform to a run of text.
+    ///
+    /// `capitalize` uppercases the first letter of each *word* and leaves the
+    /// rest as the author wrote it — not lowercasing the remainder, which is
+    /// what §16.5 says and what stops `HTML` becoming `Html`.
+    pub fn apply(self, text: &str) -> String {
+        match self {
+            TextTransform::None => text.to_owned(),
+            TextTransform::Uppercase => text.to_uppercase(),
+            TextTransform::Lowercase => text.to_lowercase(),
+            TextTransform::Capitalize => {
+                let mut out = String::with_capacity(text.len());
+                let mut at_start = true;
+                for ch in text.chars() {
+                    if at_start && ch.is_alphanumeric() {
+                        out.extend(ch.to_uppercase());
+                        at_start = false;
+                    } else {
+                        out.push(ch);
+                        // A word boundary is whitespace here. Punctuation does
+                        // not start a new word, so `o'clock` is not `O'Clock`.
+                        at_start = ch.is_whitespace();
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Parses a `text-transform` keyword.
+pub fn parse_text_transform(name: &str) -> Option<TextTransform> {
+    match name {
+        "none" => Some(TextTransform::None),
+        "uppercase" => Some(TextTransform::Uppercase),
+        "lowercase" => Some(TextTransform::Lowercase),
+        "capitalize" => Some(TextTransform::Capitalize),
         _ => None,
     }
 }
@@ -986,6 +1155,45 @@ pub struct ComputedStyle {
     pub caption_side: CaptionSide,
     /// `visibility`, inherited. A hidden box keeps its space.
     pub visibility: Visibility,
+    /// `text-transform`, inherited.
+    pub text_transform: TextTransform,
+    /// `letter-spacing` in pixels, inherited. Zero is `normal`.
+    pub letter_spacing: f32,
+    /// `text-indent`, inherited, applied to a block's first line.
+    ///
+    /// Kept as a length because it may be a percentage, which resolves against
+    /// the containing block's width and so cannot be settled in the cascade.
+    pub text_indent: Length,
+    /// A lower bound on the used height, which `height` is clamped to.
+    ///
+    /// `Auto` means no bound, as it does for `max_width`.
+    pub min_height: Length,
+    /// An upper bound on the used height.
+    ///
+    /// `Auto` means no bound. Where both apply, `min_height` wins: §10.7
+    /// applies the maximum first and the minimum second, so a box asked to be
+    /// at most 10px and at least 20px is 20px.
+    pub max_height: Length,
+    /// Generated content, already resolved to the text it stands for.
+    ///
+    /// Only ever set on a `::before` or `::after` style. Resolved in the
+    /// cascade rather than carried as a value list because every form in
+    /// scope here — a string, `attr()` — is known there, and the originating
+    /// element is in hand for `attr()`, which it is not by layout time.
+    ///
+    /// `None` is `content: none` and `content: normal`, both of which mean the
+    /// pseudo-element generates no box at all.
+    pub content: Option<String>,
+    /// `clip`, and `None` for `auto` — no clipping at all.
+    ///
+    /// Only consulted on an absolutely positioned box, which is the only
+    /// place CSS 2.1 §11.1.2 gives it any meaning.
+    pub clip: Option<ClipRect>,
+    /// `z-index`, and `None` for `auto`.
+    ///
+    /// Only consulted on a positioned box, which is the only place §9.9 gives
+    /// it any meaning.
+    pub z_index: Option<i32>,
     /// `font-family`, inherited.
     pub font_family: FontStack,
     /// `font-size` in pixels, inherited.
@@ -1022,18 +1230,38 @@ pub struct ComputedStyle {
     pub width: Length,
     /// An upper bound on the used width, which `width` is clamped to.
     ///
-    /// `Auto` means no bound. Only the maximum is modelled: `min-width` has no
-    /// use here yet, and a property that is parsed and ignored is worse than
-    /// one that is absent — it reads as supported.
+    /// `Auto` means no bound.
     pub max_width: Length,
+    /// A lower bound on the used width, applied after `max_width` (§10.4).
+    ///
+    /// `Auto` means no bound, as it does for `max_width`. This used to be
+    /// absent on the grounds that nothing needed it — a property parsed and
+    /// ignored reads as supported, which is worse than one that is missing.
+    /// Wikipedia's stylesheet asks for it 33 times.
+    pub min_width: Length,
     /// `height`.
     pub height: Length,
+    /// `counter-reset`, as `(name, value)` pairs in source order (§12.4).
+    ///
+    /// A list because one declaration can reset several counters, and their
+    /// order matters when two of them share a name.
+    pub counter_reset: Vec<(String, i32)>,
+    /// `counter-increment`, as `(name, delta)` pairs in source order.
+    pub counter_increment: Vec<(String, i32)>,
 }
 
-/// The CSS 2.1 initial value of `border-spacing`.
+/// What a `<table>` element gets for `border-spacing` when nothing says
+/// otherwise.
 ///
 /// Two pixels, and it matters: getting it wrong by 2px per edge is plainly
 /// visible on a dense table, which the era's pages are full of.
+///
+/// **Not the initial value.** §17.6.1 makes that zero; the two pixels are the
+/// HTML user-agent sheet's rule for the `table` *element*, and applying them
+/// as the initial value instead gave every `display: table` box a gap it never
+/// asked for. That is invisible in era markup, where a table is always a
+/// `<table>`, and plainly wrong on a table built out of `display` values —
+/// which is most of the CSS 2.1 suite's tables, and a modern page's.
 pub const DEFAULT_BORDER_SPACING: f32 = 2.0;
 
 /// The initial font size, and the basis for `em` at the root.
@@ -1052,11 +1280,20 @@ impl Default for ComputedStyle {
             background_repeat: BackgroundRepeat::Repeat,
             background_position: BackgroundPosition::default(),
             overflow: Overflow::Visible,
-            vertical_align: VerticalAlign::Middle,
-            border_spacing: Length::Px(DEFAULT_BORDER_SPACING),
+            vertical_align: VerticalAlign::Baseline,
+            border_spacing: Length::Px(0.0),
             border_collapse: BorderCollapse::Separate,
             caption_side: CaptionSide::Top,
             visibility: Visibility::Visible,
+            text_transform: TextTransform::None,
+            letter_spacing: 0.0,
+            text_indent: Length::Px(0.0),
+            min_height: Length::Auto,
+            max_height: Length::Auto,
+            content: None,
+            clip: None,
+            min_width: Length::Auto,
+            z_index: None,
             font_family: FontStack::default(),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -1076,6 +1313,8 @@ impl Default for ComputedStyle {
             width: Length::Auto,
             max_width: Length::Auto,
             height: Length::Auto,
+            counter_reset: Vec::new(),
+            counter_increment: Vec::new(),
         }
     }
 }
@@ -1102,6 +1341,9 @@ impl ComputedStyle {
             // §11.2: hiding a container hides what is inside it, and a
             // descendant can set `visible` to come back out.
             visibility: parent.visibility,
+            text_transform: parent.text_transform,
+            letter_spacing: parent.letter_spacing,
+            text_indent: parent.text_indent,
             ..Self::default()
         }
     }
@@ -1120,6 +1362,27 @@ pub fn parse_display(name: &str) -> Option<Display> {
 #[cfg(test)]
 mod marker_tests {
     use super::*;
+
+    #[test]
+    fn capitalize_uppercases_word_starts_and_leaves_the_rest_alone() {
+        // §16.5 capitalises the first letter of each word and says nothing
+        // about the others, so `HTML` stays `HTML`. Lowercasing the remainder
+        // is the obvious-looking mistake and it mangles every acronym on the
+        // page.
+        let cap = |s: &str| TextTransform::Capitalize.apply(s);
+        assert_eq!(cap("hello world"), "Hello World");
+        assert_eq!(cap("the HTML spec"), "The HTML Spec");
+        // Punctuation does not start a word, or `o'clock` becomes `O'Clock`.
+        assert_eq!(cap("o'clock"), "O'clock");
+        assert_eq!(cap("  leading space"), "  Leading Space");
+    }
+
+    #[test]
+    fn the_other_transforms_are_wholesale() {
+        assert_eq!(TextTransform::Uppercase.apply("MiXeD"), "MIXED");
+        assert_eq!(TextTransform::Lowercase.apply("MiXeD"), "mixed");
+        assert_eq!(TextTransform::None.apply("MiXeD"), "MiXeD");
+    }
 
     #[test]
     fn unordered_markers_are_a_fixed_glyph() {

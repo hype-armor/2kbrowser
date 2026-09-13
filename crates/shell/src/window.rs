@@ -50,6 +50,38 @@ const SCROLL_STEP: f32 = 60.0;
 /// Multiplier applied to line-based mouse wheel deltas.
 const WHEEL_LINE_HEIGHT: f32 = 40.0;
 
+/// The zoom levels, in order.
+///
+/// A fixed table rather than a multiplier applied to wherever the reader
+/// happens to be. Two reasons, and both are about being able to get back: a
+/// multiplier leaves 100% unreachable — in and out again lands on 99.99% —
+/// and it puts every reader on a different set of sizes depending on how they
+/// arrived. These are the steps browsers have settled on.
+const ZOOM_STEPS: &[f32] = &[
+    0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
+/// Where 100% sits in that table.
+const ZOOM_DEFAULT: usize = 4;
+
+/// The zoom `steps` notches from `now` along [`ZOOM_STEPS`].
+///
+/// Clamped at both ends rather than wrapping: a reader holding Ctrl and
+/// scrolling wants the biggest text there is, not the smallest.
+///
+/// A zoom that is not in the table — which nothing can produce today, since
+/// every value comes from here — is treated as 100%, so the next press lands
+/// somewhere the reader recognises instead of somewhere arbitrary.
+fn stepped_zoom(now: f32, steps: i32) -> f32 {
+    let at = ZOOM_STEPS
+        .iter()
+        .position(|step| (step - now).abs() < f32::EPSILON)
+        .unwrap_or(ZOOM_DEFAULT);
+    let to = at
+        .saturating_add_signed(steps as isize)
+        .min(ZOOM_STEPS.len() - 1);
+    ZOOM_STEPS[to]
+}
+
 /// Turns what someone typed into a URL.
 ///
 /// A bare host is the overwhelmingly common case and has to work: typing
@@ -169,7 +201,9 @@ fn title_for(source: &str, mode: &RenderMode, error: Option<&str>) -> String {
     }
     match mode {
         RenderMode::Authored => format!("{source} — 2kbrowser"),
-        RenderMode::Document { .. } => format!("{source} — rendered as document — 2kbrowser"),
+        RenderMode::Document { .. } | RenderMode::DocumentFrame { .. } => {
+            format!("{source} — rendered as document — 2kbrowser")
+        }
         RenderMode::RequiresScripting => format!("{source} — needs JavaScript — 2kbrowser"),
     }
 }
@@ -201,6 +235,12 @@ struct Tab {
     /// classification did not give one to (ADR-0009). Reset on navigation for
     /// the same reason, and never true at the same time as `forcing_authored`.
     forcing_document: bool,
+    /// How much bigger than its own pixels this page is drawn (#55).
+    ///
+    /// Per tab and *not* reset on navigation, unlike the layout overrides: a
+    /// reader who zooms in has made a decision about their eyes, not about the
+    /// page, and the next page needs it just as much.
+    zoom: f32,
     /// Whether this page is in a layout decision the reader can change.
     can_toggle_layout: bool,
     /// Whether this page's certificate verified only against a local root.
@@ -213,6 +253,10 @@ struct Tab {
     finding: Option<crate::field::Field>,
     /// Where the current query matches, in canvas coordinates.
     matches: Vec<layout::Rect>,
+    /// Where the reader's selection is, one rectangle per line (#53).
+    selection: Vec<layout::Rect>,
+    /// The selected text itself, for the clipboard.
+    selected: String,
     /// Which match the reader is on.
     current_match: usize,
     /// Which link has keyboard focus, as an index into `link_groups()`.
@@ -238,10 +282,13 @@ impl Tab {
             error: None,
             forcing_authored: false,
             forcing_document: false,
+            zoom: 1.0,
             can_toggle_layout: false,
             local_root: false,
             finding: None,
             matches: Vec::new(),
+            selection: Vec::new(),
+            selected: String::new(),
             current_match: 0,
             focused_link: None,
             focused_rects: Vec::new(),
@@ -373,13 +420,26 @@ struct App {
     /// pointer the moment it is pressed, which would move the page before the
     /// drag had begun.
     dragging: Option<f32>,
+    /// The context menu, while one is open (#54).
+    menu: Option<crate::menu::Menu>,
+    /// The system clipboard, opened on the first copy and then kept.
+    ///
+    /// `None` until something is copied, and still `None` where there is no
+    /// clipboard to be had.
+    clipboard: Option<arboard::Clipboard>,
+    /// Where a text selection drag started, in document coordinates.
+    ///
+    /// `None` when the pointer is not selecting. Set on press rather than on
+    /// the first move, because the anchor is where the press was and by the
+    /// time a move arrives the pointer is somewhere else.
+    selecting: Option<(f32, f32)>,
     /// Which colour scheme the chrome draws in.
     theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
     modifiers: winit::event::Modifiers,
     /// The chrome bar, redrawn whenever what it says changes.
     chrome: paint::Pixmap,
-    /// The tab strip. Empty when there is only one tab.
+    /// The tab strip, which is always drawn: it carries the new-tab button.
     strip: paint::Pixmap,
     /// The URL bar when it has focus. `None` means it is showing where you
     /// are rather than accepting where you want to go.
@@ -507,7 +567,13 @@ impl App {
             // anything at all: `resize` renders with whatever the viewport was
             // last told, so a press that updated only the tab moved the word on
             // the button and nothing else.
-            Some(page) => page.set_forcing(tab.forcing_authored, tab.forcing_document, width, band),
+            Some(page) => page.set_view(
+                tab.forcing_authored,
+                tab.forcing_document,
+                tab.zoom,
+                width,
+                band,
+            ),
             None => match crate::viewport::Viewport::open(
                 renderer,
                 tab.loaded.clone(),
@@ -515,6 +581,7 @@ impl App {
                 band,
                 tab.forcing_authored,
                 tab.forcing_document,
+                tab.zoom,
             ) {
                 Ok(page) => {
                     // How a band painted on another thread reaches a window
@@ -541,6 +608,13 @@ impl App {
             tab.can_toggle_layout = page.can_toggle_layout();
             tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
         }
+
+        // The old selection pointed at the old layout, and unlike a query there
+        // is nothing to re-run it from: the two points it was dragged between
+        // are where the pointer was on a page that has reflowed. Dropped rather
+        // than moved, which is what every browser does on a resize.
+        tab.selection.clear();
+        tab.selected.clear();
 
         // The old matches pointed at the old layout.
         if let Some(query) = tab.finding.as_ref().map(|field| field.text().to_owned()) {
@@ -873,10 +947,38 @@ impl App {
 
     /// Follows the focused link, if there is one.
     fn follow_focused_link(&mut self) {
-        let Some(url) = self.focused().map(|link| link.url) else {
+        let Some(link) = self.focused() else {
             return;
         };
-        self.navigate(url);
+        self.follow(link.url, link.jump_to);
+    }
+
+    /// Follows a link: another page to fetch, or a place on this one.
+    fn follow(&mut self, url: String, jump_to: Option<f32>) {
+        match jump_to {
+            Some(top) => self.jump_to(top),
+            None => self.navigate(url),
+        }
+    }
+
+    /// Scrolls so `top` is the first row of the page area.
+    ///
+    /// What following a fragment link does. Unlike [`Self::scroll_into_view`]
+    /// it moves even when the destination is already on screen: `#Etymology`
+    /// means put me at the etymology, and leaving the page where it was
+    /// because the heading happens to be visible reads as the link not
+    /// working at all.
+    fn jump_to(&mut self, top: f32) {
+        let Some(page) = &self.tab().page else { return };
+        let height = page.scrollable_height();
+        let viewport = self.viewport_height();
+        self.tab_mut().scroll = clamp_scroll(top, height, viewport);
+        // A fragment can name anything on the page, so this is the case most
+        // likely to land outside the band that is painted.
+        self.refresh_band();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// The focused link, looked up afresh.
@@ -901,6 +1003,148 @@ impl App {
             self.tab_mut().focused_link = None;
         }
         self.tab_mut().focused_rects = rects;
+    }
+
+    /// Moves the zoom `steps` notches along [`ZOOM_STEPS`].
+    ///
+    /// Steps rather than a multiplier, so that zooming in and back out returns
+    /// to exactly 100% rather than to 99.99%, and so that every reader lands
+    /// on the same set of sizes rather than on wherever the wheel left them.
+    fn zoom_by(&mut self, steps: i32) {
+        self.set_zoom(stepped_zoom(self.tab().zoom, steps));
+    }
+
+    /// Draws this tab's page again at `zoom`.
+    ///
+    /// A re-render and not a redraw, which is the whole point: the text is
+    /// shaped at the new size rather than a finished rendering being
+    /// stretched, so it stays sharp and reflows to the window.
+    fn set_zoom(&mut self, zoom: f32) {
+        if (self.tab().zoom - zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.tab_mut().zoom = zoom;
+        // The page reflows, so the row that was on screen is not the row that
+        // will be. Back to the top, which is what a resize does and for the
+        // same reason.
+        self.tab_mut().scroll = 0.0;
+        self.rerender();
+    }
+
+    /// Extends the selection to wherever the pointer is now.
+    ///
+    /// The answer comes from the child, because the text and its geometry are
+    /// in the box tree and the box tree is over there. One round trip per
+    /// pointer move sounds extravagant and is what find already does per
+    /// keystroke: the message is two points and the answer is a few rectangles.
+    fn extend_selection(&mut self) {
+        let Some(from) = self.selecting else { return };
+        let Some(to) = document_point(self.pointer, self.chrome_height(), self.tab().scroll) else {
+            return;
+        };
+        let Some(page) = self.tabs.active_mut().page.as_mut() else {
+            return;
+        };
+        let (rects, text) = page.select(from, to);
+        self.tab_mut().selection = rects;
+        self.tab_mut().selected = text;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Opens the context menu under the pointer.
+    ///
+    /// What goes in it is what the pointer is on: a link brings its own two
+    /// entries, and the page's own three are always there. Nothing is greyed
+    /// out — an entry that cannot do anything is left out, which is shorter to
+    /// read and cannot be clicked in hope.
+    fn open_menu(&mut self) {
+        let items = crate::menu::items_for(
+            self.link_under_pointer(),
+            !self.tab().selected.is_empty(),
+            self.tab().history.can_go_back(),
+            self.tab().history.can_go_forward(),
+        );
+        self.menu = crate::menu::Menu::open(self.pointer, items, self.size);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Drops the selection, which is what pressing anywhere does.
+    fn clear_selection(&mut self) {
+        if self.tab().selection.is_empty() && self.tab().selected.is_empty() {
+            return;
+        }
+        self.tab_mut().selection.clear();
+        self.tab_mut().selected.clear();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Puts the selected text on the system clipboard.
+    ///
+    /// Silent when there is nothing selected: the alternative is an error box
+    /// for a keystroke the reader may have pressed by accident, about a thing
+    /// they can see did not happen.
+    fn copy_selection(&mut self) {
+        let text = self.tab().selected.clone();
+        if !text.is_empty() {
+            self.copy(text);
+        }
+    }
+
+    /// Acts on whatever the pointer is over, and closes the menu.
+    fn choose_from_menu(&mut self) {
+        let Some(menu) = self.menu.take() else { return };
+        let chosen = menu
+            .item_at(self.pointer.0, self.pointer.1)
+            .and_then(|index| menu.items.get(index).cloned());
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        match chosen {
+            Some(crate::menu::Item::Back) => self.go_back(),
+            Some(crate::menu::Item::Forward) => self.go_forward(),
+            Some(crate::menu::Item::Reload) => self.reload(),
+            Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
+            Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
+            Some(crate::menu::Item::CopySelection) => self.copy_selection(),
+            // A click outside the menu dismisses it and does nothing else.
+            None => {}
+        }
+    }
+
+    /// Puts `text` on the system clipboard.
+    ///
+    /// The handle is opened once and then kept, which is not an optimisation:
+    /// on X11 the clipboard is *owned* by a running process rather than stored
+    /// anywhere, so a handle opened, written and dropped takes the text with
+    /// it and a paste a moment later gets whatever was there before.
+    ///
+    /// Silent when there is no clipboard to be had — a headless session, a
+    /// compositor that offers none. The alternative is an error box about a
+    /// thing the reader can see did not happen.
+    fn copy(&mut self, text: String) {
+        let clipboard = match &mut self.clipboard {
+            Some(clipboard) => clipboard,
+            None => match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard.insert(clipboard),
+                Err(_) => return,
+            },
+        };
+        let _ = clipboard.set_text(text);
+    }
+
+    /// Closes the menu if one is open. Whether there was one to close.
+    fn close_menu(&mut self) -> bool {
+        let had = self.menu.take().is_some();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
     }
 
     /// Scrolls `bounds` into view, if it is not already.
@@ -1175,6 +1419,12 @@ impl App {
     /// The pointer is in window coordinates; the page starts below the bar and
     /// is scrolled, so both have to come off before the page can be asked.
     fn link_under_pointer(&self) -> Option<String> {
+        self.target_under_pointer().map(|(url, _)| url)
+    }
+
+    /// The same, with where on this page the link goes if it does not leave
+    /// it.
+    fn target_under_pointer(&self) -> Option<(String, Option<f32>)> {
         // The scrollbar is on top of the page, so a link beneath it is not
         // under the pointer — it is under the bar. Answered here rather than at
         // each caller so that the cursor, a click and a middle-click cannot
@@ -1184,7 +1434,8 @@ impl App {
         }
         let page = self.tab().page.as_ref()?;
         let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
-        page.link_at(x, y).map(str::to_owned)
+        page.target_at(x, y)
+            .map(|(url, jump_to)| (url.to_owned(), jump_to))
     }
 
     /// Where the pointer falls on the scrollbar, if it falls on one at all.
@@ -1214,9 +1465,9 @@ impl App {
         self.scroll_by(to - self.tab().scroll);
     }
 
-    /// Total chrome height: the URL bar, plus the tab strip when there is one.
+    /// Total chrome height: the URL bar and the tab strip above it.
     fn chrome_height(&self) -> u32 {
-        crate::chrome::total_height(self.tabs.len())
+        crate::chrome::total_height()
     }
 
     /// Height of the page area, which is the window less the chrome.
@@ -1254,6 +1505,9 @@ impl App {
             strip,
             size,
             loading,
+            menu,
+            fonts,
+            theme,
             ..
         } = self;
         let tab = tabs.active();
@@ -1272,11 +1526,7 @@ impl App {
 
         let offset = tab.scroll as u32;
         let viewport_width = width.get() as usize;
-        let strip_height = if tabs.len() > 1 {
-            crate::chrome::TAB_HEIGHT.min(height.get())
-        } else {
-            0
-        };
+        let strip_height = crate::chrome::TAB_HEIGHT.min(height.get());
         let bar_height = (strip_height + crate::chrome::HEIGHT).min(height.get());
 
         // The strip, then the bar, across the top.
@@ -1340,6 +1590,16 @@ impl App {
                 buffer[start..].fill(0x00ff_ffff);
             }
         }
+        // Under the find highlights, so a search inside a selection still
+        // stands out. Both are tints rather than fills, so the text reads
+        // through either.
+        highlight_selection(
+            &mut buffer,
+            &tab.selection,
+            tab.scroll,
+            (width.get(), height.get()),
+            bar_height,
+        );
         highlight_matches(
             &mut buffer,
             &tab.matches,
@@ -1355,6 +1615,32 @@ impl App {
             (width.get(), height.get()),
             bar_height,
         );
+        // Over everything else, including the bar: a menu is in front of the
+        // window by definition, and one opened near the top would otherwise
+        // disappear under the chrome it overlaps.
+        if let Some(menu) = menu {
+            let pixmap = menu.render(fonts, *theme);
+            let rect = menu.rect();
+            for row in 0..pixmap.height() {
+                let y = rect.y as u32 + row;
+                if y >= height.get() {
+                    break;
+                }
+                for column in 0..pixmap.width() {
+                    let x = rect.x as u32 + column;
+                    if x >= width.get() {
+                        break;
+                    }
+                    let Some(pixel) = pixmap
+                        .pixels()
+                        .get((row * pixmap.width() + column) as usize)
+                    else {
+                        continue;
+                    };
+                    buffer[(y * width.get() + x) as usize] = pack(pixel);
+                }
+            }
+        }
         // Over everything, because it is about the window rather than about
         // the page under it, and a page can be any colour at all.
         draw_loading(
@@ -1433,11 +1719,19 @@ fn compose_row(
     let source_start = source_row as usize * page_width as usize * 4;
     for (column, slot) in out.iter_mut().enumerate() {
         // Premultiplied RGBA as it crossed the pipe, packed to the 0RGB
-        // softbuffer wants. Bounds-checked per pixel because the row may be
-        // narrower than the window after a resize the child has not caught up
-        // with.
+        // softbuffer wants.
+        //
+        // Stopping at the row's own end is the whole of it. A band narrower
+        // than the window — a resize the child has not caught up with — has no
+        // pixel for the columns past it, and a flat array does not run out
+        // there: it runs into the *next row*. Widening a window drew the page
+        // twice, the second copy sheared one row up, because every row was
+        // finished off with the beginning of the row below it.
         let at = source_start + column * 4;
-        *slot = match pixels.get(at..at + 3) {
+        *slot = match pixels
+            .get(at..at + 3)
+            .filter(|_| column < page_width as usize)
+        {
             Some(rgb) => (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]),
             None => blank,
         };
@@ -1563,7 +1857,6 @@ fn highlight_matches(
     size: (u32, u32),
     bar_height: u32,
 ) {
-    let (width, height) = size;
     for (index, rect) in matches.iter().enumerate() {
         // The current match is stronger, because "which one am I on" is the
         // question the reader is actually asking.
@@ -1572,29 +1865,63 @@ fn highlight_matches(
         } else {
             (255, 240, 150)
         };
-        let top = rect.y - scroll + bar_height as f32;
-        let (x0, x1) = (
-            rect.x.max(0.0) as u32,
-            (rect.x + rect.width).max(0.0) as u32,
-        );
-        let (y0, y1) = (
-            top.max(bar_height as f32) as u32,
-            (top + rect.height).max(0.0) as u32,
-        );
+        tint_rect(buffer, *rect, tint, scroll, size, bar_height);
+    }
+}
 
-        for y in y0..y1.min(height) {
-            for x in x0..x1.min(width) {
-                let Some(pixel) = buffer.get_mut((y * width + x) as usize) else {
-                    continue;
-                };
-                // Multiplied rather than replaced, so the text stays legible
-                // through the highlight instead of being painted over.
-                let blend = |shift: u32, tint: u32| {
-                    let channel = (*pixel >> shift) & 0xff;
-                    ((channel * tint) / 255) << shift
-                };
-                *pixel = blend(16, tint.0) | blend(8, tint.1) | blend(0, tint.2);
-            }
+/// Tints what the reader has selected (#53).
+///
+/// A blue wash, which is what selection has looked like for thirty years, and
+/// a tint rather than a fill for the same reason a match is one: the words
+/// have to stay readable underneath it. That also means it needs no separate
+/// text colour, which a fill would — and a fill over a dark document rendering
+/// would have needed a different one again.
+fn highlight_selection(
+    buffer: &mut [u32],
+    selection: &[layout::Rect],
+    scroll: f32,
+    size: (u32, u32),
+    bar_height: u32,
+) {
+    for rect in selection {
+        tint_rect(buffer, *rect, (120, 170, 255), scroll, size, bar_height);
+    }
+}
+
+/// Multiplies a rectangle of the window by a colour.
+///
+/// Multiplied rather than replaced, so the text stays legible through the
+/// tint instead of being painted over. Shared by the find highlights and the
+/// selection, which differ only in colour.
+fn tint_rect(
+    buffer: &mut [u32],
+    rect: layout::Rect,
+    tint: (u32, u32, u32),
+    scroll: f32,
+    size: (u32, u32),
+    bar_height: u32,
+) {
+    let (width, height) = size;
+    let top = rect.y - scroll + bar_height as f32;
+    let (x0, x1) = (
+        rect.x.max(0.0) as u32,
+        (rect.x + rect.width).max(0.0) as u32,
+    );
+    let (y0, y1) = (
+        top.max(bar_height as f32) as u32,
+        (top + rect.height).max(0.0) as u32,
+    );
+
+    for y in y0..y1.min(height) {
+        for x in x0..x1.min(width) {
+            let Some(pixel) = buffer.get_mut((y * width + x) as usize) else {
+                continue;
+            };
+            let blend = |shift: u32, tint: u32| {
+                let channel = (*pixel >> shift) & 0xff;
+                ((channel * tint) / 255) << shift
+            };
+            *pixel = blend(16, tint.0) | blend(8, tint.1) | blend(0, tint.2);
         }
     }
 }
@@ -1693,7 +2020,16 @@ impl ApplicationHandler<BandReady> for App {
                     MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE_HEIGHT,
                     MouseScrollDelta::PixelDelta(position) => -position.y as f32,
                 };
-                self.scroll_by(pixels);
+                // Ctrl and the wheel is zoom everywhere else, and a reader
+                // who tries it and gets a scroll has been told the browser
+                // cannot do it (#55).
+                if self.modifiers.state().control_key() {
+                    // Up the page is in, which is what every other browser and
+                    // every trackpad has agreed on.
+                    self.zoom_by(if pixels < 0.0 { 1 } else { -1 });
+                } else {
+                    self.scroll_by(pixels);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
@@ -1704,6 +2040,23 @@ impl ApplicationHandler<BandReady> for App {
                 if let Some(held) = self.dragging {
                     let top = self.pointer.1 - self.chrome_height() as f32 - held;
                     self.drag_thumb_to(top);
+                    return;
+                }
+                // A menu takes the pointer while it is open: the row under it
+                // lights up, and nothing behind it is asked about — including
+                // a selection the press before it started.
+                if let Some(menu) = &mut self.menu {
+                    let hovered = menu.item_at(self.pointer.0, self.pointer.1);
+                    if hovered != menu.hovered {
+                        menu.hovered = hovered;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                if self.selecting.is_some() {
+                    self.extend_selection();
                     return;
                 }
                 // The cursor says whether there is a link here, which is how a
@@ -1747,7 +2100,16 @@ impl ApplicationHandler<BandReady> for App {
                     self.dragging = Some(height / 2.0);
                     self.drag_thumb_to(y - height / 2.0);
                 }
-                None => {}
+                // Not on the bar: a press on the page is where a selection
+                // starts. Whether it turns out to be one is decided on release
+                // — a press that never moved is a click.
+                None => {
+                    self.selecting =
+                        document_point(self.pointer, self.chrome_height(), self.tab().scroll);
+                    if self.selecting.is_some() {
+                        self.clear_selection();
+                    }
+                }
             },
             WindowEvent::MouseInput {
                 state: ElementState::Released,
@@ -1755,30 +2117,49 @@ impl ApplicationHandler<BandReady> for App {
                 ..
             } => match button {
                 MouseButton::Left => {
+                    // An open menu owns the next click, wherever it lands: on
+                    // an entry it chooses, anywhere else it dismisses. Either
+                    // way the click does not also reach the page under it.
+                    if self.menu.is_some() {
+                        self.choose_from_menu();
+                        return;
+                    }
                     // Letting go of the thumb is not a click on whatever the
                     // pointer happens to be over by then.
                     if self.dragging.take().is_some() {
                         return;
                     }
+                    // Nor is letting go of a selection. A press that moved was
+                    // a drag across the text and not a click on whatever is
+                    // under the pointer at the end of it — which on a page of
+                    // prose is very often a link.
+                    self.selecting = None;
+                    if !self.tab().selected.is_empty() {
+                        return;
+                    }
                     // The bar owns the top of the window, so it gets first
                     // refusal on a click there.
-                    let strip_height = if self.tabs.len() > 1 {
-                        crate::chrome::TAB_HEIGHT as f32
-                    } else {
-                        0.0
-                    };
-                    if self.pointer.1 < strip_height {
-                        if let Some((index, on_close)) = crate::chrome::tab_at(
+                    if self.pointer.1 < crate::chrome::TAB_HEIGHT as f32 {
+                        match crate::chrome::strip_click(
                             self.tabs.len(),
                             self.size.0 as f32,
                             self.pointer.0,
                             self.pointer.1,
                         ) {
-                            if on_close {
+                            // A new tab shows the page you are on, which is
+                            // what Ctrl+T does and the only thing this browser
+                            // could put there.
+                            Some(crate::chrome::StripClick::NewTab) => {
+                                let url = self.tab().history.current().to_owned();
+                                self.open_tab(&url);
+                            }
+                            Some(crate::chrome::StripClick::Close(index)) => {
                                 self.close_tab(index);
-                            } else {
+                            }
+                            Some(crate::chrome::StripClick::Select(index)) => {
                                 self.select_tab(index);
                             }
+                            None => {}
                         }
                     } else if self.pointer.1 < self.chrome_height() as f32 {
                         match self.control_under_pointer() {
@@ -1801,8 +2182,8 @@ impl ApplicationHandler<BandReady> for App {
                         // A click on the page is a click on the page, even if
                         // it is not on a link: the URL bar loses focus.
                         self.cancel_editing();
-                        if let Some(url) = self.link_under_pointer() {
-                            self.navigate(url);
+                        if let Some((url, jump_to)) = self.target_under_pointer() {
+                            self.follow(url, jump_to);
                         }
                     }
                 }
@@ -1813,6 +2194,11 @@ impl ApplicationHandler<BandReady> for App {
                         self.open_tab(&url);
                     }
                 }
+                // The right-hand button opens the menu, and does it on
+                // release rather than on press so that it can be opened and
+                // chosen from with one press-move-release, the way a menu has
+                // always worked.
+                MouseButton::Right => self.open_menu(),
                 // The mouse's own back and forward buttons, which people who
                 // have them use constantly.
                 MouseButton::Back => self.go_back(),
@@ -1853,6 +2239,28 @@ impl ApplicationHandler<BandReady> for App {
                         }
                         Key::Character(c) if c == "w" => {
                             self.close_tab(self.tabs.active_index());
+                            return;
+                        }
+                        // The keyboard half of zoom. `+` is shifted on most
+                        // layouts and unshifted on some, so both spellings are
+                        // taken rather than asking the reader which keyboard
+                        // they own.
+                        Key::Character(c) if c == "+" || c == "=" => {
+                            self.zoom_by(1);
+                            return;
+                        }
+                        Key::Character(c) if c == "-" || c == "_" => {
+                            self.zoom_by(-1);
+                            return;
+                        }
+                        Key::Character(c) if c == "0" => {
+                            self.set_zoom(ZOOM_STEPS[ZOOM_DEFAULT]);
+                            return;
+                        }
+                        // Copy what is selected. Where every program has put
+                        // it, and the reason selection is worth having.
+                        Key::Character(c) if c == "c" => {
+                            self.copy_selection();
                             return;
                         }
                         // Ctrl+D saves and Ctrl+B shows the list, which is
@@ -1952,7 +2360,9 @@ impl ApplicationHandler<BandReady> for App {
                     // up the window: quitting out from under someone who only
                     // meant to drop a focus ring would be unforgivable.
                     Key::Named(NamedKey::Escape) => {
-                        if !self.clear_focused_link() {
+                        // An open menu is the innermost thing in progress, so
+                        // it is the first thing Escape gives up.
+                        if !self.close_menu() && !self.clear_focused_link() {
                             event_loop.exit();
                         }
                     }
@@ -2039,6 +2449,9 @@ pub fn open(
         over_link: false,
         loading: None,
         dragging: None,
+        selecting: None,
+        menu: None,
+        clipboard: None,
         theme: crate::chrome::Theme::LIGHT,
         modifiers: winit::event::Modifiers::default(),
         chrome: paint::Pixmap::new(1, 1).expect("1x1 pixmap"),
@@ -2148,7 +2561,7 @@ mod tests {
 
     #[test]
     fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
-        let chrome = crate::chrome::total_height(1);
+        let chrome = crate::chrome::total_height();
         assert_eq!(document_point((10.0, 0.0), chrome, 0.0), None);
         assert_eq!(
             document_point((10.0, chrome as f32 - 1.0), chrome, 0.0),
@@ -2163,7 +2576,7 @@ mod tests {
 
     #[test]
     fn scrolling_moves_the_document_under_the_pointer() {
-        let chrome = crate::chrome::total_height(1);
+        let chrome = crate::chrome::total_height();
         let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, scroll);
         assert_eq!(at(0.0), Some((0.0, 100.0)));
         assert_eq!(at(973.0), Some((0.0, 1073.0)));
@@ -2183,29 +2596,59 @@ mod tests {
         // browser where they disagree paints a link in one place and follows it
         // from another. This is the check that was missing when the bar grew
         // from 34 pixels to 46.
-        for tabs in [1_usize, 2, 5] {
-            let chrome = crate::chrome::total_height(tabs);
-            // Exactly how `draw` computes it, from the same constants.
-            let strip = if tabs > 1 {
-                crate::chrome::TAB_HEIGHT
-            } else {
-                0
-            };
-            let bar = strip + crate::chrome::HEIGHT;
-            for row in [bar, bar + 1, bar + 250, bar + 4000] {
-                for scroll in [0_u32, 1, 973, 10_000] {
-                    let drawn = row - bar + scroll;
-                    let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
-                        .expect("a row at or below the bar is on the page");
-                    assert_eq!(
-                        hit as u32, drawn,
-                        "tabs={tabs} row={row} scroll={scroll}: drawn {drawn}, hit {hit}"
-                    );
-                }
+        let chrome = crate::chrome::total_height();
+        // Exactly how `draw` computes it, from the same constants.
+        let bar = crate::chrome::TAB_HEIGHT + crate::chrome::HEIGHT;
+        for row in [bar, bar + 1, bar + 250, bar + 4000] {
+            for scroll in [0_u32, 1, 973, 10_000] {
+                let drawn = row - bar + scroll;
+                let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
+                    .expect("a row at or below the bar is on the page");
+                assert_eq!(
+                    hit as u32, drawn,
+                    "row={row} scroll={scroll}: drawn {drawn}, hit {hit}"
+                );
             }
         }
     }
     use super::*;
+
+    use super::{ZOOM_DEFAULT, ZOOM_STEPS, stepped_zoom};
+
+    #[test]
+    fn zooming_in_and_back_out_lands_on_a_hundred_percent_exactly() {
+        // The reason the levels are a table and not a multiplier. In and out
+        // again with a multiplier lands on 99.99%, which is a page laid out
+        // very slightly wrong for ever afterwards and no way to say so.
+        let one = ZOOM_STEPS[ZOOM_DEFAULT];
+        assert_eq!(stepped_zoom(stepped_zoom(one, 1), -1), one);
+        assert_eq!(stepped_zoom(stepped_zoom(one, 3), -3), one);
+    }
+
+    #[test]
+    fn zoom_stops_at_both_ends_rather_than_wrapping() {
+        // A reader holding Ctrl and scrolling wants the biggest text there is,
+        // not the smallest.
+        let (smallest, biggest) = (ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
+        assert_eq!(stepped_zoom(biggest, 1), biggest);
+        assert_eq!(stepped_zoom(biggest, 50), biggest);
+        assert_eq!(stepped_zoom(smallest, -1), smallest);
+        assert_eq!(stepped_zoom(smallest, -50), smallest);
+    }
+
+    #[test]
+    fn a_step_goes_one_level_and_not_two() {
+        assert_eq!(stepped_zoom(1.0, 1), ZOOM_STEPS[ZOOM_DEFAULT + 1]);
+        assert_eq!(stepped_zoom(1.0, -1), ZOOM_STEPS[ZOOM_DEFAULT - 1]);
+    }
+
+    #[test]
+    fn a_zoom_off_the_table_is_treated_as_a_hundred_percent() {
+        // Nothing can produce one today; if something ever does, the next
+        // press should land somewhere the reader recognises rather than
+        // somewhere arbitrary.
+        assert_eq!(stepped_zoom(1.234, 1), ZOOM_STEPS[ZOOM_DEFAULT + 1]);
+    }
 
     #[test]
     fn scroll_is_clamped_to_the_document() {
@@ -2323,7 +2766,7 @@ mod entered_url_tests {
 
 #[cfg(test)]
 mod highlight_tests {
-    use super::highlight_matches;
+    use super::{highlight_matches, highlight_selection};
     use layout::Rect;
 
     /// A 4x4 white buffer with no chrome, for arithmetic that is easier to
@@ -2438,6 +2881,63 @@ mod highlight_tests {
     fn no_matches_leaves_the_buffer_alone() {
         let mut buffer = buffer();
         highlight_matches(&mut buffer, &[], 0, 0.0, (4, 4), 0);
+        assert_eq!(tinted(&buffer), 0);
+    }
+
+    #[test]
+    fn a_selection_tints_its_lines_and_nothing_else() {
+        let mut buffer = buffer();
+        highlight_selection(
+            &mut buffer,
+            &[
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4.0,
+                    height: 1.0,
+                },
+                Rect {
+                    x: 0.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 1.0,
+                },
+            ],
+            0.0,
+            (4, 4),
+            0,
+        );
+
+        assert_eq!(tinted(&buffer), 6, "a full line and a partial one");
+    }
+
+    #[test]
+    fn a_selection_tints_rather_than_paints_over() {
+        // The words have to stay readable underneath it, which is also why it
+        // needs no text colour of its own — and why it works over the dark
+        // document rendering as well as over a white page.
+        let mut buffer = vec![0x0080_8080; 16];
+        highlight_selection(
+            &mut buffer,
+            &[Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }],
+            0.0,
+            (4, 4),
+            0,
+        );
+
+        assert_ne!(buffer[0], 0x0080_8080, "nothing was tinted");
+        assert_ne!(buffer[0], 0x0000_0000, "the pixel was painted over");
+    }
+
+    #[test]
+    fn nothing_selected_leaves_the_buffer_alone() {
+        let mut buffer = buffer();
+        highlight_selection(&mut buffer, &[], 0.0, (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
     }
 }
@@ -2561,6 +3061,15 @@ mod focus_outline_tests {
         vec![r, g, b, 0xff, r, g, b, 0xff]
     }
 
+    /// A two-pixel-wide page of several rows, each a different colour.
+    ///
+    /// One row is not enough to test a row against: reading past the end of
+    /// the only row is the one case where it also runs off the end of the
+    /// array, so the bug that mattered could not show itself.
+    fn page(rows: &[(u8, u8, u8)]) -> Vec<u8> {
+        rows.iter().flat_map(|rgb| page_row(*rgb)).collect()
+    }
+
     const DARK: u32 = 0x001c_1b22;
 
     #[test]
@@ -2586,6 +3095,18 @@ mod focus_outline_tests {
         // is still the old width, and the columns past it have no pixel.
         let mut out = [0u32; 4];
         compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
+    }
+
+    #[test]
+    fn the_columns_past_a_narrow_row_are_not_filled_from_the_next_one() {
+        // Widening the window drew the page a second time down the right-hand
+        // side, one row out of step. Each row ran past its own end into the
+        // start of the row below, which is only a hole in the array when there
+        // is no row below.
+        let page = page(&[(0x11, 0x22, 0x33), (0x44, 0x55, 0x66)]);
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &page, Some(0), 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
     }
 }

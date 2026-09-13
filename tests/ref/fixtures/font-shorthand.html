@@ -1,0 +1,40 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; }
+  h3 { font: bold 13px serif; margin: 10px 0 4px 0; }
+  div { background: #eeeeee; width: 300px; margin-bottom: 6px; }
+  .a { font: 20px/1 serif; }
+  .b { font: 20px/2 serif; }
+  .c { font: italic bold 16px serif; }
+  .d { font: bold italic 16px "Liberation Sans", sans-serif; }
+  .e { font: small-caps 700 16px monospace; }
+  .f { font: 16px/10px serif; }
+  .g { font: x-large serif; }
+  /* Resets what it does not mention: neither bold nor italic survives. */
+  .h { font-weight: bold; font-style: italic; line-height: 40px; font: 16px serif; }
+  /* Invalid: no family. The 11px monospace below it must stand. */
+  .i { font-size: 11px; font-family: monospace; font: 20px; }
+  /* A system font cannot be looked up here, so nothing changes. */
+  .j { font-size: 11px; font-family: monospace; font: menu; }
+</style></head><body>
+
+<h3>Size and line height from the shorthand</h3>
+<div class="a">20px on a 20px line</div>
+<div class="b">20px on a 40px line</div>
+<div class="f">16px on a 10px line, which overlaps by design</div>
+
+<h3>Style and weight, in either order</h3>
+<div class="c">italic bold, style first</div>
+<div class="d">italic bold, weight first, sans-serif</div>
+<div class="e">small-caps is accepted and dropped; 700 is bold; monospace</div>
+
+<h3>A keyword size</h3>
+<div class="g">x-large</div>
+
+<h3>The shorthand resets what it does not mention</h3>
+<div class="h">not bold, not italic, on a normal line</div>
+
+<h3>An invalid shorthand changes nothing</h3>
+<div class="i">still 11px monospace</div>
+<div class="j">still 11px monospace</div>
+
+</body></html>

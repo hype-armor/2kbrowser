@@ -1,0 +1,39 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font: 13px/16px serif; }
+  h3 { font: bold 13px serif; margin: 10px 0 4px 0; }
+  div { background: #cce5ff; width: 220px; margin-bottom: 8px; }
+  .cap { max-height: 32px; }
+  .roomy { max-height: 300px; }
+  .both { max-height: 10px; min-height: 60px; }
+  .padded { max-height: 20px; padding: 6px; border: 2px solid #003366; }
+  .pct { max-height: 25%; }
+  .taken-off { height: 60px; max-height: 10px; max-height: none; }
+  .negative { height: 48px; max-height: -1px; min-height: -1px; }
+  .negpad { padding: 8px; padding-top: -5px; }
+</style></head><body>
+
+<h3>A cap shortens a box, and its content overflows rather than being clipped</h3>
+<div class="cap">one<br>two<br>three<br>four</div>
+
+<h3>A cap is not a height: a shorter box is left alone</h3>
+<div class="roomy">one line only</div>
+
+<h3>Asked for both bounds at once, the minimum wins</h3>
+<div class="both">sixty, not ten</div>
+
+<h3>The bound is on the content box, so padding and border are added back</h3>
+<div class="padded">one<br>two<br>three</div>
+
+<h3>A percentage is no bound when the container's height is auto</h3>
+<div class="pct">one<br>two<br>three</div>
+
+<h3>`none` takes an earlier cap back off</h3>
+<div class="taken-off">sixty tall</div>
+
+<h3>A negative bound is invalid, so the box keeps its height</h3>
+<div class="negative">forty-eight tall</div>
+
+<h3>A negative padding is invalid; the eight-pixel padding stands</h3>
+<div class="negpad">padded evenly</div>
+
+</body></html>

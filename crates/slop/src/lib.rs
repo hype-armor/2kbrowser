@@ -194,7 +194,14 @@ pub fn extract(doc: &Document) -> Boilerplate {
     // Everything outside the article, and the furniture that survived inside
     // it: a "share this" bar between two paragraphs is inside the article by
     // every structural measure and is still not part of it.
-    let keep = kept_subtrees(doc, article.chosen, article.best, &scores);
+    let mut keep = kept_subtrees(doc, article.chosen, article.best, &scores);
+    // The page's own title, wherever it lives. `<article><header><h1>` is the
+    // standard shape, and a `<header>` outside an `<article>` is chrome by
+    // every other measure — so the heading that names the page was being
+    // dropped along with the navigation beside it, and the reading view opened
+    // with no title at all.
+    let title = page_title(doc, body, article.chosen);
+    keep.extend(title);
     let mut drop = chrome;
     for node in doc.descendants(body) {
         // Kept, inside something kept, or holding something kept. The last of
@@ -209,6 +216,19 @@ pub fn extract(doc: &Document) -> Boilerplate {
         }
     }
     drop.remove(&body);
+    // The chain of elements holding the title, taken back out of the drop set
+    // rather than never put in it. `drop` starts as the structural chrome, and
+    // the `<header>` a title sits in is chrome by every measure — it is the
+    // navigation's home as much as the title's. Only the chain is rescued, so
+    // the navigation beside the title stays dropped. The title itself is in
+    // `keep` and so was never added.
+    if let Some(title) = title {
+        let mut ancestor = doc.node(title).parent;
+        while let Some(node) = ancestor {
+            drop.remove(&node);
+            ancestor = doc.node(node).parent;
+        }
+    }
 
     Boilerplate {
         dropped: shallowest(doc, body, &drop),
@@ -424,6 +444,33 @@ fn kept_subtrees(
         }
     }
     keep
+}
+
+/// The heading that names the page, if it has one.
+///
+/// An `<h1>`, and nothing cleverer: a page has one title and it is almost
+/// always an `<h1>`. No fallback to `<h2>` — a page without one has no title
+/// worth promoting, and the nearest thing to it is a section heading from the
+/// middle of the article or a tagline from the masthead, either of which
+/// reads as the name of the piece once it is standing above the text.
+///
+/// The article's own comes first, and which way that falls matters: the era's
+/// fashion was `<h1>Site Name</h1>` in the masthead, so on those pages the
+/// first `<h1>` in the document is the site and the second is the piece.
+/// Taking the article's keeps the site's name out of a reading view that
+/// already has a headline. Only when the article has none does the first on
+/// the page stand in — which is the case this was written for, since the
+/// heading naming a Wikipedia article sits in a `<header>` that is chrome by
+/// every other measure.
+///
+/// `None` for a page with no `<h1>` at all, which is common enough: a
+/// hand-written page, or one whose heading is a picture.
+fn page_title(doc: &Document, body: NodeId, article: NodeId) -> Option<NodeId> {
+    let heading = |&node: &NodeId| doc.element(node).is_some_and(|e| e.local_name() == "h1");
+    doc.descendants(article)
+        .into_iter()
+        .find(heading)
+        .or_else(|| doc.descendants(body).into_iter().find(heading))
 }
 
 /// How much each candidate container looks like an article.
@@ -661,6 +708,141 @@ mod tests {
         );
         assert!(text.contains("By A. Writer"), "the byline went: {text}");
         assert!(!text.contains("Site name"), "the masthead survived: {text}");
+    }
+
+    #[test]
+    fn the_pages_title_is_kept_out_of_a_header_that_is_otherwise_chrome() {
+        // Wikipedia's shape, and the reason for the rescue. The `<h1>` naming
+        // the article sits in a `<header>` alongside the site navigation, so
+        // every measure says that header is chrome — and the reading view was
+        // opening on an article with no title on it.
+        let text = kept(&format!(
+            r#"<body><header><h1>Cat</h1><nav>{}</nav></header>
+               <main>{}</main></body>"#,
+            menu(),
+            prose()
+        ));
+        assert!(
+            text.contains("Cat"),
+            "the title went with the header: {text}"
+        );
+        assert!(
+            !text.contains("Section 1"),
+            "the navigation came back with it: {text}"
+        );
+    }
+
+    #[test]
+    fn only_the_titles_own_line_of_ancestors_comes_back() {
+        // The rescue reaches up from the title to the body, and no further
+        // sideways than that. A sibling of the title inside the same dropped
+        // header is still chrome.
+        let text = kept(&format!(
+            r#"<body><header><div class="titles"><h1>Cat</h1></div>
+               <div class="tools"><a href="/edit">Edit this page</a></div></header>
+               <main>{}</main></body>"#,
+            prose()
+        ));
+        assert!(text.contains("Cat"), "the title went: {text}");
+        assert!(
+            !text.contains("Edit this page"),
+            "a sibling of the title came back with it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_title_inside_the_article_and_inside_a_dropped_header_still_comes_back() {
+        // Wikipedia's actual shape, which is not the obvious one: the `<h1>`
+        // is *inside* the container chosen as the article, and still on its
+        // way out, because the `<header>` between them is the navigation's
+        // home and is chrome by every measure. A rule that asked whether the
+        // article has a heading would answer yes and rescue nothing.
+        let text = kept(&format!(
+            r#"<body><main><header><h1>Cat</h1><nav>{}</nav></header>
+               <div>{}</div></main></body>"#,
+            menu(),
+            prose()
+        ));
+        assert!(
+            text.contains("Cat"),
+            "the title went with the header: {text}"
+        );
+        assert!(
+            !text.contains("Section 1"),
+            "the navigation came back with it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_site_name_in_the_masthead_is_not_promoted_over_the_articles_own_headline() {
+        // The era's fashion was `<h1>Site Name</h1>` in the masthead, which
+        // makes the first `<h1>` on the page the site and the second the
+        // piece. An article with a headline of its own is not missing a title
+        // and has nothing to rescue.
+        let text = kept(&format!(
+            r#"<body><header><h1>The Daily Example</h1><nav>{}</nav></header>
+               <article><h1>Headline</h1>{}</article></body>"#,
+            menu(),
+            prose()
+        ));
+        assert!(text.contains("Headline"), "the headline went: {text}");
+        assert!(
+            !text.contains("The Daily Example"),
+            "the site's name was promoted over it: {text}"
+        );
+    }
+
+    #[test]
+    fn the_title_taken_is_the_first_one_and_not_some_later_heading() {
+        // With no heading in the article, the page's own name is the first
+        // `<h1>` on it. A later one — in a footer, in a sidebar — is a
+        // heading over something else entirely.
+        let text = kept(&format!(
+            r#"<body><header><h1>Cat</h1><nav>{}</nav></header>
+               <main>{}</main><footer><h1>Contact us</h1></footer></body>"#,
+            menu(),
+            prose()
+        ));
+        assert!(text.contains("Cat"), "the title went: {text}");
+        assert!(
+            !text.contains("Contact us"),
+            "a footer heading was taken for the title: {text}"
+        );
+    }
+
+    #[test]
+    fn a_tagline_in_the_masthead_is_not_a_title() {
+        // No fallback to `<h2>`. The nearest thing to a title on a page
+        // without one is a site's tagline or a section heading, and either
+        // above the article reads as the name of the piece.
+        let text = kept(&format!(
+            r#"<body><header><h2>All the news, daily</h2><nav>{}</nav></header>
+               <main>{}</main></body>"#,
+            menu(),
+            prose()
+        ));
+        assert!(text.contains("Paragraph 1"), "the article went: {text}");
+        assert!(
+            !text.contains("All the news"),
+            "the tagline was promoted to a title: {text}"
+        );
+    }
+
+    #[test]
+    fn a_section_heading_is_not_promoted_when_the_page_has_no_title() {
+        // No fallback to `<h2>`. A page with no `<h1>` has no title worth
+        // promoting, and the nearest thing to one is a heading from the middle
+        // of the article — which above the chrome would read as the page's.
+        let text = kept(&format!(
+            r#"<body><header><nav>{}</nav></header><main>{}<h2>Etymology</h2></main></body>"#,
+            menu(),
+            prose()
+        ));
+        assert!(
+            !text.contains("Section 1"),
+            "the navigation survived: {text}"
+        );
+        assert!(text.contains("Paragraph 1"), "the article went: {text}");
     }
 
     #[test]

@@ -1,0 +1,30 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 10px 0 4px 0; }
+  .half { width: 300px; background: #eeeeee; padding: 4px; }
+</style></head><body>
+
+<h3>A percentage width fills that share of the line</h3>
+<img src="assets/tile.png" width="100%" height="12" alt="full width">
+<img src="assets/tile.png" width="50%" height="12" alt="half width">
+<img src="assets/tile.png" width="25%" height="12" alt="quarter width">
+
+<h3>It measures the containing block, not the page</h3>
+<div class="half">
+  <img src="assets/tile.png" width="100%" height="12" alt="full width of the box">
+  <img src="assets/tile.png" width="50%" height="12" alt="half the box">
+</div>
+
+<h3>A pixel width still means pixels</h3>
+<img src="assets/tile.png" width="120" height="12" alt="120 pixels">
+
+<h3>CSS beats the attribute</h3>
+<img src="assets/tile.png" width="100%" height="12" style="width: 80px" alt="80 pixels">
+
+<h3>A percentage height is auto, so the image keeps its own size</h3>
+<img src="assets/tile.png" height="50%" alt="intrinsic">
+
+<h3>With no height, a percentage width keeps the aspect ratio</h3>
+<img src="assets/tile.png" width="30%" alt="scaled in proportion">
+
+</body></html>

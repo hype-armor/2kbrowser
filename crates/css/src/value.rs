@@ -32,6 +32,10 @@ pub enum Raw {
     Url(String),
     /// A comma separator, kept because some properties are comma-delimited.
     Comma,
+    /// A `/` separator. Modelled because the `font` shorthand puts one between
+    /// the size and the line height, and without it that value arrives as an
+    /// unmodelled token and the whole declaration is dropped.
+    Slash,
     /// Any token we do not model. Its presence usually invalidates a value.
     Other,
 }
@@ -72,6 +76,7 @@ pub fn read_components(input: &mut Parser<'_, '_>) -> Vec<Raw> {
             Token::Hash(h) | Token::IDHash(h) => Raw::Hash(h.as_ref().to_owned()),
             Token::UnquotedUrl(url) => Raw::Url(url.as_ref().to_owned()),
             Token::Comma => Raw::Comma,
+            Token::Delim('/') => Raw::Slash,
             Token::Function(name) => {
                 let name = name.as_ref().to_ascii_lowercase();
                 let args = input
@@ -275,6 +280,42 @@ pub enum Length {
 }
 
 impl Length {
+    /// The same length with every pixel in it made `factor` times bigger.
+    ///
+    /// What page zoom is. Applied here, as the declaration is computed, rather
+    /// than to the finished layout: a glyph shaped at twice the size is twice
+    /// as sharp, and a glyph *scaled* to twice the size is twice as blurry.
+    /// Doing it to the computed value gets the first for free, and gets
+    /// reflow with it — text at 200% wraps to the window rather than running
+    /// off the side of it.
+    ///
+    /// Only the pixels. `em` follows the font size, which is scaled with
+    /// everything else, and a percentage resolves against a basis that has
+    /// already been scaled — so scaling those too would apply the zoom twice.
+    pub fn scaled(self, factor: f32) -> Self {
+        match self {
+            Length::Px(value) => Length::Px(value * factor),
+            other => other,
+        }
+    }
+
+    /// Whether this length is negative.
+    ///
+    /// CSS 2.1 forbids a negative value for `width`, `height`, the `min-` and
+    /// `max-` bounds, `border-spacing` and padding, and an invalid value means
+    /// the declaration is dropped — the property keeps what it had. The suite
+    /// checks it head-on: `max-height: -1px` on a box with `height: 1in` must
+    /// leave a one-inch square, where a cap of minus one pixel collapses it to
+    /// nothing. `min-height: -1px` and `padding-top: -1px` are tested the same
+    /// way, and margins and offsets are *not*, because a negative one is legal
+    /// there and useful.
+    pub fn is_negative(self) -> bool {
+        match self {
+            Length::Px(value) | Length::Em(value) | Length::Percent(value) => value < 0.0,
+            Length::Auto => false,
+        }
+    }
+
     /// Resolves to pixels. `auto` and percentages need context the caller has.
     pub fn to_px(self, font_size: f32, percent_basis: f32) -> f32 {
         match self {

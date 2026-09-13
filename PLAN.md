@@ -245,6 +245,7 @@ tests/
   ref/      reference tests: render → PNG → compare against expected
   css21/    the official CSS 2.1 test suite, tracked as a pass-rate metric
   budgets/  size, memory, and startup budget enforcement
+  gaps/     what the engine honours, checked against what the docs claim
 docs/adr/   architecture decision records
 ```
 
@@ -262,6 +263,20 @@ Work branches off **`next-release`** and its pull requests target
 `next-release`. Changes collect there and ship to `main` about once a week, as
 one release that somebody read as a whole. `main` is what has shipped;
 `next-release` is what is going to.
+
+**Every branch comes off `next-release` itself.** Not off the branch before it,
+however tempting that is when one change builds on another: a stack of pull
+requests, each based on its predecessor, does not survive its own first merge.
+GitHub deletes a head branch when it merges, and a pull request whose *base*
+branch disappears is closed rather than re-pointed — so merging the bottom of a
+stack silently orphans the one above it, and the ones above that go on merging
+into branches with no route anywhere. That happened here with #37 through #42:
+four sound changes, three of them stranded, and `next-release` left holding
+only the first.
+
+The cost of the flat rule is that two branches touching the same area overlap
+in their diffs and their author resolves a conflict. That is a smaller price
+than a change that was reviewed, approved, and then quietly did not ship.
 
 The reason to collect rather than merge each change straight through is that a
 release is a unit worth reviewing. A dozen changes that are each individually
@@ -367,22 +382,22 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    lays that block out
 
 Known-wrong and recorded rather than hidden: fixed table
-layout, form controls — `<input>`, `<textarea>` and `<button>` draw no widget
-at all, `<fieldset>` no border, and a `<select>` shows its open option without a
-dropdown around it — the properties that parse and are then ignored
-(`text-indent`, `letter-spacing`, `word-spacing`, `text-transform`,
-`font-variant`, `outline`, `min-height`, `max-height`, `text-align: justify`,
-`list-style-position`, `list-style-image`, `clip`, `z-index`, `position: fixed`,
-`border-spacing`'s second value, `direction`, and generated content), a caption wider than its table — which overhangs rather than widening
+layout, forms that draw but do not work — no control can be typed into, clicked
+or submitted, a radio button is square for want of a rounded primitive, and a
+`<legend>` sits above its group rather than breaking the rule around it — the
+properties that parse and are then ignored
+(`word-spacing`, `font-variant`, `outline`, `max-height`,
+`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
+`position: fixed`, `border-spacing`'s second value, `direction`, and generated
+content), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
 `empty-cells` — ignored in the separated model, where it applies, and
 correctly ignored in the collapsing one, where it does not — the corner where
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
-settled here by width rather than by a diagonal mitre, `inline-block` laid out as
-plain `inline` — and counted as unsupported layout for that reason, so a page
-depending on it falls back to a document rather than failing quietly — and
-proper block-in-inline splitting — an inline element containing a block is
+settled here by width rather than by a diagonal mitre, an inline box's own
+border and padding taking up no room on the line — so text after a bordered
+`<span>` wraps a little late — and proper block-in-inline splitting — an inline element containing a block is
 laid out as a block instead, which matches for the shapes that occur but is
 not what CSS 2.1 §9.2.1.1 describes.
 
@@ -966,11 +981,11 @@ names. It has now — `tests/conformance`, pointed at web-platform-tests
 `css/CSS2` (revision `54f8f93`, the suite's current home; the old
 `test.csswg.org` URLs now serve a wiki page for every path).
 
-**1385 of 4821 reference tests pass — 28.7%.** Zero panics across roughly ten
+**3188 of 4821 reference tests pass — 66.1%.** Zero panics across roughly ten
 thousand renders of CSS this engine had never seen, which is the fuzzing in M4
 earning its place.
 
-Three things about that number, in the order they matter.
+Four things about that number, in the order they matter.
 
 **It is an upper bound, not a score.** A reftest passes when a test and its
 reference render the same, and an engine that ignores a property draws both
@@ -979,9 +994,24 @@ sides the same way. Reftests find inconsistency, not absence.
 **Most of the failures are real.** That was not obvious and had to be checked:
 a reftest can also fail because the pair was loosely matched during the suite's
 import into wpt, which is nothing to do with us. Running the same pairs through
-headless Chromium on a random sample of 150 failures: **140 render identically
-there**. So roughly 93% of the ~3,500 failures are this engine's, not the
-suite's.
+headless Chromium on a random sample of 150 failures: **139 render identically
+there**. So roughly 93% of the failures are this engine's, not the suite's.
+That sample was taken again from scratch after the harness fixes below, rather
+than carried forward — the population it describes had changed, and a
+re-used measurement is a stale one wearing a current number's clothes.
+
+**A test can pass because neither side rendered.** Almost every test here is
+XHTML and writes its stylesheet inside `<![CDATA[ … ]]>`. Read as HTML — which
+is how this browser reads everything, and how every browser read the XHTML the
+real web actually served — that wrapper makes CSS error recovery swallow the
+entire stylesheet. Unwrapping it in the harness moved the figure from 30.4% to
+35.5%, but the direction that matters is the other one: **342 tests stopped
+passing**, every one of them a pair with the wrapper on both sides, two lost
+stylesheets and two pages of unstyled prose matching each other exactly. A
+reftest cannot tell "identical" from "identically blank". Nothing here could
+have found those; they surfaced only because a fix aimed elsewhere made them
+move, and the lesson is that a suite of this shape has a *floor* of false
+green that has to be hunted deliberately.
 
 **The harness was wrong three times before the number meant anything.** The
 first published figure, 20.6%, was an artefact of my own tooling, and the errors
@@ -1075,8 +1105,16 @@ error anywhere in its selector is ignored entirely, so
 `[1digit], div { color: red }` must style nothing — the malformed attribute name
 takes the valid `div` with it. This engine keeps the `div` and applies the red.
 The suite catches it the way it catches everything: a page whose whole assertion
-is "no red". `selectors` is the worst-scoring chapter with content — 59 of 463 —
-and this looks like a large share of it.
+is "no red".
+
+`selectors` was for a long time the worst-scoring chapter with content — 62 of
+463 — though most of that was one absence rather than many: **339 of its 401
+failures were `first-letter-punctuation`**, the suite's per-character sweep of
+which punctuation `::first-letter` draws along with the letter. One
+pseudo-element accounted for 7% of the entire suite, which was worth knowing
+before reading the chapter's score as a verdict on selector matching. It is
+implemented now and the chapter reads quite differently; the lesson to keep is
+the one about reading a chapter score, not the number.
 
 Being strict is not the fix, which is the interesting part. Two different
 failures reach the parser as the same "did not parse": syntax that is *invalid*,
@@ -1093,7 +1131,7 @@ things we had noticed; this is the list.
 
 The engine's known gaps — an empty block collapsing through itself, an invalid
 selector not invalidating its rule, fixed table
-layout, `inline-block`, proper block-in-inline splitting — are listed
+layout, proper block-in-inline splitting — are listed
 under M2 and are not scheduled. They are places the browser is wrong rather
 than places it falls over, and none of them is what makes this unsafe.
 
@@ -1181,6 +1219,22 @@ rendering that *changed*; neither can catch a rendering that was never there.
 The same sweep turned up a longer list of properties that parse and are then
 ignored, and the README now names them rather than leaving the gap list to
 mean "the things we happened to notice".
+
+That sweep is now `tests/gaps`, and making it a standing check rather than a
+one-off is the part that matters. It renders each property twice, differing by
+one declaration, and calls it ignored when no pixel moves — which needs no
+browser, since a declaration that changes nothing changed nothing. Each row
+carries the answer the documentation claims and CI fails on a disagreement in
+either direction, so implementing a property *makes* somebody update the gap
+list rather than leaving it to be noticed. The expectations were set against
+headless Chromium once, by hand; repeating that in CI would buy nothing and
+cost a browser as a build dependency.
+
+It is the third harness here and it earns its place by finding what the other
+two cannot. A reftest passes when its two sides render alike, so a property
+both sides ignore passes; a reference baseline only covers what somebody wrote
+a fixture for. Both catch a rendering that changed. Neither catches one that
+was never there, and everything in this section was of that kind.
 
 Table captions were not on that list, because nobody had noticed they were
 missing. They were found while writing up what remained of the collapsing
