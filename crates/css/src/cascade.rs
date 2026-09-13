@@ -1478,6 +1478,15 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
     }
     if let Some(align) = element.attr("align") {
         match align.trim().to_ascii_lowercase().as_str() {
+            // A rule is a box, not text: `align` moves the rule itself, which
+            // only shows once `width` has narrowed it. The centred case needs
+            // nothing — the user-agent sheet's `margin: 0.5em auto` already
+            // centres a narrowed rule, which is what a browser does with no
+            // `align` at all.
+            side @ ("left" | "right") if tag == "hr" => {
+                push("margin-left", if side == "left" { "0" } else { "auto" });
+                push("margin-right", if side == "left" { "auto" } else { "0" });
+            }
             // On an image or table, `align` floats it; elsewhere it aligns text.
             "left" | "right" if matches!(tag, "img" | "table") => push("float", align),
             // `<table align="center">` centres the *table*, not its contents.
@@ -1551,6 +1560,24 @@ fn presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> {
         && let Some(width) = element.attr("width")
     {
         push("width", &attr_length(width));
+    }
+    // `<hr width="50%">` under a heading is one of the most characteristic
+    // things about a page of this era, and `size` is how one drew a heavy
+    // divider. Both were ignored here, so every rule came out full width and
+    // one pixel tall whatever the markup asked for.
+    if tag == "hr" {
+        if let Some(width) = element.attr("width") {
+            push("width", &attr_length(width));
+        }
+        // `size` is the rule's whole thickness, and this engine's rule is a
+        // one-pixel top border over a box of no height — so the height it
+        // wants is one less than the thickness asked for, and a `size` of 1 or
+        // 0 leaves the border to be the whole of it.
+        if let Some(size) = element.attr("size")
+            && let Ok(size) = size.trim().parse::<f32>()
+        {
+            push("height", &format!("{}px", (size - 1.0).max(0.0)));
+        }
     }
     if matches!(tag, "table" | "td" | "th" | "tr")
         && let Some(height) = element.attr("height")

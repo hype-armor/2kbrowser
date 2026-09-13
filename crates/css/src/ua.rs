@@ -64,7 +64,7 @@ center { text-align: -webkit-center; }
 /* A rule is an empty block with a border, which is how every browser has
    drawn it. Without one it is a zero-height box that draws nothing, and the
    era's pages used it constantly as a section divider. */
-hr { margin: 0.5em 0; height: 0; border-top: 1px solid #999999; }
+hr { margin: 0.5em auto; height: 0; border-top: 1px solid #999999; }
 
 /* The table structure is declared here rather than recognised by tag name in
    layout, which is what lets a table built out of `display` values on plain

@@ -5715,6 +5715,60 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_takes_the_width_and_thickness_its_markup_asks_for() {
+        // `<hr width="50%">` under a heading is one of the most characteristic
+        // things about a page of this era, and `size` is how one drew a heavy
+        // divider. Both were ignored: every rule came out full width and a
+        // pixel tall.
+        let rule = |markup: &str| {
+            let rendered = run(
+                &format!("<body>{markup}</body>"),
+                "body { margin: 0 }",
+                600.0,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.node.is_some() && b.style.border.top.used_width(16.0) > 0.0)
+                .expect("the rule")
+                .rect
+        };
+        assert_eq!(
+            rule("<hr>").width,
+            600.0,
+            "a plain rule still fills its line"
+        );
+        assert_eq!(rule(r#"<hr width="200">"#).width, 200.0);
+        assert_eq!(rule(r#"<hr width="50%">"#).width, 300.0);
+        // `size` is the thickness of the whole rule, and this one is a
+        // one-pixel border over a box of no height.
+        assert_eq!(rule(r#"<hr size="8">"#).height, 8.0);
+        assert_eq!(rule(r#"<hr size="1">"#).height, 1.0);
+    }
+
+    #[test]
+    fn a_narrowed_rule_is_centred_unless_it_is_told_otherwise() {
+        // What a browser does with no `align` at all, and what makes a
+        // half-width rule sit under the middle of a heading rather than
+        // against the left margin.
+        let left_edge = |markup: &str| {
+            let rendered = run(
+                &format!("<body>{markup}</body>"),
+                "body { margin: 0 }",
+                600.0,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.node.is_some() && b.style.border.top.used_width(16.0) > 0.0)
+                .expect("the rule")
+                .rect
+                .x
+        };
+        assert_eq!(left_edge(r#"<hr width="200">"#), 200.0, "not centred");
+        assert_eq!(left_edge(r#"<hr width="200" align="left">"#), 0.0);
+        assert_eq!(left_edge(r#"<hr width="200" align="right">"#), 400.0);
+    }
+
+    #[test]
     fn an_inline_element_wrapping_a_block_still_lays_the_block_out() {
         // `<font>…<hr>…</font>` is ordinary markup. Skipped when gathering
         // inline runs and never reached by the block walk, the `<hr>`
