@@ -1,0 +1,79 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font-size: 13px; }
+  h3 { font-size: 13px; margin: 12px 0 4px 0; }
+  table { margin-bottom: 10px; }
+  td, th { padding: 3px 9px; }
+
+  /* §17.5.1's six layers, bottom to top: the table, its column groups, its
+     columns, its row groups, its rows, its cells. An opaque layer hides every
+     one below it, so the two tables below each leave the other's layers out —
+     one table showing all six would show only the top one. */
+
+  /* The lower three. The column group's pink shows in the first and third
+     columns, where no column of its own overrides it; the table's grey shows
+     only in the `border-spacing` gaps, which is the one place §17.6.1 lets it
+     through. */
+  .lower { background: #bbbbbb; border-spacing: 5px; }
+  .lower colgroup { background: #ffcccc; }
+  .lower .second { background: #ccffcc; }
+
+  /* The upper three, with the seams closed — how the era's layout tables were
+     built, and the case where a band is one rectangle rather than one per
+     cell. */
+  .upper { background: #bbbbbb; border-spacing: 0; }
+  .upper thead { background: #ccccff; }
+  .upper tbody { background: #ffffcc; }
+  .upper tr.striped { background: #ffcc66; }
+  .upper td.own { background: #66cc66; }
+
+  /* The same upper three with the seams open, so a row and a row group have to
+     stop at each gap rather than running through it. */
+  .spaced { background: #bbbbbb; border-spacing: 5px; }
+  .spaced tbody { background: #ffffcc; }
+  .spaced tr.striped { background: #ffcc66; }
+  .spaced td.own { background: #66cc66; }
+
+  /* A band's background *image* is positioned against the band as a whole, so
+     a `no-repeat` tile appears once however many cells the band covers — and
+     not once per cell. */
+  .tiled { border-spacing: 6px; }
+  .tiled tbody {
+    background-image: url("assets/tile.png");
+    background-repeat: no-repeat;
+    background-position: top right;
+  }
+</style></head><body>
+
+<h3>The table, its column groups and its columns</h3>
+<table class="lower">
+  <colgroup><col><col class="second"><col></colgroup>
+  <tr><td>one</td><td>two</td><td>three</td></tr>
+  <tr><td>four</td><td>five</td><td>six</td></tr>
+</table>
+
+<h3>Its row groups, rows and cells, with the seams closed</h3>
+<table class="upper">
+  <thead><tr><th>head</th><th>head</th><th>head</th></tr></thead>
+  <tbody>
+    <tr><td>body</td><td>body</td><td>body</td></tr>
+    <tr class="striped"><td>striped</td><td class="own">cell</td><td>striped</td></tr>
+  </tbody>
+</table>
+
+<h3>And with the seams open, where each stops at the gap</h3>
+<table class="spaced">
+  <tbody>
+    <tr><td>body</td><td>body</td><td>body</td></tr>
+    <tr class="striped"><td>striped</td><td class="own">cell</td><td>striped</td></tr>
+  </tbody>
+</table>
+
+<h3>One tile for the band, not one per cell</h3>
+<table class="tiled">
+  <tbody>
+    <tr><td>a</td><td>b</td><td>c</td></tr>
+    <tr><td>d</td><td>e</td><td>f</td></tr>
+  </tbody>
+</table>
+
+</body></html>

@@ -3238,9 +3238,155 @@ fn layout_table(
         cursor_y += height + spacing;
     }
 
-    // Row boxes first, so their backgrounds paint behind the cells.
     let row_width: f32 =
         widths.iter().sum::<f32>() + spacing * (widths.len().saturating_sub(1)) as f32;
+    let left_of = |column: usize| {
+        x + spacing + widths[..column].iter().sum::<f32>() + spacing * column as f32
+    };
+    let band_width = |start: usize, end: usize| {
+        widths[start..end].iter().sum::<f32>() + spacing * (end - start - 1) as f32
+    };
+
+    // §17.5.1: a table is six superimposed layers, and a background in a lower
+    // one shows through wherever the layers above it are transparent. Bottom to
+    // top they are the table, its column groups, its columns, its row groups,
+    // its rows and its cells — which is the order they are emitted in here,
+    // since paint draws a box's children in the order it is given them. The
+    // table's own box belongs to the caller; the other five are below.
+    //
+    // §17.6.1 decides their *shape*. In the separated model the gaps between
+    // cells show the table's background and nothing else, so a band covers the
+    // cell areas it spans and stops at every gap. With `border-spacing: 0`
+    // those areas are contiguous and one rectangle is exact — which is every
+    // layout table of the era, since `cellspacing="0"` is what closed the seams
+    // — so only a table that asked for a gap pays for a rectangle per cell.
+
+    // The band's whole rectangle: what a background *image* is positioned
+    // against, whatever the cell areas inside it look like.
+    let whole = |rows: &std::ops::Range<usize>, columns: &std::ops::Range<usize>| Rect {
+        x: left_of(columns.start),
+        y: tops[rows.start],
+        width: band_width(columns.start, columns.end),
+        height: tops[rows.end - 1] + heights[rows.end - 1] - tops[rows.start],
+    };
+    // The cell areas it covers: what its background *colour* is painted on.
+    let areas = |rows: &std::ops::Range<usize>, columns: &std::ops::Range<usize>| -> Vec<Rect> {
+        if spacing == 0.0 {
+            return vec![whole(rows, columns)];
+        }
+        let mut out = Vec::with_capacity(rows.len() * columns.len());
+        for row in rows.clone() {
+            for column in columns.clone() {
+                out.push(Rect {
+                    x: left_of(column),
+                    y: tops[row],
+                    width: widths[column],
+                    height: heights[row],
+                });
+            }
+        }
+        out
+    };
+    let plain = |rect: Rect, style: ComputedStyle, node: NodeId| LayoutBox {
+        rect,
+        style,
+        text: None,
+        content_origin: (0.0, 0.0),
+        content_width: rect.width,
+        children: Vec::new(),
+        replaced: None,
+        node: Some(node),
+        round: false,
+        top_border_gap: None,
+    };
+
+    /// The boxes one band's background needs.
+    ///
+    /// Two at most, and one on any table nobody spaced out. The colour goes on
+    /// the cell areas and the image on the band as a whole: §17.5.1 makes a
+    /// band one box that the gaps cut holes in rather than a box per cell, so
+    /// an image cut up with the colour would be drawn once per cell where
+    /// `tbody { background: url(x) top right no-repeat }` asks for exactly one.
+    /// Clipping one box to several rectangles is a shape the display list
+    /// cannot express, so the image stays whole and bleeds into the gaps —
+    /// wrong only on a table that asked for spacing *and* put an image on a
+    /// band, and less wrong than drawing it four times.
+    fn band_background(
+        style: &ComputedStyle,
+        colour_areas: &[Rect],
+        image_area: Rect,
+        node: NodeId,
+        plain: impl Fn(Rect, ComputedStyle, NodeId) -> LayoutBox,
+        out: &mut Vec<LayoutBox>,
+    ) {
+        // §17.6.1 has user agents ignore `border` on a row group, a column or
+        // a column group in the separated model; in the collapsing one
+        // whatever it declared was spent on winning the grid line rather than
+        // on a line of its own.
+        let bare = ComputedStyle {
+            border: css::style::Borders::default(),
+            ..style.clone()
+        };
+        if colour_areas.len() == 1 && colour_areas[0] == image_area {
+            out.push(plain(image_area, bare, node));
+            return;
+        }
+        if !bare.background_color.is_transparent() {
+            let colour = ComputedStyle {
+                background_image: None,
+                ..bare.clone()
+            };
+            for &rect in colour_areas {
+                out.push(plain(rect, colour.clone(), node));
+            }
+        }
+        if bare.background_image.is_some() {
+            out.push(plain(
+                image_area,
+                ComputedStyle {
+                    background_color: css::Color::TRANSPARENT,
+                    ..bare
+                },
+                node,
+            ));
+        }
+    }
+
+    let draws = |style: &ComputedStyle| {
+        !style.background_color.is_transparent() || style.background_image.is_some()
+    };
+    let mut boxes = Vec::new();
+    for band in grid.column_groups.iter().chain(&grid.columns_declared) {
+        let columns = band.start..band.end.min(grid.columns);
+        let rows = 0..heights.len();
+        if columns.start < columns.end && !rows.is_empty() && draws(&band.style) {
+            band_background(
+                &band.style,
+                &areas(&rows, &columns),
+                whole(&rows, &columns),
+                band.node,
+                plain,
+                &mut boxes,
+            );
+        }
+    }
+    for band in &grid.row_groups {
+        let rows = band.first..band.end.min(heights.len());
+        let columns = 0..grid.columns;
+        if rows.start < rows.end && draws(&band.style) {
+            band_background(
+                &band.style,
+                &areas(&rows, &columns),
+                whole(&rows, &columns),
+                band.node,
+                plain,
+                &mut boxes,
+            );
+        }
+    }
+    parent.children.append(&mut boxes);
+
+    // Then the rows, over the groups and behind the cells.
     for (index, row) in grid.rows.iter().enumerate() {
         // A row's edges are grid lines in the collapsing model, and whatever
         // border it declared has already been offered to them. Drawing it here
@@ -3249,23 +3395,36 @@ fn layout_table(
         if collapsed.is_some() {
             row_style.border = css::style::Borders::default();
         }
-        parent.children.push(LayoutBox {
-            rect: Rect {
+        // A row keeps its own box whether it draws anything or not: it is what
+        // a click between two cells lands on, and in the collapsing model it is
+        // what the grid lines were resolved against. Its *background* follows
+        // the same rule as a band's, so where there is spacing to stay out of
+        // it moves onto boxes of its own and off this one.
+        let rows = index..index + 1;
+        let columns = 0..grid.columns;
+        if spacing > 0.0 && draws(&row_style) && grid.columns > 0 {
+            band_background(
+                &row_style,
+                &areas(&rows, &columns),
+                whole(&rows, &columns),
+                row.node,
+                plain,
+                &mut boxes,
+            );
+            parent.children.append(&mut boxes);
+            row_style.background_color = css::Color::TRANSPARENT;
+            row_style.background_image = None;
+        }
+        parent.children.push(plain(
+            Rect {
                 x: x + spacing,
                 y: tops[index],
                 width: row_width,
                 height: heights[index],
             },
-            style: row_style,
-            text: None,
-            content_origin: (0.0, 0.0),
-            content_width: row_width,
-            children: Vec::new(),
-            replaced: None,
-            node: Some(row.node),
-            round: false,
-            top_border_gap: None,
-        });
+            row_style,
+            row.node,
+        ));
     }
 
     // Cells stretch to fill every row they cover, so backgrounds and borders
@@ -5671,33 +5830,53 @@ mod tests {
     }
 
     #[test]
-    fn a_row_gets_a_box_spanning_its_cells() {
-        // Striped tables put the colour on `<tr>`, so the row needs a box of
-        // its own: without one there is nothing for that background to paint
-        // on and the stripes vanish.
+    fn a_row_background_covers_its_cells_and_not_the_space_between_them() {
+        // Striped tables put the colour on `<tr>`, so the row needs somewhere
+        // to paint: without it there is nothing for that background to land on
+        // and the stripes vanish. §17.6.1 says where — the cell areas, and not
+        // the `border-spacing` between them, which shows the table's own
+        // background. The UA sheet gives every table 2px of it, so a plain
+        // `<table>` is already the interesting case.
         let rendered = run(
             "<body><table><tr><td>one</td><td>two</td></tr></table></body>",
             "body { margin: 0 } tr { background: #ff0000 }",
             600.0,
         );
         let all = content_boxes(&rendered);
-        let cells: Vec<_> = all.iter().filter(|b| b.text.is_some()).collect();
-        let row = all
+        let cells: Vec<_> = all
             .iter()
-            .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0))
-            .expect("a box carries the row background");
+            .filter(|b| b.text.is_some())
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(cells.len(), 2, "two cells");
+        let painted: Vec<Rect> = all
+            .iter()
+            .filter(|b| b.style.background_color == css::Color::rgb(255, 0, 0))
+            .map(|b| b.rect)
+            .collect();
+        assert!(!painted.is_empty(), "nothing carries the row background");
 
-        let left = cells.iter().map(|c| c.rect.x).fold(f32::MAX, f32::min);
-        let right = cells
-            .iter()
-            .map(|c| c.rect.x + c.rect.width)
-            .fold(f32::MIN, f32::max);
+        // Every cell is covered by one of them…
+        for cell in &cells {
+            assert!(
+                painted.iter().any(|red| red.x <= cell.x
+                    && red.x + red.width >= cell.x + cell.width
+                    && red.y <= cell.y
+                    && red.y + red.height >= cell.y + cell.height),
+                "cell {cell:?} has no background behind it"
+            );
+        }
+        // …and none of them reaches into the gap between the two.
+        let gap_left = cells[0].x + cells[0].width;
+        let gap_right = cells[1].x;
+        assert!(gap_right > gap_left, "the cells are not separated");
+        let middle = (gap_left + gap_right) / 2.0;
         assert!(
-            row.rect.x <= left && row.rect.x + row.rect.width >= right,
-            "row {:?} must span its cells {left}..{right}",
-            row.rect
+            !painted
+                .iter()
+                .any(|red| red.x < middle && red.x + red.width > middle),
+            "the row background ran through the {gap_left}..{gap_right} gap"
         );
-        assert!(row.rect.height > 0.0, "a row with cells has height");
     }
 
     #[test]

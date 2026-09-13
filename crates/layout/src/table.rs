@@ -69,6 +69,8 @@ pub struct Row {
 /// is transparent, which is why the rows are still flattened.
 #[derive(Debug, Clone)]
 pub struct RowBand {
+    /// The `thead`, `tbody` or `tfoot` element.
+    pub node: NodeId,
     /// Its computed style.
     pub style: ComputedStyle,
     /// Index of its first row in [`Grid::rows`].
@@ -80,6 +82,8 @@ pub struct RowBand {
 /// A `col` or `colgroup`, and the columns it covers.
 #[derive(Debug, Clone)]
 pub struct ColumnBand {
+    /// The `col` or `colgroup` element.
+    pub node: NodeId,
     /// Its computed style.
     pub style: ComputedStyle,
     /// First column covered.
@@ -206,6 +210,7 @@ fn collect_columns(
             Display::TableColumn => {
                 let span = span_of(element);
                 grid.columns_declared.push(ColumnBand {
+                    node: child,
                     style: style.clone(),
                     start: column,
                     end: column + span,
@@ -230,6 +235,7 @@ fn collect_columns(
                     has_children = true;
                     let span = span_of(col);
                     grid.columns_declared.push(ColumnBand {
+                        node: inner,
                         style: col_style.clone(),
                         start: column,
                         end: column + span,
@@ -240,6 +246,7 @@ fn collect_columns(
                     column += span_of(element);
                 }
                 grid.column_groups.push(ColumnBand {
+                    node: child,
                     style: style.clone(),
                     start,
                     end: column,
@@ -400,6 +407,7 @@ fn collect_rows(
                 let band = grid.row_groups.len();
                 let first = grid.rows.len();
                 grid.row_groups.push(RowBand {
+                    node: child,
                     style: style.clone(),
                     first,
                     end: first,
