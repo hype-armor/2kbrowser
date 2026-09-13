@@ -16,6 +16,28 @@ record for everything earlier.
 
 ## Unreleased
 
+**A radio button is round and a `<legend>` sits in its group's rule** (#32,
+#33). Both were drawn wrong for the same reason: the display list had rectangles
+and nothing else, so a radio was a square — indistinguishable from the checkbox
+beside it — and a fieldset's rule ran unbroken behind a legend that sat above the
+group. The shape of a radio is not decoration: it is what tells a reader "one of
+these" from "any of these", which is the difference between two questions. So
+there is an ellipse in the display list now, used by exactly two boxes — the
+radio and the dot inside a checked one — rather than the beginning of
+`border-radius`, which CSS 2.1 does not have.
+
+The legend needed layout rather than paint. HTML's rendering section, not CSS
+2.1, puts it *in* the rule, which means the rule is painted as two pieces with
+the legend's own box sizing the gap, and the legend is lifted to straddle the
+fieldset's top border. It shrinks to fit first — a full-width legend would cut
+the whole rule away and leave the box open at the top — and the room it gave up
+in flow is reclaimed, so the group's contents start below the legend rather than
+below where the legend used to be. The fieldset then moves down by the half of
+the legend standing above it, so nothing above the group is trodden on.
+
+The conformance number is unchanged at 3202 of 4821: CSS 2.1's suite has no
+fieldset in it, and would not be where this showed up if it had.
+
 **The conformance harness renders each document through a font store of its
 own** (#31). One store was held for the whole run of eleven thousand documents.
 Its shaping cache stops inserting at a cap, and `cosmic-text`'s own
