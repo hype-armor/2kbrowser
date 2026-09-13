@@ -29,12 +29,15 @@
 //! than an oversight — a control that draws correctly makes the page read
 //! correctly, and interaction is a separate piece of work with a separate risk.
 //!
-//! Radio buttons are drawn square, because the rasteriser has rectangles and no
-//! rounded primitive. A round one wants either a circle in the display list or
-//! a bitmap, and both are more than this change is for.
+//! Nothing can be typed into, clicked, or submitted — see above. What *is* here
+//! besides the controls themselves is [`break_the_rule_for_a_legend`], because
+//! a `<fieldset>`'s rule and the `<legend>` that breaks it are the same piece of
+//! HTML furniture as the controls they surround.
 
 use css::style::ComputedStyle;
 use dom::{Document, NodeId};
+
+use crate::LayoutBox;
 
 /// A form control this engine knows how to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +52,7 @@ pub enum Control {
     Button,
     /// A checkbox.
     Checkbox,
-    /// A radio button, drawn square — see the module note.
+    /// A radio button, drawn round so that it is not mistaken for a checkbox.
     Radio,
     /// A multi-line text field.
     TextArea,
@@ -314,6 +317,86 @@ fn selected_option(doc: &Document, node: NodeId) -> Option<NodeId> {
         })
         .or(options.first())
         .copied()
+}
+
+/// Lifts a `<fieldset>`'s `<legend>` into the top rule and cuts the rule around
+/// it. Returns how far the fieldset's border box has to move down to make room.
+///
+/// CSS 2.1 says nothing about either element; this is HTML's rendering section,
+/// and it is the one piece of form furniture that no combination of CSS 2.1
+/// properties can express. The rule runs through the legend's *middle*, so half
+/// the legend is above the fieldset's border box and half is below it:
+///
+/// ```text
+///   ┌─ A legend ────────────────┐      the rule stops either side of the text
+///   │                           │      and the text straddles it
+/// ```
+///
+/// Three things follow, and all three are done here rather than in the caller,
+/// because they are one rule and only make sense together:
+///
+/// * The legend shrinks to fit. A full-width legend would cut the whole rule
+///   away and leave the box open at the top. Its width comes from the text it
+///   already laid out — the widest line it produced — which is shrink-to-fit
+///   for anything that fitted on one line, and every legend does.
+/// * The legend moves up to straddle the rule, and the rest of the group's
+///   contents move up by what is left of the legend's slot in flow. What
+///   remains of that slot is the half of the legend standing above the rule,
+///   which is exactly the distance the whole box then moves down — so the
+///   legend's top edge ends up where the fieldset's border box began, and
+///   nothing above the fieldset is trodden on.
+/// * The span of the top border the legend crosses is recorded on the box, for
+///   paint to leave undrawn.
+///
+/// Only the fieldset's *first* child is a legend in this sense, which is what
+/// HTML says and what stops a second one from cutting a second hole.
+pub(crate) fn break_the_rule_for_a_legend(
+    doc: &Document,
+    node: NodeId,
+    border_top: f32,
+    box_: &mut LayoutBox,
+) -> f32 {
+    if doc
+        .element(node)
+        .is_none_or(|element| element.local_name() != "fieldset")
+    {
+        return 0.0;
+    }
+    let is_legend = |child: &LayoutBox| {
+        child
+            .node
+            .and_then(|id| doc.element(id))
+            .is_some_and(|element| element.local_name() == "legend")
+    };
+    let Some((legend, rest)) = box_
+        .children
+        .split_first_mut()
+        .filter(|(a, _)| is_legend(a))
+    else {
+        return 0.0;
+    };
+
+    // Shrink to fit, keeping the left edge where flow put it.
+    if let Some(text) = &legend.text {
+        let surround = legend.rect.width - legend.content_width;
+        legend.content_width = text.width;
+        legend.rect.width = text.width + surround;
+    }
+
+    let height = legend.rect.height;
+    // Half the legend stands above the rule; the other half, plus the rule
+    // itself, is the part of its slot in flow that nothing needs any more.
+    let above = ((height - border_top) / 2.0).max(0.0);
+    let reclaimed = (height - above).max(0.0);
+
+    legend.rect.y = -above;
+    box_.top_border_gap = Some((legend.rect.x, legend.rect.x + legend.rect.width));
+
+    for child in rest {
+        child.rect.y -= reclaimed;
+    }
+    box_.rect.height = (box_.rect.height - reclaimed).max(0.0);
+    above
 }
 
 fn collect_options(doc: &Document, node: NodeId, out: &mut Vec<NodeId>) {

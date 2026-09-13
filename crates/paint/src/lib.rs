@@ -46,6 +46,19 @@ pub enum DisplayItem {
         /// Fill colour.
         color: Color,
     },
+    /// A filled ellipse, inscribed in a rectangle.
+    ///
+    /// CSS 2.1 has no rounded anything, so this exists for one box: a radio
+    /// button. A square radio beside a square checkbox is not a cosmetic
+    /// shortfall — the shape *is* the meaning, a square saying "any of these"
+    /// and a circle "one of these", and drawing both square removes the only
+    /// thing telling a reader which question they are answering.
+    Ellipse {
+        /// The box the ellipse is inscribed in.
+        rect: Rect,
+        /// Fill colour.
+        color: Color,
+    },
     /// A decoded image drawn into a rectangle.
     Image {
         /// The element the image belongs to, used to look it up at raster time.
@@ -165,7 +178,36 @@ fn paint_box(
     // `display: none` and the reason an author reaches for it.
     let drawn = box_.style.visibility == Visibility::Visible;
 
-    if drawn && !box_.style.background_color.is_transparent() {
+    // A round box — a radio button, and nothing else — is a ring rather than
+    // four border rects around a filled rectangle: the border colour fills the
+    // whole ellipse and the background is drawn inside it, inset by the border
+    // width. Two fills rather than a stroke, because a stroked ellipse needs a
+    // pen width and joins and this needs neither.
+    if drawn && box_.round {
+        let border = box_.style.border.top.used_width(box_.style.font_size);
+        let outer = Rect {
+            x,
+            y,
+            width: box_.rect.width,
+            height: box_.rect.height,
+        };
+        let frame = box_.style.border.top.color.unwrap_or(box_.style.color);
+        if border > 0.0 {
+            list.items.push(DisplayItem::Ellipse {
+                rect: outer,
+                color: frame,
+            });
+        }
+        list.items.push(DisplayItem::Ellipse {
+            rect: Rect {
+                x: outer.x + border,
+                y: outer.y + border,
+                width: (outer.width - border * 2.0).max(0.0),
+                height: (outer.height - border * 2.0).max(0.0),
+            },
+            color: box_.style.background_color,
+        });
+    } else if drawn && !box_.style.background_color.is_transparent() {
         list.items.push(DisplayItem::Rect {
             rect: Rect {
                 x,
@@ -198,7 +240,8 @@ fn paint_box(
         });
     }
 
-    if drawn {
+    // A round box drew its own border above, as the ring.
+    if drawn && !box_.round {
         paint_borders(box_, x, y, list);
     }
 
@@ -330,7 +373,12 @@ fn clip_items(items: &mut Vec<DisplayItem>, from: usize, clip: Rect) {
         // clips the tiling without moving where the tiles start — the anchor
         // that decides the phase is carried separately, for exactly this
         // reason.
+        // An ellipse is narrowed by narrowing the box it is inscribed in,
+        // which squashes it rather than cutting it. That is wrong in general
+        // and right for the only thing that draws one: a radio button is small
+        // enough that a clip either misses it or removes it.
         DisplayItem::Rect { rect, .. }
+        | DisplayItem::Ellipse { rect, .. }
         | DisplayItem::Image { rect, .. }
         | DisplayItem::Tile { rect, .. } => match intersect(*rect, clip) {
             Some(narrowed) => {
@@ -386,19 +434,35 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
     let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(box_.style.color);
 
     if border.top.style.is_visible() && top > 0.0 {
-        push_border_side(
-            list,
-            &Rect {
-                x,
-                y,
-                width,
-                height: top,
-            },
-            border.top.style,
-            top,
-            Side::Top,
-            color_of(&border.top),
-        );
+        // A `<fieldset>`'s rule stops either side of its `<legend>`, so the top
+        // side is drawn as the two pieces the gap leaves rather than as one
+        // run. Each piece is a border side in its own right: a `groove` still
+        // has to light and shade from the same direction on both, which is why
+        // this splits the rect and calls the same code twice instead of
+        // painting one side and rubbing a hole in it.
+        let (from, to) = match box_.top_border_gap {
+            Some((from, to)) => (from.clamp(0.0, width), to.clamp(0.0, width)),
+            None => (width, width),
+        };
+        for piece in [(0.0, from), (to, width)] {
+            let (start, end) = piece;
+            if end <= start {
+                continue;
+            }
+            push_border_side(
+                list,
+                &Rect {
+                    x: x + start,
+                    y,
+                    width: end - start,
+                    height: top,
+                },
+                border.top.style,
+                top,
+                Side::Top,
+                color_of(&border.top),
+            );
+        }
     }
     if border.bottom.style.is_visible() && bottom > 0.0 {
         push_border_side(
@@ -717,6 +781,12 @@ pub fn rasterise_band(
                     fill_rect(&mut pixmap, &rect, *color);
                 }
             }
+            DisplayItem::Ellipse { rect, color } => {
+                let rect = shifted(rect, top);
+                if drawable(&rect) {
+                    fill_ellipse(&mut pixmap, &rect, *color);
+                }
+            }
             DisplayItem::Image { node, rect } => {
                 let rect = shifted(rect, top);
                 if drawable(&rect)
@@ -967,6 +1037,35 @@ fn tile_image(
             );
         }
     }
+}
+
+/// Fills the ellipse inscribed in `rect`.
+///
+/// Anti-aliased, where a rectangle is not: a circle drawn without it is a
+/// staircase, and the whole point of this primitive is that the shape reads.
+/// Determinism across platforms is unaffected — the rasteriser is `tiny-skia`
+/// and the anti-aliasing is its own arithmetic, not the host's (ADR-0005).
+fn fill_ellipse(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
+    if rect.width <= 0.0 || rect.height <= 0.0 || color.is_transparent() {
+        return;
+    }
+    let Some(oval) = tiny_skia::Rect::from_xywh(rect.x, rect.y, rect.width, rect.height) else {
+        return;
+    };
+    let mut builder = PathBuilder::new();
+    builder.push_oval(oval);
+    let Some(path) = builder.finish() else { return };
+
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 fn fill_rect(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
@@ -1698,6 +1797,56 @@ mod tests {
                 .unwrap_or(width)
         };
         assert!(leftmost_ink("p { text-align: center }") > leftmost_ink("p { text-align: left }"));
+    }
+    #[test]
+    fn a_legend_leaves_a_hole_in_the_rule_and_the_rest_of_it_standing() {
+        // The point of the hole is that a reader sees the legend *in* the rule
+        // rather than floating above an unbroken line. So the rule has to stop
+        // where the legend starts and pick up again where it ends — both halves
+        // of that, since a rule that vanished entirely would pass a test that
+        // only looked for the gap.
+        const CSS: &str = "body { margin: 0 } \
+                           fieldset { margin: 0; border: 2px solid black; padding: 6px }";
+        fn dark(pixmap: &Pixmap, x: u32, y: u32) -> bool {
+            let (r, g, b) = at(pixmap, x, y);
+            r < 128 && g < 128 && b < 128
+        }
+        /// The top rule: the first row that is mostly drawn.
+        fn rule_row(pixmap: &Pixmap) -> u32 {
+            (0..pixmap.height())
+                .find(|&y| {
+                    (0..pixmap.width()).filter(|&x| dark(pixmap, x, y)).count() as u32
+                        > pixmap.width() / 2
+                })
+                .expect("a rule across the page")
+        }
+
+        let with = render(
+            "<body><fieldset><legend>L</legend><div style=\"height: 20px\"></div></fieldset></body>",
+            CSS,
+            200,
+        );
+        let without = render(
+            "<body><fieldset><div style=\"height: 20px\"></div></fieldset></body>",
+            CSS,
+            200,
+        );
+
+        // Inside the legend's own left padding, which is the near end of the
+        // gap and the one place in it no glyph can reach.
+        let y = rule_row(&with);
+        assert!(!dark(&with, 9, y), "the rule ran on behind the legend");
+        assert!(dark(&with, 1, y), "the rule lost its left end");
+        assert!(
+            dark(&with, 198, y),
+            "the rule did not pick up again after the legend"
+        );
+
+        let y = rule_row(&without);
+        assert!(
+            dark(&without, 9, y),
+            "a fieldset with no legend drew a gap anyway"
+        );
     }
 }
 

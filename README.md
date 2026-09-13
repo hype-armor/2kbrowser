@@ -187,10 +187,10 @@ and `rows` count characters and lines rather than pixels, and a field follows
 the font it is set in. A password field shows bullets and never its value.
 **Nothing can be typed into, clicked, or submitted**, and that is the stopping
 point rather than an oversight: a control that draws correctly makes the page
-read correctly, and interaction is separate work with a separate risk. Two
-things a browser draws and this does not: a radio button is square, because the
-rasteriser has rectangles and no rounded primitive, and a `<legend>` sits above
-its group rather than breaking the rule it is written into.
+read correctly, and interaction is separate work with a separate risk. A radio
+button is drawn round and a checkbox square — the shape is the question, "one of
+these" against "any of these" — and a `<legend>` sits *in* its group's rule, with
+the rule stopping either side of it, as HTML's rendering section has it.
 
 And a list of properties that parse and are then ignored, which is longer than
 this file used to admit: `word-spacing`, `font-variant`, `outline`,

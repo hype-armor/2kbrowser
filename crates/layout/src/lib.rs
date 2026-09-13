@@ -346,6 +346,22 @@ pub struct LayoutBox {
     /// Anonymous boxes — the canvas root, a list marker — have none. Paint uses
     /// it to find the element's background image, and hit testing will want it.
     pub node: Option<NodeId>,
+    /// Drawn as an ellipse inscribed in its border box rather than as a
+    /// rectangle.
+    ///
+    /// One box uses this: a radio button, and the mark inside a checked one.
+    /// CSS 2.1 has no rounded anything, so this is not the beginning of
+    /// `border-radius` — it is the shape that tells a reader a radio from a
+    /// checkbox, which is the difference between "one of these" and "any of
+    /// these" and the only thing distinguishing the two questions.
+    pub round: bool,
+    /// A span of the top border, in this box's own coordinates, that is not
+    /// painted.
+    ///
+    /// One box uses this too: a `<fieldset>`, whose `<legend>` sits in the rule
+    /// rather than above it and so has to have the rule cut away behind it.
+    /// See [`forms::break_the_rule_for_a_legend`].
+    pub top_border_gap: Option<(f32, f32)>,
 }
 
 /// The single margin that two adjoining ones collapse into (CSS 2.1 §8.3.1).
@@ -833,6 +849,8 @@ pub fn layout(
         children: Vec::new(),
         replaced: None,
         node: None,
+        round: false,
+        top_border_gap: None,
     };
 
     let height = layout_block(
@@ -1071,6 +1089,8 @@ fn marker_box(
         children: Vec::new(),
         replaced: None,
         node: None,
+        round: false,
+        top_border_gap: None,
     })
 }
 
@@ -1186,6 +1206,8 @@ fn layout_inline_block(
         children: Vec::new(),
         replaced: None,
         node: None,
+        round: false,
+        top_border_gap: None,
     };
     let consumed = layout_block(
         doc,
@@ -1319,10 +1341,13 @@ fn emit_replaced_boxes(
                     label
                 });
 
-            // A checked box needs a mark, and the rasteriser draws rectangles:
-            // a filled inner square reads as "checked" and is what a small
-            // checkbox mostly comes down to at this size anyway. The radio gets
-            // the same square, which is the divergence named in `forms`.
+            // A checked box needs a mark: a filled inner shape reads as
+            // "checked" and is most of what a control this small comes down
+            // to. Round for a radio and square for a checkbox, because the
+            // shape is the question — "one of these" against "any of these" —
+            // and drawing both square leaves a reader unable to tell which
+            // they are answering.
+            let round = matches!(control, Some(forms::Control::Radio));
             let checked = matches!(
                 control,
                 Some(forms::Control::Checkbox | forms::Control::Radio)
@@ -1331,7 +1356,11 @@ fn emit_replaced_boxes(
                 .is_some_and(|element| element.attr("checked").is_some());
             let mut children = Vec::new();
             if checked {
-                let inset = (placed.width * 0.25).max(1.0);
+                // A dot needs more room inside the ring than a square mark
+                // needs inside a box: at this size an inset of a quarter
+                // leaves a circle that reads as a smudge against the border.
+                let share = if round { 0.3 } else { 0.25 };
+                let inset = (placed.width * share).max(1.0);
                 let mark = ComputedStyle {
                     background_color: child_style.color,
                     ..ComputedStyle::default()
@@ -1350,6 +1379,8 @@ fn emit_replaced_boxes(
                     children: Vec::new(),
                     replaced: None,
                     node: None,
+                    round,
+                    top_border_gap: None,
                 });
             }
 
@@ -1367,6 +1398,8 @@ fn emit_replaced_boxes(
                 children,
                 replaced: control.is_none().then_some(node),
                 node: Some(node),
+                round,
+                top_border_gap: None,
             });
         }
     }
@@ -1862,6 +1895,8 @@ fn flush_inline(
         children: Vec::new(),
         replaced: None,
         node: None,
+        round: false,
+        top_border_gap: None,
     };
     if let Some(laid_out) = &anonymous.text {
         let laid_out = laid_out.clone();
@@ -2017,6 +2052,8 @@ fn layout_block(
             children: Vec::new(),
             replaced: Some(node),
             node: Some(node),
+            round: false,
+            top_border_gap: None,
         };
         let consumed = Consumed {
             height: box_.rect.height,
@@ -2045,6 +2082,8 @@ fn layout_block(
         children: Vec::new(),
         replaced: None,
         node: Some(node),
+        round: false,
+        top_border_gap: None,
     };
 
     // Inline children become styled runs shaped as one paragraph, so a <b> or
@@ -2265,6 +2304,8 @@ fn layout_block(
                     children: Vec::new(),
                     replaced: None,
                     node: None,
+                    round: false,
+                    top_border_gap: None,
                 };
                 let taken = layout_block(
                     doc,
@@ -2720,6 +2761,14 @@ fn layout_block(
         box_.rect.height = box_.rect.height.max(floor);
     }
 
+    // A `<legend>` is lifted into its `<fieldset>`'s top rule now that the
+    // group's contents are laid out and the legend's own size is known. It
+    // shortens the box, so it runs before anything reads the final height —
+    // and before the out-of-flow children below are placed, which are measured
+    // against the content box it leaves behind rather than the one the
+    // legend's slot in flow had made.
+    let legend_overhang = forms::break_the_rule_for_a_legend(doc, node, border_top, &mut box_);
+
     // Absolutely positioned children, now that this block's size is known.
     // A positioned box becomes the containing block for its own descendants;
     // otherwise the one inherited from an ancestor still applies.
@@ -2752,6 +2801,8 @@ fn layout_block(
             children: Vec::new(),
             replaced: None,
             node: None,
+            round: false,
+            top_border_gap: None,
         };
         // An absolutely positioned box with `width: auto` shrinks to fit its
         // content rather than filling its containing block — the difference
@@ -2846,12 +2897,15 @@ fn layout_block(
         Some(escaped) => collapse(margin_top, escaped),
         None => margin_top,
     };
-    box_.rect.y += collapsed_top - margin_top;
+    box_.rect.y += collapsed_top + legend_overhang - margin_top;
 
     let own_bottom = style.margin.bottom.to_px(font_size, available_width);
     let consumed = Consumed {
         height: box_.rect.height,
-        margin_top: collapsed_top,
+        // A lifted legend stands above the border box, so the box moves down by
+        // what sticks out and the space it needs is reported as margin — the
+        // one field a caller already reads as "room above this box".
+        margin_top: collapsed_top + legend_overhang,
         margin_bottom: match escaped_bottom {
             Some(escaped) => collapse(own_bottom, escaped),
             None => own_bottom,
@@ -3075,6 +3129,8 @@ fn layout_table(
                 children: Vec::new(),
                 replaced: None,
                 node: None,
+                round: false,
+                top_border_gap: None,
             };
             // A cell establishes its own formatting context, so floats outside
             // the table do not reach into it.
@@ -3164,6 +3220,8 @@ fn layout_table(
             children: Vec::new(),
             replaced: None,
             node: Some(row.node),
+            round: false,
+            top_border_gap: None,
         });
     }
 
@@ -3271,6 +3329,8 @@ fn emit_collapsed_borders(
             children: Vec::new(),
             replaced: None,
             node: None,
+            round: false,
+            top_border_gap: None,
         }
     };
 
@@ -3412,6 +3472,8 @@ fn place_float(
         children: Vec::new(),
         replaced: None,
         node: None,
+        round: false,
+        top_border_gap: None,
     };
     let float_height = layout_block(
         doc,
@@ -7662,6 +7724,132 @@ mod tests {
         assert!(
             control_box(&empty).children.is_empty(),
             "an unchecked box was ticked"
+        );
+    }
+
+    #[test]
+    fn a_radio_is_round_and_a_checkbox_is_square() {
+        let shape = |kind: &str| {
+            let html = format!(r#"<body><input type="{kind}" checked></body>"#);
+            let rendered = run(&html, "body { margin: 0 }", 600.0);
+            let control = control_box(&rendered);
+            (control.round, control.children[0].round)
+        };
+        assert_eq!(shape("radio"), (true, true), "a radio was drawn square");
+        assert_eq!(shape("checkbox"), (false, false), "a checkbox went round");
+    }
+
+    /// The fieldset, found by the gap its legend cut in the rule.
+    fn fieldset_box(rendered: &Rendered) -> &LayoutBox {
+        content_boxes(rendered)
+            .into_iter()
+            .find(|b| b.top_border_gap.is_some())
+            .expect("a fieldset whose rule was broken")
+    }
+
+    #[test]
+    fn a_legend_straddles_the_rule_it_breaks() {
+        let rendered = run(
+            "<body><fieldset><legend>A legend</legend><p>in</p></fieldset></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let fieldset = fieldset_box(&rendered);
+        let legend = &fieldset.children[0];
+        let border = fieldset
+            .style
+            .border
+            .top
+            .used_width(fieldset.style.font_size);
+        assert!(border > 0.0, "the fieldset drew no rule to break");
+        // The rule runs through the legend's middle: as much of it stands above
+        // the fieldset's border box as reaches below the rule's underside.
+        let above = -legend.rect.y;
+        let below = legend.rect.y + legend.rect.height - border;
+        assert!(
+            (above - below).abs() < 0.01,
+            "the legend sits {above} above the rule and {below} below it"
+        );
+    }
+
+    #[test]
+    fn a_legend_shrinks_to_fit_so_the_rule_survives_it() {
+        let rendered = run(
+            "<body><fieldset><legend>A legend</legend><p>in</p></fieldset></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let fieldset = fieldset_box(&rendered);
+        let (from, to) = fieldset.top_border_gap.expect("a gap");
+        assert!(
+            to - from > 0.0 && to < fieldset.rect.width / 2.0,
+            "the gap ran {from}..{to} across a {} box, which leaves no rule",
+            fieldset.rect.width
+        );
+        assert!(
+            (fieldset.children[0].rect.width - (to - from)).abs() < 0.01,
+            "the gap is not the legend's own width"
+        );
+    }
+
+    #[test]
+    fn a_legend_does_not_reach_above_the_fieldset_into_what_precedes_it() {
+        let rendered = run(
+            "<body><p>above</p><fieldset><legend>A legend</legend><p>in</p></fieldset></body>",
+            "body { margin: 0 } p { margin: 0 } fieldset { margin: 0 }",
+            600.0,
+        );
+        let boxes = content_boxes(&rendered);
+        let above = boxes
+            .iter()
+            .find(|b| b.text.is_some())
+            .expect("the paragraph above");
+        let bottom = above.rect.y + above.rect.height;
+        let fieldset = fieldset_box(&rendered);
+        let legend_top = fieldset.rect.y + fieldset.children[0].rect.y;
+        assert!(
+            legend_top >= bottom - 0.01,
+            "the legend's top at {legend_top} is above the paragraph ending at {bottom}"
+        );
+    }
+
+    #[test]
+    fn a_legend_leaves_no_empty_slot_behind_it() {
+        // Lifting the legend out of flow without reclaiming the room it had
+        // there leaves a band of nothing under the rule, which reads as a
+        // fieldset with a very generous top padding rather than as a group.
+        let rendered = run(
+            "<body><fieldset><legend>A legend</legend><p>in</p></fieldset></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let fieldset = fieldset_box(&rendered);
+        let legend = &fieldset.children[0];
+        let content = &fieldset.children[1];
+        let gap = content.rect.y - (legend.rect.y + legend.rect.height);
+        let padding = fieldset
+            .style
+            .padding
+            .top
+            .to_px(fieldset.style.font_size, 600.0);
+        assert!(
+            (gap - padding).abs() < 0.01,
+            "the contents start {gap} below the legend, not the {padding} of padding"
+        );
+    }
+
+    #[test]
+    fn only_a_first_child_legend_breaks_the_rule() {
+        let rendered = run(
+            "<body><fieldset><p>in</p><legend>A legend</legend></fieldset></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        assert!(
+            content_boxes(&rendered)
+                .into_iter()
+                .all(|b| b.top_border_gap.is_none()),
+            "a legend that is not the group's first child cut the rule anyway"
         );
     }
 

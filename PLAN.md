@@ -383,9 +383,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 
 Known-wrong and recorded rather than hidden: fixed table
 layout, forms that draw but do not work — no control can be typed into, clicked
-or submitted, a radio button is square for want of a rounded primitive, and a
-`<legend>` sits above its group rather than breaking the rule around it — the
-properties that parse and are then ignored
+or submitted — the properties that parse and are then ignored
 (`word-spacing`, `font-variant`, `outline`, `max-height`,
 `text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
 `position: fixed`, `border-spacing`'s second value, `direction`, and generated
