@@ -16,6 +16,29 @@ record for everything earlier.
 
 ## Unreleased
 
+**The conformance harness renders each document through a font store of its
+own** (#31). One store was held for the whole run of eleven thousand documents.
+Its shaping cache stops inserting at a cap, and `cosmic-text`'s own
+`FontSystem` loads faces and remembers fallback matches as it goes — so what a
+store held when a given test ran depended on every test before it, and a result
+could turn on the order of the walk rather than on the document. A change
+confined to table layout once flipped `text/bidi-flag-emoji-02`, which contains
+no table.
+
+The number is unchanged at 3202 of 4821, which is the reassuring half of the
+answer: the measurement was not distorted, it was only *able* to be. It costs
+3.4 seconds on a 13-second run, because the faces are embedded and load lazily
+— a fresh store is about twenty microseconds.
+
+**And `cargo run -p budgets` says when the browser it spawns is out of date**
+(#64). That command builds the budget harness, not `target/release/2kbrowser`,
+so the parent could be the new code and the child on disk whatever was built
+last. The run then failed with "renderer sent a malformed message", which reads
+as "this change broke the wire format" and means "the binary on disk is from a
+different change". It warns now, before anything measures. A warning and not a
+failure: the check is a heuristic over file times, and one that can stop a run
+has to be right every time.
+
 **An absolutely positioned box is moved by its margins** (#30). §10.3.7 puts
 the margins in the equation it solves, so `margin-left: 40px` moves the box
 forty pixels whether `left` is a length or `auto`, and `right` is measured from

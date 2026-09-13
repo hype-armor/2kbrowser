@@ -17,7 +17,7 @@
 //! budget harness that silently reports green for unimplemented measurements is
 //! worse than no harness, because it manufactures confidence.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Maximum size of the stripped release binary.
@@ -68,6 +68,12 @@ const BROWSER: &str = if cfg!(target_os = "windows") {
 };
 
 fn main() -> ExitCode {
+    // Before anything measures the browser, check that the browser on disk is
+    // the browser the sources describe. See `staleness`.
+    if let Some(warning) = staleness() {
+        eprintln!("{warning}\n");
+    }
+
     let checks = vec![
         binary_size(),
         Check {
@@ -453,6 +459,96 @@ fn repo_root() -> Option<PathBuf> {
     )
 }
 
+/// Whether the browser on disk is older than the sources, as a warning to
+/// print before any measurement that spawns it.
+///
+/// `cargo run --release -p budgets` builds *this* crate and its dependencies.
+/// It does not build `target/release/2kbrowser`, which is what the memory
+/// budget spawns as a renderer. So the parent can be the new code while the
+/// child on disk is whatever was built last — on another branch, quite
+/// possibly — and the run then reports
+///
+/// ```text
+/// peak memory rendering a page    FAIL  (the page did not render: renderer
+///                                        sent a malformed message: length
+///                                        field does not fit the frame)
+/// ```
+///
+/// which reads as "this change broke the wire format" and means "the binary on
+/// disk is from a different change". The failure is loud and points at the
+/// wrong thing, which is the worst shape a diagnostic can have.
+///
+/// A warning rather than a failure: the check is a heuristic over file times,
+/// and a heuristic that can *stop* a run has to be right every time. This one
+/// only has to be useful when it fires. A missing binary is not stale and is
+/// reported by the budget that needs it, in the words that budget already has.
+fn staleness() -> Option<String> {
+    let binary = binary_path()?;
+    let built = binary.metadata().ok()?.modified().ok()?;
+    let (newest, source) = newest_source(&repo_root()?)?;
+    (newest > built).then(|| {
+        format!(
+            "warning: {} is older than {}.\n\
+             warning: `cargo run -p budgets` does not build the browser it spawns — run \
+             `cargo build --release` first, or what follows measures the last build rather \
+             than this one.",
+            binary.display(),
+            source.display()
+        )
+    })
+}
+
+/// The most recently modified source file under `root`, and when.
+///
+/// Walks `crates/` and the workspace manifests — what a build of the browser
+/// depends on and nothing else, so that editing this harness or a test fixture
+/// does not report the browser as stale.
+fn newest_source(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
+    /// Deep enough for this repository; a bound rather than a judgement.
+    const MAX_DEPTH: usize = 12;
+
+    fn walk(
+        path: &Path,
+        depth: usize,
+        best: &mut Option<(std::time::SystemTime, PathBuf)>,
+    ) -> Option<()> {
+        if depth >= MAX_DEPTH {
+            return Some(());
+        }
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, depth + 1, best);
+                continue;
+            }
+            let is_source = path
+                .extension()
+                .is_some_and(|extension| extension == "rs" || extension == "toml");
+            if !is_source {
+                continue;
+            }
+            if let Ok(modified) = entry.metadata().and_then(|data| data.modified())
+                && best.as_ref().is_none_or(|(best, _)| modified > *best)
+            {
+                *best = Some((modified, path));
+            }
+        }
+        Some(())
+    }
+
+    let mut best = None;
+    walk(&root.join("crates"), 0, &mut best);
+    for manifest in ["Cargo.toml", "Cargo.lock"] {
+        let path = root.join(manifest);
+        if let Ok(modified) = path.metadata().and_then(|data| data.modified())
+            && best.as_ref().is_none_or(|(best, _)| modified > *best)
+        {
+            best = Some((modified, path));
+        }
+    }
+    best
+}
+
 /// Locates the release binary: first CLI argument, else the conventional path.
 fn binary_path() -> Option<PathBuf> {
     if let Some(arg) = std::env::args_os().nth(1) {
@@ -509,5 +605,41 @@ fn human_bytes(bytes: u64) -> String {
         format!("{:.2} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_newest_source_is_a_source_of_this_browser() {
+        // The staleness warning compares the browser's build time against
+        // this. Pointed at the wrong tree it would either never fire or fire
+        // always, and a warning that always fires is one nobody reads.
+        let root = repo_root().expect("repo root");
+        let (_, path) = newest_source(&root).expect("some source");
+        assert!(
+            path.starts_with(root.join("crates")) || path.parent() == Some(root.as_path()),
+            "{} is not a source of the browser",
+            path.display()
+        );
+        let extension = path.extension().expect("an extension");
+        assert!(extension == "rs" || extension == "toml", "{extension:?}");
+    }
+
+    #[test]
+    fn editing_this_harness_does_not_make_the_browser_stale() {
+        // `tests/` is deliberately outside the walk: a change to the budget
+        // harness or a reference fixture does not mean the browser on disk is
+        // out of date, and reporting that it does would train the reader to
+        // ignore the warning.
+        let root = repo_root().expect("repo root");
+        let (_, path) = newest_source(&root).expect("some source");
+        assert!(
+            !path.starts_with(root.join("tests")),
+            "the walk reached {}",
+            path.display()
+        );
     }
 }
