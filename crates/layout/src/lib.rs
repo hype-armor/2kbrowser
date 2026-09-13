@@ -117,6 +117,27 @@ impl ContainingBlock {
 /// behaviour for left-to-right text; a box with neither stays where normal flow
 /// would have put it, which is what makes `position: absolute` with no offsets
 /// behave like a hoisted static box.
+///
+/// The margins are part of the equation rather than an afterthought. §10.3.7
+/// solves
+///
+/// ```text
+/// left + margin-left + border-left + padding-left + width
+///      + padding-right + border-right + margin-right + right
+///   = width of the containing block
+/// ```
+///
+/// so `margin-left: 40px` moves the box forty pixels whether `left` is `0` or
+/// `auto`, and `margin-right` is what `right` is measured *from*. §10.6.4 is
+/// the same equation vertically. This used to read `style.offsets` alone, and
+/// the margin the probe layout had already applied was then overwritten by the
+/// answer — so every absolutely positioned box sat flat against its containing
+/// block's content edge.
+///
+/// `size` is the border box, which is what the two ends of that equation
+/// bracket. A percentage margin resolves against the containing block's
+/// *width* on both axes, which is why the vertical ones are given
+/// `containing.0`.
 fn absolute_offset(
     style: &ComputedStyle,
     containing: (f32, f32),
@@ -125,16 +146,24 @@ fn absolute_offset(
 ) -> (f32, f32) {
     let font_size = style.font_size;
     let offsets = style.offsets;
+    let margin_left = style.margin.left.to_px(font_size, containing.0);
+    let margin_right = style.margin.right.to_px(font_size, containing.0);
+    let margin_top = style.margin.top.to_px(font_size, containing.0);
+    let margin_bottom = style.margin.bottom.to_px(font_size, containing.0);
 
     let x = match (offsets.left, offsets.right) {
-        (Length::Auto, Length::Auto) => static_position.0,
-        (Length::Auto, right) => containing.0 - right.to_px(font_size, containing.0) - size.0,
-        (left, _) => left.to_px(font_size, containing.0),
+        (Length::Auto, Length::Auto) => static_position.0 + margin_left,
+        (Length::Auto, right) => {
+            containing.0 - right.to_px(font_size, containing.0) - margin_right - size.0
+        }
+        (left, _) => left.to_px(font_size, containing.0) + margin_left,
     };
     let y = match (offsets.top, offsets.bottom) {
-        (Length::Auto, Length::Auto) => static_position.1,
-        (Length::Auto, bottom) => containing.1 - bottom.to_px(font_size, containing.1) - size.1,
-        (top, _) => top.to_px(font_size, containing.1),
+        (Length::Auto, Length::Auto) => static_position.1 + margin_top,
+        (Length::Auto, bottom) => {
+            containing.1 - bottom.to_px(font_size, containing.1) - margin_bottom - size.1
+        }
+        (top, _) => top.to_px(font_size, containing.1) + margin_top,
     };
     (x, y)
 }
@@ -2284,7 +2313,13 @@ fn layout_block(
         return consumed;
     }
 
-    let mut absolutes: Vec<(NodeId, ComputedStyle, f32)> = Vec::new();
+    // Absolutely positioned children, with the static position they were seen
+    // at and how many boxes this one had emitted by then — which is where the
+    // box goes back in, so that positioned siblings paint in document order
+    // (Appendix E, step 8). Appending them all at the end instead is a
+    // rendering bug that only shows when two positioned boxes overlap: the
+    // absolute one always wins, whatever the source said.
+    let mut absolutes: Vec<(NodeId, ComputedStyle, f32, usize)> = Vec::new();
     let mut cursor_y = padding_top + border_top + content_height;
     // Inline children seen since the last block child. Flushed as an anonymous
     // box when a block child arrives, and again at the end.
@@ -2368,7 +2403,7 @@ fn layout_block(
         if child_style.position.is_out_of_flow() {
             // Laid out after the in-flow content, when this block's height —
             // and so its containing-block size — is finally known.
-            absolutes.push((child, child_style.clone(), cursor_y));
+            absolutes.push((child, child_style.clone(), cursor_y, box_.children.len()));
             continue;
         }
         if child_style.display == Display::None
@@ -2692,7 +2727,11 @@ fn layout_block(
         content_width,
         (box_.rect.height - padding_top - padding_bottom - border_top - border_bottom).max(0.0),
     );
-    for (child, child_style, static_y) in absolutes {
+    // `at` is non-decreasing across these, so a running count of what has
+    // already gone back in keeps each one in front of the siblings that follow
+    // it and behind the ones that do not.
+    let mut reinserted = 0;
+    for (child, child_style, static_y, at) in absolutes {
         let child_containing = if style.position.is_positioned() {
             ContainingBlock::establish(own_size)
         } else {
@@ -2784,7 +2823,9 @@ fn layout_block(
         // Convert from containing-block coordinates to this box's own.
         child_box.rect.x = cb_x - child_containing.offset.0;
         child_box.rect.y = cb_y - child_containing.offset.1;
-        box_.children.push(child_box);
+        box_.children
+            .insert((at + reinserted).min(box_.children.len()), child_box);
+        reinserted += 1;
     }
 
     // `position: relative` shifts the box after everything around it has been
@@ -5766,6 +5807,82 @@ mod tests {
         assert_eq!(left_edge(r#"<hr width="200">"#), 200.0, "not centred");
         assert_eq!(left_edge(r#"<hr width="200" align="left">"#), 0.0);
         assert_eq!(left_edge(r#"<hr width="200" align="right">"#), 400.0);
+    }
+
+    #[test]
+    fn an_absolutely_positioned_box_is_moved_by_its_margins() {
+        // §10.3.7 puts the margins in the equation it solves, so `margin-left`
+        // moves the box whether `left` is a length or `auto`. This used to
+        // read the offsets alone, and every absolutely positioned box sat flat
+        // against its containing block's content edge.
+        let placed = |declaration: &str| {
+            let rendered = run(
+                "<body><div class=wrap><div id=t></div></div></body>",
+                &format!(
+                    "body {{ margin: 0 }} .wrap {{ position: relative; height: 200px }} \
+                     #t {{ position: absolute; width: 30px; height: 20px; \
+                           background: #ff0000; {declaration} }}"
+                ),
+                600.0,
+            );
+            let box_ = content_boxes(&rendered)
+                .into_iter()
+                .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0))
+                .expect("the positioned box");
+            (box_.rect.x, box_.rect.y)
+        };
+        assert_eq!(placed("left: 0; top: 0"), (0.0, 0.0), "the control");
+        assert_eq!(placed("left: 0; top: 0; margin-left: 40px"), (40.0, 0.0));
+        assert_eq!(placed("left: auto; top: 0; margin-left: 40px"), (40.0, 0.0));
+        assert_eq!(placed("left: 0; top: auto; margin-top: 40px"), (0.0, 40.0));
+        // `right` is measured from the margin edge, so the margin moves the box
+        // *away* from the edge it is anchored to.
+        assert_eq!(placed("right: 0; top: 0"), (570.0, 0.0));
+        assert_eq!(placed("right: 0; top: 0; margin-right: 10px"), (560.0, 0.0));
+        assert_eq!(
+            placed("bottom: 0; left: 0; margin-bottom: 10px"),
+            (0.0, 170.0)
+        );
+    }
+
+    #[test]
+    fn two_positioned_boxes_paint_in_the_order_they_were_written() {
+        // Appendix E step 8: positioned descendants with `z-index: auto` paint
+        // in document order. Absolutely positioned boxes used to be appended
+        // after every in-flow child, so an absolute box always covered a
+        // relative sibling however the source was written — invisible until
+        // two of them overlap, and then wrong every time.
+        let order = |first: &str, second: &str| {
+            let rendered = run(
+                &format!(
+                    "<body><div class=wrap><div id=a class={first}></div>\
+                     <div id=b class={second}></div></div></body>"
+                ),
+                "body { margin: 0 } .wrap { position: relative; height: 100px } \
+                 .abs { position: absolute; top: 0; left: 0 } \
+                 .rel { position: relative; top: 0; left: 0 } \
+                 #a { background: #ff0000 } #b { background: #0000ff } \
+                 #a, #b { width: 50px; height: 50px }",
+                600.0,
+            );
+            // Whichever is later among this box's children is painted last.
+            content_boxes(&rendered)
+                .into_iter()
+                .filter(|b| !b.style.background_color.is_transparent())
+                .map(|b| b.style.background_color)
+                .next_back()
+                .expect("two boxes")
+        };
+        assert_eq!(
+            order("abs", "rel"),
+            css::Color::rgb(0, 0, 255),
+            "the relative box is written second and must paint on top"
+        );
+        assert_eq!(
+            order("rel", "abs"),
+            css::Color::rgb(0, 0, 255),
+            "the absolute box is written second and must paint on top"
+        );
     }
 
     #[test]
