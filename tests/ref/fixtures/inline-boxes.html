@@ -1,0 +1,64 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 12px; font-size: 13px; width: 380px; }
+  h3 { font-size: 13px; margin: 12px 0 4px 0; }
+  p { margin: 0 0 6px 0; }
+
+  /* A highlighted phrase: the commonest inline box there is. */
+  .hl { background: #ffcc00; padding: 0 8px; }
+
+  /* A pill, which is a background and padding and nothing else. */
+  .pill { background: #003366; color: #ffffff; padding: 2px 10px; }
+
+  /* Border and padding together, so the two are told apart. */
+  .bord { border: 2px solid #cc0000; padding: 1px 6px; }
+
+  /* Long enough to break, which is where an inline box stops being one
+     rectangle: §8.4 gives it one fragment per line, with the horizontal
+     padding on the first and the last only. */
+  .wrap { background: #cceeff; padding: 0 10px; }
+
+  /* Nothing inside it at all. It still has a height — its font's — and still
+     draws, which is how a coloured rule or a spacer is written. */
+  .empty { background: #66cc66; padding: 0 20px; }
+
+  /* An inline box around another one: the outer background must run behind
+     the inner rather than stopping either side of it. */
+  .outer { background: #eeddcc; padding: 0 6px; }
+  .inner { background: #cc6600; color: #ffffff; }
+
+  /* A transparent border still takes room on the line (§8.4), which is the
+     half of this that has nothing to do with painting. */
+  .room { border-left: 40px solid #99cc00; }
+
+  /* `line-height` does not grow an inline box (§10.6.1): the background is
+     the height of the text, not of the line box it sits in. */
+  .airy { line-height: 2.4; }
+
+  /* Vertical padding overflows the line rather than moving the lines apart. */
+  .tall { background: #ddccee; padding: 6px 4px; }
+</style></head><body>
+
+<h3>A background and padding around a phrase</h3>
+<p>before <span class="hl">text</span> after</p>
+
+<h3>An inline box with nothing in it still has a size</h3>
+<p>before <span class="empty"></span> after</p>
+
+<h3>Padding, and padding inside a border</h3>
+<p>A <span class="pill">pill</span> and a <span class="bord">bordered</span> one.</p>
+
+<h3>One fragment per line, with the ends on the ends</h3>
+<p><span class="wrap">A long highlighted phrase that has to break across more than
+one line, so that its padding lands on the first fragment and the last</span> done.</p>
+
+<h3>A box inside a box is not a hole in the outer one</h3>
+<p>Before <span class="outer">outer <span class="inner">inner</span> outer</span> after.</p>
+
+<h3>A border takes room whether or not it is looked at</h3>
+<p><span class="room">this text starts forty pixels in</span></p>
+
+<h3>Line height does not grow the box; vertical padding overflows it</h3>
+<p class="airy">one <span class="hl">airy</span> line, and <span class="tall">tall
+padding</span> that overflows rather than spreading the lines</p>
+
+</body></html>

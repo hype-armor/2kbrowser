@@ -8,11 +8,11 @@ use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
     DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, ListStyleType,
-    MEDIUM_BORDER, NORMAL_LINE_HEIGHT, TextAlign, WhiteSpace, parse_background_position,
-    parse_background_repeat, parse_border_collapse, parse_border_style, parse_caption_side,
-    parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type, parse_overflow,
-    parse_position, parse_text_decoration, parse_text_transform, parse_vertical_align,
-    parse_visibility,
+    MEDIUM_BORDER, NORMAL_LINE_HEIGHT, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
+    parse_background_position, parse_background_repeat, parse_border_collapse, parse_border_style,
+    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type,
+    parse_overflow, parse_position, parse_text_decoration, parse_text_transform,
+    parse_vertical_align, parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -990,7 +990,10 @@ fn apply(
             }
         }
         "border-width" => {
-            let lengths: Vec<Length> = values.iter().filter_map(parse_length).collect();
+            let lengths: Vec<Length> = values
+                .iter()
+                .filter_map(|raw| parse_border_width(raw, zoom))
+                .collect();
             let widths = expand_four(&lengths);
             for (side, width) in border_sides(&mut style.border).into_iter().zip(widths) {
                 if let Some(width) = width {
@@ -1841,26 +1844,15 @@ fn parse_border_shorthand(values: &[Raw], zoom: f32) -> BorderShorthand {
                 out.style = Some(style);
                 continue;
             }
-            match name.as_str() {
-                "thin" => {
-                    out.width = Some(Length::Px(1.0 * zoom));
-                    continue;
-                }
-                "medium" => {
-                    out.width = Some(Length::Px(MEDIUM_BORDER * zoom));
-                    continue;
-                }
-                "thick" => {
-                    out.width = Some(Length::Px(5.0 * zoom));
-                    continue;
-                }
-                _ => {}
+            if let Some(width) = parse_border_width(raw, zoom) {
+                out.width = Some(width);
+                continue;
             }
         }
         if let Some(color) = parse_color(raw) {
             out.color = Some(color);
-        } else if let Some(length) = parse_length(raw) {
-            out.width = Some(length.scaled(zoom));
+        } else if let Some(width) = parse_border_width(raw, zoom) {
+            out.width = Some(width);
         }
     }
     out
@@ -1873,6 +1865,36 @@ fn apply_border_shorthand(side: &mut BorderSide, parsed: &BorderShorthand, zoom:
     side.width = parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER * zoom));
     side.style = parsed.style.unwrap_or_default();
     side.color = parsed.color;
+}
+
+/// One border width: a named one, or a length that is not negative.
+///
+/// The three keywords are the era's whole vocabulary for this — `border: thin
+/// solid` is how a table rule was written before anyone counted pixels — and
+/// until now they were only understood inside the `border` shorthand, so
+/// `border-top-width: thin` silently stayed medium.
+///
+/// A negative width is invalid, and an invalid declaration is *ignored* rather
+/// than clamped: `border-top-width: -1pt` leaves the initial `medium` standing,
+/// which is a visible border and not an absent one. Clamping to zero instead is
+/// the difference between the suite's negative-length tests passing and failing,
+/// and it was failing them silently — both sides of those reftests draw inline
+/// borders, so with inline borders unimplemented the pair matched by drawing
+/// nothing at all.
+///
+/// The scaling is applied here so a zoomed page's borders scale with it, which
+/// the keyword path was already doing and the length path did at each call.
+fn parse_border_width(raw: &Raw, zoom: f32) -> Option<Length> {
+    if let Raw::Ident(name) = raw {
+        return match name.as_str() {
+            "thin" => Some(Length::Px(THIN_BORDER * zoom)),
+            "medium" => Some(Length::Px(MEDIUM_BORDER * zoom)),
+            "thick" => Some(Length::Px(THICK_BORDER * zoom)),
+            _ => None,
+        };
+    }
+    let length = parse_length(raw)?;
+    (!length.is_negative()).then(|| length.scaled(zoom))
 }
 
 /// Handles `border-top`, `border-left-width`, and friends.
@@ -1894,8 +1916,8 @@ fn apply_border_longhand(borders: &mut Borders, rest: &str, values: &[Raw], zoom
         // `border-top: 1px solid red`
         None => apply_border_shorthand(side, &parse_border_shorthand(values, zoom), zoom),
         Some("width") => {
-            if let Some(width) = parse_length(first) {
-                side.width = width.scaled(zoom);
+            if let Some(width) = parse_border_width(first, zoom) {
+                side.width = width;
             }
         }
         Some("style") => {
