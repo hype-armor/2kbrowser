@@ -835,6 +835,24 @@ pub fn layout(
     let body = doc.find_element("body").unwrap_or_else(|| doc.root());
     let body_style = styles.get(body).cloned().unwrap_or_default();
 
+    // §14.2: the root element's background paints the canvas, and only when it
+    // has none does the body's get used in its place. Resolved before anything
+    // is laid out, because it decides what the boxes below may paint.
+    let html = doc.find_element("html");
+    let html_style = html.and_then(|node| styles.get(node));
+    let html_background = html_style
+        .map(|style| style.background_color)
+        .unwrap_or(css::Color::TRANSPARENT);
+    // Whether it is the *body's* background that reached the canvas, which is
+    // what decides whether the body — and the box holding it — may still paint
+    // one of its own.
+    let propagated = html_background.is_transparent();
+    let canvas_background = if propagated {
+        body_style.background_color
+    } else {
+        html_background
+    };
+
     let mut root = LayoutBox {
         rect: Rect {
             x: 0.0,
@@ -842,7 +860,32 @@ pub fn layout(
             width: viewport_width,
             height: 0.0,
         },
-        style: body_style.clone(),
+        // The body's style, minus its background where that background has
+        // already gone to the canvas. This box is as tall as the *content* and
+        // the canvas is as tall as the *window*, so painting it again lays an
+        // opaque rectangle over the lower part of whatever the canvas holds:
+        // with a colour that is the same colour and nobody can see it, and with
+        // an image it is the image's lower half gone — a page with a
+        // `no-repeat` tile taller than its own text lost everything below the
+        // last line.
+        //
+        // Kept where the background did *not* propagate, because then this box
+        // is what carries the page's colour out to the window edge past the
+        // reader gutter — which holds the text back from the glass and must not
+        // become a pale frame around a coloured page.
+        style: ComputedStyle {
+            background_color: if propagated {
+                css::Color::TRANSPARENT
+            } else {
+                body_style.background_color
+            },
+            background_image: if propagated {
+                None
+            } else {
+                body_style.background_image.clone()
+            },
+            ..body_style.clone()
+        },
         text: None,
         content_origin: (0.0, 0.0),
         content_width: viewport_width,
@@ -869,18 +912,17 @@ pub fn layout(
     );
     root.rect.height = height.outer();
 
-    // §14.2: the root element's background paints the canvas, and only when it
-    // has none does the body's get used in its place.
-    let html = doc.find_element("html");
-    let html_style = html.and_then(|node| styles.get(node));
-    let html_background = html_style
-        .map(|style| style.background_color)
-        .unwrap_or(css::Color::TRANSPARENT);
-    let canvas_background = if html_background.is_transparent() {
-        body_style.background_color
-    } else {
-        html_background
-    };
+    // §14.2 again: when it was the *body's* background that reached the canvas,
+    // the body's own background properties take their initial values — it is
+    // not painted a second time. The image half of that is settled in paint,
+    // which has to know the source node anyway; the colour is settled here,
+    // where which element was the source has just been decided.
+    if propagated
+        && let Some(box_) = root.children.first_mut()
+        && box_.node == Some(body)
+    {
+        box_.style.background_color = css::Color::TRANSPARENT;
+    }
 
     // The image propagates independently of the colour: a root with a colour
     // and a body with a tile is ordinary markup, and both belong on the canvas.

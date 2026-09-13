@@ -62,10 +62,6 @@ const WIDTH: u32 = 800;
 /// than what a reader would see.
 const HEIGHT: u32 = 600;
 
-/// Rendered taller than the viewport, then cropped, so that content below the
-/// fold still influences layout above it the way it would in a real window.
-const MAX_HEIGHT: u32 = 3000;
-
 /// Flags marking a test no headless image comparison can perform.
 ///
 /// Skipped and counted, never failed. These are not engine gaps: `interact`
@@ -280,13 +276,25 @@ fn render(path: &Path, fonts: &mut FontStore) -> Option<Vec<u8>> {
     // stylesheets these tests lean on actually resolve.
     let url = net::file_url(path);
     let (origin, base) = net::parse_url(&url).ok()?;
+    // A *viewport* and not a canvas: 800x600 of window, filled to the bottom
+    // whatever the page's own height is. §14.2 puts the root element's
+    // background — or the body's, in its place — over the whole canvas, so a
+    // short page with `html { background: green }` is a green window in every
+    // browser. Rendering to the content's height and padding the rest with
+    // white made it a green strip above white, and a reftest whose two sides
+    // differ in height could not then match however right the rendering was.
     let page =
-        shell::render::render_with_base(&html, WIDTH, MAX_HEIGHT, fonts, Some((&origin, &base)));
+        shell::render::render_in_viewport(&html, WIDTH, HEIGHT, fonts, Some((&origin, &base)));
     Some(viewport(&page.pixmap))
 }
 
-/// The top-left 800x600 of a render, padded with white where the page is
-/// shorter — which is what a browser window shows.
+/// The top-left 800x600 of a render.
+///
+/// The render already fills the window — see `render`, which asks for a
+/// viewport rather than a canvas — so this crops a *taller* page and does
+/// nothing to a shorter one. The padding below is the belt to that pair of
+/// braces, and white only because a pixmap that came back short is a bug rather
+/// than a rendering.
 fn viewport(pixmap: &paint::Pixmap) -> Vec<u8> {
     const CHANNELS: usize = 4;
     let stride = WIDTH as usize * CHANNELS;
