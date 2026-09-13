@@ -16,6 +16,32 @@ record for everything earlier.
 
 ## Unreleased
 
+**The reader gutter is made of padding** (#91). A page that asks for
+`body { margin: 0 }` gets eight pixels anyway, because those pages were written
+for a window with browser chrome around it and taken literally they put the
+first letter of every line against the glass. That floor was applied to the
+*margin*, which is outside the background — so a `body { margin: 0; background:
+navy }` page came out navy with a pale frame around it, which is the same "looks
+like a bug" the gutter exists to avoid, one step further out.
+
+The compensation for that was the box holding the page carrying the body's
+background out to the window on its behalf. Right when that background is the
+canvas's, and wrong when the root has one of its own: `html { background: purple
+}` with a navy body came out navy to the window edge instead of navy in a purple
+field. Padding is inside the background, so with the floor on the padding the
+background reaches the glass by itself and §14.2 needs no exception — the
+holding box paints no background at all now, which is what #76 wanted and could
+not have.
+
+The floor is on the distance from the glass rather than on the margin alone, so
+a page that spent it on padding has already met it and one that spent half needs
+only the other half.
+
+3261 of 4821 reference tests to 3264, with nothing newly failing. The blast
+radius is smaller than it looks: every reference fixture is unchanged, and all
+three pages in README.md's screenshots render byte-identically, because a page
+has to ask for *less* than the gutter before any of this is reachable.
+
 **A table has six background layers, and now paints five of them** (#86).
 §17.5.1 makes a table the table, its column groups, its columns, its row
 groups, its rows and its cells, superimposed in that order, with a background in

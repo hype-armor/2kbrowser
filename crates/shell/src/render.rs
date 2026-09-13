@@ -410,6 +410,20 @@ impl Loader for DirectLoader {
 /// So the page keeps a gutter whatever it asks for. Eight pixels, matching the
 /// UA sheet's own body margin: enough to read against, not enough to be a
 /// second opinion about the page's design.
+///
+/// Made of **padding**, not margin, and the difference is the whole reason this
+/// comment is longer than the constant. Padding is inside the background where
+/// margin is outside it: a `body { margin: 0; background: navy }` page topped up
+/// with margin is navy with a pale frame around it — which is exactly the
+/// "looks like a bug" this exists to avoid, one step further out. Topped up with
+/// padding it is navy to the glass with its text held off.
+///
+/// It also keeps §14.2 honest. The compensation for the frame used to be that
+/// the box holding the page carried the body's background out to the window,
+/// which is right when that background is the canvas's and wrong when the root
+/// has one of its own — `html { background: purple }` with a navy body came out
+/// navy to the window edge instead of navy in a purple field. With the gutter
+/// inside the background there is nothing to compensate for.
 const PAGE_GUTTER: f32 = 8.0;
 
 /// Renders HTML at a given viewport width.
@@ -1940,12 +1954,12 @@ mod tests {
     fn the_pages_background_still_reaches_the_window_edge() {
         // The gutter holds the page's *content* back; it is not a frame drawn
         // around the page. A body background that stopped 8px short would put a
-        // pale border around every coloured page.
+        // pale border around every coloured page, which is why the gutter is
+        // made of padding rather than margin: padding is inside the background.
         //
         // The root is given a background of its own so that §14.2 propagation
-        // cannot answer this by accident: the canvas is white here, and the
-        // blue at the window edge can only have come from the body's own box
-        // still spanning the window.
+        // cannot answer this by accident: the canvas is white here, and blue at
+        // the window edge can only have come from the body's own box.
         let mut fonts = FontStore::new();
         let page = render(
             "<style>html { background: #ffffff } \
@@ -1954,17 +1968,26 @@ mod tests {
             2000,
             &mut fonts,
         );
-        let row = &page.pixmap.data()[..page.pixmap.width() as usize * 4];
-        let colour = |pixel: &[u8]| (pixel[0], pixel[1], pixel[2]);
+        let width = page.pixmap.width() as usize;
+        let colour = |x: usize, y: usize| {
+            let at = (y * width + x) * 4;
+            let pixel = &page.pixmap.data()[at..at + 4];
+            (pixel[0], pixel[1], pixel[2])
+        };
+        const BLUE: (u8, u8, u8) = (0x33, 0x66, 0xcc);
+
+        // Whichever row the body's box lands on — which is not row zero, and
+        // deliberately not asserted: the `<p>`'s top margin collapses out
+        // through a body with no border or padding of its own, so the box
+        // starts below it. That is §8.3.1 and is what a browser does too; it is
+        // the *horizontal* reach this test is about.
+        let row = (0..page.pixmap.height() as usize)
+            .find(|&y| colour(0, y) == BLUE)
+            .expect("no row carries the page's background to the left edge");
         assert_eq!(
-            colour(&row[..4]),
-            (0x33, 0x66, 0xcc),
-            "the top-left pixel is not the page's background"
-        );
-        assert_eq!(
-            colour(&row[row.len() - 4..]),
-            (0x33, 0x66, 0xcc),
-            "the top-right pixel is not the page's background"
+            colour(width - 1, row),
+            BLUE,
+            "the background reached the left edge of row {row} and not the right"
         );
     }
 

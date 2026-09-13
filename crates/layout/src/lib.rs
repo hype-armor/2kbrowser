@@ -844,8 +844,7 @@ pub fn layout(
         .map(|style| style.background_color)
         .unwrap_or(css::Color::TRANSPARENT);
     // Whether it is the *body's* background that reached the canvas, which is
-    // what decides whether the body — and the box holding it — may still paint
-    // one of its own.
+    // what decides whether the body may still paint one of its own.
     let propagated = html_background.is_transparent();
     let canvas_background = if propagated {
         body_style.background_color
@@ -860,30 +859,23 @@ pub fn layout(
             width: viewport_width,
             height: 0.0,
         },
-        // The body's style, minus its background where that background has
-        // already gone to the canvas. This box is as tall as the *content* and
-        // the canvas is as tall as the *window*, so painting it again lays an
-        // opaque rectangle over the lower part of whatever the canvas holds:
-        // with a colour that is the same colour and nobody can see it, and with
-        // an image it is the image's lower half gone — a page with a
-        // `no-repeat` tile taller than its own text lost everything below the
-        // last line.
+        // The body's style, minus its background. §14.2 sends that to the
+        // canvas where the root has none of its own, and the element is not
+        // painted a second time; this box is as tall as the *content* where the
+        // canvas is as tall as the *window*, so painting it again lays an
+        // opaque rectangle over the lower part of whatever the canvas holds. A
+        // page with a `no-repeat` tile taller than its own text lost everything
+        // below the last line to exactly that.
         //
-        // Kept where the background did *not* propagate, because then this box
-        // is what carries the page's colour out to the window edge past the
-        // reader gutter — which holds the text back from the glass and must not
-        // become a pale frame around a coloured page.
+        // And where the background did *not* propagate — a root with a colour
+        // of its own — it belongs to the body's box and nowhere else. This box
+        // used to carry it anyway, so that the reader gutter would not show as
+        // a pale frame around a coloured page; the gutter is made of padding
+        // now, which keeps the background against the glass without anything
+        // having to carry it there.
         style: ComputedStyle {
-            background_color: if propagated {
-                css::Color::TRANSPARENT
-            } else {
-                body_style.background_color
-            },
-            background_image: if propagated {
-                None
-            } else {
-                body_style.background_image.clone()
-            },
+            background_color: css::Color::TRANSPARENT,
+            background_image: None,
             ..body_style.clone()
         },
         text: None,

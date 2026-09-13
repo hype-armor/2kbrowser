@@ -76,8 +76,8 @@ impl StyleMap {
         }
     }
 
-    /// Raises a node's left and right margins to at least `least` pixels,
-    /// leaving a wider margin alone.
+    /// Holds a node's content at least `least` pixels from each side, leaving a
+    /// node that already asks for more alone.
     ///
     /// For the page gutter. The UA sheet's `body { margin: 8px }` is a default
     /// and an author's `margin: 0` beats it, which leaves text against the
@@ -87,24 +87,40 @@ impl StyleMap {
     /// applied after the cascade, like [`Self::hide`], instead of pretending to
     /// be a stylesheet.
     ///
-    /// `available_width` resolves a percentage margin, which has to be measured
+    /// The shortfall goes on the **padding**, and the margin the page asked for
+    /// counts towards the floor rather than being replaced by it. Padding is
+    /// inside the background where margin is outside it, and that is the whole
+    /// difference: a `body { margin: 0; background: navy }` page topped up with
+    /// margin is navy with a pale frame around it, which is precisely what the
+    /// gutter is not for. Topped up with padding it is navy to the glass with
+    /// its text held off — which is also what lets §14.2 hold without an
+    /// exception, since nothing then has to carry the body's background out to
+    /// the window on its behalf.
+    ///
+    /// `available_width` resolves a percentage, which has to be measured
     /// against something before it can be compared with a length in pixels.
     pub fn keep_off_the_edges(&mut self, node: NodeId, least: f32, available_width: f32) {
         let Some(style) = self.styles.get_mut(&node) else {
             return;
         };
         let font_size = style.font_size;
-        for margin in [&mut style.margin.left, &mut style.margin.right] {
-            // An `auto` horizontal margin on a block of automatic width
-            // resolves to zero, so it has asked for nothing and the floor
-            // applies.
-            let asked = match *margin {
-                Length::Auto => 0.0,
-                length => length.to_px(font_size, available_width),
-            };
-            if asked < least {
-                *margin = Length::Px(least);
-            }
+        // An `auto` horizontal margin on a block of automatic width resolves to
+        // zero, so it has asked for nothing and the whole floor applies.
+        let px = |length: Length| match length {
+            Length::Auto => 0.0,
+            length => length.to_px(font_size, available_width),
+        };
+        // Unrolled rather than looped: two sides, and a loop over them needs
+        // either an enum or two mutable borrows of the same style.
+        let topped = |margin: Length, padding: Length| {
+            let short = least - px(margin) - px(padding);
+            (short > 0.0).then(|| Length::Px(px(padding) + short))
+        };
+        if let Some(left) = topped(style.margin.left, style.padding.left) {
+            style.padding.left = left;
+        }
+        if let Some(right) = topped(style.margin.right, style.padding.right) {
+            style.padding.right = right;
         }
     }
 }
@@ -3683,49 +3699,106 @@ mod tests {
         assert!(block.display.is_supported_layout());
     }
 
-    /// The body's horizontal margins after the floor has been applied.
-    fn margins_after_floor(css: &str, least: f32, available_width: f32) -> (Length, Length) {
+    /// The body's style after the floor has been applied.
+    fn after_floor(css: &str, least: f32, available_width: f32) -> ComputedStyle {
         let doc = dom::parse(&format!("<style>{css}</style><body>x</body>"));
         let sheets = [Stylesheet::parse(css)];
         let mut map = cascade(&doc, &sheets);
         let body = doc.find_element("body").expect("a body");
         map.keep_off_the_edges(body, least, available_width);
-        let style = map.get(body).expect("a styled body");
-        (style.margin.left, style.margin.right)
+        map.get(body).expect("a styled body").clone()
+    }
+
+    /// How far its content sits from each side of the window: the two edges
+    /// added together, which is the thing the floor is a floor on.
+    fn insets_after_floor(css: &str, least: f32, available_width: f32) -> (f32, f32) {
+        let style = after_floor(css, least, available_width);
+        let px = |length: Length| match length {
+            Length::Auto => 0.0,
+            length => length.to_px(style.font_size, available_width),
+        };
+        (
+            px(style.margin.left) + px(style.padding.left),
+            px(style.margin.right) + px(style.padding.right),
+        )
     }
 
     #[test]
-    fn the_edge_floor_raises_a_margin_that_is_under_it() {
-        let (left, right) = margins_after_floor("body { margin: 0 }", 8.0, 400.0);
-        assert_eq!(left, Length::Px(8.0));
-        assert_eq!(right, Length::Px(8.0));
+    fn the_edge_floor_holds_content_off_a_page_that_asked_for_nothing() {
+        assert_eq!(
+            insets_after_floor("body { margin: 0 }", 8.0, 400.0),
+            (8.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn the_edge_floor_is_made_of_padding_so_a_background_still_reaches_the_glass() {
+        // The whole reason it is not margin. Margin is outside the background,
+        // so topping it up puts a pale frame around every `body { margin: 0 }`
+        // page that set a colour — which is the opposite of what a gutter is
+        // for, and left §14.2 needing an exception to paper over.
+        let style = after_floor("body { margin: 0 }", 8.0, 400.0);
+        assert_eq!(style.margin.left, Length::Px(0.0), "the margin was raised");
+        assert_eq!(style.padding.left, Length::Px(8.0));
     }
 
     #[test]
     fn the_edge_floor_leaves_a_wider_margin_alone() {
         // A floor that overwrote whatever it found would be a fixed margin, and
         // would flatten every page's own spacing to the same eight pixels.
-        let (left, _) = margins_after_floor("body { margin: 40px }", 8.0, 400.0);
-        assert_eq!(left, Length::Px(40.0));
+        let style = after_floor("body { margin: 40px }", 8.0, 400.0);
+        assert_eq!(style.margin.left, Length::Px(40.0));
+        assert_eq!(
+            style.padding.left,
+            Length::Px(0.0),
+            "and adds nothing to it"
+        );
+    }
+
+    #[test]
+    fn the_edge_floor_counts_the_padding_a_page_already_asked_for() {
+        // The floor is on the distance from the glass, so a page that spent it
+        // on padding has already met it and a page that spent half of it needs
+        // only the other half.
+        let style = after_floor("body { margin: 0; padding: 0 20px }", 8.0, 400.0);
+        assert_eq!(style.padding.left, Length::Px(20.0), "padding was raised");
+
+        let topped = after_floor("body { margin: 0; padding: 0 3px }", 8.0, 400.0);
+        assert_eq!(
+            topped.padding.left,
+            Length::Px(8.0),
+            "3px plus the missing 5"
+        );
     }
 
     #[test]
     fn the_edge_floor_measures_a_percentage_margin_before_judging_it() {
         // 5% of 400px is 20px, which already clears the floor; 1% is 4px, which
         // does not. Comparing the numbers unresolved would get both wrong.
-        let (wide, _) = margins_after_floor("body { margin: 0 5% }", 8.0, 400.0);
-        assert_eq!(wide, Length::Percent(5.0), "a wide percentage was replaced");
+        let wide = after_floor("body { margin: 0 5% }", 8.0, 400.0);
+        assert_eq!(wide.margin.right, Length::Percent(5.0));
+        assert_eq!(
+            wide.padding.right,
+            Length::Px(0.0),
+            "a wide percentage was topped up anyway"
+        );
 
-        let (narrow, _) = margins_after_floor("body { margin: 0 1% }", 8.0, 400.0);
-        assert_eq!(narrow, Length::Px(8.0), "a narrow percentage was kept");
+        let narrow = after_floor("body { margin: 0 1% }", 8.0, 400.0);
+        assert_eq!(
+            narrow.padding.right,
+            Length::Px(4.0),
+            "1% of 400 is 4px, so 4 more are owed"
+        );
     }
 
     #[test]
     fn the_edge_floor_treats_an_auto_margin_as_asking_for_nothing() {
         // `margin: 0 auto` on a block of automatic width — which the body is —
         // resolves to zero, so the page has asked for no room at all.
-        let (left, right) = margins_after_floor("body { margin: 0 auto }", 8.0, 400.0);
-        assert_eq!((left, right), (Length::Px(8.0), Length::Px(8.0)));
+        assert_eq!(
+            insets_after_floor("body { margin: 0 auto }", 8.0, 400.0),
+            (8.0, 8.0)
+        );
     }
 
     #[test]
