@@ -161,6 +161,37 @@ impl FloatContext {
         }
     }
 
+    /// How many floats this context holds.
+    ///
+    /// Only useful beside [`FloatContext::absorb`], to tell the floats a
+    /// descendant added from the ones it inherited.
+    pub fn len(&self) -> usize {
+        self.floats.len()
+    }
+
+    /// Takes on the floats a descendant placed, moved back into this context's
+    /// coordinates.
+    ///
+    /// The other half of [`FloatContext::translated`], and the reason that one
+    /// is not enough on its own. A float belongs to a block formatting context
+    /// rather than to the block that declared it, so a float written inside an
+    /// ordinary nested block is *this* context's float too: text after that
+    /// block has to flow around it, and a later sibling that clears has to
+    /// clear it. A descendant works in a shifted copy, so what it added has to
+    /// come back — `from` is how many floats the copy started with, and
+    /// `(dx, dy)` is the shift being undone.
+    pub fn absorb(&mut self, inner: &FloatContext, from: usize, dx: f32, dy: f32) {
+        for float in inner.floats.iter().skip(from) {
+            self.floats.push(PlacedFloat {
+                left: float.left + dx,
+                right: float.right + dx,
+                top: float.top + dy,
+                bottom: float.bottom + dy,
+                ..*float
+            });
+        }
+    }
+
     /// The lowest edge of any float, used so a container encloses its floats.
     pub fn lowest_edge(&self) -> f32 {
         self.floats

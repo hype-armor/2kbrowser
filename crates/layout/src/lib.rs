@@ -377,6 +377,19 @@ fn collapse(first: f32, second: f32) -> f32 {
 /// It escaped. The property was not modelled at all until then, so the box did
 /// not know it was a formatting context.
 fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
+    establishes_a_formatting_context(style)
+}
+
+/// Whether the box establishes a block formatting context of its own.
+///
+/// Two rules follow from the same fact and are easy to mistake for two
+/// unrelated special cases. A box with a formatting context of its own keeps
+/// its children's margins rather than letting them collapse through it
+/// (§8.3.1), **and** it contains its floats rather than letting them hang out
+/// below its bottom edge (§10.6.3). That second one is why `overflow: hidden`
+/// on a container is the usual way to make a float "count", a trick that reads
+/// as superstition until the two rules are seen to be the same rule.
+fn establishes_a_formatting_context(style: &ComputedStyle) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
         || style.display == Display::TableCell
@@ -845,7 +858,7 @@ pub fn layout(
         0.0,
         0.0,
         viewport_width,
-        FloatContext::new(viewport_width),
+        &mut FloatContext::new(viewport_width),
         ContainingBlock::viewport(viewport_width, viewport_width),
         &mut root,
     );
@@ -1199,7 +1212,7 @@ fn layout_inline_block(
         effective,
         // An inline-block establishes a formatting context of its own, so no
         // float declared outside it reaches in.
-        FloatContext::new(effective),
+        &mut FloatContext::new(effective),
         ContainingBlock::establish((effective, 0.0)),
         &mut holder,
     );
@@ -1900,7 +1913,11 @@ fn layout_block(
     x: f32,
     y: f32,
     available_width: f32,
-    inherited: FloatContext,
+    // Borrowed rather than taken, because a float this box does not contain is
+    // still the caller's float: it belongs to the nearest ancestor that
+    // establishes a formatting context, and everything between here and there
+    // has to flow around it and be able to clear it.
+    inherited: &mut FloatContext,
     containing: ContainingBlock,
     parent: &mut LayoutBox,
 ) -> Consumed {
@@ -2087,6 +2104,7 @@ fn layout_block(
     let mut content_height = 0.0;
     // Floats declared by ancestors still apply here, shifted into this block's
     // coordinates; this block's own floats are added on top.
+    let inherited_floats = inherited.len();
     let mut context = inherited.translated(
         padding_left + border_left,
         padding_top + border_top,
@@ -2276,7 +2294,7 @@ fn layout_block(
                     box_.rect.x,
                     at,
                     width,
-                    FloatContext::new(width),
+                    &mut FloatContext::new(width),
                     ContainingBlock::viewport(width, width),
                     &mut holder,
                 );
@@ -2509,7 +2527,8 @@ fn layout_block(
         // from the floats above it by construction, so it cannot end up higher
         // than it would have without the collapse.
         cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
-        let child_context = context.translated(0.0, cursor_y - into_context, content_width);
+        let mut child_context = context.translated(0.0, cursor_y - into_context, content_width);
+        let child_floats = child_context.len();
         // A normal-flow child's containing block is *this* box, so the
         // definite height it may resolve a percentage against is this box's,
         // not an ancestor's. Carrying the ancestor's down instead would let
@@ -2528,10 +2547,15 @@ fn layout_block(
             padding_left + border_left,
             cursor_y,
             content_width,
-            child_context,
+            &mut child_context,
             child_containing,
             &mut box_,
         );
+        // A float the child did not contain is this block's float now. Without
+        // this it stays inside the copy the child was handed and is forgotten
+        // the moment that copy is dropped: text after the child would not flow
+        // around it, and a later sibling could not clear it.
+        context.absorb(&child_context, child_floats, 0.0, cursor_y - into_context);
         // §8.3.1's second rule: with nothing between them — no top border, no
         // top padding, and nothing already laid out above — a first child's top
         // margin is adjoining its parent's, and the two collapse into one
@@ -2667,9 +2691,29 @@ fn layout_block(
         _ => None,
     };
 
-    let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
-        + padding_bottom
-        + border_bottom;
+    // §10.6.3: a block's automatic height is decided by its **in-flow**
+    // content. A float taller than that content hangs out below the bottom
+    // edge rather than growing the block — which is the whole reason `clear`
+    // exists, and the reason a container that must contain its floats is given
+    // a formatting context of its own.
+    //
+    // A box that has one is the exception, and there the floats are its own to
+    // contain. Everything below the block still sees the float through the
+    // float context it was handed, so text after a wrapped float still flows
+    // around it; what changes is only whose *box* grows.
+    let floats_are_contained = establishes_a_formatting_context(style);
+    let in_flow_end = if floats_are_contained {
+        cursor_y.max(padding_top + border_top + context.lowest_edge())
+    } else {
+        // Still floored at the content edge, which is not about floats at all:
+        // `lowest_edge` is zero on a context with no floats in it, so the
+        // expression above was doing double duty and the floor went with the
+        // floats when they were taken out. A negative bottom margin can drive
+        // the cursor above where the content started, and a box of negative
+        // height is not a thing.
+        cursor_y.max(padding_top + border_top)
+    };
+    let content_end = in_flow_end + padding_bottom + border_bottom;
     let surround = padding_top + padding_bottom + border_top + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
@@ -2801,7 +2845,7 @@ fn layout_block(
             0.0,
             0.0,
             width_basis,
-            FloatContext::new(width_basis),
+            &mut FloatContext::new(width_basis),
             ContainingBlock::viewport(width_basis, child_containing.size.1),
             &mut probe,
         );
@@ -2865,6 +2909,17 @@ fn layout_block(
             && matches!(style.height, Length::Auto | Length::Px(0.0))
             && !keeps_its_childrens_margins(style),
     };
+    // And out again, unless this box contains them. A float placed here or in
+    // a descendant belongs to the nearest ancestor with a formatting context
+    // of its own, and the coordinates go back the way they came.
+    if !floats_are_contained {
+        inherited.absorb(
+            &context,
+            inherited_floats,
+            padding_left + border_left,
+            padding_top + border_top,
+        );
+    }
     parent.children.push(box_);
     consumed
 }
@@ -3089,7 +3144,7 @@ fn layout_table(
                 // Placed on the second pass; only the height matters here.
                 0.0,
                 width,
-                FloatContext::new(width),
+                &mut FloatContext::new(width),
                 ContainingBlock::viewport(width, width),
                 &mut holder,
             );
@@ -3423,7 +3478,7 @@ fn place_float(
         0.0,
         0.0,
         float_width,
-        FloatContext::new(float_width),
+        &mut FloatContext::new(float_width),
         ContainingBlock::viewport(float_width, float_width),
         &mut probe,
     );
@@ -7129,18 +7184,63 @@ mod tests {
     }
 
     #[test]
-    fn a_container_encloses_a_float_taller_than_its_text() {
-        // Otherwise the next block starts beside the float and overlaps it.
+    fn a_float_hangs_out_below_the_block_that_contains_it() {
+        // §10.6.3: a block's automatic height is decided by its *in-flow*
+        // content. This used to assert the opposite — that the container grew
+        // to enclose the float — with the reason "otherwise the next block
+        // starts beside the float and overlaps it". That reason was real and
+        // the fix was in the wrong place: the next block is *supposed* to start
+        // beside the float, with its lines narrowed by it, which is what the
+        // float context now carries out of the block instead.
         let rendered = run(
-            "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
-            "body { margin: 0 } .f { float: left; width: 60px; height: 120px }",
+            "<body><div class=\"box\"><div class=\"f\">side</div>short</div>\
+             <p id=after>after</p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .f { float: left; width: 60px; height: 120px }",
             400.0,
         );
         let container = content_boxes(&rendered)[0];
         assert!(
-            container.rect.height >= 120.0,
-            "container must enclose its float, got {}",
+            container.rect.height < 30.0,
+            "the container grew to its float, got {}",
             container.rect.height
+        );
+
+        // The float is still known about below: the paragraph after the
+        // container has its line pushed clear of the float's right edge.
+        let line = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| Some((b, b.text.as_ref()?.lines.first()?)))
+            .find(|(_, line)| line.text.contains("after"))
+            .map(|(b, line)| b.rect.x + line.glyphs.first().map_or(0.0, |g| g.x))
+            .expect("the paragraph after");
+        assert!(
+            line >= 60.0,
+            "the text after the container ran under the float, at {line}"
+        );
+    }
+
+    #[test]
+    fn a_block_that_makes_its_own_formatting_context_does_contain_its_floats() {
+        // The other half of §10.6.3, and the reason `overflow: hidden` on a
+        // container is the usual way to make a float "count": the two rules are
+        // the same rule, and a box with a formatting context of its own holds
+        // the floats inside it.
+        let height = |extra: &str| {
+            let rendered = run(
+                "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
+                &format!(
+                    "body {{ margin: 0 }} .f {{ float: left; width: 60px; height: 120px }} \
+                     .box {{ {extra} }}"
+                ),
+                400.0,
+            );
+            content_boxes(&rendered)[0].rect.height
+        };
+        assert!(height("") < 30.0, "the plain container grew to its float");
+        assert!(
+            height("overflow: hidden") >= 120.0,
+            "an overflow container must contain its float"
         );
     }
 
