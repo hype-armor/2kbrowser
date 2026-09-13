@@ -624,8 +624,17 @@ mod tests {
             "{} is not a source of the browser",
             path.display()
         );
+        // `lock` as well as `rs` and `toml`: `newest_source` watches
+        // `Cargo.lock` on purpose, because a dependency that moved makes the
+        // binary on disk just as stale as an edited source file does. Leaving
+        // it out here passed for as long as the lock file was never the newest
+        // thing in the tree, and failed the first time a release bumped the
+        // version — which touches the lock and nothing else.
         let extension = path.extension().expect("an extension");
-        assert!(extension == "rs" || extension == "toml", "{extension:?}");
+        assert!(
+            extension == "rs" || extension == "toml" || extension == "lock",
+            "{extension:?}"
+        );
     }
 
     #[test]

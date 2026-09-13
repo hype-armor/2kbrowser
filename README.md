@@ -135,6 +135,13 @@ found them; they turned up only because a fix aimed at something else made them
 move. See PLAN.md — the harness's own bugs have been more instructive than the
 figure every time.
 
+That trap is not historical. Implementing inline boxes made **eleven** more of
+them move, every one a test whose reference expresses its expected result with an
+inline background or border — so both sides had been drawing nothing and matching
+on it. They are the reason the figure is measured in both directions here rather
+than reported as a total: a release that reports only its gains cannot tell you
+whether it found more than it broke.
+
 Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
 not clipped — it is drawn, and the canvas is now grown to hold it, which it was

@@ -16,47 +16,33 @@ record for everything earlier.
 
 ## Unreleased
 
-**A propagated background covers the canvas rather than the content** (#76).
-§14.2 puts the root element's background — or the body's, in its place — over
-the *entire canvas*. This put it there and then painted it a second time on the
-anonymous box that holds the page, which is as tall as the content rather than
-as tall as the window. With a colour that is an opaque rectangle of exactly the
-same colour and nobody could see it. With a background image it is an opaque
-rectangle over the top of the image: a page with a `no-repeat` tile taller than
-its own text lost everything below the last line, and the era's tiled pages lost
-the tile everywhere the text did not reach. The `era-page` reference fixture had
-been recording that as its expected output.
+## 0.3.0
 
-The body no longer repaints the colour on its own box either, which is the same
-sentence of §14.2 — when the body's background is what reached the canvas, its
-own background properties take their initial values.
+A release about the half of the box model that only ever worked for blocks.
+README.md has been listing "the box model with borders and backgrounds" under
+what works since the beginning, and it meant block boxes; an inline one drew
+nothing and took no room, which is why a highlighted phrase came out as plain
+text. That is the bulk of what is below, and it brought two older bugs up with
+it.
 
-**And the conformance harness measures a window instead of a canvas.** It
-rendered each document to its content height and padded the rest of the 800x600
-comparison with *white*, which a browser does not do: a short page with
-`html { background: green }` is a green window everywhere and was a green strip
-above white here. Both sides of a reftest are usually short in the same way, so
-this was mostly neutral — it bit where the two sides differ in height or the
-canvas has a colour of its own.
+**The CSS 2.1 conformance suite went from 66.1% to 66.9%** — 3188 of 4821
+reference tests to 3226 — which is a small number in front of a large change,
+and the direction it is small in is worth the paragraph.
 
-The two changes had to land together, and that is the whole reason #76 sat
-filed rather than fixed. Made separately, each is worth **net zero**: the harness
-change alone wins `backgrounds/background-root-001` and loses
-`floats-clear/margin-collapse-clear-017`, and the §14.2 fix alone wins
-`css1/c45-bg-canvas-000` and loses the same one. Together: **3225 of 4821 to
-3226**, one newly passing and none newly failing. The issue asked for
-`margin-collapse-clear-017` to be settled against a real browser first; it was,
-and headless Chromium draws the full ruler that neither of our two sides was
-drawing.
+49 tests newly pass and **11 newly fail**. Every one of the 11 was passing
+because *neither* side of the pair drew anything: their references express the
+expected result with an inline background or border, so with those unimplemented
+both sides rendered nothing and matched perfectly. A reftest cannot tell
+"identical" from "identically blank" — the same trap the harness's CDATA fix
+turned up by the hundred in 0.2.0, and the reason the number here is measured in
+both directions rather than reported as a total. Each of the 11 now names a real
+gap and each is filed: table row-group backgrounds (#86), `inherit` as a value
+(#87), `direction: rtl` (#88), `line-height: normal` taken from the font rather
+than a constant (#89), and two that were already recorded.
 
-One newly passing rather than two, because the §14.2 fix is applied only where
-the background actually propagated. The reader gutter tops up the body's margin
-to keep text off the glass, and the box holding the page carries the body's
-background out past it so the gutter is not a pale frame around a coloured page —
-which is right when that background is the canvas's and wrong when it is not.
-`c45-bg-canvas-000` is the wrong case and still fails; #91 says what it needs,
-which is the gutter made of padding rather than margin and is a wider change than
-this one.
+The rest of the release is a fieldset that looks like a fieldset, a radio button
+you can tell from a checkbox, and two places where the engine and the instrument
+measuring it were wrong in the same direction at once.
 
 **An inline box is a box** (#46, #71). A `<span>` with a background, padding or
 a border drew none of them and reserved no room for any of them: a highlighted
@@ -140,6 +126,48 @@ the legend standing above it, so nothing above the group is trodden on.
 
 The conformance number is unchanged at 3202 of 4821: CSS 2.1's suite has no
 fieldset in it, and would not be where this showed up if it had.
+
+**A propagated background covers the canvas rather than the content** (#76).
+§14.2 puts the root element's background — or the body's, in its place — over
+the *entire canvas*. This put it there and then painted it a second time on the
+anonymous box that holds the page, which is as tall as the content rather than
+as tall as the window. With a colour that is an opaque rectangle of exactly the
+same colour and nobody could see it. With a background image it is an opaque
+rectangle over the top of the image: a page with a `no-repeat` tile taller than
+its own text lost everything below the last line, and the era's tiled pages lost
+the tile everywhere the text did not reach. The `era-page` reference fixture had
+been recording that as its expected output.
+
+The body no longer repaints the colour on its own box either, which is the same
+sentence of §14.2 — when the body's background is what reached the canvas, its
+own background properties take their initial values.
+
+**And the conformance harness measures a window instead of a canvas.** It
+rendered each document to its content height and padded the rest of the 800x600
+comparison with *white*, which a browser does not do: a short page with
+`html { background: green }` is a green window everywhere and was a green strip
+above white here. Both sides of a reftest are usually short in the same way, so
+this was mostly neutral — it bit where the two sides differ in height or the
+canvas has a colour of its own.
+
+The two changes had to land together, and that is the whole reason #76 sat
+filed rather than fixed. Made separately, each is worth **net zero**: the harness
+change alone wins `backgrounds/background-root-001` and loses
+`floats-clear/margin-collapse-clear-017`, and the §14.2 fix alone wins
+`css1/c45-bg-canvas-000` and loses the same one. Together: **3225 of 4821 to
+3226**, one newly passing and none newly failing. The issue asked for
+`margin-collapse-clear-017` to be settled against a real browser first; it was,
+and headless Chromium draws the full ruler that neither of our two sides was
+drawing.
+
+One newly passing rather than two, because the §14.2 fix is applied only where
+the background actually propagated. The reader gutter tops up the body's margin
+to keep text off the glass, and the box holding the page carries the body's
+background out past it so the gutter is not a pale frame around a coloured page —
+which is right when that background is the canvas's and wrong when it is not.
+`c45-bg-canvas-000` is the wrong case and still fails; #91 says what it needs,
+which is the gutter made of padding rather than margin and is a wider change than
+this one.
 
 **The conformance harness renders each document through a font store of its
 own** (#31). One store was held for the whole run of eleven thousand documents.
