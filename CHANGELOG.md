@@ -16,6 +16,20 @@ record for everything earlier.
 
 ## Unreleased
 
+**An absolutely positioned box is moved by its margins** (#30). §10.3.7 puts
+the margins in the equation it solves, so `margin-left: 40px` moves the box
+forty pixels whether `left` is a length or `auto`, and `right` is measured from
+the *margin* edge. This read the offsets alone, and the margin the probe layout
+had already applied was then overwritten by the answer — so every absolutely
+positioned box sat flat against its containing block's content edge.
+
+**And positioned boxes paint in the order they were written.** Appendix E step
+8: positioned descendants with `z-index: auto` paint in document order.
+Absolutely positioned boxes were appended after every in-flow child, so an
+absolute box always covered a relative sibling however the source was written.
+Invisible until two of them overlap — and then wrong every time. The margin fix
+is what made them overlap, which is how this was found.
+
 **A rule takes the width and thickness its markup asks for** (#39). `<hr
 width="50%">`, `<hr width="200">` and `<hr size="8">` were all ignored: every
 rule came out full width and a pixel tall. A half-width centred rule under a
