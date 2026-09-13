@@ -46,6 +46,19 @@ pub enum DisplayItem {
         /// Fill colour.
         color: Color,
     },
+    /// A filled ellipse, inscribed in a rectangle.
+    ///
+    /// CSS 2.1 has no rounded anything, so this exists for one box: a radio
+    /// button. A square radio beside a square checkbox is not a cosmetic
+    /// shortfall — the shape *is* the meaning, a square saying "any of these"
+    /// and a circle "one of these", and drawing both square removes the only
+    /// thing telling a reader which question they are answering.
+    Ellipse {
+        /// The box the ellipse is inscribed in.
+        rect: Rect,
+        /// Fill colour.
+        color: Color,
+    },
     /// A decoded image drawn into a rectangle.
     Image {
         /// The element the image belongs to, used to look it up at raster time.
@@ -165,7 +178,36 @@ fn paint_box(
     // `display: none` and the reason an author reaches for it.
     let drawn = box_.style.visibility == Visibility::Visible;
 
-    if drawn && !box_.style.background_color.is_transparent() {
+    // A round box — a radio button, and nothing else — is a ring rather than
+    // four border rects around a filled rectangle: the border colour fills the
+    // whole ellipse and the background is drawn inside it, inset by the border
+    // width. Two fills rather than a stroke, because a stroked ellipse needs a
+    // pen width and joins and this needs neither.
+    if drawn && box_.round {
+        let border = box_.style.border.top.used_width(box_.style.font_size);
+        let outer = Rect {
+            x,
+            y,
+            width: box_.rect.width,
+            height: box_.rect.height,
+        };
+        let frame = box_.style.border.top.color.unwrap_or(box_.style.color);
+        if border > 0.0 {
+            list.items.push(DisplayItem::Ellipse {
+                rect: outer,
+                color: frame,
+            });
+        }
+        list.items.push(DisplayItem::Ellipse {
+            rect: Rect {
+                x: outer.x + border,
+                y: outer.y + border,
+                width: (outer.width - border * 2.0).max(0.0),
+                height: (outer.height - border * 2.0).max(0.0),
+            },
+            color: box_.style.background_color,
+        });
+    } else if drawn && !box_.style.background_color.is_transparent() {
         list.items.push(DisplayItem::Rect {
             rect: Rect {
                 x,
@@ -198,7 +240,8 @@ fn paint_box(
         });
     }
 
-    if drawn {
+    // A round box drew its own border above, as the ring.
+    if drawn && !box_.round {
         paint_borders(box_, x, y, list);
     }
 
@@ -225,6 +268,19 @@ fn paint_box(
         let content_width = box_.content_width;
         for line in &layout.lines {
             let dx = line_offset(box_.style.text_align, line.width, content_width);
+            // An inline box's own background and border, under everything the
+            // line draws. Outermost first, which is the order the fragments
+            // come in, so a nested span's background covers its parent's.
+            for fragment in &line.boxes {
+                let Some((_, style)) = layout
+                    .inline_boxes
+                    .iter()
+                    .find(|(source, _)| *source == fragment.source)
+                else {
+                    continue;
+                };
+                paint_inline_box(fragment, style, content_x + dx, content_y, list);
+            }
             // Rules go under the glyphs so an underline sitting close to a
             // descender is crossed by it rather than cutting through it.
             for rule in line.decorations.iter().filter(|rule| !rule.hidden) {
@@ -330,7 +386,12 @@ fn clip_items(items: &mut Vec<DisplayItem>, from: usize, clip: Rect) {
         // clips the tiling without moving where the tiles start — the anchor
         // that decides the phase is carried separately, for exactly this
         // reason.
+        // An ellipse is narrowed by narrowing the box it is inscribed in,
+        // which squashes it rather than cutting it. That is wrong in general
+        // and right for the only thing that draws one: a radio button is small
+        // enough that a clip either misses it or removes it.
         DisplayItem::Rect { rect, .. }
+        | DisplayItem::Ellipse { rect, .. }
         | DisplayItem::Image { rect, .. }
         | DisplayItem::Tile { rect, .. } => match intersect(*rect, clip) {
             Some(narrowed) => {
@@ -367,6 +428,127 @@ fn intersect(rect: Rect, clip: Rect) -> Option<Rect> {
     })
 }
 
+/// Emits one line's worth of a non-replaced inline box: the background and
+/// border it draws where it crosses that line (§8.4).
+///
+/// An inline box broken over three lines draws three of these. The horizontal
+/// margin, border and padding belong to the whole box rather than to each
+/// fragment, so they appear on the first fragment and the last — `opens` and
+/// `closes` — and the stretch in between runs edge to edge. The vertical ones
+/// are on every fragment, and overflow the line box rather than growing it
+/// (§10.6.1): a highlighted phrase with 4px of padding is 8px taller than its
+/// text wherever it appears, and the lines around it do not move apart to make
+/// room. That is what browsers do and what makes inline padding a thing authors
+/// use sparingly.
+fn paint_inline_box(
+    fragment: &text::InlineBoxFragment,
+    style: &css::style::ComputedStyle,
+    origin_x: f32,
+    origin_y: f32,
+    list: &mut DisplayList,
+) {
+    let font_size = style.font_size;
+    // Percentages on an inline box's padding resolve against the containing
+    // block's width, which is not known here. They are rare enough on a span
+    // that a basis of zero — which reads them as nothing — is better than a
+    // basis that is wrong in a way nobody can see the cause of.
+    let px = |length: css::value::Length| length.to_px(font_size, 0.0);
+    let border = &style.border;
+    let (border_top, border_bottom) = (
+        border.top.used_width(font_size),
+        border.bottom.used_width(font_size),
+    );
+    // The reserved stretch starts at the margin's outer edge, so the border box
+    // is inside it by whichever margins are on this fragment.
+    let left = origin_x
+        + fragment.x
+        + if fragment.opens {
+            px(style.margin.left)
+        } else {
+            0.0
+        };
+    let right = origin_x + fragment.x + fragment.width
+        - if fragment.closes {
+            px(style.margin.right)
+        } else {
+            0.0
+        };
+    let top = origin_y + fragment.y - px(style.padding.top) - border_top;
+    let bottom = origin_y + fragment.y + fragment.height + px(style.padding.bottom) + border_bottom;
+    let rect = Rect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+
+    if !style.background_color.is_transparent() {
+        list.items.push(DisplayItem::Rect {
+            rect,
+            color: style.background_color,
+        });
+    }
+
+    // Top and bottom run the length of the fragment; the two sides are drawn
+    // only where the box actually begins and ends.
+    let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(style.color);
+    let sides = [
+        (
+            &border.top,
+            Side::Top,
+            border_top,
+            true,
+            Rect {
+                height: border_top,
+                ..rect
+            },
+        ),
+        (
+            &border.bottom,
+            Side::Bottom,
+            border_bottom,
+            true,
+            Rect {
+                y: rect.y + rect.height - border_bottom,
+                height: border_bottom,
+                ..rect
+            },
+        ),
+        (
+            &border.left,
+            Side::Left,
+            border.left.used_width(font_size),
+            fragment.opens,
+            Rect {
+                y: rect.y + border_top,
+                width: border.left.used_width(font_size),
+                height: (rect.height - border_top - border_bottom).max(0.0),
+                ..rect
+            },
+        ),
+        (
+            &border.right,
+            Side::Right,
+            border.right.used_width(font_size),
+            fragment.closes,
+            Rect {
+                x: rect.x + rect.width - border.right.used_width(font_size),
+                y: rect.y + border_top,
+                width: border.right.used_width(font_size),
+                height: (rect.height - border_top - border_bottom).max(0.0),
+            },
+        ),
+    ];
+    for (side, which, thickness, present, edge) in sides {
+        if present && side.style.is_visible() && thickness > 0.0 {
+            push_border_side(list, &edge, side.style, thickness, which, color_of(side));
+        }
+    }
+}
+
 /// Emits the four border edges of a box.
 ///
 /// Corners are mitred by letting the top and bottom edges span the full width
@@ -386,19 +568,35 @@ fn paint_borders(box_: &LayoutBox, x: f32, y: f32, list: &mut DisplayList) {
     let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(box_.style.color);
 
     if border.top.style.is_visible() && top > 0.0 {
-        push_border_side(
-            list,
-            &Rect {
-                x,
-                y,
-                width,
-                height: top,
-            },
-            border.top.style,
-            top,
-            Side::Top,
-            color_of(&border.top),
-        );
+        // A `<fieldset>`'s rule stops either side of its `<legend>`, so the top
+        // side is drawn as the two pieces the gap leaves rather than as one
+        // run. Each piece is a border side in its own right: a `groove` still
+        // has to light and shade from the same direction on both, which is why
+        // this splits the rect and calls the same code twice instead of
+        // painting one side and rubbing a hole in it.
+        let (from, to) = match box_.top_border_gap {
+            Some((from, to)) => (from.clamp(0.0, width), to.clamp(0.0, width)),
+            None => (width, width),
+        };
+        for piece in [(0.0, from), (to, width)] {
+            let (start, end) = piece;
+            if end <= start {
+                continue;
+            }
+            push_border_side(
+                list,
+                &Rect {
+                    x: x + start,
+                    y,
+                    width: end - start,
+                    height: top,
+                },
+                border.top.style,
+                top,
+                Side::Top,
+                color_of(&border.top),
+            );
+        }
     }
     if border.bottom.style.is_visible() && bottom > 0.0 {
         push_border_side(
@@ -717,6 +915,12 @@ pub fn rasterise_band(
                     fill_rect(&mut pixmap, &rect, *color);
                 }
             }
+            DisplayItem::Ellipse { rect, color } => {
+                let rect = shifted(rect, top);
+                if drawable(&rect) {
+                    fill_ellipse(&mut pixmap, &rect, *color);
+                }
+            }
             DisplayItem::Image { node, rect } => {
                 let rect = shifted(rect, top);
                 if drawable(&rect)
@@ -967,6 +1171,35 @@ fn tile_image(
             );
         }
     }
+}
+
+/// Fills the ellipse inscribed in `rect`.
+///
+/// Anti-aliased, where a rectangle is not: a circle drawn without it is a
+/// staircase, and the whole point of this primitive is that the shape reads.
+/// Determinism across platforms is unaffected — the rasteriser is `tiny-skia`
+/// and the anti-aliasing is its own arithmetic, not the host's (ADR-0005).
+fn fill_ellipse(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
+    if rect.width <= 0.0 || rect.height <= 0.0 || color.is_transparent() {
+        return;
+    }
+    let Some(oval) = tiny_skia::Rect::from_xywh(rect.x, rect.y, rect.width, rect.height) else {
+        return;
+    };
+    let mut builder = PathBuilder::new();
+    builder.push_oval(oval);
+    let Some(path) = builder.finish() else { return };
+
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 fn fill_rect(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
@@ -1675,6 +1908,95 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_box_paints_its_background_and_border() {
+        // The bug this pins: a `<span>` with a background drew its text and
+        // nothing else. A highlighted phrase, a tinted `<code>`, a pill — all
+        // ordinary markup, all plain text until now.
+        let count = |pixmap: &Pixmap, want: (u8, u8, u8)| {
+            pixmap
+                .pixels()
+                .iter()
+                .filter(|p| (p.red(), p.green(), p.blue()) == want)
+                .count()
+        };
+        let yellow = (255, 204, 0);
+
+        let plain = render(
+            "<body><p>a <span>b</span> c</p></body>",
+            "body{margin:0}",
+            200,
+        );
+        assert_eq!(
+            count(&plain, yellow),
+            0,
+            "a plain span painted a background"
+        );
+
+        let filled = render(
+            "<body><p>a <span>b</span> c</p></body>",
+            "body{margin:0} span{background:#ffcc00;padding:0 6px}",
+            200,
+        );
+        assert!(
+            count(&filled, yellow) > 100,
+            "the span's background came out {} pixels",
+            count(&filled, yellow)
+        );
+
+        // And the border is on the outside of the padding, not instead of it.
+        let bordered = render(
+            "<body><p>a <span>b</span> c</p></body>",
+            "body{margin:0} span{background:#ffcc00;padding:0 6px;border:2px solid #cc0000}",
+            200,
+        );
+        assert!(count(&bordered, (204, 0, 0)) > 40, "no border drawn");
+        assert!(
+            count(&bordered, yellow) >= count(&filled, yellow),
+            "the border ate the background it should surround"
+        );
+    }
+
+    #[test]
+    fn an_inline_boxs_horizontal_border_is_only_on_the_ends() {
+        // §8.4: the left and right sides belong to the whole box, so a box
+        // broken over two lines draws them once each and not once per line.
+        // Counted as red pixels: two vertical 2px sides at ~14px of content
+        // area is a few dozen, four would be twice that.
+        let sides = |css: &str| {
+            let pixmap = render(
+                "<body><p><span>one two three four five six seven eight</span></p></body>",
+                css,
+                120,
+            );
+            pixmap
+                .pixels()
+                .iter()
+                .filter(|p| (p.red(), p.green(), p.blue()) == (204, 0, 0))
+                .count()
+        };
+        let one_line = render(
+            "<body><p><span>short</span></p></body>",
+            "body{margin:0} span{border-left:2px solid #cc0000;border-right:2px solid #cc0000}",
+            400,
+        );
+        let per_side = one_line
+            .pixels()
+            .iter()
+            .filter(|p| (p.red(), p.green(), p.blue()) == (204, 0, 0))
+            .count()
+            / 2;
+        assert!(per_side > 8, "a 2px side came out {per_side} pixels");
+        let broken = sides(
+            "body{margin:0} span{border-left:2px solid #cc0000;border-right:2px solid #cc0000}",
+        );
+        assert!(
+            broken < per_side * 4,
+            "a box broken over lines drew {broken} pixels of side, which is more than the two \
+             it has"
+        );
+    }
+
+    #[test]
     fn rendering_is_deterministic() {
         // The property ADR-0005 buys: identical input, identical bytes. If this
         // ever fails, the single shared baseline set is invalid.
@@ -1698,6 +2020,56 @@ mod tests {
                 .unwrap_or(width)
         };
         assert!(leftmost_ink("p { text-align: center }") > leftmost_ink("p { text-align: left }"));
+    }
+    #[test]
+    fn a_legend_leaves_a_hole_in_the_rule_and_the_rest_of_it_standing() {
+        // The point of the hole is that a reader sees the legend *in* the rule
+        // rather than floating above an unbroken line. So the rule has to stop
+        // where the legend starts and pick up again where it ends — both halves
+        // of that, since a rule that vanished entirely would pass a test that
+        // only looked for the gap.
+        const CSS: &str = "body { margin: 0 } \
+                           fieldset { margin: 0; border: 2px solid black; padding: 6px }";
+        fn dark(pixmap: &Pixmap, x: u32, y: u32) -> bool {
+            let (r, g, b) = at(pixmap, x, y);
+            r < 128 && g < 128 && b < 128
+        }
+        /// The top rule: the first row that is mostly drawn.
+        fn rule_row(pixmap: &Pixmap) -> u32 {
+            (0..pixmap.height())
+                .find(|&y| {
+                    (0..pixmap.width()).filter(|&x| dark(pixmap, x, y)).count() as u32
+                        > pixmap.width() / 2
+                })
+                .expect("a rule across the page")
+        }
+
+        let with = render(
+            "<body><fieldset><legend>L</legend><div style=\"height: 20px\"></div></fieldset></body>",
+            CSS,
+            200,
+        );
+        let without = render(
+            "<body><fieldset><div style=\"height: 20px\"></div></fieldset></body>",
+            CSS,
+            200,
+        );
+
+        // Inside the legend's own left padding, which is the near end of the
+        // gap and the one place in it no glyph can reach.
+        let y = rule_row(&with);
+        assert!(!dark(&with, 9, y), "the rule ran on behind the legend");
+        assert!(dark(&with, 1, y), "the rule lost its left end");
+        assert!(
+            dark(&with, 198, y),
+            "the rule did not pick up again after the legend"
+        );
+
+        let y = rule_row(&without);
+        assert!(
+            dark(&without, 9, y),
+            "a fieldset with no legend drew a gap anyway"
+        );
     }
 }
 
@@ -2210,5 +2582,51 @@ mod canvas_background_tests {
         assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(html));
         // The body's own tile is not propagated, so it still paints normally.
         assert_eq!(tiles(&list), 1);
+    }
+
+    #[test]
+    fn a_propagated_background_colour_is_not_painted_over_the_canvas_again() {
+        // §14.2's other half, and the one that was wrong. The colour reached
+        // the canvas *and* stayed on the anonymous root box, which is as tall
+        // as the content rather than as tall as the window — so it laid an
+        // opaque rectangle over the top of whatever the canvas held. Invisible
+        // while the canvas held only the same colour; it cost the whole lower
+        // part of a `no-repeat` background image taller than the page's text.
+        let (list, _) = list_for(
+            r#"<body style="background: #00ff00 url(tile.gif) no-repeat"><p>x</p></body>"#,
+        );
+        assert_eq!(
+            list.canvas,
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            },
+            "the colour did not reach the canvas"
+        );
+        let fills = list
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(item, DisplayItem::Rect { color, .. }
+                    if !color.is_transparent())
+            })
+            .count();
+        assert_eq!(fills, 0, "the canvas colour was painted a second time");
+    }
+
+    #[test]
+    fn an_ordinary_background_colour_is_still_painted() {
+        // The guard above is on the canvas box alone, so it must not have
+        // taken every background with it.
+        let (list, _) = list_for(r#"<body><p style="background: #00ff00">x</p></body>"#);
+        assert!(
+            list.items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Rect { color, .. }
+                    if !color.is_transparent())),
+            "a paragraph's background went missing"
+        );
     }
 }

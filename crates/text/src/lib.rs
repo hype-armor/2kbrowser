@@ -142,6 +142,25 @@ fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
 /// between 0.52 and 0.53, and the value is halved before it is used.
 const X_HEIGHT: f32 = 0.5;
 
+/// The ascent and descent of an inline box's content area, as fractions of the
+/// font size.
+///
+/// §10.6.1 leaves the content area's height up to the user agent, and every
+/// browser answers with the font's own ascent and descent. These are those, for
+/// the faces bundled here: Liberation Serif is 0.891 over 0.216, Sans 0.905
+/// over 0.212, and Mono 0.833 over 0.300 — three fonts whose *sums* agree to
+/// within 0.026 even where the split does not.
+///
+/// Constants rather than a lookup because `cosmic-text` does not hand back the
+/// face's metrics with a shaped run: it reports a baseline that already has the
+/// line box's half-leading folded in, and the CSS `line-height` as the height.
+/// Deriving the content area from that would make a double-spaced paragraph
+/// highlight its phrases in bands that touch each other rather than at the size
+/// of the words, which is exactly what §10.6.1 says not to do.
+const ASCENT: f32 = 0.89;
+/// See [`ASCENT`].
+const DESCENT: f32 = 0.22;
+
 /// An atomic inline box that takes up room on a line without contributing
 /// glyphs — an image, in practice.
 ///
@@ -201,6 +220,20 @@ pub struct InlineSpan {
     pub height: f32,
 }
 
+/// One side of an inline box, as a width the line has to make room for.
+///
+/// §8.4: horizontal margins, borders and padding on a non-replaced inline box
+/// *are* inserted into the line, at the box's start and end — and only there,
+/// however many lines the box is broken across. The vertical ones are drawn but
+/// do not enter the line's height, which is §10.6.1 and is a separate rule.
+#[derive(Debug, Clone, Copy)]
+pub struct InlineEdge {
+    /// Room to reserve: the margin, border and padding on this side.
+    pub width: f32,
+    /// Whether this is the box's opening side rather than its closing one.
+    pub opening: bool,
+}
+
 /// A run of text with its own style, within a block's inline content.
 #[derive(Debug, Clone)]
 pub struct InlineRun {
@@ -211,8 +244,22 @@ pub struct InlineRun {
     /// Set when this run is an atomic inline box rather than text, in which
     /// case `text` is ignored.
     pub replaced: Option<ReplacedInline>,
+    /// Set when this run is one side of an inline box rather than content, in
+    /// which case `text` is ignored too.
+    pub edge: Option<InlineEdge>,
     /// The element this run's text came from, for hit testing.
     pub source: Option<usize>,
+    /// The inline boxes this run sits inside that have something to draw,
+    /// outermost first, by the caller's own numbering.
+    ///
+    /// Not the same question as `source`, which is the innermost *element* and
+    /// is about hit testing. A background belongs to an ancestor as much as to
+    /// the element the text is in — `<span class=hl>a <b>b</b> c</span>` is one
+    /// yellow stretch and not two with a hole where the bold is — so the whole
+    /// chain is carried and a fragment is measured over everything inside it.
+    /// And a box need not be an element: `::before` draws one and is none.
+    /// Empty for almost every run on almost every page, which costs nothing.
+    pub boxes: Vec<usize>,
 }
 
 impl InlineRun {
@@ -222,7 +269,9 @@ impl InlineRun {
             text: text.into(),
             style,
             replaced: None,
+            edge: None,
             source: None,
+            boxes: Vec::new(),
         }
     }
 
@@ -230,6 +279,12 @@ impl InlineRun {
     /// it later.
     pub fn from_element(mut self, source: usize) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    /// Names the drawn inline boxes this run sits inside, outermost first.
+    pub fn inside(mut self, boxes: Vec<usize>) -> Self {
+        self.boxes = boxes;
         self
     }
 
@@ -241,9 +296,54 @@ impl InlineRun {
             text: String::new(),
             style,
             replaced: Some(box_),
+            edge: None,
             source: Some(box_.id),
+            boxes: Vec::new(),
         }
     }
+
+    /// A run that is one side of an inline box: no content, just its room.
+    ///
+    /// `source` is for hit testing as everywhere else — the element the box
+    /// came from, or the one a pseudo-element hangs off. Which box it opens is
+    /// the last entry of `boxes`, set with [`InlineRun::inside`].
+    pub fn edge(source: Option<usize>, edge: InlineEdge, style: ComputedStyle) -> Self {
+        Self {
+            text: String::new(),
+            style,
+            replaced: None,
+            edge: Some(edge),
+            source,
+            boxes: Vec::new(),
+        }
+    }
+}
+
+/// One line's worth of an inline box: the background, padding and border it
+/// draws where it crosses that line.
+///
+/// An inline box broken across three lines draws three of these (§8.4). The
+/// horizontal padding and border are on the first and last only, which is what
+/// `opens` and `closes` record; the vertical ones are on every fragment,
+/// because the box is as tall as its content area wherever it appears.
+#[derive(Debug, Clone, Copy)]
+pub struct InlineBoxFragment {
+    /// The box this fragment belongs to, keying it to a style in
+    /// [`TextLayout::inline_boxes`].
+    pub source: usize,
+    /// Left edge of the content-and-padding area, relative to the text origin.
+    pub x: f32,
+    /// Top edge of the content area, relative to the text origin.
+    pub y: f32,
+    /// Width of the stretch, including whichever horizontal edges are on it.
+    pub width: f32,
+    /// Height of the content area: what the text in it occupies, which is not
+    /// the line's height and does not grow with `line-height`.
+    pub height: f32,
+    /// Whether the box's opening side falls on this fragment.
+    pub opens: bool,
+    /// Whether its closing side does.
+    pub closes: bool,
 }
 
 /// A rule drawn under, over, or through a stretch of text.
@@ -277,6 +377,9 @@ pub struct Line {
     pub replaced: Vec<PlacedReplaced>,
     /// Which element each stretch of this line came from.
     pub spans: Vec<InlineSpan>,
+    /// Inline boxes crossing this line, outermost first, each with the piece of
+    /// itself it draws here.
+    pub boxes: Vec<InlineBoxFragment>,
     /// Rules under, over, and through this line's text.
     pub decorations: Vec<DecorationRun>,
     /// The line's text, with glyph offsets pointing into it.
@@ -301,6 +404,12 @@ pub struct TextLayout {
     pub height: f32,
     /// Width of the widest line.
     pub width: f32,
+    /// The style of each inline box that draws something, keyed by the number
+    /// its fragments name.
+    ///
+    /// Held once here rather than copied onto every fragment: a box broken over
+    /// twenty lines has one style and twenty rectangles.
+    pub inline_boxes: Vec<(usize, ComputedStyle)>,
 }
 
 /// A shaped, unbreakable piece of text.
@@ -343,6 +452,26 @@ struct Segment {
     hidden: bool,
     /// Colour of the span this segment came from, for its rules to match.
     color: Option<(u8, u8, u8, u8)>,
+    /// Set when this segment is one side of an inline box rather than content.
+    edge: Option<InlineEdge>,
+    /// The drawn inline boxes this segment sits inside, outermost first.
+    boxes: Vec<usize>,
+}
+
+impl Segment {
+    /// Whether this segment is the opening side of box `id`.
+    ///
+    /// Asked of the innermost box the segment is inside rather than of its
+    /// `source`, which names an *element* and is about hit testing: a box can
+    /// be a pseudo-element, which is no element at all.
+    fn opens(&self, id: usize) -> bool {
+        self.boxes.last() == Some(&id) && self.edge.is_some_and(|edge| edge.opening)
+    }
+
+    /// Whether it is the closing side.
+    fn closes(&self, id: usize) -> bool {
+        self.boxes.last() == Some(&id) && self.edge.is_some_and(|edge| !edge.opening)
+    }
 }
 
 /// Most shaped segments one store will remember.
@@ -680,6 +809,16 @@ impl FontStore {
         }
 
         let mut layout = TextLayout::default();
+        // One entry per inline box that draws something, taken from its opening
+        // edge — which the caller emits for exactly the boxes that have
+        // anything to draw, so there is no filtering to do here.
+        for run in runs {
+            if let (Some(edge), Some(&id)) = (run.edge, run.boxes.last())
+                && edge.opening
+            {
+                layout.inline_boxes.push((id, run.style.clone()));
+            }
+        }
         let mut y = 0.0f32;
         let mut current: Vec<Segment> = Vec::new();
         let mut x = 0.0f32;
@@ -852,6 +991,7 @@ impl FontStore {
             glyphs,
             replaced: Self::replaced_for(current, offset, line_y, ascent, line_height),
             spans: Self::spans_for(current, offset, line_y, line_height),
+            boxes: Self::boxes_for(current, offset, line_y + ascent),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
             text,
             width,
@@ -859,6 +999,62 @@ impl FontStore {
             baseline: ascent,
         });
         current.clear();
+    }
+
+    /// One fragment per inline box crossing this line.
+    ///
+    /// Measured over every segment *inside* the box rather than over the ones
+    /// that name it as their innermost element, which is the difference between
+    /// one background behind a whole highlighted phrase and two with a hole
+    /// where a nested `<b>` sits.
+    ///
+    /// The height is the content area — what the text occupies — and not the
+    /// line box. §10.6.1: `line-height` does not grow an inline box's
+    /// background, so a paragraph set double-spaced highlights its phrases at
+    /// the size of the words rather than in bands that touch.
+    fn boxes_for(segments: &[Segment], offset: f32, baseline: f32) -> Vec<InlineBoxFragment> {
+        let mut out: Vec<InlineBoxFragment> = Vec::new();
+        for segment in segments {
+            let left = segment.x + offset;
+            let right = left + segment.shaped.width;
+            let (top, height) = match segment.replaced {
+                // An atomic box hangs from the baseline by its own; the inline
+                // box around it has to cover all of it.
+                Some(box_) => (baseline - box_.baseline, box_.height),
+                // §10.6.1: the content area, which `line-height` moves the
+                // lines around but does not grow. Taken as the em box — the
+                // same 0.8 ascent the line breaker already assumes — rather
+                // than from the shaped metrics, which carry the CSS line
+                // height and would put a double-spaced paragraph's highlights
+                // in bands that touch.
+                None => (
+                    baseline - segment.font_size * ASCENT,
+                    segment.font_size * (ASCENT + DESCENT),
+                ),
+            };
+            for &source in &segment.boxes {
+                match out.iter_mut().find(|box_| box_.source == source) {
+                    Some(found) => {
+                        found.width = right - found.x;
+                        let bottom = (found.y + found.height).max(top + height);
+                        found.y = found.y.min(top);
+                        found.height = bottom - found.y;
+                        found.opens |= segment.opens(source);
+                        found.closes |= segment.closes(source);
+                    }
+                    None => out.push(InlineBoxFragment {
+                        source,
+                        x: left,
+                        y: top,
+                        width: right - left,
+                        height,
+                        opens: segment.opens(source),
+                        closes: segment.closes(source),
+                    }),
+                }
+            }
+        }
+        out
     }
 
     /// Merges the line's segments into one span per element.
@@ -1050,6 +1246,46 @@ impl FontStore {
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
                     hidden: run.style.visibility == Visibility::Hidden,
+                    edge: None,
+                    boxes: run.boxes.clone(),
+                });
+                continue;
+            }
+
+            // One side of an inline box: no glyphs and no height of its own,
+            // just the room §8.4 puts on the line for it. Zero-height so that a
+            // box whose padding is taller than its text does not make the line
+            // taller — §10.6.1, which the fragment drawn later overflows on
+            // purpose.
+            if let Some(edge) = run.edge {
+                // Shaped metrics, not a guess: an inline box is as tall as the
+                // font it is set in whether or not any text of its own reaches
+                // this line, so an empty `<span>` with a border draws the same
+                // height as one holding a word. A space is shaped for its
+                // metrics alone and its width thrown away.
+                let metrics = self.shape_segment(" ", &run.style);
+                out.push(Segment {
+                    shaped: Shaped {
+                        // The ascent and height only. The space's glyphs and
+                        // its text would otherwise be drawn and searched: an
+                        // edge is room on the line, not a character on it.
+                        glyphs: Vec::new(),
+                        text: String::new(),
+                        width: edge.width,
+                        ..metrics
+                    },
+                    trailing_space: 0.0,
+                    mandatory_break: false,
+                    align: run.style.vertical_align,
+                    x: 0.0,
+                    replaced: None,
+                    source: run.source,
+                    decoration: TextDecoration::default(),
+                    font_size: run.style.font_size,
+                    color: span_color(&run.style),
+                    hidden: run.style.visibility == Visibility::Hidden,
+                    edge: Some(edge),
+                    boxes: run.boxes.clone(),
                 });
                 continue;
             }
@@ -1119,6 +1355,8 @@ impl FontStore {
                             font_size: run.style.font_size,
                             color: span_color(&run.style),
                             hidden: run.style.visibility == Visibility::Hidden,
+                            edge: None,
+                            boxes: run.boxes.clone(),
                         });
                     }
                     continue;
@@ -1137,6 +1375,8 @@ impl FontStore {
                     font_size: run.style.font_size,
                     color: span_color(&run.style),
                     hidden: run.style.visibility == Visibility::Hidden,
+                    edge: None,
+                    boxes: run.boxes.clone(),
                 });
             }
         }
@@ -1644,6 +1884,206 @@ mod tests {
         let whole = store.layout("the quick brown fox jumps over the lazy dog", &plain, 160.0);
         assert_eq!(split.lines.len(), whole.lines.len());
         assert!((split.height - whole.height).abs() < 0.01);
+    }
+
+    /// The runs for `before <span>…</span> after`, where the span's two sides
+    /// each take `edge` pixels and the box is numbered 1.
+    fn bracketed(text: &str, edge: f32, style: &ComputedStyle) -> Vec<InlineRun> {
+        let side = |opening| {
+            InlineRun::edge(
+                Some(7),
+                InlineEdge {
+                    width: edge,
+                    opening,
+                },
+                style.clone(),
+            )
+            .inside(vec![1])
+        };
+        vec![
+            InlineRun::text("before ".to_owned(), style.clone()),
+            side(true),
+            InlineRun::text(text.to_owned(), style.clone()).inside(vec![1]),
+            side(false),
+            InlineRun::text(" after".to_owned(), style.clone()),
+        ]
+    }
+
+    #[test]
+    fn an_inline_box_takes_room_on_the_line_for_its_two_sides() {
+        // §8.4. The bug this pins: the edges were painted and never measured,
+        // so text after a padded span kept going and wrapped late.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let bare = store.layout_runs(&bracketed("middle", 0.0, &plain), &plain, 1000.0);
+        let padded = store.layout_runs(&bracketed("middle", 25.0, &plain), &plain, 1000.0);
+        let grown = padded.lines[0].width - bare.lines[0].width;
+        assert!(
+            (grown - 50.0).abs() < 0.01,
+            "two 25px sides grew the line by {grown}"
+        );
+    }
+
+    #[test]
+    fn an_inline_box_gets_one_fragment_per_line_it_crosses() {
+        // §8.4 again: a box broken across lines paints one rectangle per line,
+        // and its two horizontal sides belong to the whole box rather than to
+        // each piece — so only the first fragment opens and only the last
+        // closes.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let long = "a phrase long enough that it cannot possibly fit on one line";
+        let layout = store.layout_runs(&bracketed(long, 8.0, &plain), &plain, 200.0);
+        assert!(layout.lines.len() > 2, "the phrase did not break");
+
+        let fragments: Vec<_> = layout
+            .lines
+            .iter()
+            .filter_map(|line| line.boxes.first())
+            .collect();
+        assert_eq!(
+            fragments.len(),
+            layout.lines.len(),
+            "a line the box crosses drew no fragment"
+        );
+        assert!(
+            fragments[0].opens,
+            "the first fragment did not open the box"
+        );
+        assert!(
+            fragments.last().expect("a fragment").closes,
+            "the last fragment did not close it"
+        );
+        assert!(
+            fragments[1..fragments.len() - 1]
+                .iter()
+                .all(|fragment| !fragment.opens && !fragment.closes),
+            "a middle fragment carried a horizontal side"
+        );
+    }
+
+    #[test]
+    fn an_inline_boxs_fragment_covers_what_is_nested_inside_it() {
+        // An outer background must run behind an inner span rather than
+        // stopping either side of it: `<span class=hl>a <b>b</b> c</span>` is
+        // one yellow stretch. The inner runs name the outer box too, which is
+        // what a fragment is measured over.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let runs = vec![
+            InlineRun::edge(
+                Some(1),
+                InlineEdge {
+                    width: 0.0,
+                    opening: true,
+                },
+                plain.clone(),
+            )
+            .inside(vec![1]),
+            InlineRun::text("one ".to_owned(), plain.clone()).inside(vec![1]),
+            InlineRun::text("two".to_owned(), plain.clone()).inside(vec![1, 2]),
+            InlineRun::text(" three".to_owned(), plain.clone()).inside(vec![1]),
+            InlineRun::edge(
+                Some(1),
+                InlineEdge {
+                    width: 0.0,
+                    opening: false,
+                },
+                plain.clone(),
+            )
+            .inside(vec![1]),
+        ];
+        let layout = store.layout_runs(&runs, &plain, 1000.0);
+        let line = &layout.lines[0];
+        let outer = line
+            .boxes
+            .iter()
+            .find(|box_| box_.source == 1)
+            .expect("outer");
+        let inner = line
+            .boxes
+            .iter()
+            .find(|box_| box_.source == 2)
+            .expect("inner");
+        assert!(
+            outer.x <= inner.x && outer.x + outer.width >= inner.x + inner.width,
+            "the outer box {:?} did not cover the inner one {:?}",
+            (outer.x, outer.width),
+            (inner.x, inner.width)
+        );
+        assert_eq!(
+            line.boxes[0].source, 1,
+            "the outer box must come first so the inner paints over it"
+        );
+    }
+
+    #[test]
+    fn an_inline_box_is_as_tall_as_its_text_and_not_as_its_line() {
+        // §10.6.1: `line-height` moves the lines apart and does not grow the
+        // box. A double-spaced paragraph highlights its phrases at the size of
+        // the words rather than in bands that touch.
+        let mut store = FontStore::new();
+        let tight = style(16.0);
+        let airy = ComputedStyle {
+            line_height: 40.0,
+            ..style(16.0)
+        };
+        let mut of = |style: &ComputedStyle| {
+            store
+                .layout_runs(&bracketed("middle", 0.0, style), style, 1000.0)
+                .lines[0]
+                .boxes[0]
+                .height
+        };
+        let tight_height = of(&tight);
+        let airy_height = of(&airy);
+        assert!(
+            (tight_height - airy_height).abs() < 0.01,
+            "line-height grew the box from {tight_height} to {airy_height}"
+        );
+    }
+
+    #[test]
+    fn an_inline_box_with_nothing_in_it_is_still_as_tall_as_its_font() {
+        // A `<span>` holding only padding — a pill, a coloured rule — has no
+        // text to measure, and measuring it as nothing would draw nothing.
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let runs = vec![
+            InlineRun::text("before ".to_owned(), plain.clone()),
+            InlineRun::edge(
+                Some(1),
+                InlineEdge {
+                    width: 10.0,
+                    opening: true,
+                },
+                plain.clone(),
+            )
+            .inside(vec![1]),
+            InlineRun::edge(
+                Some(1),
+                InlineEdge {
+                    width: 10.0,
+                    opening: false,
+                },
+                plain.clone(),
+            )
+            .inside(vec![1]),
+            InlineRun::text(" after".to_owned(), plain.clone()),
+        ];
+        let layout = store.layout_runs(&runs, &plain, 1000.0);
+        let fragment = layout.lines[0].boxes[0];
+        assert!(
+            fragment.height > 10.0,
+            "an empty inline box came out {} tall",
+            fragment.height
+        );
+        assert!(
+            (fragment.width - 20.0).abs() < 0.01,
+            "its width is its two sides, not {}",
+            fragment.width
+        );
+        assert!(fragment.opens && fragment.closes);
     }
 
     #[test]

@@ -64,7 +64,7 @@ center { text-align: -webkit-center; }
 /* A rule is an empty block with a border, which is how every browser has
    drawn it. Without one it is a zero-height box that draws nothing, and the
    era's pages used it constantly as a section divider. */
-hr { margin: 0.5em 0; height: 0; border-top: 1px solid #999999; }
+hr { margin: 0.5em auto; height: 0; border-top: 1px solid #999999; }
 
 /* The table structure is declared here rather than recognised by tag name in
    layout, which is what lets a table built out of `display` values on plain
@@ -108,11 +108,11 @@ input[type=checkbox], input[type=radio] {
 input[type=hidden] { display: none; }
 
 /* `fieldset` groups controls and has drawn a rule around them since it
-   existed. `legend` sits *in* that rule in a browser, which needs the border to
-   be broken where the text crosses it; that is not done here, so the legend is
-   drawn as an ordinary block above the group's contents. */
+   existed. `legend` sits *in* that rule, which needs the rule broken where the
+   text crosses it; layout does that, and the horizontal padding here is the gap
+   between the text and the two cut ends. */
 fieldset { display: block; border: 2px groove #cccccc; padding: 6px; margin: 1em 2px; }
-legend { display: block; font-weight: bold; }
+legend { display: block; font-weight: bold; padding: 0 2px; }
 
 big { font-size: 1.17em; }
 small, sub, sup { font-size: 0.83em; }

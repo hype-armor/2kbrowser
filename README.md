@@ -51,8 +51,11 @@ disk, parsed into an arena DOM, cascaded through a CSS 2.1 subset, laid out,
 shaped against bundled Liberation faces, and rasterised on the CPU.
 
 Working: the cascade with selectors, specificity, and inheritance; the box
-model with borders and backgrounds; inline layout with per-span styles and
-Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`,
+model with borders and backgrounds, on inline boxes as well as block ones — a
+`<span>` with a background and padding draws them, one fragment per line it
+crosses (§8.4), and its horizontal padding and border take room on the line so
+the text after it wraps where a browser wraps it; inline layout with per-span
+styles and Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`,
 `cellspacing`, and **both border models** — including
 `border-collapse: collapse`, where adjoining borders resolve into one line
 centred on the grid line between them, which is what a Wikipedia infobox or
@@ -101,8 +104,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3188 of 4821 reference tests pass,
-66.1%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **3226 of 4821 reference tests pass,
+66.9%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -132,10 +135,14 @@ found them; they turned up only because a fix aimed at something else made them
 move. See PLAN.md — the harness's own bugs have been more instructive than the
 figure every time.
 
-Known to be missing or wrong, rather than hidden: an inline box paints no
-background, padding or border, so a highlighted phrase or a tinted `<code>`
-comes out as plain text (issue #46) — "the box model with borders and
-backgrounds" above means *block* boxes; `overflow` is understood
+That trap is not historical. Implementing inline boxes made **eleven** more of
+them move, every one a test whose reference expresses its expected result with an
+inline background or border — so both sides had been drawing nothing and matching
+on it. They are the reason the figure is measured in both directions here rather
+than reported as a total: a release that reports only its gains cannot tell you
+whether it found more than it broke.
+
+Known to be missing or wrong, rather than hidden: `overflow` is understood
 only for its effect on formatting contexts, and content that overflows a box is
 not clipped — it is drawn, and the canvas is now grown to hold it, which it was
 not until a `height: 0` box turned out to be losing its text off the bottom
@@ -167,10 +174,8 @@ content (§10.3.9), placed on the line as one atom, and hung from the baseline o
 its own last line (§10.8.1), with `vertical-align` deciding where on the line it
 hangs. It no longer counts as layout this engine cannot do, so a page built on
 inline-blocks keeps the author's layout instead of falling back to a document
-(ADR-0009). What is still missing around it: an inline box's own border and
-padding take up no room on the line, so text after a bordered `<span>` does not
-wrap where it should; and an `<iframe>` has no intrinsic size, so one with
-`width: auto` comes out empty rather than 300x150.
+(ADR-0009). What is still missing around it: an `<iframe>` has no intrinsic
+size, so one with `width: auto` comes out empty rather than 300x150.
 
 A page can also fall back because its *frame* is unsupported while its prose is
 not — a Wikipedia article is the case, where the text is ordinary flow and the
@@ -187,10 +192,10 @@ and `rows` count characters and lines rather than pixels, and a field follows
 the font it is set in. A password field shows bullets and never its value.
 **Nothing can be typed into, clicked, or submitted**, and that is the stopping
 point rather than an oversight: a control that draws correctly makes the page
-read correctly, and interaction is separate work with a separate risk. Two
-things a browser draws and this does not: a radio button is square, because the
-rasteriser has rectangles and no rounded primitive, and a `<legend>` sits above
-its group rather than breaking the rule it is written into.
+read correctly, and interaction is separate work with a separate risk. A radio
+button is drawn round and a checkbox square — the shape is the question, "one of
+these" against "any of these" — and a `<legend>` sits *in* its group's rule, with
+the rule stopping either side of it, as HTML's rendering section has it.
 
 And a list of properties that parse and are then ignored, which is longer than
 this file used to admit: `word-spacing`, `font-variant`, `outline`,

@@ -14,6 +14,209 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
+## Unreleased
+
+## 0.3.0
+
+A release about the half of the box model that only ever worked for blocks.
+README.md has been listing "the box model with borders and backgrounds" under
+what works since the beginning, and it meant block boxes; an inline one drew
+nothing and took no room, which is why a highlighted phrase came out as plain
+text. That is the bulk of what is below, and it brought two older bugs up with
+it.
+
+**The CSS 2.1 conformance suite went from 66.1% to 66.9%** — 3188 of 4821
+reference tests to 3226 — which is a small number in front of a large change,
+and the direction it is small in is worth the paragraph.
+
+49 tests newly pass and **11 newly fail**. Every one of the 11 was passing
+because *neither* side of the pair drew anything: their references express the
+expected result with an inline background or border, so with those unimplemented
+both sides rendered nothing and matched perfectly. A reftest cannot tell
+"identical" from "identically blank" — the same trap the harness's CDATA fix
+turned up by the hundred in 0.2.0, and the reason the number here is measured in
+both directions rather than reported as a total. Each of the 11 now names a real
+gap and each is filed: table row-group backgrounds (#86), `inherit` as a value
+(#87), `direction: rtl` (#88), `line-height: normal` taken from the font rather
+than a constant (#89), and two that were already recorded.
+
+The rest of the release is a fieldset that looks like a fieldset, a radio button
+you can tell from a checkbox, and two places where the engine and the instrument
+measuring it were wrong in the same direction at once.
+
+**An inline box is a box** (#46, #71). A `<span>` with a background, padding or
+a border drew none of them and reserved no room for any of them: a highlighted
+phrase, a tinted `<code>`, a coloured label, a pill — all ordinary markup, all
+coming out as plain text with the words after it wrapping in the wrong place.
+README.md listed "the box model with borders and backgrounds" under what works
+without saying it meant *block* boxes.
+
+An inline box is not one rectangle, which is why this waited so long. §8.4 gives
+it one fragment per line it crosses, with the horizontal margin, border and
+padding on the first fragment and the last — they belong to the whole box,
+however many lines it is broken over — and the stretch in between running edge
+to edge. The line breaker now takes those two sides as unbreakable runs of their
+own, so the room is reserved where the text is measured rather than added at
+paint time, and a fragment is measured over everything *inside* the box rather
+than over the runs that name it: `<span class=hl>a <b>b</b> c</span>` is one
+yellow stretch and not two with a hole where the bold is.
+
+The vertical padding and border are drawn and do not enter the line's height
+(§10.6.1), so a phrase with 4px of padding overflows its line rather than pushing
+the lines around it apart — which is what browsers do and why inline padding is
+something authors use sparingly. The box is as tall as its font's content area
+and not as tall as its line box, so a double-spaced paragraph highlights its
+phrases at the size of the words instead of in bands that touch.
+
+A pseudo-element is an inline box like any other, so `div::before { content: "";
+background: gold; padding: 0 8px }` draws a gold block. That technique drew
+nothing here, and the reference fixture for generated content had a line
+recording it as a known gap — which was filed against generated content and was
+never about generated content at all.
+
+**Two bugs came out from under it**, both of them invisible while inline boxes
+drew nothing.
+
+A space at the start of an inline box survived collapsing. A paragraph whose
+source breaks the line and indents before `<span> text` kept the space inside the
+span, which §16.6.1 removes for being at the start of a line. It cost four pixels
+nobody could see until a border drew a box for the space to sit inside. The cause
+was a run that collapses to *nothing* being read as "no space here" rather than
+"still whatever preceded it".
+
+And a negative border width was clamped to zero instead of ignored. CSS 2.1
+makes `border-top-width: -1pt` an invalid declaration, which leaves the initial
+`medium` standing — a visible border, not an absent one. While in there,
+`thin`/`medium`/`thick` now work as longhand values; they were understood only
+inside the `border` shorthand, so `border-top-width: thin` silently stayed
+medium.
+
+**3202 of 4821 reference tests to 3225**, with 34 newly passing and 11 newly
+failing. Every one of the 11 is a test that was passing because *neither* side
+drew anything — the "identically blank" pairs the harness's CDATA fix turned up
+by the hundred. They now name real gaps: a background on a `display:
+table-row-group` box is not painted (#86, 4 tests), `inherit` is not implemented
+as a value (#87, 2), `direction: rtl` is not (#88, 3), `word-spacing` is not (1,
+already recorded in README.md), and downloadable `@font-face` fonts are not (1,
+outside the scope in ADR-0004).
+
+Two more tests were lost to something the work found rather than caused:
+`line-height: normal` is a flat 1.2 here where a browser takes the font's own
+ascent and descent, so an inline box's content area and the line box around it
+disagree by a pixel and a half where they should be the same height (#89).
+
+**A radio button is round and a `<legend>` sits in its group's rule** (#32,
+#33). Both were drawn wrong for the same reason: the display list had rectangles
+and nothing else, so a radio was a square — indistinguishable from the checkbox
+beside it — and a fieldset's rule ran unbroken behind a legend that sat above the
+group. The shape of a radio is not decoration: it is what tells a reader "one of
+these" from "any of these", which is the difference between two questions. So
+there is an ellipse in the display list now, used by exactly two boxes — the
+radio and the dot inside a checked one — rather than the beginning of
+`border-radius`, which CSS 2.1 does not have.
+
+The legend needed layout rather than paint. HTML's rendering section, not CSS
+2.1, puts it *in* the rule, which means the rule is painted as two pieces with
+the legend's own box sizing the gap, and the legend is lifted to straddle the
+fieldset's top border. It shrinks to fit first — a full-width legend would cut
+the whole rule away and leave the box open at the top — and the room it gave up
+in flow is reclaimed, so the group's contents start below the legend rather than
+below where the legend used to be. The fieldset then moves down by the half of
+the legend standing above it, so nothing above the group is trodden on.
+
+The conformance number is unchanged at 3202 of 4821: CSS 2.1's suite has no
+fieldset in it, and would not be where this showed up if it had.
+
+**A propagated background covers the canvas rather than the content** (#76).
+§14.2 puts the root element's background — or the body's, in its place — over
+the *entire canvas*. This put it there and then painted it a second time on the
+anonymous box that holds the page, which is as tall as the content rather than
+as tall as the window. With a colour that is an opaque rectangle of exactly the
+same colour and nobody could see it. With a background image it is an opaque
+rectangle over the top of the image: a page with a `no-repeat` tile taller than
+its own text lost everything below the last line, and the era's tiled pages lost
+the tile everywhere the text did not reach. The `era-page` reference fixture had
+been recording that as its expected output.
+
+The body no longer repaints the colour on its own box either, which is the same
+sentence of §14.2 — when the body's background is what reached the canvas, its
+own background properties take their initial values.
+
+**And the conformance harness measures a window instead of a canvas.** It
+rendered each document to its content height and padded the rest of the 800x600
+comparison with *white*, which a browser does not do: a short page with
+`html { background: green }` is a green window everywhere and was a green strip
+above white here. Both sides of a reftest are usually short in the same way, so
+this was mostly neutral — it bit where the two sides differ in height or the
+canvas has a colour of its own.
+
+The two changes had to land together, and that is the whole reason #76 sat
+filed rather than fixed. Made separately, each is worth **net zero**: the harness
+change alone wins `backgrounds/background-root-001` and loses
+`floats-clear/margin-collapse-clear-017`, and the §14.2 fix alone wins
+`css1/c45-bg-canvas-000` and loses the same one. Together: **3225 of 4821 to
+3226**, one newly passing and none newly failing. The issue asked for
+`margin-collapse-clear-017` to be settled against a real browser first; it was,
+and headless Chromium draws the full ruler that neither of our two sides was
+drawing.
+
+One newly passing rather than two, because the §14.2 fix is applied only where
+the background actually propagated. The reader gutter tops up the body's margin
+to keep text off the glass, and the box holding the page carries the body's
+background out past it so the gutter is not a pale frame around a coloured page —
+which is right when that background is the canvas's and wrong when it is not.
+`c45-bg-canvas-000` is the wrong case and still fails; #91 says what it needs,
+which is the gutter made of padding rather than margin and is a wider change than
+this one.
+
+**The conformance harness renders each document through a font store of its
+own** (#31). One store was held for the whole run of eleven thousand documents.
+Its shaping cache stops inserting at a cap, and `cosmic-text`'s own
+`FontSystem` loads faces and remembers fallback matches as it goes — so what a
+store held when a given test ran depended on every test before it, and a result
+could turn on the order of the walk rather than on the document. A change
+confined to table layout once flipped `text/bidi-flag-emoji-02`, which contains
+no table.
+
+The number is unchanged at 3202 of 4821, which is the reassuring half of the
+answer: the measurement was not distorted, it was only *able* to be. It costs
+3.4 seconds on a 13-second run, because the faces are embedded and load lazily
+— a fresh store is about twenty microseconds.
+
+**And `cargo run -p budgets` says when the browser it spawns is out of date**
+(#64). That command builds the budget harness, not `target/release/2kbrowser`,
+so the parent could be the new code and the child on disk whatever was built
+last. The run then failed with "renderer sent a malformed message", which reads
+as "this change broke the wire format" and means "the binary on disk is from a
+different change". It warns now, before anything measures. A warning and not a
+failure: the check is a heuristic over file times, and one that can stop a run
+has to be right every time.
+
+**An absolutely positioned box is moved by its margins** (#30). §10.3.7 puts
+the margins in the equation it solves, so `margin-left: 40px` moves the box
+forty pixels whether `left` is a length or `auto`, and `right` is measured from
+the *margin* edge. This read the offsets alone, and the margin the probe layout
+had already applied was then overwritten by the answer — so every absolutely
+positioned box sat flat against its containing block's content edge.
+
+**And positioned boxes paint in the order they were written.** Appendix E step
+8: positioned descendants with `z-index: auto` paint in document order.
+Absolutely positioned boxes were appended after every in-flow child, so an
+absolute box always covered a relative sibling however the source was written.
+Invisible until two of them overlap — and then wrong every time. The margin fix
+is what made them overlap, which is how this was found.
+
+**A rule takes the width and thickness its markup asks for** (#39). `<hr
+width="50%">`, `<hr width="200">` and `<hr size="8">` were all ignored: every
+rule came out full width and a pixel tall. A half-width centred rule under a
+heading is one of the most characteristic things about a page of this era, and
+`size` is how one drew a heavy divider.
+
+A narrowed rule is centred, which is what a browser does with no `align` at
+all, and `align="left"` or `"right"` moves it — on an `<hr>` that attribute
+moves the rule itself rather than aligning text, which is the one element where
+those two readings differ.
+
 ## 0.2.0
 
 A release about the engine rather than the browser around it. **The CSS 2.1

@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "budgets"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "net",
  "sandbox",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "conformance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dom",
  "net",
@@ -375,7 +375,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "css"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cssparser",
  "dom",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "dom"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "html5ever",
 ]
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "fuzz"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "css",
  "dom",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "gaps"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "shell",
  "text",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "layout"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "css",
  "dom",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "encoding_rs",
  "rustls",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "paint"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "css",
  "dom",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "reftests"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "net",
  "paint",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "layout",
  "libc",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "seatbelt"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "seccompiler"
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "css",
@@ -2085,7 +2085,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dom",
 ]
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "text"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cosmic-text",
  "css",
