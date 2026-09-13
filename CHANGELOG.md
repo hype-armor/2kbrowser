@@ -14,7 +14,27 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
-## Unreleased
+## 0.2.0
+
+A release about the engine rather than the browser around it. **The CSS 2.1
+conformance suite went from 30.1% to 66.1%** — 1451 of 4821 reference tests to
+3188 — which is more than the suite had passed in the whole of the project
+before it.
+
+Almost none of that came from making rendering *better*. It came from things
+that were absent altogether, each failing wholesale rather than in detail:
+`::first-letter`, `inline-block`, counters, generated content, tables built
+from `display` values rather than from tag names, and the adjacent sibling
+combinator, which was dropped entirely and is in dozens of the suite's shared
+reference files. A property that is not implemented fails every test that
+mentions it, and there is no partial credit to be had.
+
+One of the larger jumps was not engine work at all but a fix to the harness,
+and it is written up below with the direction that matters rather than the
+flattering one.
+
+The browser also answers the pointer now: text selects and copies, the
+right-hand button opens a menu, and Ctrl with the wheel zooms.
 
 **Two table-structure bugs, both found by drawing a picture rather than by the
 suite.** Making a demo page of the newly supported CSS turned up a table that
@@ -174,6 +194,80 @@ was previously not drawn at all — the reftest matched because both sides were
 blank. What they point at: an inline box's own border and padding still take up
 no room on the line, and an `<iframe>` has no intrinsic size, so one with
 `width: auto` comes out empty instead of 300x150.
+
+**Text selects, and copies.** Dragging across the page selects what the drag
+crossed — in reading order, not the rectangle between the two points, so
+dragging down the margin takes whole lines the way it does everywhere else.
+Ctrl+C puts it on the system clipboard. A browser you cannot quote from is a
+browser you cannot use for the thing people mostly use one for.
+
+**A menu on the right-hand button.** Back, forward, reload, open in new tab,
+copy link address, copy. Each entry appears only when it would do something:
+no greyed-out rows, and no "Copy" with nothing selected. Ordered nearest-first
+— what the pointer is on, then what is on the page, then what the tab can do —
+with a test pinning that order, because a menu with "Reload" above "Copy link
+address" makes the reader read the whole list every time.
+
+**Ctrl and the wheel zoom.** In steps, and the page reflows to the window
+rather than being scaled up afterwards: text is shaped at the size it is drawn,
+so it is twice as sharp rather than twice as blurry, and a zoomed page still
+fits the width it has.
+
+**Four interface bugs, all of them things a reader would hit in the first
+minute.** A window wider than the page drew the page twice. The links inside a
+fallback rendering were not clickable. The new-tab button sat where the tab
+strip covered it when only one tab was open. And a closed pipe — what a shell
+does when you press Ctrl+C on a piped command — crashed the renderer rather
+than ending its work.
+
+**The reading view got its furniture back.** It falls back on a page whose
+*frame* is unsupported while its prose is not — a Wikipedia article is the
+case, where the text is ordinary flow and the columns around it are not. The
+page's title is on it again, the blank lines pages use as spacing are dropped
+rather than stacked, and the reader's colours win over colours written into the
+markup: an author's dark text left standing over the reader's dark page is the
+same bug upside down, and Wikipedia's taxobox carries its colours on every row.
+
+**Six more properties off the gap list.** `clip` on an absolutely positioned
+box, `min-width`, `max-height`, `overflow` clipping — content outside a
+clipping box is no longer somewhere the page can be scrolled to — a percentage
+width on an image, and the `font` shorthand. `max-height` came with the rule
+that a negative length is *invalid* rather than clamped, which is CSS 2.1's
+answer for every property that takes one.
+
+**Three layout bugs that were each invisible from the outside.** The adjacent
+sibling combinator `div + div` was dropped entirely, which is rare in
+hand-written pages and everywhere in the suite's shared references — fixing it
+moved 206 tests at once, none of them about selectors. A float with no block
+child after it was never placed at all, because floats are held back and placed
+when the next block arrives and nothing arrived. And the canvas was sized to
+the root box rather than to what the page drew, so a `height: 0` box with text
+in it had its text painted and then cut off by a canvas that ended above it —
+cut off being indistinguishable from never drawn.
+
+**Generated content.** `::before` and `::after` produce real boxes, with
+strings and `attr()` in `content`. A form `content` cannot express drops the
+whole declaration rather than half of it: a pseudo-element showing part of what
+the author asked for looks deliberate.
+
+**Width media queries, and a selector bug worth naming.** `@media` with a width
+condition is answered against the real viewport. Underneath it, selector lists
+were split on every comma — including commas *inside* `:is(…)` and `:not(…)`.
+Wikipedia ships `… :is(p,table,thead + tbody) { display: none }`, and splitting
+that left a bare `table` selector which matched **every table on the page** and
+hid all of them, the infobox included. The pseudo-classes themselves were
+always rejected correctly; the list simply never reached that check in one
+piece.
+
+**A measurement fix that moved the number more than any feature.** Almost every
+test in the suite is XHTML and writes its stylesheet inside `<![CDATA[ … ]]>`.
+Read as HTML — which is how this browser reads everything, and how every
+browser read the XHTML the real web served — that wrapper makes CSS error
+recovery swallow the whole stylesheet. The harness now unwraps it. The
+direction that matters is not the gain: **342 tests stopped passing**, every
+one a pair with the wrapper on both sides, two lost stylesheets and two pages
+of unstyled prose matching each other exactly. A reftest cannot tell
+"identical" from "identically blank".
 
 **Forms are drawn.** An `<input>` is a void element with no content, so until now
 it laid out as nothing at all: a search box was not an empty box, it was absent,
