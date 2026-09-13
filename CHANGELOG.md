@@ -16,8 +16,16 @@ record for everything earlier.
 
 ## Unreleased
 
-Nothing yet. Changes land on `next-release` and are summarised here as they go,
-rather than reconstructed from the log on the morning of a release.
+**A rule takes the width and thickness its markup asks for** (#39). `<hr
+width="50%">`, `<hr width="200">` and `<hr size="8">` were all ignored: every
+rule came out full width and a pixel tall. A half-width centred rule under a
+heading is one of the most characteristic things about a page of this era, and
+`size` is how one drew a heavy divider.
+
+A narrowed rule is centred, which is what a browser does with no `align` at
+all, and `align="left"` or `"right"` moves it — on an `<hr>` that attribute
+moves the rule itself rather than aligning text, which is the one element where
+those two readings differ.
 
 ## 0.2.0
 
