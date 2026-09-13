@@ -1042,8 +1042,12 @@ pub fn parse_border_style(name: &str) -> Option<BorderStyle> {
     BorderStyle::parse(name)
 }
 
+/// The `thin` border width.
+pub const THIN_BORDER: f32 = 1.0;
 /// The `medium` border width, and the initial value.
 pub const MEDIUM_BORDER: f32 = 3.0;
+/// The `thick` border width.
+pub const THICK_BORDER: f32 = 5.0;
 
 /// One edge of a border.
 #[derive(Debug, Clone, Copy, PartialEq)]

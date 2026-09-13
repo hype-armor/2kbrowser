@@ -17,9 +17,10 @@
   .none::before   { content: none; color: #cc0000; }
   .normal::before { content: normal; color: #cc0000; }
 
-  /* An empty string generates a box. It is invisible here and should not be:
-     no inline box paints a background or padding yet — issue #46, and nothing
-     to do with generated content. Kept so the baseline records it. */
+  /* An empty string generates a box, and a box with a background and padding
+     draws them: a pseudo-element is an inline box like any other. This drew
+     nothing until inline boxes did (#46), which was never about generated
+     content — the bug was one level down. */
   .empty::before { content: ""; background: #ffcc00; padding: 0 8px; }
 
   /* Out of scope, so the whole declaration goes rather than half of it.
@@ -67,8 +68,8 @@
 <p class="column">display: table-column</p>
 <p class="hidden">display: none</p>
 
-<h3>An empty string generates a box, which paints nothing here (#46)</h3>
-<p class="empty">no yellow: an inline box has no background yet</p>
+<h3>An empty string generates a box, and the box is drawn</h3>
+<p class="empty">a yellow block precedes this line</p>
 
 <h3>Counters</h3>
 <ol class="chapters"><li>first</li><li>second</li><li>third</li></ol>

@@ -1848,6 +1848,7 @@ fn flush_inline(
         intrinsic,
         &blocks,
         content_width,
+        &mut Numbering::default(),
     ));
     runs.extend(tail);
     if !runs
@@ -3545,8 +3546,16 @@ fn collect_inline_runs(
     // one also collects a *stretch* of inline children between two blocks,
     // and a pseudo-element attached to every stretch would appear several
     // times over.
+    let mut numbering = Numbering::default();
     if let Some(before) = generated_run(styles, node, PseudoElement::Before) {
-        runs.push(before);
+        push_generated(
+            before,
+            node,
+            &[],
+            &mut numbering,
+            available_width,
+            &mut runs,
+        );
     }
     runs.extend(inline_runs_for(
         doc,
@@ -3557,9 +3566,10 @@ fn collect_inline_runs(
         intrinsic,
         blocks,
         available_width,
+        &mut numbering,
     ));
     if let Some(after) = generated_run(styles, node, PseudoElement::After) {
-        runs.push(after);
+        push_generated(after, node, &[], &mut numbering, available_width, &mut runs);
     }
     runs
 }
@@ -3642,6 +3652,7 @@ fn inline_runs_for(
     intrinsic: &IntrinsicSizes,
     blocks: &InlineBlocks,
     available_width: f32,
+    numbering: &mut Numbering,
 ) -> Vec<InlineRun> {
     let mut runs = Vec::new();
     for &child in children {
@@ -3654,6 +3665,8 @@ fn inline_runs_for(
             intrinsic,
             blocks,
             available_width,
+            &[],
+            numbering,
             &mut runs,
         );
     }
@@ -3668,15 +3681,40 @@ fn inline_runs_for(
             previous_ended_in_space = run.text.ends_with(char::is_whitespace);
             continue;
         }
+        // An edge is not part of the text stream at all, so the state carries
+        // straight across it: `<p><span> text` opens with a space that §16.6.1
+        // removes for being at the start of a line, and treating the edge as
+        // content would keep it — visibly, once the span draws a border for it
+        // to sit inside.
+        if run.edge.is_some() {
+            continue;
+        }
+        // An atomic inline box carries no text but is content all the same, so
+        // the space after `<img> text` is between two things and survives.
+        if run.replaced.is_some() {
+            previous_ended_in_space = false;
+            continue;
+        }
         let collapsed = collapse_whitespace_from(&run.text, previous_ended_in_space);
-        previous_ended_in_space = collapsed.ends_with(' ');
+        // A run that collapsed to nothing did not end in a space, but it did
+        // not end in anything else either: what precedes the next run is still
+        // whatever preceded this one. Reading the empty string as "no space
+        // here" is what let `<p>\n  <span> text` keep two spaces' worth of
+        // nothing and then a third real one.
+        previous_ended_in_space =
+            collapsed.ends_with(' ') || (collapsed.is_empty() && previous_ended_in_space);
         run.text = collapsed;
     }
-    // Leading and trailing whitespace of the whole block is dropped.
-    if let Some(first) = runs.first_mut() {
+    // Leading and trailing whitespace of the whole block is dropped. An edge
+    // run is skipped over rather than trimmed: it carries no text, so the space
+    // at the start of `<p><span> text</span>` is on the run *after* it and
+    // trimming the edge would trim nothing. Replaced runs are deliberately not
+    // skipped — the space after a leading image is real text between two
+    // things, not the block's own leading whitespace.
+    if let Some(first) = runs.iter_mut().find(|run| run.edge.is_none()) {
         first.text = first.text.trim_start().to_owned();
     }
-    if let Some(last) = runs.last_mut() {
+    if let Some(last) = runs.iter_mut().rev().find(|run| run.edge.is_none()) {
         last.text = last.text.trim_end().to_owned();
     }
     runs
@@ -3695,6 +3733,8 @@ fn gather_one(
     intrinsic: &IntrinsicSizes,
     blocks: &InlineBlocks,
     available_width: f32,
+    boxes: &[usize],
+    numbering: &mut Numbering,
     out: &mut Vec<InlineRun>,
 ) {
     if let Some(text) = doc.text(child) {
@@ -3706,7 +3746,11 @@ fn gather_one(
         // every face bundled here, and a line measured lowercase would wrap in
         // the wrong place and then be drawn in capitals over the top.
         let transformed = inherited.text_transform.apply(text);
-        out.push(InlineRun::text(transformed, inherited.clone()).from_element(holder.0));
+        out.push(
+            InlineRun::text(transformed, inherited.clone())
+                .from_element(holder.0)
+                .inside(boxes.to_vec()),
+        );
         return;
     }
     let Some(style) = styles.get(child) else {
@@ -3826,6 +3870,13 @@ fn gather_one(
         return;
     }
 
+    // §8.4: a non-replaced inline box's horizontal margin, border and padding
+    // are inserted into the line at its two ends — once for the whole box,
+    // however many lines it breaks across — and it draws its background and
+    // border wherever it goes. Both are bracketed here, around the recursion
+    // that gathers what is inside it.
+    let inside = open_a_box(style, Some(child.0), boxes, numbering, available_width, out);
+
     // §12.1 again, one level in: a `::before` on an inline element inside the
     // block is part of the same line, and nothing else reaches it.
     // `collect_inline_runs` brackets the block's own generated boxes, and this
@@ -3833,7 +3884,7 @@ fn gather_one(
     // are, since the elements a stylesheet numbers or labels are spans and
     // anchors far more often than they are the container.
     if let Some(before) = generated_run(styles, child, PseudoElement::Before) {
-        out.push(before);
+        push_generated(before, child, &inside, numbering, available_width, out);
     }
     for &grandchild in doc.children(child) {
         gather_one(
@@ -3845,12 +3896,178 @@ fn gather_one(
             intrinsic,
             blocks,
             available_width,
+            &inside,
+            numbering,
             out,
         );
     }
     if let Some(after) = generated_run(styles, child, PseudoElement::After) {
-        out.push(after);
+        push_generated(after, child, &inside, numbering, available_width, out);
     }
+
+    close_a_box(style, Some(child.0), &inside, boxes, available_width, out);
+}
+
+/// Numbers the inline boxes of one block's run sequence.
+///
+/// A box is not always an element — `::before` draws one and is none — so the
+/// numbering is the caller's own rather than a node id. It only has to be
+/// unique within the runs handed to one text layout, which is what lets a
+/// pseudo-element have a box without inventing a node for it.
+#[derive(Default)]
+struct Numbering(usize);
+
+impl Numbering {
+    fn next(&mut self) -> usize {
+        self.0 += 1;
+        self.0
+    }
+}
+
+/// Opens an inline box around what follows, if it has anything to open for.
+///
+/// Returns the chain of boxes the content inside it sits in — `boxes` again
+/// when there was nothing to open, so the caller can use it either way.
+fn open_a_box(
+    style: &ComputedStyle,
+    source: Option<usize>,
+    boxes: &[usize],
+    numbering: &mut Numbering,
+    available_width: f32,
+    out: &mut Vec<InlineRun>,
+) -> Vec<usize> {
+    let (left, _) = inline_edges(style, available_width);
+    if !brackets(style, available_width) {
+        return boxes.to_vec();
+    }
+    let mut inside = boxes.to_vec();
+    inside.push(numbering.next());
+    out.push(
+        InlineRun::edge(
+            source,
+            text::InlineEdge {
+                width: left,
+                opening: true,
+            },
+            style.clone(),
+        )
+        .inside(inside.clone()),
+    );
+    inside
+}
+
+/// The other end of [`open_a_box`]. `inside` is what it returned and `boxes`
+/// what was passed to it; they differ exactly when a box was opened.
+fn close_a_box(
+    style: &ComputedStyle,
+    source: Option<usize>,
+    inside: &[usize],
+    boxes: &[usize],
+    available_width: f32,
+    out: &mut Vec<InlineRun>,
+) {
+    if inside.len() == boxes.len() {
+        return;
+    }
+    let (_, right) = inline_edges(style, available_width);
+    out.push(
+        InlineRun::edge(
+            source,
+            text::InlineEdge {
+                width: right,
+                opening: false,
+            },
+            style.clone(),
+        )
+        .inside(inside.to_vec()),
+    );
+}
+
+/// Emits one generated run inside its own inline box.
+///
+/// `::before` and `::after` generate inline boxes like any other, and a
+/// stylesheet that gives one a border expects to see it: `div::before { border:
+/// solid orange; content: "PASS" }` is the suite's own way of asking whether a
+/// pseudo-element is a box at all.
+fn push_generated(
+    run: InlineRun,
+    element: NodeId,
+    boxes: &[usize],
+    numbering: &mut Numbering,
+    available_width: f32,
+    out: &mut Vec<InlineRun>,
+) {
+    let style = run.style.clone();
+    let inside = open_a_box(
+        &style,
+        Some(element.0),
+        boxes,
+        numbering,
+        available_width,
+        out,
+    );
+    out.push(run.inside(inside.clone()));
+    close_a_box(
+        &style,
+        Some(element.0),
+        &inside,
+        boxes,
+        available_width,
+        out,
+    );
+}
+
+/// Whether an inline box needs bracketing at all: room on the line, something
+/// to draw, or both.
+fn brackets(style: &ComputedStyle, available_width: f32) -> bool {
+    let (left, right) = inline_edges(style, available_width);
+    left > 0.0 || right > 0.0 || draws_a_box(style)
+}
+
+/// Room an inline box's two sides take on the line (§8.4).
+///
+/// Margin as well as border and padding: all three apply horizontally to an
+/// inline box, and all three were being dropped. The vertical ones are absent
+/// on purpose — §10.6.1 keeps them out of the line's height, and the box
+/// overflows the line rather than growing it.
+fn inline_edges(style: &ComputedStyle, available_width: f32) -> (f32, f32) {
+    let font_size = style.font_size;
+    let side = |margin: Length, border: f32, padding: Length| {
+        margin.to_px(font_size, available_width)
+            + border
+            + padding.to_px(font_size, available_width)
+    };
+    (
+        side(
+            style.margin.left,
+            style.border.left.used_width(font_size),
+            style.padding.left,
+        ),
+        side(
+            style.margin.right,
+            style.border.right.used_width(font_size),
+            style.padding.right,
+        ),
+    )
+}
+
+/// Whether an inline box has anything to paint where it crosses a line.
+///
+/// A background — colour or image — or any visible border. Not padding on its
+/// own: transparent padding with nothing around it still takes room on the
+/// line, which [`inline_edges`] handles, but there is nothing to draw for it.
+fn draws_a_box(style: &ComputedStyle) -> bool {
+    let font_size = style.font_size;
+    !style.background_color.is_transparent()
+        || style.background_image.is_some()
+        || [
+            &style.border.top,
+            &style.border.right,
+            &style.border.bottom,
+            &style.border.left,
+        ]
+        .iter()
+        .any(|side| side.style.is_visible() && side.used_width(font_size) > 0.0)
 }
 
 /// Collapses whitespace per `white-space: normal`.
@@ -5161,6 +5378,116 @@ mod tests {
             })
             .collect();
         assert_eq!(widths[1] - widths[0], 10.0, "5px of border on each side");
+    }
+
+    /// The first line of the first box that laid text out.
+    fn first_line(rendered: &Rendered) -> &text::Line {
+        content_boxes(rendered)
+            .into_iter()
+            .find_map(|b| b.text.as_ref())
+            .map(|text| &text.lines[0])
+            .expect("a line of text")
+    }
+
+    #[test]
+    fn an_inline_boxs_padding_and_border_take_room_on_the_line() {
+        // §8.4: horizontal padding, border and margin on an inline box are
+        // inserted into the line. Until they were, a `<span>` with 50px of
+        // padding either side drew it and the line breaker never saw it, so
+        // the text beside it wrapped a hundred pixels late.
+        let of = |css: &str| {
+            let rendered = run(
+                "<body><p>before <span>middle</span> after</p></body>",
+                css,
+                600.0,
+            );
+            first_line(&rendered).width
+        };
+        let bare = of("body { margin: 0 }");
+        assert!(
+            (of("body { margin: 0 } span { padding: 0 20px }") - bare - 40.0).abs() < 0.01,
+            "padding reserved nothing"
+        );
+        assert!(
+            (of("body { margin: 0 } span { border: 0 solid red; border-width: 0 9px }")
+                - bare
+                - 18.0)
+                .abs()
+                < 0.01,
+            "a border reserved nothing"
+        );
+        assert!(
+            (of("body { margin: 0 } span { margin: 0 7px }") - bare - 14.0).abs() < 0.01,
+            "a margin reserved nothing"
+        );
+    }
+
+    #[test]
+    fn an_inline_box_that_draws_nothing_and_reserves_nothing_is_not_a_box() {
+        // The common case by far. A plain `<span>` or `<b>` must not put two
+        // empty segments on every line it touches, nor a style in the table
+        // paint walks.
+        let rendered = run(
+            "<body><p>plain <span>span</span> here</p></body>",
+            "body { margin: 0 }",
+            600.0,
+        );
+        let text = content_boxes(&rendered)
+            .into_iter()
+            .find_map(|b| b.text.as_ref())
+            .expect("a line of text");
+        assert!(text.inline_boxes.is_empty(), "a plain span became a box");
+        assert!(text.lines[0].boxes.is_empty());
+    }
+
+    #[test]
+    fn an_inline_boxs_background_is_drawn_behind_its_whole_stretch() {
+        // Including whatever is nested inside it: `<span class=hl>a <b>b</b>
+        // c</span>` is one yellow stretch, not two with a hole where the bold
+        // is.
+        let rendered = run(
+            "<body><p><span>one <b>two</b> three</span></p></body>",
+            "body { margin: 0 } span { background: #ffcc00 }",
+            600.0,
+        );
+        let line = first_line(&rendered);
+        assert_eq!(line.boxes.len(), 1, "the box was drawn in pieces");
+        assert!(
+            (line.boxes[0].width - line.width).abs() < 0.01,
+            "the background covered {} of a {} line",
+            line.boxes[0].width,
+            line.width
+        );
+    }
+
+    #[test]
+    fn whitespace_at_the_start_of_an_inline_box_still_collapses_away() {
+        // §16.6.1 removes a space at the start of a line, and an inline box's
+        // opening edge is not content that could keep one alive. The bug this
+        // pins was invisible until the box drew a border for the space to sit
+        // inside — and then it was a four-pixel gap on every such span.
+        let rendered = run(
+            "<body><p>\n  <span> text</span></p></body>",
+            "body { margin: 0 } span { border: 1px solid red }",
+            600.0,
+        );
+        assert_eq!(first_line(&rendered).text.trim_end(), "text");
+    }
+
+    #[test]
+    fn a_space_after_an_inline_image_is_not_collapsed_away() {
+        // The other half of the rule above, and the one it is easy to break
+        // reaching for the first: an atomic inline box *is* content, so the
+        // space between it and the word after it is between two things.
+        let mut sizes = IntrinsicSizes::new();
+        let doc = dom::parse(r#"<body><p><img src="a.png"> word</p></body>"#);
+        sizes.insert(doc.find_element("img").expect("img"), (20.0, 20.0));
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
+        let mut fonts = FontStore::new();
+        let rendered = Rendered {
+            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+        };
+        assert_eq!(first_line(&rendered).text, " word");
     }
 
     #[test]
@@ -7926,6 +8253,7 @@ mod tests {
                 glyphs: Vec::new(),
                 replaced: Vec::new(),
                 spans: Vec::new(),
+                boxes: Vec::new(),
                 decorations: Vec::new(),
                 text: String::new(),
                 width: 200.0,
@@ -7934,6 +8262,7 @@ mod tests {
             }],
             height: 12.0,
             width: 200.0,
+            inline_boxes: Vec::new(),
         };
         clip_label(&mut label, 50.0);
         assert_eq!(label.width, 50.0);

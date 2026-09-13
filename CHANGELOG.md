@@ -16,6 +16,67 @@ record for everything earlier.
 
 ## Unreleased
 
+**An inline box is a box** (#46, #71). A `<span>` with a background, padding or
+a border drew none of them and reserved no room for any of them: a highlighted
+phrase, a tinted `<code>`, a coloured label, a pill — all ordinary markup, all
+coming out as plain text with the words after it wrapping in the wrong place.
+README.md listed "the box model with borders and backgrounds" under what works
+without saying it meant *block* boxes.
+
+An inline box is not one rectangle, which is why this waited so long. §8.4 gives
+it one fragment per line it crosses, with the horizontal margin, border and
+padding on the first fragment and the last — they belong to the whole box,
+however many lines it is broken over — and the stretch in between running edge
+to edge. The line breaker now takes those two sides as unbreakable runs of their
+own, so the room is reserved where the text is measured rather than added at
+paint time, and a fragment is measured over everything *inside* the box rather
+than over the runs that name it: `<span class=hl>a <b>b</b> c</span>` is one
+yellow stretch and not two with a hole where the bold is.
+
+The vertical padding and border are drawn and do not enter the line's height
+(§10.6.1), so a phrase with 4px of padding overflows its line rather than pushing
+the lines around it apart — which is what browsers do and why inline padding is
+something authors use sparingly. The box is as tall as its font's content area
+and not as tall as its line box, so a double-spaced paragraph highlights its
+phrases at the size of the words instead of in bands that touch.
+
+A pseudo-element is an inline box like any other, so `div::before { content: "";
+background: gold; padding: 0 8px }` draws a gold block. That technique drew
+nothing here, and the reference fixture for generated content had a line
+recording it as a known gap — which was filed against generated content and was
+never about generated content at all.
+
+**Two bugs came out from under it**, both of them invisible while inline boxes
+drew nothing.
+
+A space at the start of an inline box survived collapsing. A paragraph whose
+source breaks the line and indents before `<span> text` kept the space inside the
+span, which §16.6.1 removes for being at the start of a line. It cost four pixels
+nobody could see until a border drew a box for the space to sit inside. The cause
+was a run that collapses to *nothing* being read as "no space here" rather than
+"still whatever preceded it".
+
+And a negative border width was clamped to zero instead of ignored. CSS 2.1
+makes `border-top-width: -1pt` an invalid declaration, which leaves the initial
+`medium` standing — a visible border, not an absent one. While in there,
+`thin`/`medium`/`thick` now work as longhand values; they were understood only
+inside the `border` shorthand, so `border-top-width: thin` silently stayed
+medium.
+
+**3202 of 4821 reference tests to 3225**, with 34 newly passing and 11 newly
+failing. Every one of the 11 is a test that was passing because *neither* side
+drew anything — the "identically blank" pairs the harness's CDATA fix turned up
+by the hundred. They now name real gaps: a background on a `display:
+table-row-group` box is not painted (#86, 4 tests), `inherit` is not implemented
+as a value (#87, 2), `direction: rtl` is not (#88, 3), `word-spacing` is not (1,
+already recorded in README.md), and downloadable `@font-face` fonts are not (1,
+outside the scope in ADR-0004).
+
+Two more tests were lost to something the work found rather than caused:
+`line-height: normal` is a flat 1.2 here where a browser takes the font's own
+ascent and descent, so an inline box's content area and the line box around it
+disagree by a pixel and a half where they should be the same height (#89).
+
 **A radio button is round and a `<legend>` sits in its group's rule** (#32,
 #33). Both were drawn wrong for the same reason: the display list had rectangles
 and nothing else, so a radio was a square — indistinguishable from the checkbox

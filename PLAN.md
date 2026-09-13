@@ -393,9 +393,8 @@ such box here, so the table sits further left than a browser draws it —
 `empty-cells` — ignored in the separated model, where it applies, and
 correctly ignored in the collapsing one, where it does not — the corner where
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
-settled here by width rather than by a diagonal mitre, an inline box's own
-border and padding taking up no room on the line — so text after a bordered
-`<span>` wraps a little late — and proper block-in-inline splitting — an inline element containing a block is
+settled here by width rather than by a diagonal mitre, and proper
+block-in-inline splitting — an inline element containing a block is
 laid out as a block instead, which matches for the shapes that occur but is
 not what CSS 2.1 §9.2.1.1 describes.
 

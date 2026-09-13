@@ -268,6 +268,19 @@ fn paint_box(
         let content_width = box_.content_width;
         for line in &layout.lines {
             let dx = line_offset(box_.style.text_align, line.width, content_width);
+            // An inline box's own background and border, under everything the
+            // line draws. Outermost first, which is the order the fragments
+            // come in, so a nested span's background covers its parent's.
+            for fragment in &line.boxes {
+                let Some((_, style)) = layout
+                    .inline_boxes
+                    .iter()
+                    .find(|(source, _)| *source == fragment.source)
+                else {
+                    continue;
+                };
+                paint_inline_box(fragment, style, content_x + dx, content_y, list);
+            }
             // Rules go under the glyphs so an underline sitting close to a
             // descender is crossed by it rather than cutting through it.
             for rule in line.decorations.iter().filter(|rule| !rule.hidden) {
@@ -413,6 +426,127 @@ fn intersect(rect: Rect, clip: Rect) -> Option<Rect> {
         width: right - x,
         height: bottom - y,
     })
+}
+
+/// Emits one line's worth of a non-replaced inline box: the background and
+/// border it draws where it crosses that line (§8.4).
+///
+/// An inline box broken over three lines draws three of these. The horizontal
+/// margin, border and padding belong to the whole box rather than to each
+/// fragment, so they appear on the first fragment and the last — `opens` and
+/// `closes` — and the stretch in between runs edge to edge. The vertical ones
+/// are on every fragment, and overflow the line box rather than growing it
+/// (§10.6.1): a highlighted phrase with 4px of padding is 8px taller than its
+/// text wherever it appears, and the lines around it do not move apart to make
+/// room. That is what browsers do and what makes inline padding a thing authors
+/// use sparingly.
+fn paint_inline_box(
+    fragment: &text::InlineBoxFragment,
+    style: &css::style::ComputedStyle,
+    origin_x: f32,
+    origin_y: f32,
+    list: &mut DisplayList,
+) {
+    let font_size = style.font_size;
+    // Percentages on an inline box's padding resolve against the containing
+    // block's width, which is not known here. They are rare enough on a span
+    // that a basis of zero — which reads them as nothing — is better than a
+    // basis that is wrong in a way nobody can see the cause of.
+    let px = |length: css::value::Length| length.to_px(font_size, 0.0);
+    let border = &style.border;
+    let (border_top, border_bottom) = (
+        border.top.used_width(font_size),
+        border.bottom.used_width(font_size),
+    );
+    // The reserved stretch starts at the margin's outer edge, so the border box
+    // is inside it by whichever margins are on this fragment.
+    let left = origin_x
+        + fragment.x
+        + if fragment.opens {
+            px(style.margin.left)
+        } else {
+            0.0
+        };
+    let right = origin_x + fragment.x + fragment.width
+        - if fragment.closes {
+            px(style.margin.right)
+        } else {
+            0.0
+        };
+    let top = origin_y + fragment.y - px(style.padding.top) - border_top;
+    let bottom = origin_y + fragment.y + fragment.height + px(style.padding.bottom) + border_bottom;
+    let rect = Rect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+
+    if !style.background_color.is_transparent() {
+        list.items.push(DisplayItem::Rect {
+            rect,
+            color: style.background_color,
+        });
+    }
+
+    // Top and bottom run the length of the fragment; the two sides are drawn
+    // only where the box actually begins and ends.
+    let color_of = |side: &css::style::BorderSide| side.color.unwrap_or(style.color);
+    let sides = [
+        (
+            &border.top,
+            Side::Top,
+            border_top,
+            true,
+            Rect {
+                height: border_top,
+                ..rect
+            },
+        ),
+        (
+            &border.bottom,
+            Side::Bottom,
+            border_bottom,
+            true,
+            Rect {
+                y: rect.y + rect.height - border_bottom,
+                height: border_bottom,
+                ..rect
+            },
+        ),
+        (
+            &border.left,
+            Side::Left,
+            border.left.used_width(font_size),
+            fragment.opens,
+            Rect {
+                y: rect.y + border_top,
+                width: border.left.used_width(font_size),
+                height: (rect.height - border_top - border_bottom).max(0.0),
+                ..rect
+            },
+        ),
+        (
+            &border.right,
+            Side::Right,
+            border.right.used_width(font_size),
+            fragment.closes,
+            Rect {
+                x: rect.x + rect.width - border.right.used_width(font_size),
+                y: rect.y + border_top,
+                width: border.right.used_width(font_size),
+                height: (rect.height - border_top - border_bottom).max(0.0),
+            },
+        ),
+    ];
+    for (side, which, thickness, present, edge) in sides {
+        if present && side.style.is_visible() && thickness > 0.0 {
+            push_border_side(list, &edge, side.style, thickness, which, color_of(side));
+        }
+    }
 }
 
 /// Emits the four border edges of a box.
@@ -1771,6 +1905,95 @@ mod tests {
         assert_eq!(red, 0, "hidden must not paint");
         // But it still occupies space, so the box is taller than its content.
         assert!(hidden.height() >= 32, "6px top + 20px content + 6px bottom");
+    }
+
+    #[test]
+    fn an_inline_box_paints_its_background_and_border() {
+        // The bug this pins: a `<span>` with a background drew its text and
+        // nothing else. A highlighted phrase, a tinted `<code>`, a pill — all
+        // ordinary markup, all plain text until now.
+        let count = |pixmap: &Pixmap, want: (u8, u8, u8)| {
+            pixmap
+                .pixels()
+                .iter()
+                .filter(|p| (p.red(), p.green(), p.blue()) == want)
+                .count()
+        };
+        let yellow = (255, 204, 0);
+
+        let plain = render(
+            "<body><p>a <span>b</span> c</p></body>",
+            "body{margin:0}",
+            200,
+        );
+        assert_eq!(
+            count(&plain, yellow),
+            0,
+            "a plain span painted a background"
+        );
+
+        let filled = render(
+            "<body><p>a <span>b</span> c</p></body>",
+            "body{margin:0} span{background:#ffcc00;padding:0 6px}",
+            200,
+        );
+        assert!(
+            count(&filled, yellow) > 100,
+            "the span's background came out {} pixels",
+            count(&filled, yellow)
+        );
+
+        // And the border is on the outside of the padding, not instead of it.
+        let bordered = render(
+            "<body><p>a <span>b</span> c</p></body>",
+            "body{margin:0} span{background:#ffcc00;padding:0 6px;border:2px solid #cc0000}",
+            200,
+        );
+        assert!(count(&bordered, (204, 0, 0)) > 40, "no border drawn");
+        assert!(
+            count(&bordered, yellow) >= count(&filled, yellow),
+            "the border ate the background it should surround"
+        );
+    }
+
+    #[test]
+    fn an_inline_boxs_horizontal_border_is_only_on_the_ends() {
+        // §8.4: the left and right sides belong to the whole box, so a box
+        // broken over two lines draws them once each and not once per line.
+        // Counted as red pixels: two vertical 2px sides at ~14px of content
+        // area is a few dozen, four would be twice that.
+        let sides = |css: &str| {
+            let pixmap = render(
+                "<body><p><span>one two three four five six seven eight</span></p></body>",
+                css,
+                120,
+            );
+            pixmap
+                .pixels()
+                .iter()
+                .filter(|p| (p.red(), p.green(), p.blue()) == (204, 0, 0))
+                .count()
+        };
+        let one_line = render(
+            "<body><p><span>short</span></p></body>",
+            "body{margin:0} span{border-left:2px solid #cc0000;border-right:2px solid #cc0000}",
+            400,
+        );
+        let per_side = one_line
+            .pixels()
+            .iter()
+            .filter(|p| (p.red(), p.green(), p.blue()) == (204, 0, 0))
+            .count()
+            / 2;
+        assert!(per_side > 8, "a 2px side came out {per_side} pixels");
+        let broken = sides(
+            "body{margin:0} span{border-left:2px solid #cc0000;border-right:2px solid #cc0000}",
+        );
+        assert!(
+            broken < per_side * 4,
+            "a box broken over lines drew {broken} pixels of side, which is more than the two \
+             it has"
+        );
     }
 
     #[test]
