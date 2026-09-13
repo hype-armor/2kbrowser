@@ -14,6 +14,11 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
+## Unreleased
+
+Nothing yet. Changes land on `next-release` and are summarised here as they go,
+rather than reconstructed from the log on the morning of a release.
+
 ## 0.2.0
 
 A release about the engine rather than the browser around it. **The CSS 2.1
