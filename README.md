@@ -59,8 +59,11 @@ styles and Unicode line breaking; floats; tables with automatic column sizing, `
 `cellspacing`, and **both border models** — including
 `border-collapse: collapse`, where adjoining borders resolve into one line
 centred on the grid line between them, which is what a Wikipedia infobox or
-wikitable is built out of; table captions, which sit outside the table's
-border box on whichever side `caption-side` names; `visibility`, where a
+wikitable is built out of; §17.5.1's six background layers, so that a
+`<tbody>`, a `<col>` or a `<colgroup>` paints behind the rows and cells the way
+a `<tr>` already did — and stops at each `border-spacing` gap, where §17.6.1
+shows the table's own background instead; table captions, which sit outside the
+table's border box on whichever side `caption-side` names; `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
 `letter-spacing`, `text-indent` on a block's first line, `min-height` and
@@ -104,8 +107,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3226 of 4821 reference tests pass,
-66.9%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **3261 of 4821 reference tests pass,
+67.6%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not

@@ -16,6 +16,41 @@ record for everything earlier.
 
 ## Unreleased
 
+**A table has six background layers, and now paints five of them** (#86).
+§17.5.1 makes a table the table, its column groups, its columns, its row
+groups, its rows and its cells, superimposed in that order, with a background in
+a lower layer showing through wherever the ones above it are transparent. Only
+two of the six were painted: the table and the cells, plus rows, which had a box
+of their own because `<tr bgcolor>` striping is how the era made a table
+readable. A `<tbody>`, a `<col>` or a `<colgroup>` with a background painted
+nothing at all.
+
+**35 newly passing tests and none newly failing**, which is a great deal more
+than the four the issue was filed on. Twenty-one of them are in `backgrounds`,
+where the suite works through every background property against every element it
+applies to, and a table part is a lot of those elements.
+
+§17.6.1 decides the *shape*, and this is where a browser and a naive
+implementation part company: in the separated model the gaps between cells show
+the table's own background and nothing else, so a band covers the cell areas it
+spans and stops at every gap. Rows had been filling the gaps too — the UA sheet
+gives every table 2px of `border-spacing`, so this was visible on any striped
+table that had not set `cellspacing="0"`.
+
+Splitting a band into one box per cell is right for a colour and wrong for an
+image, which is the interesting part. A background image is positioned against
+the band as a *whole* — §17.5.1 makes a band one box that the gaps cut holes in,
+not a box per cell — so cutting the image up draws it once per cell, and
+`tbody { background: url(x) top right no-repeat }` drew four squares where the
+suite asks for exactly one. Four tests said so. The colour is painted on the
+cell areas and the image on the band, which is right for both except that the
+image still bleeds into the gaps: clipping one box to several rectangles is a
+shape the display list cannot express. Reachable only on a table that asked for
+spacing *and* put an image on a band, and less wrong than drawing it four times.
+
+A `table-layers` reference fixture covers all of it, and was compared against
+headless Chromium before it was blessed.
+
 ## 0.3.0
 
 A release about the half of the box model that only ever worked for blocks.
