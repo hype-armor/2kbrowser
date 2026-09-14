@@ -982,10 +982,22 @@ impl FontStore {
         for segment in segments {
             let fits = current.is_empty() || x + segment.shaped.width <= available;
             if !fits {
+                // Ended because the next word would not fit, so this is not the
+                // last line of its paragraph and §16.2 justifies it.
+                let justify = (default_style.text_align == css::style::TextAlign::Justify)
+                    .then_some(available);
                 let (offset, _) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
-                Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
+                Self::push_line(
+                    &mut layout,
+                    &mut current,
+                    offset,
+                    y,
+                    ascent,
+                    line_height,
+                    justify,
+                );
                 y += line_height;
                 x = 0.0;
                 line_height = self.used_line_height(default_style);
@@ -1037,7 +1049,15 @@ impl FontStore {
                 let (offset, _) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
-                Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
+                Self::push_line(
+                    &mut layout,
+                    &mut current,
+                    offset,
+                    y,
+                    ascent,
+                    line_height,
+                    None,
+                );
                 y += line_height;
                 x = 0.0;
                 line_height = self.used_line_height(default_style);
@@ -1050,7 +1070,15 @@ impl FontStore {
         if !current.is_empty() {
             let (offset, _) = constraints(y, line_height);
             let offset = offset + if first_line { indent } else { 0.0 };
-            Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
+            Self::push_line(
+                &mut layout,
+                &mut current,
+                offset,
+                y,
+                ascent,
+                line_height,
+                None,
+            );
             y += line_height;
         }
 
@@ -1070,7 +1098,34 @@ impl FontStore {
         line_y: f32,
         ascent: f32,
         line_height: f32,
+        justify_to: Option<f32>,
     ) {
+        // §16.2: `justify` stretches the spaces until the line fills its box.
+        // Only the spaces — letters stay where the shaper put them — and only
+        // on a line that was ended because the next word would not fit. The
+        // last line of a paragraph, and the line before a forced break, keep
+        // their natural width, which is why the caller decides rather than this.
+        if let Some(target) = justify_to {
+            let inked = current
+                .last()
+                .map_or(0.0, |segment| segment.x + segment.shaped.width);
+            let gaps = current
+                .iter()
+                .take(current.len().saturating_sub(1))
+                .filter(|segment| segment.trailing_space > 0.0)
+                .count();
+            let slack = target - inked;
+            if gaps > 0 && slack > 0.0 {
+                let each = slack / gaps as f32;
+                let mut shift = 0.0;
+                for segment in current.iter_mut() {
+                    segment.x += shift;
+                    if segment.trailing_space > 0.0 {
+                        shift += each;
+                    }
+                }
+            }
+        }
         let mut glyphs = Vec::new();
         let mut text = String::new();
         let mut width = 0.0f32;
@@ -1433,10 +1488,13 @@ impl FontStore {
                 let space_width = if spacing.is_empty() {
                     0.0
                 } else if preserve {
+                    // §16.4: `word-spacing` is added to *each* space, and a
+                    // preformatted run can hold a row of them.
                     self.shape_segment(&spacing, &run.style).width
+                        + run.style.word_spacing * spacing.chars().count() as f32
                 } else {
                     // Collapsed runs already hold at most one space.
-                    self.shape_segment(" ", &run.style).width
+                    self.shape_segment(" ", &run.style).width + run.style.word_spacing
                 };
 
                 if trimmed.is_empty() {
@@ -2326,6 +2384,60 @@ mod tests {
         let layout = store.layout("", &style(16.0), 100.0);
         assert!(layout.lines.is_empty());
         assert_eq!(layout.height, 0.0);
+    }
+    #[test]
+    fn word_spacing_widens_every_gap_and_nothing_else() {
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let spaced = ComputedStyle {
+            word_spacing: 20.0,
+            ..style(16.0)
+        };
+        let bare = store.layout("one two three", &plain, 1000.0);
+        let wide = store.layout("one two three", &spaced, 1000.0);
+        let grew = wide.lines[0].width - bare.lines[0].width;
+        assert!(
+            (grew - 40.0).abs() < 0.01,
+            "two gaps at 20px grew the line by {grew}"
+        );
+    }
+
+    #[test]
+    fn justify_fills_every_line_but_the_last() {
+        // §16.2. The last line of a paragraph keeps its natural width, which is
+        // the difference between justified text and a page of stretched
+        // fragments.
+        let mut store = FontStore::new();
+        let justified = ComputedStyle {
+            text_align: css::style::TextAlign::Justify,
+            ..style(16.0)
+        };
+        let text = "The quick brown fox jumps over the lazy dog and keeps on running";
+        let layout = store.layout(text, &justified, 200.0);
+        assert!(layout.lines.len() > 2, "the text did not wrap enough");
+
+        for (index, line) in layout.lines.iter().enumerate() {
+            if index + 1 == layout.lines.len() {
+                assert!(
+                    line.width < 200.0 - 1.0,
+                    "the last line was stretched to {}",
+                    line.width
+                );
+            } else {
+                assert!(
+                    (line.width - 200.0).abs() < 0.01,
+                    "line {index} came to {} rather than filling 200",
+                    line.width
+                );
+            }
+        }
+
+        // And left alignment leaves them all ragged.
+        let ragged = store.layout(text, &style(16.0), 200.0);
+        assert!(
+            ragged.lines.iter().any(|line| line.width < 199.0),
+            "unjustified text filled every line exactly"
+        );
     }
 }
 

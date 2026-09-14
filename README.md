@@ -111,8 +111,9 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3356 of 4821 reference tests pass,
-69.6%**, with no panics across roughly ten thousand renders. That is an upperbound rather than a score — a reftest passes when both sides look the same, and
+The CSS 2.1 suite has been run against it: **3352 of 4821 reference tests pass,
+69.5%**, with no panics across roughly ten thousand renders. That is an upper
+bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
 vendored.
@@ -202,8 +203,8 @@ these" against "any of these" — and a `<legend>` sits *in* its group's rule, w
 the rule stopping either side of it, as HTML's rendering section has it.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `word-spacing`, `font-variant`, `outline`,
-`text-align: justify`, `list-style-position`, `list-style-image`,
+this file used to admit: `font-variant`,
+`list-style-position`, `list-style-image`,
 `clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so

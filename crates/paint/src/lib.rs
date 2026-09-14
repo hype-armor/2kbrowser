@@ -245,6 +245,62 @@ fn paint_box(
         paint_borders(box_, x, y, list);
     }
 
+    // §18.4: outside the border box, the same on all four sides, and taking up
+    // no room — so it is drawn after the border it surrounds and over whatever
+    // happens to be beside the box. An outline that moved the page could not be
+    // used to mark focus, which is what the property is for.
+    if drawn {
+        let width = box_.style.outline.used_width(box_.style.font_size);
+        if width > 0.0 && box_.style.outline.style.is_visible() {
+            let rect = Rect {
+                x: x - width,
+                y: y - width,
+                width: box_.rect.width + width * 2.0,
+                height: box_.rect.height + width * 2.0,
+            };
+            let color = box_.style.outline.color.unwrap_or(box_.style.color);
+            let style = box_.style.outline.style;
+            let sides = [
+                (
+                    Side::Top,
+                    Rect {
+                        height: width,
+                        ..rect
+                    },
+                ),
+                (
+                    Side::Bottom,
+                    Rect {
+                        y: rect.y + rect.height - width,
+                        height: width,
+                        ..rect
+                    },
+                ),
+                (
+                    Side::Left,
+                    Rect {
+                        y: rect.y + width,
+                        width,
+                        height: (rect.height - width * 2.0).max(0.0),
+                        ..rect
+                    },
+                ),
+                (
+                    Side::Right,
+                    Rect {
+                        x: rect.x + rect.width - width,
+                        y: rect.y + width,
+                        width,
+                        height: (rect.height - width * 2.0).max(0.0),
+                    },
+                ),
+            ];
+            for (side, edge) in sides {
+                push_border_side(list, &edge, style, width, side, color);
+            }
+        }
+    }
+
     if drawn && let Some(node) = box_.replaced {
         list.items.push(DisplayItem::Image {
             node,
@@ -1994,6 +2050,47 @@ mod tests {
             "a box broken over lines drew {broken} pixels of side, which is more than the two \
              it has"
         );
+    }
+
+    #[test]
+    fn an_outline_is_drawn_outside_the_border_and_moves_nothing() {
+        // §18.4: outside the border box and taking up no room, which is the
+        // whole point — an outline that moved the page could not be used to
+        // mark focus.
+        let red = |pixmap: &Pixmap| {
+            pixmap
+                .pixels()
+                .iter()
+                .filter(|p| (p.red(), p.green(), p.blue()) == (255, 0, 0))
+                .count()
+        };
+        const CSS: &str = "body { margin: 20px } p { margin: 0; width: 100px; height: 20px; \
+                           border: 2px solid #000000 }";
+        let bare = render("<body><p>x</p></body>", CSS, 200);
+        let outlined = render(
+            "<body><p>x</p></body>",
+            "body { margin: 20px } p { margin: 0; width: 100px; height: 20px; \
+             border: 2px solid #000000; outline: 3px solid #ff0000 }",
+            200,
+        );
+        assert_eq!(red(&bare), 0);
+        assert!(red(&outlined) > 100, "no outline drawn");
+        assert_eq!(
+            bare.height(),
+            outlined.height(),
+            "the outline changed the page's height"
+        );
+
+        // It is *outside* the border: the pixel three rows above the box's top
+        // edge is outline, and the border is still black underneath.
+        let (r, g, b) = at(&outlined, 40, 19);
+        assert_eq!(
+            (r, g, b),
+            (255, 0, 0),
+            "the row above the border is not red"
+        );
+        let (r, g, b) = at(&outlined, 40, 21);
+        assert_eq!((r, g, b), (0, 0, 0), "the border itself was overwritten");
     }
 
     #[test]
