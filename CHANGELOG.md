@@ -16,6 +16,23 @@ record for everything earlier.
 
 ## Unreleased
 
+**`inherit` is a value now**, which it was not before — the cascade read it as
+a length, a colour or a font family name, failed to parse it, and dropped the
+declaration. §6.2.1 makes it universal: every property takes it, including the
+forty-odd that do not inherit on their own, and it means the parent's
+*computed* value rather than a re-parse of what the parent declared. So a child
+of an element sized `font-size: 50%` that says `font-size: inherit` gets the
+parent's resolved pixels, not half of its own.
+
+It is handled once, ahead of the per-property parsing, because there is nothing
+for a property's own parser to say about a value that is a copy. A shorthand
+spreads across every longhand it covers, so `border: inherit` takes the width,
+the style and the colour, and `border-left-width: inherit` takes exactly the one
+field its name points at. Worth **50 conformance tests** with nothing lost in
+the other direction — the `-inherit-` tests exist across nearly every property
+group, which is why one small change in the cascade moves that many rows at
+once.
+
 **`word-spacing`, `outline` and `text-align: justify`**, three of the properties
 PLAN.md has been listing as parsed and then ignored since M2 opened. And `ex`,
 a CSS 2.1 length unit that parsed as nothing at all — `outline-width: 0ex` left
