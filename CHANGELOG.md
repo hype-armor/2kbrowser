@@ -16,6 +16,39 @@ record for everything earlier.
 
 ## Unreleased
 
+**Line boxes have a strut now** (§10.8.1), and quirks mode takes it away again
+on a line with no text — which is the quirk the era's sliced-image tables were
+built on.
+
+The strut was half there: a line started at the block's own line height with an
+ascent of `font_size * 0.8`. That is near enough for deciding how *tall* a line
+is and nowhere near enough for deciding how far below the baseline it reaches,
+which is the same number subtracted from the line height. So an image sitting
+alone in a table cell had no descender space under it at all, in either mode.
+With the face's own metrics and half-leading — the extra a `line-height` asks
+for split above and below the content rather than hung underneath it — the
+image lands on the same pixel row Chromium puts it on.
+
+Doing only that would have made things worse, not better, for the pages this
+engine is for. Quirks mode is where the era lives, and there a line box holding
+no text has no strut: the cell is exactly as tall as the picture. A sliced
+image with a hairline gap under every tile is not a near miss, it is the page
+visibly coming apart. Both modes are now pixel-exact against Chromium, and both
+have a reference fixture.
+
+**Net one conformance test, the wrong way** — two recovered, three lost — and
+worth saying why rather than burying. All three losses are a test and a
+reference that used to be *equally* wrong and now differ, with our side of each
+having moved toward Chromium: `floats-124` puts its green band on row 8 where
+Chromium puts it on 7 and the reference is still on 9;
+`line-breaking-font-size-zero-001` is 98 rows against Chromium's 100, up from
+92. Holding the line boxes wrong to keep three pairs agreeing with each other
+would be the wrong trade.
+
+Nine reference baselines grow by between one and forty-two pixels, all of them
+in standards mode and all of them around images and form controls, which is
+where descender space belongs.
+
 **`font-variant: small-caps`**, another of the properties PLAN.md has been
 listing as parsed and then ignored since M2 opened — and the `font` shorthand
 now keeps the `small-caps` it had been accepting and throwing away.

@@ -363,8 +363,11 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    `top`/`right`/`bottom`/`left`, shrink-to-fit widths. `position: fixed` takes
    the viewport as its containing block whatever is positioned above it —
    though it still scrolls with the page, which needs the display list to be
-   re-placed per scroll position rather than blitted. **Quirks mode** — *started;* unitless lengths and hash-less hex
-   colours parse, other quirks outstanding. **Framesets** — *done*
+   re-placed per scroll position rather than blitted. **Quirks mode** —
+   *started;* unitless lengths and hash-less hex colours parse, and a line box
+   holding no text has no strut — the quirk the era's sliced-image tables were
+   built on, without which every tile of a sliced image gets a hairline gap
+   under it. Other quirks outstanding. **Framesets** — *done*
 7. **Presentational attributes** — *done.* `bgcolor`, `text`, `link`, `align`,
    `valign`, `hspace`/`vspace`, `<font>`, `background`, and the table
    attributes, at their own cascade origin between the UA sheet and author

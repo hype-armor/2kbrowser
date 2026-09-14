@@ -180,6 +180,23 @@ fn case_runs(text: &str) -> Vec<(usize, &str)> {
     out
 }
 
+/// Whether a line box gets §10.8.1's strut.
+///
+/// It always does in standards mode. The quirk is the one the era's layouts
+/// were built on: in quirks mode a line box holding no text at all — an image
+/// alone in a table cell, a spacer GIF, a sliced-image row — has no strut, so
+/// the cell is exactly as tall as the image and the famous few pixels of
+/// descender space below it do not appear. Pages of the period were authored
+/// against that, and a sliced image with a gap under every tile is not a near
+/// miss: it is the page visibly coming apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strut {
+    /// Standards mode: every line box has one.
+    Always,
+    /// Quirks mode: only a line with text on it.
+    WhereThereIsText,
+}
+
 /// A face's vertical metrics, as fractions of the font size.
 ///
 /// Two questions are answered from these and they are not the same question.
@@ -999,7 +1016,18 @@ impl FontStore {
         default_style: &ComputedStyle,
         max_width: f32,
     ) -> TextLayout {
-        self.layout_runs_constrained(runs, default_style, |_, _| (0.0, max_width))
+        self.layout_runs_in(runs, default_style, Strut::Always, |_, _| (0.0, max_width))
+    }
+
+    /// The same, told whether the document's mode puts a strut on every line.
+    pub fn layout_runs_with(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        strut: Strut,
+        max_width: f32,
+    ) -> TextLayout {
+        self.layout_runs_in(runs, default_style, strut, |_, _| (0.0, max_width))
     }
 
     /// Shapes and wraps runs where the available width varies down the page.
@@ -1017,6 +1045,21 @@ impl FontStore {
         &mut self,
         runs: &[InlineRun],
         default_style: &ComputedStyle,
+        constraints: F,
+    ) -> TextLayout
+    where
+        F: Fn(f32, f32) -> (f32, f32),
+    {
+        self.layout_runs_in(runs, default_style, Strut::Always, constraints)
+    }
+
+    /// The whole of it: runs, a strut rule, and a width that varies down the
+    /// page.
+    pub fn layout_runs_in<F>(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        strut: Strut,
         constraints: F,
     ) -> TextLayout
     where
@@ -1041,9 +1084,30 @@ impl FontStore {
         let mut y = 0.0f32;
         let mut current: Vec<Segment> = Vec::new();
         let mut x = 0.0f32;
-        let mut line_height = self.used_line_height(default_style);
+        let held_height = self.used_line_height(default_style);
+        let line_height = held_height;
+        // §10.8.1's strut: an invisible box of the block's own font and line
+        // height, on every line box whether or not there is text on it.
+        //
+        // Its ascent was `font_size * 0.8` — near enough for deciding how tall
+        // a line is, and nowhere near enough for deciding how far *below* the
+        // baseline the line reaches, which is the same number subtracted from
+        // the line height. The face's own metrics put an image alone in a table
+        // cell on the pixel row a browser puts it on; the approximation put it
+        // more than a pixel out, and that difference is the whole of the era's
+        // sliced-image layouts.
+        let (strut_ascent, strut_descent) =
+            Self::strut(self.content_box(default_style), line_height);
+        let (strut_ascent, strut_descent, strut_height) = match strut {
+            Strut::Always => (strut_ascent, strut_descent, line_height),
+            // Held back until a line turns out to have text on it, and applied
+            // then rather than here: what it contributes is the same either
+            // way, and this is the only place that knows the difference.
+            Strut::WhereThereIsText => (0.0, 0.0, 0.0),
+        };
+        let mut line_height = strut_height;
         let mut ascent = if default_style.font_size.is_finite() {
-            default_style.font_size * 0.8
+            strut_ascent
         } else {
             0.0
         };
@@ -1060,7 +1124,16 @@ impl FontStore {
         // `line-height` — and mixing them here is the half-leading model, which
         // is a larger change than this: it moves every line on every page,
         // including ones with nothing atomic on them at all.
-        let mut descent = 0.0f32;
+        //
+        // The strut's own descent is the exception, and it is not an exception
+        // to the paragraph above: it is the same number for every line in the
+        // block, so it can be taken once here without asking what landed on
+        // any particular line. §10.8.1 puts the strut on every line box whether
+        // or not there is text on it, which is what gives an image alone in a
+        // table cell the few pixels of room below it that the era's sliced-image
+        // layouts are famous for tripping over. Without it a line held nothing
+        // but its tallest box and the descender space vanished.
+        let mut descent = strut_descent;
 
         // The available width depends on the line's height, and the height
         // depends on what lands on the line. Query with the height so far and
@@ -1105,9 +1178,9 @@ impl FontStore {
                 );
                 y += line_height;
                 x = 0.0;
-                line_height = self.used_line_height(default_style);
-                ascent = default_style.font_size * 0.8;
-                descent = 0.0;
+                line_height = strut_height;
+                ascent = strut_ascent;
+                descent = strut_descent;
                 available = constraints(y, line_height).1;
             }
 
@@ -1134,6 +1207,16 @@ impl FontStore {
                     ascent = ascent.max(segment.shaped.ascent);
                     if replaced.is_some() {
                         descent = descent.max(segment.shaped.height - segment.shaped.ascent);
+                    } else if strut == Strut::WhereThereIsText {
+                        // Text on the line, so the quirk does not apply to it
+                        // after all and the strut joins in — from here on, and
+                        // not retroactively, which is the same thing: every
+                        // contribution is a maximum.
+                        let (held_ascent, held_descent) =
+                            Self::strut(self.content_box(default_style), held_height);
+                        ascent = ascent.max(held_ascent);
+                        descent = descent.max(held_descent);
+                        line_height = line_height.max(held_height);
                     }
                     line_height = line_height.max(segment.shaped.height);
                 }
@@ -1273,6 +1356,20 @@ impl FontStore {
             baseline: ascent,
         });
         current.clear();
+    }
+
+    /// The strut's half of a line box: how far it reaches above and below the
+    /// baseline (§10.8.1).
+    ///
+    /// `line-height` is distributed evenly above and below the content area —
+    /// half-leading — rather than being added underneath. A paragraph set at
+    /// `line-height: 2` has its extra room split between the lines, not hung
+    /// off the bottom of each one, and putting it all below is what tips text
+    /// out of the middle of a table cell.
+    fn strut(content: (f32, f32), line_height: f32) -> (f32, f32) {
+        let (ascent, descent) = content;
+        let leading = (line_height - ascent - descent) / 2.0;
+        ((ascent + leading).max(0.0), (descent + leading).max(0.0))
     }
 
     /// One fragment per inline box crossing this line.
@@ -1822,6 +1919,30 @@ mod tests {
     }
 
     #[test]
+    fn a_line_reaches_below_its_baseline_by_the_struts_descent() {
+        // An image alone on a line: the line is taller than the picture,
+        // because §10.8.1's strut is on it whether or not there is text.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let runs = [InlineRun::replaced(
+            ReplacedInline {
+                id: 1,
+                width: 40.0,
+                height: 40.0,
+                baseline: 40.0,
+            },
+            style.clone(),
+        )];
+
+        let laid = fonts.layout_runs_with(&runs, &style, Strut::Always, 400.0);
+        assert!(
+            laid.height > 40.0,
+            "no room below the image: line is {} for a 40px picture",
+            laid.height
+        );
+    }
+
+    #[test]
     fn small_caps_leaves_capitals_and_the_line_alone() {
         let mut fonts = FontStore::new();
         let mut style = ComputedStyle {
@@ -1871,6 +1992,59 @@ mod tests {
         assert_eq!(case_runs(""), Vec::new());
         // Digits and spaces are not lowercase, so they join the capitals.
         assert_eq!(case_runs("A1 b"), vec![(0, "A1 "), (3, "b")]);
+    }
+
+    #[test]
+    fn quirks_mode_takes_the_strut_off_a_line_with_no_text() {
+        // The quirk the era's sliced-image tables were built on: the cell is
+        // exactly as tall as the picture, with no descender space under it.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let image = ReplacedInline {
+            id: 1,
+            width: 40.0,
+            height: 40.0,
+            baseline: 40.0,
+        };
+        let runs = [InlineRun::replaced(image, style.clone())];
+
+        let laid = fonts.layout_runs_with(&runs, &style, Strut::WhereThereIsText, 400.0);
+        assert_eq!(laid.height, 40.0);
+    }
+
+    #[test]
+    fn quirks_mode_keeps_the_strut_where_there_is_text() {
+        // Only a line with *nothing* on it but boxes loses the strut. One word
+        // beside the picture brings it back, in either mode.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let image = ReplacedInline {
+            id: 1,
+            width: 40.0,
+            height: 40.0,
+            baseline: 40.0,
+        };
+        let runs = [
+            InlineRun::text("x", style.clone()),
+            InlineRun::replaced(image, style.clone()),
+        ];
+
+        let quirks = fonts.layout_runs_with(&runs, &style, Strut::WhereThereIsText, 400.0);
+        let standards = fonts.layout_runs_with(&runs, &style, Strut::Always, 400.0);
+        assert_eq!(quirks.height, standards.height);
+        assert!(quirks.height > 40.0, "line is only {}", quirks.height);
+    }
+
+    #[test]
+    fn line_height_is_split_above_and_below_the_text() {
+        // Half-leading: a paragraph set double-spaced puts the extra room
+        // evenly around each line rather than hanging it underneath, which is
+        // what keeps text in the middle of a table cell.
+        let (ascent, descent) = FontStore::strut((14.0, 4.0), 40.0);
+
+        assert_eq!(ascent, 25.0);
+        assert_eq!(descent, 15.0);
+        assert_eq!(ascent + descent, 40.0);
     }
 
     #[test]

@@ -1,0 +1,17 @@
+<!doctype html>
+<title>line box strut, standards mode</title>
+<style>
+  body { margin: 10px; font: 16px serif; background: #fff }
+  table { border-collapse: collapse; background: #c00 }
+  td { padding: 0 }
+  img { display: inline; border: 0 }
+  .tall { line-height: 2; background: #cde }
+  .short { line-height: 1; background: #dec }
+</style>
+<!-- The strut is on every line box, so the cell is taller than the image by
+     the block font's descender: red shows below the picture. -->
+<table><tr><td><img src="assets/logo.png" width="40" height="40"></td></tr></table>
+<!-- Half-leading: the extra room a line-height asks for is split above and
+     below the text, not hung underneath it. -->
+<p class="tall">Double-spaced, with the leading split evenly</p>
+<p class="short">Line height below the content area, which overflows both ways</p>
