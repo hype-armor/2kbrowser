@@ -141,6 +141,25 @@ pub enum FontStyle {
     Italic,
 }
 
+/// The `font-variant` property (§15.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontVariant {
+    /// Ordinary glyphs.
+    #[default]
+    Normal,
+    /// Lowercase letters drawn as smaller capitals.
+    SmallCaps,
+}
+
+/// Parses a `font-variant` keyword.
+pub fn parse_font_variant(name: &str) -> Option<FontVariant> {
+    match name.to_ascii_lowercase().as_str() {
+        "normal" => Some(FontVariant::Normal),
+        "small-caps" => Some(FontVariant::SmallCaps),
+        _ => None,
+    }
+}
+
 /// The `text-align` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAlign {
@@ -1337,6 +1356,8 @@ pub struct ComputedStyle {
     pub font_weight: u16,
     /// `font-style`, inherited.
     pub font_style: FontStyle,
+    /// `font-variant`, which here means small capitals or not.
+    pub font_variant: FontVariant,
     /// `line-height`, inherited. `normal` until a font resolves it.
     pub line_height: LineHeight,
     /// `text-align`, inherited.
@@ -1498,6 +1519,7 @@ impl Default for ComputedStyle {
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
             font_style: FontStyle::Normal,
+            font_variant: FontVariant::Normal,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
@@ -1530,6 +1552,7 @@ impl ComputedStyle {
             font_size: parent.font_size,
             font_weight: parent.font_weight,
             font_style: parent.font_style,
+            font_variant: parent.font_variant,
             line_height: parent.line_height,
             text_align: parent.text_align,
             white_space: parent.white_space,

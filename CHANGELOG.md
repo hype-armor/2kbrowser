@@ -16,6 +16,26 @@ record for everything earlier.
 
 ## Unreleased
 
+**`font-variant: small-caps`**, another of the properties PLAN.md has been
+listing as parsed and then ignored since M2 opened — and the `font` shorthand
+now keeps the `small-caps` it had been accepting and throwing away.
+
+Synthesised, because there is nothing to ask for: the bundled Liberation faces
+carry no small-caps variant. Lowercase letters are uppercased and shaped at 0.7
+of the size, which is the number Chromium synthesises at — measured off a
+rendering (a 100px `x` in small caps beside a 100px `X` gives cap heights of 46
+and 65) rather than argued about from first principles. Our glyphs now land on
+the same pixel rows as Chromium's.
+
+Two things it deliberately does not do. It does not shrink the line: a word of
+nothing but lowercase keeps the full-size ascent and line height, or a
+paragraph of small caps would read as one set in a smaller font. And it does
+not change the text — the glyph offsets still point at what the author wrote,
+so a search for "word" finds a word drawn as WORD.
+
+No conformance change, and none was available: CSS 2.1's suite has no
+`font-variant` test at all. This one is for the pages, not for the number.
+
 **Two things absolutely positioned boxes were measured against, neither of
 them what CSS 2.1 says.** Worth **43 conformance tests** between them, with
 nothing lost the other way, and both showed up as a box in the wrong place
