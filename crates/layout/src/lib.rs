@@ -1920,10 +1920,49 @@ fn table_widths(
                 + style.border.right.used_width(style.font_size)
         }
     };
+    let caption = caption_floor(doc, styles, fonts, node, intrinsic, available, depth + 1);
     (
-        mins.iter().sum::<f32>() + surround,
-        maxes.iter().sum::<f32>() + surround,
+        (mins.iter().sum::<f32>() + surround).max(caption),
+        (maxes.iter().sum::<f32>() + surround).max(caption),
     )
+}
+
+/// The narrowest a table may be and still hold its captions (§17.4).
+///
+/// CSS 2.1 puts a table and its captions in a wrapper box together, and this
+/// engine does not build one. The part that shows is the width: a one-column
+/// table whose heading is a long phrase is as wide as the heading, so
+/// `margin: 0 auto` centres the pair rather than the table alone and a bordered
+/// table does not sit off to one side of its own title.
+///
+/// The captions' *minimum*, not their maximum: a caption wraps, and a long one
+/// should not stretch its table across the page. That is the same rule the
+/// caption itself is laid out under.
+fn caption_floor(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    node: NodeId,
+    intrinsic: &IntrinsicSizes,
+    available: f32,
+    depth: usize,
+) -> f32 {
+    table::captions(doc, styles, node)
+        .into_iter()
+        .map(|(caption, caption_style)| {
+            subtree_widths(
+                doc,
+                styles,
+                fonts,
+                caption,
+                &caption_style,
+                intrinsic,
+                available,
+                depth,
+            )
+            .0
+        })
+        .fold(0.0f32, f32::max)
 }
 
 /// Resolves `margin-left: auto` and `margin-right: auto` against the space a
@@ -3278,6 +3317,21 @@ fn layout_table(
     } else {
         table::distribute_widths(&mins, &maxes, Some(usable))
     };
+
+    // §17.4 again: a table narrower than its own caption is widened to it, up
+    // to the room it has. Applied to the columns rather than to the box, so
+    // the cells fill the table they are in — widening the box alone leaves a
+    // one-cell table with its background showing past its only cell.
+    let floor = caption_floor(doc, styles, fonts, node, intrinsic, available_width, 0)
+        .min(usable + spacing_total)
+        - spacing_total;
+    let content: f32 = widths.iter().sum();
+    if content > 0.0 && floor > content {
+        let scale = floor / content;
+        for width in &mut widths {
+            *width *= scale;
+        }
+    }
 
     // A table with no declared width shrinks to fit its content. One with a
     // declared width fills it, which is exactly what `<table width="100%">`
@@ -5558,12 +5612,12 @@ mod tests {
     }
 
     #[test]
-    fn a_caption_never_wraps_narrower_than_its_longest_word() {
-        // A one-column table of a single character would otherwise wrap its
-        // heading to a letter a line. Browsers widen the table's wrapper box to
-        // the caption's minimum; with no wrapper here the caption overhangs
-        // instead, which comes to the same picture except for where the table
-        // sits across it.
+    fn a_table_is_at_least_as_wide_as_its_caption() {
+        // §17.4's wrapper box. A one-column table of a single character would
+        // otherwise wrap its heading to a letter a line — or, once it stopped
+        // doing that, hang the heading off one side. The table is widened to
+        // the caption's minimum instead, which is what a browser does and what
+        // keeps the pair centred together.
         let rendered = run(
             "<body><table><caption>Extraordinarily</caption>\
              <tr><td>x</td></tr></table></body>",
@@ -5576,10 +5630,41 @@ mod tests {
             .find(|b| b.style.display != Display::Table)
             .expect("a caption")
             .rect;
+
         assert!(
-            caption.width > table.width,
-            "caption {caption:?} was squeezed to the table's {table:?}"
+            caption.width > 50.0,
+            "the caption wrapped to {caption:?}, so it is being measured by its longest word"
         );
+        assert_eq!(
+            table.width, caption.width,
+            "the table {table:?} and its caption {caption:?} share a wrapper box and a width"
+        );
+    }
+
+    #[test]
+    fn a_caption_that_may_not_wrap_widens_its_table_to_the_whole_line() {
+        // `white-space: nowrap` makes the caption's minimum the whole phrase
+        // rather than its longest word, which is the number the wrapper box is
+        // sized from.
+        let rendered = run(
+            "<body><table><caption>A heading of several words</caption>\
+             <tr><td>x</td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0 } caption { white-space: nowrap }",
+            600.0,
+        );
+        let caption = siblings(&rendered)
+            .iter()
+            .find(|b| b.style.display != Display::Table)
+            .expect("a caption")
+            .rect;
+        let lines = siblings(&rendered)
+            .iter()
+            .find(|b| b.style.display != Display::Table)
+            .and_then(|b| b.text.as_ref())
+            .map_or(0, |text| text.lines.len());
+
+        assert_eq!(lines, 1, "a caption that may not wrap wrapped anyway");
+        assert_eq!(table_of(&rendered).rect.width, caption.width);
     }
 
     #[test]

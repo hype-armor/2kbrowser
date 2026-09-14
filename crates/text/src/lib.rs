@@ -2088,8 +2088,19 @@ impl FontStore {
                 continue;
             }
             let preserve = run.style.white_space == WhiteSpace::Pre;
+            // §16.6: `nowrap` collapses whitespace like `normal` and wraps
+            // like `pre` — which is to say not at all. So the opportunities
+            // are filtered rather than the segmentation rewritten: a run that
+            // may not break is one long segment, and everything downstream
+            // already knows what to do with a segment too wide for its line.
+            let opportunities: Vec<_> = unicode_linebreak::linebreaks(&run.text)
+                .filter(|(_, opportunity)| {
+                    run.style.white_space != WhiteSpace::NoWrap
+                        || *opportunity == unicode_linebreak::BreakOpportunity::Mandatory
+                })
+                .collect();
             let mut start = 0usize;
-            for (at, opportunity) in unicode_linebreak::linebreaks(&run.text) {
+            for (at, opportunity) in opportunities {
                 let piece = &run.text[start..at];
                 let piece_start = start;
                 start = at;
@@ -2226,8 +2237,18 @@ impl FontStore {
         // under-report a bold or larger span and let its column collapse.
         let mut min: f32 = 0.0;
         for run in runs {
-            for word in run.text.split_whitespace() {
-                let single = [InlineRun::text(word, run.style.clone())];
+            // What counts as one unbreakable piece depends on where the run is
+            // allowed to break at all. Neither `pre` nor `nowrap` breaks at a
+            // space, so their narrowest piece is a whole line rather than a
+            // word — which is what makes a `white-space: nowrap` caption widen
+            // the table under it instead of being measured by its longest word
+            // and then overflowing.
+            let pieces: Vec<&str> = match run.style.white_space {
+                WhiteSpace::Normal => run.text.split_whitespace().collect(),
+                WhiteSpace::Pre | WhiteSpace::NoWrap => run.text.split('\n').collect(),
+            };
+            for piece in pieces {
+                let single = [InlineRun::text(piece, run.style.clone())];
                 min = min.max(self.layout_runs(&single, default_style, f32::MAX).width);
             }
         }
