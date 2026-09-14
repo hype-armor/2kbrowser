@@ -993,7 +993,7 @@ fn baseline() -> f32 {
 pub(crate) fn ui_style(size: f32) -> ComputedStyle {
     ComputedStyle {
         font_size: size,
-        line_height: size * 1.2,
+        line_height: css::style::LineHeight::Px(size * 1.2),
         font_family: FontStack {
             families: Vec::new(),
             generic: GenericFamily::SansSerif,

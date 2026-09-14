@@ -16,6 +16,51 @@ record for everything earlier.
 
 ## Unreleased
 
+**`line-height: normal` comes from the font** (#89). It was a flat 1.2 times the
+font size, applied in the cascade, where there are no fonts to ask. §10.8.1
+leaves the value to the user agent and says it should be "based on the font",
+and every browser answers with the face's own ascent, descent and line gap —
+1.15 for Liberation Serif against the 1.2 used here, and further off for the
+other two bundled families.
+
+Three things had to change together, which is why this was filed rather than
+done at the time.
+
+**`normal` had to survive the cascade.** `line-height` is a `LineHeight` now
+rather than a number of pixels: `Normal`, a unitless `Number`, or `Px`. The
+first is resolved in `text`, where a face can be measured; `cosmic-text` will
+not name the face it matched, so it is found by shaping one `x` and reading the
+id off the glyph.
+
+**A unitless number had to inherit as a number.** §10.8.1 says so, and the old
+code resolved `1.2` to pixels immediately — so an `<h1>` at 32px inherited the
+body's 19.2px line and its text would have overlapped. What stopped it was a
+heuristic in `font-size` that recomputed the line height whenever it still
+matched the parent's, as a way of asking "was that `normal`, inherited?". That
+question has an answer now, and the heuristic is gone.
+
+**And the UA sheet had to stop pinning it.** `body { line-height: 1.2 }` was
+overriding `normal` on every element of every page, since it inherits. No
+browser's UA sheet sets one. Removing it is what makes the rest of this visible.
+
+The metrics are rounded to whole pixels, which is not cosmetic and is what took
+the change from a net loss to a net gain. Every browser built on FreeType does
+it: an ascent decides where a baseline sits, and a baseline on a half pixel is a
+line of text rendered through a filter. It also stops a fraction of a pixel per
+line accumulating down a page — forty lines of a third of a pixel is a line's
+worth of drift by the bottom, and it lands differently depending on how many
+lines came before it. Unrounded, seven `background-position-applies-to-*` tests
+failed by exactly one pixel.
+
+An inline box's content area (§10.6.1) is measured from the same face, which
+retires two constants that were the bundled faces' metrics written down by hand
+because nothing could reach the real ones.
+
+**3264 of 4821 reference tests to 3271**, nothing newly failing — and a page of
+five paragraphs now has its baselines on exactly the same rows as Chromium's,
+which is the check worth more than the seven tests. Every reference baseline
+moves, because every line on every page does.
+
 **The reader gutter is made of padding** (#91). A page that asks for
 `body { margin: 0 }` gets eight pixels anyway, because those pages were written
 for a window with browser chrome around it and taken literally they put the

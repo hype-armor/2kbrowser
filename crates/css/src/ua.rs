@@ -15,7 +15,12 @@ main, nav, section, figure, figcaption, hr, form, fieldset, table {
 
 head, script, style, title, meta, link, base, noscript { display: none; }
 
-body { margin: 8px; line-height: 1.2; }
+/* No `line-height` here, and that is deliberate: no browser's UA sheet sets one
+   either. Left alone it stays `normal`, which §10.8.1 hands to the user agent
+   and every browser answers from the face — its ascent, its descent and the
+   gap it asks for between one line and the next. Pinning 1.2 here overrode that
+   for every element on every page, since it inherits. */
+body { margin: 8px; }
 
 p, blockquote, dl, ul, ol, form, pre, figure { margin: 1em 0; }
 
