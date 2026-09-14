@@ -1,0 +1,19 @@
+<!doctype html>
+<title>position: fixed</title>
+<style>
+  body { margin: 0; font: 14px serif }
+  .rel {
+    position: relative; margin: 50px; padding: 15px;
+    border: 5px solid #036; background: #cde; height: 90px;
+  }
+  /* Identical declarations, different containing blocks: the absolute one
+     measures from its positioned ancestor's padding box, the fixed one from
+     the window. */
+  .abs { position: absolute; top: 0; left: 0; width: 30px; height: 30px; background: #063 }
+  .fix { position: fixed; top: 0; left: 0; width: 30px; height: 30px; background: #c30 }
+</style>
+<div class="rel">
+  <div class="abs"></div>
+  <div class="fix"></div>
+  Both squares are written here, inside this positioned box.
+</div>
