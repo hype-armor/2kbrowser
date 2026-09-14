@@ -224,7 +224,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { font-variant: small-caps }",
         body: "<p id=t>small caps text</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "outline",
@@ -249,7 +249,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { background: #ccc; font-size: 20px }",
         declaration: "#t { font-variant: small-caps }",
         body: "<div id=t>small caps</div>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "content on ::before",

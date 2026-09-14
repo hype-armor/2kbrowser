@@ -1,0 +1,15 @@
+<!doctype html>
+<title>font-variant: small-caps</title>
+<style>
+  body { margin: 12px; width: 360px; font: 20px serif }
+  p { margin: 0 0 10px }
+  .sc { font-variant: small-caps }
+  /* The shorthand carries it too, in any order before the size. */
+  .shorthand { font: small-caps italic bold 20px serif }
+  /* Capitals, digits and punctuation are left at full size. */
+  .mixed { font-variant: small-caps }
+</style>
+<p>Ordinary text for comparison</p>
+<p class="sc">Ordinary text for comparison</p>
+<p class="shorthand">Through the font shorthand</p>
+<p class="mixed">MIXED 1999 text, with punctuation!</p>

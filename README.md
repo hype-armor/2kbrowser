@@ -207,7 +207,7 @@ these" against "any of these" — and a `<legend>` sits *in* its group's rule, w
 the rule stopping either side of it, as HTML's rendering section has it.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `font-variant`, `list-style-image`,
+this file used to admit: `list-style-image`,
 `clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
@@ -223,6 +223,13 @@ box of the item's own content rather than a box in the list's padding, so the
 text after it starts further along and the *second* line wraps back under the
 marker instead of beside it — which is the whole visible difference between the
 two values.
+
+`font-variant: small-caps` came off it as well, synthesised rather than asked
+for: the bundled Liberation faces carry no small-caps variant, so lowercase
+letters are set as capitals at 0.7 of the size — which is the ratio Chromium
+synthesises at, measured off a rendering rather than argued about. A word of
+nothing but lowercase still sits on a full-size line, or a paragraph of small
+caps would read as one somebody set in a smaller font.
 
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by

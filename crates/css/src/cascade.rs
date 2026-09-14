@@ -7,10 +7,10 @@ use dom::{Document, ElementData, NodeId};
 use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, LineHeight,
-    ListStyleType, MEDIUM_BORDER, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
+    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, FontVariant, GenericFamily,
+    LineHeight, ListStyleType, MEDIUM_BORDER, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
     parse_background_position, parse_background_repeat, parse_border_collapse, parse_border_style,
-    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float,
+    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float, parse_font_variant,
     parse_list_style_position, parse_list_style_type, parse_overflow, parse_position,
     parse_text_decoration, parse_text_transform, parse_vertical_align, parse_visibility,
 };
@@ -737,6 +737,7 @@ fn apply(
         "font" => {
             if let Some(font) = parse_font_shorthand(values, parent, zoom) {
                 style.font_style = font.style;
+                style.font_variant = font.variant;
                 style.font_weight = font.weight;
                 style.font_size = font.size;
                 style.line_height = font.line_height.unwrap_or(LineHeight::Normal);
@@ -752,6 +753,13 @@ fn apply(
         "font-size" => {
             if let Some(size) = parse_font_size(first, parent.font_size, zoom) {
                 style.font_size = size;
+            }
+        }
+        "font-variant" => {
+            if let Raw::Ident(name) = first
+                && let Some(variant) = parse_font_variant(name)
+            {
+                style.font_variant = variant;
             }
         }
         "font-weight" => {
@@ -1179,8 +1187,10 @@ fn inherit_property(style: &mut ComputedStyle, name: &str, parent: &ComputedStyl
         "font-size" => style.font_size = parent.font_size,
         "font-weight" => style.font_weight = parent.font_weight,
         "font-style" => style.font_style = parent.font_style,
+        "font-variant" => style.font_variant = parent.font_variant,
         "line-height" => style.line_height = parent.line_height,
         "font" => {
+            style.font_variant = parent.font_variant;
             style.font_family = parent.font_family.clone();
             style.font_size = parent.font_size;
             style.font_weight = parent.font_weight;
@@ -1333,6 +1343,7 @@ fn parse_font_size(raw: &Raw, parent_size: f32, zoom: f32) -> Option<f32> {
 /// Everything a `font` shorthand sets.
 struct FontShorthand {
     style: FontStyle,
+    variant: FontVariant,
     weight: u16,
     size: f32,
     /// `None` where the shorthand wrote no `/ line-height`, which means
@@ -1348,10 +1359,6 @@ struct FontShorthand {
 /// change nothing at all, which is why this returns an `Option` rather than
 /// filling in defaults.
 ///
-/// `small-caps` is accepted and then discarded. `font-variant` is not
-/// implemented here, and rejecting the whole declaration over it would throw
-/// away the size and family too — the page would lose styling it should have,
-/// to no one's benefit.
 ///
 /// The system font keywords — `font: menu`, `caption`, `status-bar` — need no
 /// case of their own, though it is tempting to write one. CSS 2.1 §15.8 says
@@ -1366,6 +1373,7 @@ fn parse_font_shorthand(
     zoom: f32,
 ) -> Option<FontShorthand> {
     let mut style = FontStyle::Normal;
+    let mut variant = FontVariant::Normal;
     let mut weight = 400;
     let mut index = 0;
 
@@ -1375,7 +1383,8 @@ fn parse_font_shorthand(
     while let Some(value) = values.get(index) {
         match value {
             Raw::Ident(name) => match name.as_str() {
-                "normal" | "small-caps" => {}
+                "normal" => variant = FontVariant::Normal,
+                "small-caps" => variant = FontVariant::SmallCaps,
                 "italic" | "oblique" => style = FontStyle::Italic,
                 "bold" => weight = 700,
                 "bolder" => weight = (parent.font_weight + 300).min(900),
@@ -1415,6 +1424,7 @@ fn parse_font_shorthand(
     }
     Some(FontShorthand {
         style,
+        variant,
         weight,
         size,
         line_height,

@@ -17,7 +17,8 @@ use cosmic_text::{
     Weight,
 };
 use css::style::{
-    ComputedStyle, FontStyle, GenericFamily, TextDecoration, VerticalAlign, Visibility, WhiteSpace,
+    ComputedStyle, FontStyle, FontVariant, GenericFamily, TextDecoration, VerticalAlign,
+    Visibility, WhiteSpace,
 };
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
@@ -141,6 +142,43 @@ fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
 /// correct and would move nothing perceptible: the four bundled faces sit
 /// between 0.52 and 0.53, and the value is halved before it is used.
 const X_HEIGHT: f32 = 0.5;
+
+/// How much smaller a synthesised small capital is than a full one.
+///
+/// The bundled Liberation faces carry no small-caps variant, so `small-caps`
+/// has to be drawn rather than asked for: lowercase letters are set as capitals
+/// at this fraction of the size.
+///
+/// Measured rather than chosen: a 100px `x` in `small-caps` beside a 100px `X`
+/// in Chromium gives cap heights of 46 and 65, which is this number to within
+/// a rounded pixel. Reading it off a rendering was quicker than arguing about
+/// what a face with real small capitals would have done, and it puts this
+/// engine where the rest of the web already is.
+const SMALL_CAPS: f32 = 0.7;
+
+/// Maximal stretches of lowercase and of everything else, with their byte
+/// offsets into `text`.
+///
+/// Split at the case boundary rather than per character so a word keeps its
+/// shaping: `Word` is two pieces and not five, and the four letters after the
+/// capital are kerned against each other as they would be anywhere else.
+fn case_runs(text: &str) -> Vec<(usize, &str)> {
+    let mut out: Vec<(usize, &str)> = Vec::new();
+    let mut start = 0;
+    let mut lower: Option<bool> = None;
+    for (at, ch) in text.char_indices() {
+        let is_lower = ch.is_lowercase();
+        if lower.is_some_and(|was| was != is_lower) {
+            out.push((start, &text[start..at]));
+            start = at;
+        }
+        lower = Some(is_lower);
+    }
+    if start < text.len() {
+        out.push((start, &text[start..]));
+    }
+    out
+}
 
 /// A face's vertical metrics, as fractions of the font size.
 ///
@@ -802,7 +840,74 @@ impl FontStore {
     /// only at Unicode break opportunities, where shaping does not carry over.
     fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Shaped {
         let line_height = self.used_line_height(style);
+        if style.font_variant == FontVariant::SmallCaps {
+            return self.shape_small_caps(text, style, line_height);
+        }
         self.shape_with(text, style, line_height)
+    }
+
+    /// Draws lowercase letters as smaller capitals (§15.8's `small-caps`).
+    ///
+    /// Synthesised, because the bundled faces have no small-caps variant to ask
+    /// for and there is nowhere else to get one. The synthesis is the standard
+    /// one: uppercase the lowercase letters and shape them at [`SMALL_CAPS`] of
+    /// the size, leaving every other character alone.
+    ///
+    /// The line's metrics come from the full-size shaping rather than from the
+    /// pieces. A word that happens to be all lowercase would otherwise sit on a
+    /// shorter line than the word beside it, and a paragraph of small caps
+    /// would read as a paragraph somebody set in a smaller font.
+    fn shape_small_caps(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Shaped {
+        let mut plain = style.clone();
+        plain.font_variant = FontVariant::Normal;
+        let mut small = plain.clone();
+        small.font_size = style.font_size * SMALL_CAPS;
+
+        // Full size, for the ascent and the line height — and for the whole
+        // answer when the segment has no lowercase in it to shrink, which on a
+        // page that sets this is most of them.
+        let full = self.shape_with(text, &plain, line_height);
+        if !text.chars().any(char::is_lowercase) {
+            return full;
+        }
+
+        let mut out = Shaped {
+            text: text.to_owned(),
+            ascent: full.ascent,
+            height: full.height,
+            ..Shaped::default()
+        };
+        for (at, piece) in case_runs(text) {
+            let raised = piece.to_uppercase();
+            let lower = piece.starts_with(char::is_lowercase);
+            let shaped = if lower {
+                self.shape_with(&raised, &small, line_height)
+            } else {
+                self.shape_with(piece, &plain, line_height)
+            };
+            // `to_uppercase` can change a piece's length — ß becomes SS — while
+            // the glyph offsets index the *original* text, which is what a
+            // search and a selection are made of. So they are shifted where the
+            // two lengths agree, which is every ASCII word, and collapsed to the
+            // whole piece where they do not: a selection that snaps to one word
+            // beats an offset pointing into the middle of a character.
+            let exact = !lower || raised.len() == piece.len();
+            for glyph in &shaped.glyphs {
+                let (start, end) = if exact {
+                    (at + glyph.start, at + glyph.end)
+                } else {
+                    (at, at + piece.len())
+                };
+                out.glyphs.push(PositionedGlyph {
+                    x: glyph.x + out.width,
+                    start,
+                    end,
+                    ..*glyph
+                });
+            }
+            out.width += shaped.width;
+        }
+        out
     }
 
     /// The same, at a line height already resolved.
@@ -1679,6 +1784,93 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn small_caps_draws_lowercase_as_smaller_capitals() {
+        let mut fonts = FontStore::new();
+        let mut style = ComputedStyle {
+            font_size: 100.0,
+            ..ComputedStyle::default()
+        };
+
+        let plain = fonts.shape_segment("x", &style);
+        let caps = fonts.shape_segment("X", &style);
+        style.font_variant = FontVariant::SmallCaps;
+        let small = fonts.shape_segment("x", &style);
+
+        // It is a capital, not a lowercase letter: it is nothing like as wide
+        // as the `x` it was written as.
+        assert!(
+            small.width > plain.width,
+            "small cap {} is no wider than the lowercase {}",
+            small.width,
+            plain.width
+        );
+        // And it is a *small* one.
+        assert!(
+            small.width < caps.width,
+            "small cap {} is not smaller than the full capital {}",
+            small.width,
+            caps.width
+        );
+        let ratio = small.width / caps.width;
+        assert!(
+            (ratio - SMALL_CAPS).abs() < 0.02,
+            "expected about {SMALL_CAPS} of a capital, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn small_caps_leaves_capitals_and_the_line_alone() {
+        let mut fonts = FontStore::new();
+        let mut style = ComputedStyle {
+            font_size: 40.0,
+            ..ComputedStyle::default()
+        };
+        let plain = fonts.shape_segment("ABC", &style);
+        style.font_variant = FontVariant::SmallCaps;
+        let small = fonts.shape_segment("ABC", &style);
+
+        assert_eq!(small.width, plain.width, "capitals must not shrink");
+
+        // A word of nothing but lowercase still sits on a full-size line, or a
+        // paragraph of small caps would read as one set in a smaller font.
+        let lower = fonts.shape_segment("abc", &style);
+        assert_eq!(lower.height, plain.height);
+        assert_eq!(lower.ascent, plain.ascent);
+    }
+
+    #[test]
+    fn small_caps_keeps_the_text_it_was_written_as() {
+        // What a search and a selection match against is the source text, not
+        // the capitals drawn in its place.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle {
+            font_variant: FontVariant::SmallCaps,
+            ..ComputedStyle::default()
+        };
+        let shaped = fonts.shape_segment("Word", &style);
+
+        assert_eq!(shaped.text, "Word");
+        for glyph in &shaped.glyphs {
+            assert!(
+                glyph.end <= shaped.text.len(),
+                "glyph range {}..{} escapes {:?}",
+                glyph.start,
+                glyph.end,
+                shaped.text
+            );
+        }
+    }
+
+    #[test]
+    fn case_runs_split_on_the_boundary_and_nowhere_else() {
+        assert_eq!(case_runs("Word"), vec![(0, "W"), (1, "ord")]);
+        assert_eq!(case_runs("abc"), vec![(0, "abc")]);
+        assert_eq!(case_runs(""), Vec::new());
+        // Digits and spaces are not lowercase, so they join the capitals.
+        assert_eq!(case_runs("A1 b"), vec![(0, "A1 "), (3, "b")]);
     }
 
     #[test]
