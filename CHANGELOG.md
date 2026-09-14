@@ -16,6 +16,44 @@ record for everything earlier.
 
 ## Unreleased
 
+**An inline element holding a block is broken around it** (§9.2.1.1), instead
+of being laid out as a block. **Worth 31 conformance tests against 1 lost.**
+
+The old shape put the element's background and border around the block child,
+made it fill its container where two fragments are each as wide as their own
+text, and applied vertical margins an inline box does not have.
+
+What makes it tractable is that the split is a matter of *style*, not of new
+machinery. A fragment gets the element's style with the sides it does not own
+zeroed — the start side on the first, the end side on the last, nothing at
+either break — and the room reserved on the line and the border painted later
+both read that same style, so neither has to be told a split happened.
+
+Three things had to agree about it, and each announced itself by losing a box:
+
+- **The float pass.** A split element no longer has a layout pass of its own,
+  so a float inside it was reached by nothing and vanished. It descends now.
+- **Document order.** The walk hands the container a *grandchild* — the block
+  that broke the element open — and `precedes` looked for it among the
+  container's children, found nothing, and read that as "does not precede". A
+  float declared beside such a block was never placed before it and fell
+  through to the end of the container.
+- **Inheritance.** The text inside a split element is gathered as a child of
+  the *container*, so a `<span style="color: black">` broken around a block
+  drew its halves in whatever colour the container had.
+
+A fourth was not a bug but a judgement. The anonymous block a stretch lands in
+takes the split element's style rather than the container's, because the line's
+strut comes from it: `<font size="2">` broken around an `<hr>` — the era's own
+markup, and what turned this up — otherwise spaces a sidebar's links out by the
+difference between the two fonts. Arguably not what §9.2.1.1's anonymous boxes
+inherit. It is what every browser draws.
+
+The one test lost, `box-display/block-in-inline-001`, is one **Chromium fails
+too** — checked directly, same rectangle. It was passing here by the usual
+accident: the old block-shaped rendering happened to match a reference the
+correct shape does not.
+
 **A box is measured one inline stretch at a time.** The words before a block
 child and the words after it can never share a line, and the intrinsic width
 was gathering the whole box's inline content in one sequence and measuring it

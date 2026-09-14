@@ -268,6 +268,14 @@ run is shaped forwards and then mirrored, brackets included. The levels still
 come from the crate; only their application to glyphs is ours, and no shaper
 will reverse letters it has been given no reason to reverse.
 
+An inline element holding a block is broken around it now (§9.2.1.1) rather
+than being laid out as a block: two boxes, one on each side, with the block a
+sibling between them and outside the element's border. `<font>…<hr>…</font>` is
+ordinary in the era's markup, and the difference is visible the moment the
+element has a background — the old shape painted it straight through the rule.
+The sides go on the outside ends and nothing at either break, which is §8.4's
+rule for a box split across lines applied to a box split around a block.
+
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by
 `counter-reset` covers the element, its **following siblings**, and all of

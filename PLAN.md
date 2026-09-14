@@ -342,7 +342,11 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    longhand it covers
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
-   size, and collapse whitespace across run boundaries. **Right-to-left text**
+   size, and collapse whitespace across run boundaries. **Block-in-inline
+   splitting** (§9.2.1.1): an inline element holding a block is broken around
+   it into two boxes, so the block is a sibling of the halves rather than
+   inside the element's border — which is what `<font>…<hr>…</font>`, ordinary
+   in the era's markup, has always needed. **Right-to-left text**
    — `direction`, `unicode-bidi`, UAX #9's reordering per line, mirrored
    brackets, and an inline box that draws one fragment per contiguous run when
    reordering cuts it in two
@@ -411,12 +415,6 @@ it:
   the same blocker `url()` in `content` has and the same scope decision.
 - **The corner where two collapsed borders cross** is settled by width rather
   than by a diagonal mitre. CSS 2.1 leaves it undefined.
-- **Block-in-inline splitting** (§9.2.1.1, #116). The geometry is right: a box
-  is measured one inline *stretch* at a time, so the words before the block and
-  the words after it no longer ask for room to share a line. The box is not:
-  an inline element containing a block is laid out as a block, so its
-  background and border wrap the block child instead of stopping either side of
-  it, and its vertical margins apply where an inline box has none.
 - **`position: fixed` scrolls with the page** (#108). Its containing block is
   the viewport, which is the layout half; staying put needs the display list to
   know which items are anchored to the window, which is a change to how
