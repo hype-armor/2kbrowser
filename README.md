@@ -210,8 +210,7 @@ And a list of properties that parse and are then ignored, which is longer than
 this file used to admit: `list-style-image`,
 `clip`, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
-leave the page's own styling standing, `direction` and everything else
-about right-to-left text, and the parts of generated content still out of
+leave the page's own styling standing, and the parts of generated content still out of
 scope: `open-quote` and its family, which needs the nesting depth of quotation
 marks, and `url()` in `content`, which needs an image fetched for a box that is
 not an element. Each of those drops the whole declaration rather than showing
@@ -249,6 +248,25 @@ again, because a line box with no text on it has no strut there. Pages of the
 era were authored against that: a sliced image with a gap under every tile is
 not a near miss, it is the page coming apart. Both modes now land on the same
 pixel row as Chromium.
+
+`direction` and `unicode-bidi` came off it, which is most of what
+right-to-left text needed. The algorithm itself is `unicode-bidi`'s — the same
+crate `cosmic-text` already uses, so nothing new entered the tree — and the
+work here is what a shaper cannot do for you: running it over the whole inline
+formatting context rather than per word, reordering each line's segments by the
+levels it returns, and putting an inline box's own borders back at the ends of
+its box rather than letting them reorder like characters. Two Hebrew words now
+come out in the right order, a `<span>` cut in two by reordering draws two
+fragments, and the space between a Hebrew run and the English after it lands
+between them instead of at the end of the line.
+
+One piece of UAX #9 is written here rather than taken, and it is worth naming:
+Latin text under an explicit override. The shaper does not act on the
+formatting codes at all — handed `<RLO>abcdef<PDF>` it draws two blank boxes
+and six letters forwards, which was measured before it was believed — so the
+run is shaped forwards and then mirrored, brackets included. The levels still
+come from the crate; only their application to glyphs is ours, and no shaper
+will reverse letters it has been given no reason to reverse.
 
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by

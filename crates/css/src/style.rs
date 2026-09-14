@@ -160,10 +160,62 @@ pub fn parse_font_variant(name: &str) -> Option<FontVariant> {
     }
 }
 
+/// The `direction` property (§8.6): which way inline content runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    /// Left to right. The initial value.
+    #[default]
+    Ltr,
+    /// Right to left.
+    Rtl,
+}
+
+/// Parses a `direction` keyword.
+pub fn parse_direction(name: &str) -> Option<Direction> {
+    match name.to_ascii_lowercase().as_str() {
+        "ltr" => Some(Direction::Ltr),
+        "rtl" => Some(Direction::Rtl),
+        _ => None,
+    }
+}
+
+/// The `unicode-bidi` property (§8.6): how an element joins the bidi algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnicodeBidi {
+    /// The element's text takes part in the surrounding paragraph's ordering.
+    #[default]
+    Normal,
+    /// The element opens an embedding at its own `direction`.
+    Embed,
+    /// The element's characters are forced to its own `direction`, whatever
+    /// they are — the property's equivalent of U+202D/U+202E.
+    BidiOverride,
+}
+
+/// Parses a `unicode-bidi` keyword.
+pub fn parse_unicode_bidi(name: &str) -> Option<UnicodeBidi> {
+    match name.to_ascii_lowercase().as_str() {
+        "normal" => Some(UnicodeBidi::Normal),
+        "embed" => Some(UnicodeBidi::Embed),
+        "bidi-override" => Some(UnicodeBidi::BidiOverride),
+        _ => None,
+    }
+}
+
 /// The `text-align` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAlign {
-    /// Align to the start edge.
+    /// The initial value: whichever edge `direction` makes the start one.
+    ///
+    /// CSS 2.1 §16.2 writes the initial value as "`left` if `direction` is
+    /// `ltr`, `right` if it is `rtl`", which is not a value any stylesheet can
+    /// name and so has to be one this enum can hold. Resolving it at the point
+    /// of use rather than in the cascade is what keeps it right through
+    /// inheritance: `text-align` inherits and `direction` inherits separately,
+    /// so a child can be handed this from one ancestor and its direction from
+    /// another.
+    Start,
+    /// Align to the left edge.
     Left,
     /// Centre within the line box.
     Center,
@@ -186,6 +238,15 @@ impl TextAlign {
     /// Whether lines are centred.
     pub fn centres_text(self) -> bool {
         matches!(self, TextAlign::Center | TextAlign::CenterBlocks)
+    }
+
+    /// The value with [`TextAlign::Start`] settled against a direction.
+    pub fn against(self, direction: Direction) -> Self {
+        match (self, direction) {
+            (TextAlign::Start, Direction::Ltr) => TextAlign::Left,
+            (TextAlign::Start, Direction::Rtl) => TextAlign::Right,
+            (align, _) => align,
+        }
     }
 }
 
@@ -1358,6 +1419,13 @@ pub struct ComputedStyle {
     pub font_style: FontStyle,
     /// `font-variant`, which here means small capitals or not.
     pub font_variant: FontVariant,
+    /// `direction` (§8.6), which decides the base level of a paragraph and
+    /// which end of the line its text starts from.
+    pub direction: Direction,
+    /// `unicode-bidi` (§8.6). Does *not* inherit, unlike `direction`: an
+    /// override applies to the element that declares it and to text directly
+    /// inside it, and a nested element opens its own.
+    pub unicode_bidi: UnicodeBidi,
     /// `line-height`, inherited. `normal` until a font resolves it.
     pub line_height: LineHeight,
     /// `text-align`, inherited.
@@ -1520,8 +1588,10 @@ impl Default for ComputedStyle {
             font_weight: 400,
             font_style: FontStyle::Normal,
             font_variant: FontVariant::Normal,
+            direction: Direction::Ltr,
+            unicode_bidi: UnicodeBidi::Normal,
             line_height: LineHeight::Normal,
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::default(),
             list_style_type: ListStyleType::Disc,
@@ -1553,6 +1623,8 @@ impl ComputedStyle {
             font_weight: parent.font_weight,
             font_style: parent.font_style,
             font_variant: parent.font_variant,
+            direction: parent.direction,
+            unicode_bidi: UnicodeBidi::Normal,
             line_height: parent.line_height,
             text_align: parent.text_align,
             white_space: parent.white_space,

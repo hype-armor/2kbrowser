@@ -16,6 +16,53 @@ record for everything earlier.
 
 ## Unreleased
 
+**Right-to-left text**, which PLAN.md has been listing as unimplemented since
+M2 opened: `direction`, `unicode-bidi`, and the reordering itself. Worth **21
+conformance tests** against 2 lost.
+
+The algorithm is `unicode-bidi`'s — the crate `cosmic-text` already depends on,
+so the tree gains no new code — and what had been missing was everything around
+it. Shaping happened per word, so each Hebrew word came out right and the words
+came out in the wrong order; the fix is to run the analysis over the whole
+inline formatting context and reorder each line's segments by the levels it
+returns. Segments are split at level boundaries as well as at line-break
+opportunities, because `AAA<RLO>BBB` is one unbreakable word and two
+directions.
+
+An inline box's own borders are not characters and do not reorder like them.
+They attach to the ends of the box in the box's own direction, so a `<span>`
+that reordering cuts in two draws two fragments with a border on the outside of
+each end and nothing at the join — and a nested box's side stays inside its
+parent's, which is a plain left-to-right case that broke first and caught the
+tie-break the wrong way round.
+
+Whitespace turned out to need a level of its own. The space between two Hebrew
+words travels with them; the space between the last Hebrew word and the English
+after it is a neutral at the paragraph's direction and belongs past the whole
+Hebrew run. Same character, same place in the source, two different answers.
+
+One piece of UAX #9 is written here rather than taken: Latin under an explicit
+override. The shaper does not act on the formatting codes — handed
+`<RLO>abcdef<PDF>` it draws two blank boxes and six letters forwards, measured
+before believed — so such a run is shaped forwards and then mirrored, with rule
+L4's brackets swapped by shaping the mirrored characters and letting the shaper
+find the glyphs.
+
+`text-align` gains a `Start` value, because §16.2's initial value is "left if
+`direction` is `ltr`, right if it is `rtl`" — not a value a stylesheet can name
+and so one the enum has to hold, resolved where it is used rather than in the
+cascade, since `text-align` and `direction` inherit separately.
+
+And a pre-existing bug this uncovered: `text-align: right` measured from the
+edge of the *box* rather than the edge of the room the line actually had, so a
+right-aligned line beside a float was pushed past it. Lines carry their own
+available width now.
+
+Two tests lost, both right-to-left and both needing block-level work that is
+not here: a box split across lines by a `<br>`, and §10.3.3's over-constrained
+margin, whose one-line version moved every absolutely positioned and replaced
+box as well (8 recovered against 37 lost) and was backed out.
+
 **Line boxes have a strut now** (§10.8.1), and quirks mode takes it away again
 on a line with no text — which is the quirk the era's sliced-image tables were
 built on.

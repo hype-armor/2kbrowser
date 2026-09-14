@@ -342,7 +342,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    longhand it covers
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
-   size, and collapse whitespace across run boundaries.
+   size, and collapse whitespace across run boundaries. **Right-to-left text**
+   — `direction`, `unicode-bidi`, UAX #9's reordering per line, mirrored
+   brackets, and an inline box that draws one fragment per contiguous run when
+   reordering cuts it in two
 3. **Tables** — *done.* Automatic column sizing from cell content, `colspan`
    and `rowspan`, row groups, declared widths, shrink-to-fit boxes, row
    backgrounds, `border-spacing` including the `cellspacing` attribute, and
@@ -397,7 +400,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden: forms that draw but do not work —
 no control can be typed into, clicked or submitted — the properties that parse
 and are then ignored
-(`list-style-image` and `direction`), a caption wider than its table — which overhangs rather than widening
+(`list-style-image`), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
 the corner where

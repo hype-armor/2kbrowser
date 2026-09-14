@@ -14,8 +14,8 @@ pub mod table;
 use css::cascade::StyleMap;
 use css::selector::PseudoElement;
 use css::style::{
-    BorderCollapse, CaptionSide, ComputedStyle, Display, Float, Overflow, Position, TextAlign,
-    VerticalAlign, WhiteSpace,
+    BorderCollapse, CaptionSide, ComputedStyle, Direction, Display, Float, Overflow, Position,
+    TextAlign, VerticalAlign, WhiteSpace,
 };
 use css::value::Length;
 use dom::{Document, NodeId};
@@ -675,7 +675,11 @@ fn hit_test_box(box_: &LayoutBox, x: f32, y: f32, offset_x: f32, offset_y: f32) 
         let content_x = left + box_.content_origin.0;
         let content_y = top + box_.content_origin.1;
         for line in &text.lines {
-            let dx = line_offset(box_.style.text_align, line.width, box_.content_width);
+            let dx = line_offset(
+                box_.style.text_align.against(box_.style.direction),
+                line.width,
+                line.available.min(box_.content_width),
+            );
             for span in &line.spans {
                 let span_x = content_x + dx + span.x;
                 let span_y = content_y + span.y;
@@ -737,7 +741,11 @@ fn placed_lines<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<PlacedLin
             out.push(PlacedLine {
                 line,
                 origin_x: content_x
-                    + line_offset(box_.style.text_align, line.width, box_.content_width),
+                    + line_offset(
+                        box_.style.text_align.against(box_.style.direction),
+                        line.width,
+                        line.available.min(box_.content_width),
+                    ),
                 origin_y: content_y,
                 top: line_top,
                 bottom: line_top + line.baseline * 1.25,
@@ -804,7 +812,11 @@ fn collect_matches(
             if line.glyphs.is_empty() {
                 continue;
             }
-            let dx = line_offset(box_.style.text_align, line.width, box_.content_width);
+            let dx = line_offset(
+                box_.style.text_align.against(box_.style.direction),
+                line.width,
+                line.available.min(box_.content_width),
+            );
             let lowered = line.text.to_lowercase();
             // Lowercasing can change a string's length — `İ` becomes two chars
             // — so an offset into the lowered text is not an offset into the
@@ -890,7 +902,11 @@ fn collect_rects(
         let content_x = left + box_.content_origin.0;
         let content_y = top + box_.content_origin.1;
         for line in &text.lines {
-            let dx = line_offset(box_.style.text_align, line.width, box_.content_width);
+            let dx = line_offset(
+                box_.style.text_align.against(box_.style.direction),
+                line.width,
+                line.available.min(box_.content_width),
+            );
             for span in line.spans.iter().filter(|span| span.source == node.0) {
                 out.push(Rect {
                     x: content_x + dx + span.x,
@@ -1430,7 +1446,11 @@ fn emit_replaced_boxes(
     for line in &layout.lines {
         // The same shift paint applies to the line's glyphs, so a centred line
         // carries its images along with its text.
-        let dx = line_offset(style.text_align, line.width, content_width);
+        let dx = line_offset(
+            style.text_align.against(style.direction),
+            line.width,
+            line.available.min(content_width),
+        );
         for placed in &line.replaced {
             let node = NodeId(placed.id);
             // An inline-block was laid out whole before the line was
@@ -1910,8 +1930,14 @@ fn table_widths(
 /// box leaves over.
 ///
 /// Two auto margins split it, which centres the box. One takes all of it,
-/// which pushes the box to the other side. Neither, and the leftover simply
-/// sits to the right, as an over-constrained box does in left-to-right text.
+/// which pushes the box to the other side.
+///
+/// Neither, and the leftover simply sits to the right, as an over-constrained
+/// box does in left-to-right text. §10.3.3 says a right-to-left one should put
+/// it on the left instead, which is not done here: the one-line version of it
+/// moved every absolutely positioned and replaced box as well, because they
+/// reach this by a path with over-constraint rules of their own (§10.3.7 and
+/// §10.3.8). Measured at 8 recovered against 37 lost, and backed out.
 fn distribute_auto_margins(style: &ComputedStyle, leftover: f32, left: &mut f32, right: &mut f32) {
     let leftover = leftover.max(0.0);
     match (style.margin.left, style.margin.right) {
@@ -4412,6 +4438,7 @@ fn open_a_box(
             text::InlineEdge {
                 width: left,
                 opening: true,
+                rtl: style.direction == Direction::Rtl,
             },
             style.clone(),
         )
@@ -4440,6 +4467,7 @@ fn close_a_box(
             text::InlineEdge {
                 width: right,
                 opening: false,
+                rtl: style.direction == Direction::Rtl,
             },
             style.clone(),
         )
@@ -4570,7 +4598,11 @@ fn collapse_whitespace_from(text: &str, after_space: bool) -> String {
 /// Horizontal offset for a line, given the alignment of its block.
 pub fn line_offset(align: TextAlign, line_width: f32, content_width: f32) -> f32 {
     match align {
-        TextAlign::Left | TextAlign::Justify => 0.0,
+        // `Start` cannot reach here: every caller resolves it against the
+        // box's own `direction` first, which is the only place that knows
+        // which edge the start is. Treated as `Left` rather than panicking,
+        // because a misplaced line is a better failure than a blank window.
+        TextAlign::Start | TextAlign::Left | TextAlign::Justify => 0.0,
         TextAlign::Center | TextAlign::CenterBlocks => {
             ((content_width - line_width) / 2.0).max(0.0)
         }
@@ -6339,10 +6371,10 @@ mod tests {
             .iter()
             .find(|b| b.text.is_some())
             .expect("the cell's text");
-        assert_eq!(
-            cell.style.text_align,
-            TextAlign::Left,
-            "the contents must not be centred"
+        assert!(
+            !cell.style.text_align.centres_text(),
+            "the contents must not be centred, but are {:?}",
+            cell.style.text_align
         );
     }
 
@@ -9116,6 +9148,7 @@ mod tests {
                 decorations: Vec::new(),
                 text: String::new(),
                 width: 200.0,
+                available: 200.0,
                 y: 0.0,
                 baseline: 10.0,
             }],
