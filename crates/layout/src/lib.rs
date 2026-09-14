@@ -1771,6 +1771,42 @@ fn subtree_widths(
     );
     let (mut min, mut max) = fonts.intrinsic_widths(&runs, style);
 
+    // Measured again, one inline *stretch* at a time, whenever a block child
+    // separates them. `collect_inline_runs` gathers the whole box's inline
+    // content in one sequence — which is what the box lays out when it has no
+    // block children, and a fiction the moment it has one: the words before
+    // the block and the words after it can never share a line, and measuring
+    // them as though they could reports a box wide enough for both.
+    //
+    // §9.2.1.1's shape is where this shows up: an inline element holding a
+    // block is laid out as a block here, so `Line 1<div>Line 2</div>Line 3`
+    // asked its table cell for the width of `Line 1Line 3` — very nearly
+    // double what a browser gives it.
+    //
+    // The whole-box measurement above is kept as a floor rather than replaced,
+    // because it is the one that carries `::before` and `::after`.
+    let stretches = inline_stretches(doc, styles, node);
+    if stretches.len() > 1 {
+        let mut widest = (0.0f32, 0.0f32);
+        for stretch in &stretches {
+            let runs = inline_runs_for(
+                doc,
+                styles,
+                stretch,
+                style,
+                node,
+                intrinsic,
+                &InlineBlocks::new(),
+                available,
+                &mut Numbering::default(),
+            );
+            let (stretch_min, stretch_max) = fonts.intrinsic_widths(&runs, style);
+            widest = (widest.0.max(stretch_min), widest.1.max(stretch_max));
+        }
+        min = widest.0;
+        max = widest.1;
+    }
+
     for &child in doc.children(node) {
         let Some(child_style) = styles.get(child) else {
             continue;
@@ -1963,6 +1999,47 @@ fn caption_floor(
             .0
         })
         .fold(0.0f32, f32::max)
+}
+
+/// A box's inline children, grouped into the stretches a block child separates.
+///
+/// One group for a box with no block children at all, which is the common case
+/// and the one a caller can skip this for. More than one means the box lays out
+/// its inline content in pieces, and anything measuring it has to measure the
+/// pieces.
+fn inline_stretches(doc: &Document, styles: &StyleMap, node: NodeId) -> Vec<Vec<NodeId>> {
+    let mut out: Vec<Vec<NodeId>> = vec![Vec::new()];
+    for &child in doc.children(node) {
+        let Some(child_style) = styles.get(child) else {
+            // A text node has no style and is inline content whatever it sits
+            // beside.
+            if doc.text(child).is_some() {
+                out.last_mut().expect("one stretch always").push(child);
+            }
+            continue;
+        };
+        if child_style.display == Display::None {
+            continue;
+        }
+        // Out of flow, or floated, or positioned by a table: none of them
+        // interrupts the line the text around them is on.
+        if child_style.position.is_out_of_flow()
+            || child_style.float != Float::None
+            || child_style.display.is_table_internal()
+        {
+            continue;
+        }
+        if is_inline_child(doc, styles, child, child_style) {
+            out.last_mut().expect("one stretch always").push(child);
+        } else {
+            out.push(Vec::new());
+        }
+    }
+    out.retain(|stretch| !stretch.is_empty());
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
+    out
 }
 
 /// Resolves `margin-left: auto` and `margin-right: auto` against the space a
@@ -6107,6 +6184,59 @@ mod tests {
                 pair[1].rect
             );
         }
+    }
+
+    #[test]
+    fn a_box_is_measured_one_inline_stretch_at_a_time() {
+        // The words before a block child and the words after it can never
+        // share a line, so a box that asks for room for both is asking for
+        // roughly twice what it needs. §9.2.1.1's shape is where it shows: an
+        // inline element holding a block is laid out as a block, and the two
+        // halves of its text were measured as one line.
+        let rendered = run(
+            "<body><table><tr><td>\
+             <span class=\"i\">Line 1<span class=\"b\">Line 2</span>Line 3</span>\
+             </td></tr></table></body>",
+            "body { margin: 0 } td { padding: 0; border: 0 } \
+             .i { display: inline } .b { display: block }",
+            600.0,
+        );
+        let cell = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::TableCell)
+            .expect("a cell");
+        let line = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|text| text.lines.iter())
+            .map(|line| line.width)
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            cell.rect.width < line * 1.5,
+            "the cell is {} wide for a widest line of {line}, which is room for two",
+            cell.rect.width
+        );
+    }
+
+    #[test]
+    fn inline_stretches_are_cut_at_block_children_and_nowhere_else() {
+        let doc = dom::parse(
+            "<body><div>text <b>bold</b> <img> <p>block</p> after <i>it</i></div></body>",
+        );
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("")]);
+        let div = doc.find_element("div").expect("a div");
+        let stretches = inline_stretches(&doc, &styles, div);
+
+        assert_eq!(
+            stretches.len(),
+            2,
+            "one <p> between the inline content makes two stretches, not {}",
+            stretches.len()
+        );
+        // A float or an out-of-flow box interrupts nothing.
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("p { float: left }")]);
+        assert_eq!(inline_stretches(&doc, &styles, div).len(), 1);
     }
 
     #[test]

@@ -16,6 +16,26 @@ record for everything earlier.
 
 ## Unreleased
 
+**A box is measured one inline stretch at a time.** The words before a block
+child and the words after it can never share a line, and the intrinsic width
+was gathering the whole box's inline content in one sequence and measuring it
+as though they could — reporting a box wide enough for both.
+
+§9.2.1.1's shape is where it showed. An inline element holding a block is laid
+out as a block here, so `Line 1<div>Line 2</div>Line 3` in a table cell asked
+for the width of `Line 1Line 3`: very nearly double what a browser gives it,
+and the cell came out twice the size beside an identical one built out of
+divs. That is `box-display/block-in-inline-001`, which now matches Chromium to
+the pixel.
+
+One conformance test, nothing lost, and the fix is not really about
+block-in-inline at all — it is about any block container with mixed children,
+which is most of the era's markup.
+
+The rest of §9.2.1.1 is still outstanding and PLAN.md now says which part: the
+geometry is right, the box is not. An inline element's background and border
+wrap the block child instead of stopping either side of it.
+
 **Right-to-left text**, which PLAN.md has been listing as unimplemented since
 M2 opened: `direction`, `unicode-bidi`, and the reordering itself. Worth **21
 conformance tests** against 2 lost.
