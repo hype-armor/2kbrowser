@@ -406,8 +406,12 @@ and are then ignored
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
 settled here by width rather than by a diagonal mitre, and proper
 block-in-inline splitting — an inline element containing a block is
-laid out as a block instead, which matches for the shapes that occur but is
-not what CSS 2.1 §9.2.1.1 describes.
+laid out as a block instead, which is not what CSS 2.1 §9.2.1.1 describes. The
+geometry is right now: a box is measured one inline *stretch* at a time, so the
+words before the block and the words after it no longer ask for room to share
+a line. What is left is the box: the inline element's background and border
+wrap the block child instead of stopping either side of it, and its vertical
+margins apply where an inline box has none.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes
