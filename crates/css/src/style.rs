@@ -532,14 +532,19 @@ impl ListStyleType {
     /// in a list marker is the marker's, not the number's, and
     /// `content: counter(chapter) ". "` writes its own.
     ///
-    /// A bullet type has no number to print, so it prints nothing — which is
-    /// what §12.4.3 says `counter(n, disc)` does.
+    /// §12.4.3 supports every `list-style-type` here, the glyph ones included:
+    /// `counter(c, square)` prints a square, not nothing. It read the other way
+    /// here for a while, and the suite could not tell — the test that checks it
+    /// has a reference built out of `list-style-position: inside` markers,
+    /// which this engine also drew nowhere, so a blank matched a blank.
+    ///
+    /// `none` is the one that prints nothing, and it is the only one.
     pub fn counter(self, ordinal: usize) -> String {
         match self {
-            ListStyleType::Disc
-            | ListStyleType::Circle
-            | ListStyleType::Square
-            | ListStyleType::None => String::new(),
+            ListStyleType::Disc | ListStyleType::Circle | ListStyleType::Square => {
+                self.marker(ordinal)
+            }
+            ListStyleType::None => String::new(),
             ListStyleType::Decimal => format!("{ordinal}"),
             ListStyleType::LowerAlpha => alphabetic(ordinal, 'a'),
             ListStyleType::UpperAlpha => alphabetic(ordinal, 'A'),
@@ -602,6 +607,26 @@ pub fn parse_clip(values: &[Raw]) -> Option<Option<ClipRect>> {
         bottom: *bottom,
         left: *left,
     }))
+}
+
+/// `list-style-position` (§12.5.1): where the marker sits relative to the item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListStylePosition {
+    /// Outside the item's box, in the list's own padding. The initial value.
+    #[default]
+    Outside,
+    /// The first inline box of the item's content, which text flows after and
+    /// wraps *under* rather than beside.
+    Inside,
+}
+
+/// Parses a `list-style-position` keyword.
+pub fn parse_list_style_position(name: &str) -> Option<ListStylePosition> {
+    match name.to_ascii_lowercase().as_str() {
+        "outside" => Some(ListStylePosition::Outside),
+        "inside" => Some(ListStylePosition::Inside),
+        _ => None,
+    }
 }
 
 /// Parses a `list-style-type` keyword.
@@ -1322,6 +1347,8 @@ pub struct ComputedStyle {
     pub text_decoration: TextDecoration,
     /// `list-style-type`, inherited so a list's items pick it up from the list.
     pub list_style_type: ListStyleType,
+    /// Where the marker sits (§12.5.1). Inherited, like the type.
+    pub list_style_position: ListStylePosition,
     /// `margin`.
     pub margin: Edges,
     /// `padding`.
@@ -1476,6 +1503,7 @@ impl Default for ComputedStyle {
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::default(),
             list_style_type: ListStyleType::Disc,
+            list_style_position: ListStylePosition::Outside,
             margin: Edges::ZERO,
             padding: Edges::ZERO,
             border: Borders::default(),
@@ -1506,6 +1534,7 @@ impl ComputedStyle {
             text_align: parent.text_align,
             white_space: parent.white_space,
             list_style_type: parent.list_style_type,
+            list_style_position: parent.list_style_position,
             // §17.6: inherited, so a rule on `table` reaches the cells that
             // have to agree with it about where their borders are.
             border_collapse: parent.border_collapse,

@@ -368,7 +368,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    CSS. The era's markup keeps most of its styling here rather than in CSS, so
    without this these pages render as unstyled text
 8. **Lists, decorations, rules, and forced breaks** — *done.* Markers with
-   `<ol start>` and `<li value>`, `text-decoration` propagated per §16.3,
+   `<ol start>` and `<li value>`, `list-style-position` — an `inside` marker
+   joins the item's first line, so the text wraps back *under* it rather than
+   beside it — `text-decoration` propagated per §16.3,
    underlined links via attribute selectors, `<hr>`, and `<br>`
 9. **Tiled backgrounds** — *done.* `background-image`, `background-repeat`, the
    `background` shorthand and its reset, `<body background>`, and canvas
@@ -389,7 +391,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden: forms that draw but do not work —
 no control can be typed into, clicked or submitted — the properties that parse
 and are then ignored
-(`font-variant`, `list-style-position`, `list-style-image`,
+(`font-variant`, `list-style-image`,
 `position: fixed`, and `direction`), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —

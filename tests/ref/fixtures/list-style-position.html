@@ -1,0 +1,23 @@
+<!doctype html>
+<title>list-style-position</title>
+<style>
+  body { margin: 0; font: 16px serif; width: 300px }
+  ul { width: 220px; margin: 0 0 12px; padding-left: 40px }
+  .inside { list-style-position: inside }
+  ol { width: 220px; margin: 0; padding-left: 40px; list-style-position: inside }
+</style>
+<!-- Outside: the marker sits in the list's padding, and the second line of a
+     wrapped item lines up under the first. -->
+<ul>
+  <li>an item long enough to wrap onto a second line</li>
+</ul>
+<!-- Inside: the marker is on the first line, so that line starts further
+     along and the second line wraps back *under* the marker. -->
+<ul class="inside">
+  <li>an item long enough to wrap onto a second line</li>
+</ul>
+<!-- Numbering is unchanged by where the marker goes. -->
+<ol>
+  <li>first</li>
+  <li>second</li>
+</ol>

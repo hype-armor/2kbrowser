@@ -2216,6 +2216,7 @@ fn layout_block(
     }
 
     if style.display == Display::ListItem
+        && style.list_style_position == css::style::ListStylePosition::Outside
         && let Some(marker) = marker_box(
             doc,
             styles,
@@ -3800,6 +3801,24 @@ fn collect_inline_runs(
     // and a pseudo-element attached to every stretch would appear several
     // times over.
     let mut numbering = Numbering::default();
+    // §12.5.1: an `inside` marker is the first inline box of the item's own
+    // content, so it goes on the first line and the text that follows wraps
+    // *under* it rather than beside it. That is the whole difference from
+    // `outside`, which is a box in the list's padding — and it is why this is
+    // a run rather than a child box: only something on the line can push the
+    // first line's text along and leave the rest of them where they were.
+    //
+    // Ahead of `::before`, which is where a browser puts it.
+    if let Some(marker) = inside_marker_run(doc, styles, node, inherited) {
+        push_generated(
+            marker,
+            node,
+            &[],
+            &mut numbering,
+            available_width,
+            &mut runs,
+        );
+    }
     if let Some(before) = generated_run(styles, node, PseudoElement::Before) {
         push_generated(
             before,
@@ -3885,6 +3904,54 @@ fn generated_run(styles: &StyleMap, node: NodeId, which: PseudoElement) -> Optio
         Display::None | Display::TableColumn | Display::TableColumnGroup
     );
     (!boxless).then(|| InlineRun::text(content, style.clone()))
+}
+
+/// The marker of a `list-style-position: inside` item, as an inline run.
+///
+/// Shares `list_ordinal` and `ListStyleType::marker` with the `outside` path,
+/// so the two positions can never disagree about what the marker *says* —
+/// only about where it goes. The trailing space is the gap: `outside` gets one
+/// from arithmetic, and an inline marker has nowhere to put that but in the
+/// text, which is also how a browser produces it.
+fn inside_marker_run(
+    doc: &Document,
+    styles: &StyleMap,
+    node: NodeId,
+    style: &ComputedStyle,
+) -> Option<InlineRun> {
+    if style.display != Display::ListItem
+        || style.list_style_position != css::style::ListStylePosition::Inside
+    {
+        return None;
+    }
+    let ordinal = if style.list_style_type.is_ordered() {
+        list_ordinal(doc, styles, node)
+    } else {
+        1
+    };
+    let text = style.list_style_type.marker(ordinal);
+    if text.is_empty() {
+        return None;
+    }
+    // The item's font and colour, but none of its box: a marker carries no
+    // margin, border, padding or background of its own. Cloning the style
+    // whole gave it all four, and §8.4 then charged the item's horizontal
+    // margin to the line — so `margin-left: 1in` on the list item bought a
+    // second inch of inline edge and the box came out an inch too wide.
+    let mut marker = style.clone();
+    marker.display = Display::Inline;
+    let none = css::style::Edges {
+        top: Length::Px(0.0),
+        right: Length::Px(0.0),
+        bottom: Length::Px(0.0),
+        left: Length::Px(0.0),
+    };
+    marker.margin = none;
+    marker.padding = none;
+    marker.border = css::style::Borders::default();
+    marker.background_color = css::Color::TRANSPARENT;
+    marker.background_image = None;
+    Some(InlineRun::text(format!("{text}\u{00a0}"), marker))
 }
 
 /// Collects inline runs from a specific list of siblings.
@@ -5802,6 +5869,85 @@ mod tests {
         let boxes = replaced_boxes(&rendered);
         assert_eq!(boxes.len(), 1);
         assert_eq!(boxes[0].rect.height, 40.0);
+    }
+
+    #[test]
+    fn an_inside_marker_joins_the_first_line_instead_of_the_padding() {
+        let css = "ul { list-style-position: inside }";
+        let rendered = run("<body><ul><li>one</li></ul></body>", css, 400.0);
+        let boxes = content_boxes(&rendered);
+        let item = boxes
+            .iter()
+            .find(|b| b.style.display == Display::ListItem)
+            .expect("a list item");
+
+        // No separate marker box: the bullet is in the item's own text.
+        assert!(
+            item.children.iter().all(|child| child.text.is_none()),
+            "an inside marker must not also be a box in the padding"
+        );
+        let first = item
+            .text
+            .as_ref()
+            .and_then(|text| text.lines.first())
+            .expect("the item's first line");
+        assert!(
+            first.text.starts_with('\u{2022}'),
+            "expected the bullet at the start of {:?}",
+            first.text
+        );
+    }
+
+    #[test]
+    fn an_inside_marker_pushes_the_first_line_along() {
+        // The point of `inside`: the marker takes room *on the line*, so the
+        // text starts further right than the same item without one would.
+        let plain = run(
+            "<body><ul style=\"list-style-type: none\"><li>one</li></ul></body>",
+            "",
+            400.0,
+        );
+        let marked = run(
+            "<body><ul style=\"list-style-position: inside\"><li>one</li></ul></body>",
+            "",
+            400.0,
+        );
+        let width = |rendered: &Rendered| {
+            content_boxes(rendered)
+                .into_iter()
+                .find(|b| b.style.display == Display::ListItem)
+                .and_then(|item| item.text.as_ref().map(|text| text.width))
+                .expect("a list item with text")
+        };
+
+        assert!(
+            width(&marked) > width(&plain),
+            "inside marker added no width: {} vs {}",
+            width(&marked),
+            width(&plain)
+        );
+    }
+
+    #[test]
+    fn an_inside_marker_still_counts_up() {
+        let rendered = run(
+            "<body><ol style=\"list-style-position: inside\"><li>a</li><li>b</li></ol></body>",
+            "",
+            400.0,
+        );
+        let items: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::ListItem)
+            .filter_map(|b| {
+                b.text
+                    .as_ref()
+                    .and_then(|text| text.lines.first())
+                    .map(|line| line.text.clone())
+            })
+            .collect();
+
+        assert!(items[0].starts_with('1'), "{:?}", items[0]);
+        assert!(items[1].starts_with('2'), "{:?}", items[1]);
     }
 
     #[test]

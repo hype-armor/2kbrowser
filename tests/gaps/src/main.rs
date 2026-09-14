@@ -294,7 +294,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { width: 200px }",
         declaration: "#t { list-style-position: inside }",
         body: "<ul id=t><li>an item long enough to wrap onto a second line</li></ul>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "z-index",

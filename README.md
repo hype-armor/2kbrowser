@@ -207,8 +207,7 @@ these" against "any of these" — and a `<legend>` sits *in* its group's rule, w
 the rule stopping either side of it, as HTML's rendering section has it.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `font-variant`,
-`list-style-position`, `list-style-image`,
+this file used to admit: `font-variant`, `list-style-image`,
 `clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
@@ -218,6 +217,12 @@ scope: `open-quote` and its family, which needs the nesting depth of quotation
 marks, and `url()` in `content`, which needs an image fetched for a box that is
 not an element. Each of those drops the whole declaration rather than showing
 part of what the author asked for, which would look deliberate.
+
+`list-style-position` came off it too. An `inside` marker is the first inline
+box of the item's own content rather than a box in the list's padding, so the
+text after it starts further along and the *second* line wraps back under the
+marker instead of beside it — which is the whole visible difference between the
+two values.
 
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by
