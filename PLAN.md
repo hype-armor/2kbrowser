@@ -336,7 +336,10 @@ now closed: see M2 item 2 below.
 The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 
 1. Real cascade and selector matching; full box model; backgrounds and
-   **borders** — *done.*
+   **borders** — *done.* `inherit` is a value every property takes (§6.2.1),
+   which is a copy of the parent's *computed* value rather than a re-parse of
+   what the parent declared, and which a shorthand spreads across every
+   longhand it covers
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
    size, and collapse whitespace across run boundaries.

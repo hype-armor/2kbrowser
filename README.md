@@ -50,7 +50,11 @@ compare pixels and a person cannot compare descriptions.
 disk, parsed into an arena DOM, cascaded through a CSS 2.1 subset, laid out,
 shaped against bundled Liberation faces, and rasterised on the CPU.
 
-Working: the cascade with selectors, specificity, and inheritance; the box
+Working: the cascade with selectors, specificity, and inheritance —
+including `inherit` as an explicit value, which takes the parent's computed
+value for properties that do not inherit on their own, so `width: inherit` on
+a child of a 300px box is 300px and `border: inherit` takes the width, the
+style and the colour together; the box
 model with borders and backgrounds, on inline boxes as well as block ones — a
 `<span>` with a background and padding draws them, one fragment per line it
 crosses (§8.4), and its horizontal padding and border take room on the line so

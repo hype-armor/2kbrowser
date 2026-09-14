@@ -633,6 +633,19 @@ fn apply(
     let parse_size = |raw: &Raw| parse_length(raw).filter(|length| !length.is_negative());
     let parse_color = |raw: &Raw| parse_color_quirky(raw, quirks);
 
+    // §6.2.1: every property takes `inherit`, and it means the parent's
+    // computed value whether or not the property inherits by default. Handled
+    // here rather than in each of the fifty arms below, which is also the only
+    // way to get it right: the value is a *copy*, with no parsing to do and
+    // nothing for a property's own parser to say about it.
+    if values.len() == 1
+        && let Raw::Ident(name) = first
+        && name.eq_ignore_ascii_case("inherit")
+    {
+        inherit_property(style, &declaration.name, parent);
+        return;
+    }
+
     match declaration.name.as_str() {
         "display" => {
             if let Raw::Ident(name) = first
@@ -1114,6 +1127,163 @@ fn apply(
                 apply_border_longhand(&mut style.border, rest, values, zoom);
             }
         }
+    }
+}
+
+/// Copies one property's computed value from the parent (§6.2.1's `inherit`).
+///
+/// Written out rather than derived, because there is nothing to derive it from:
+/// a computed style is a struct of forty fields and the mapping from a CSS
+/// property name to the fields it covers is exactly the knowledge `apply` above
+/// encodes in the other direction. A shorthand copies every field it covers,
+/// which is what makes `border: inherit` take the width, the style *and* the
+/// colour.
+///
+/// A property missing here is a property whose `inherit` is dropped, which is
+/// the same thing that happens to any value this engine cannot parse.
+fn inherit_property(style: &mut ComputedStyle, name: &str, parent: &ComputedStyle) {
+    match name {
+        "display" => style.display = parent.display,
+        "color" => style.color = parent.color,
+        "background-color" => style.background_color = parent.background_color,
+        "background-image" => style.background_image = parent.background_image.clone(),
+        "background-repeat" => style.background_repeat = parent.background_repeat,
+        "background-position" => style.background_position = parent.background_position,
+        "background" => {
+            style.background_color = parent.background_color;
+            style.background_image = parent.background_image.clone();
+            style.background_repeat = parent.background_repeat;
+            style.background_position = parent.background_position;
+        }
+        "font-family" => style.font_family = parent.font_family.clone(),
+        "font-size" => style.font_size = parent.font_size,
+        "font-weight" => style.font_weight = parent.font_weight,
+        "font-style" => style.font_style = parent.font_style,
+        "line-height" => style.line_height = parent.line_height,
+        "font" => {
+            style.font_family = parent.font_family.clone();
+            style.font_size = parent.font_size;
+            style.font_weight = parent.font_weight;
+            style.font_style = parent.font_style;
+            style.line_height = parent.line_height;
+        }
+        "letter-spacing" => style.letter_spacing = parent.letter_spacing,
+        "word-spacing" => style.word_spacing = parent.word_spacing,
+        "text-align" => style.text_align = parent.text_align,
+        "text-decoration" => style.text_decoration = parent.text_decoration,
+        "text-indent" => style.text_indent = parent.text_indent,
+        "text-transform" => style.text_transform = parent.text_transform,
+        "white-space" => style.white_space = parent.white_space,
+        "visibility" => style.visibility = parent.visibility,
+        "vertical-align" => style.vertical_align = parent.vertical_align,
+        "list-style-type" => style.list_style_type = parent.list_style_type,
+        "float" => style.float = parent.float,
+        "clear" => style.clear = parent.clear,
+        "position" => style.position = parent.position,
+        "overflow" => style.overflow = parent.overflow,
+        "clip" => style.clip = parent.clip,
+        "z-index" => style.z_index = parent.z_index,
+        "width" => style.width = parent.width,
+        "min-width" => style.min_width = parent.min_width,
+        "max-width" => style.max_width = parent.max_width,
+        "height" => style.height = parent.height,
+        "min-height" => style.min_height = parent.min_height,
+        "max-height" => style.max_height = parent.max_height,
+        "top" => style.offsets.top = parent.offsets.top,
+        "right" => style.offsets.right = parent.offsets.right,
+        "bottom" => style.offsets.bottom = parent.offsets.bottom,
+        "left" => style.offsets.left = parent.offsets.left,
+        "margin" => style.margin = parent.margin,
+        "padding" => style.padding = parent.padding,
+        "border" => style.border = parent.border,
+        "border-width" => {
+            for (side, from) in border_sides(&mut style.border)
+                .into_iter()
+                .zip(border_sides_of(parent))
+            {
+                side.width = from.width;
+            }
+        }
+        "border-style" => {
+            for (side, from) in border_sides(&mut style.border)
+                .into_iter()
+                .zip(border_sides_of(parent))
+            {
+                side.style = from.style;
+            }
+        }
+        "border-color" => {
+            for (side, from) in border_sides(&mut style.border)
+                .into_iter()
+                .zip(border_sides_of(parent))
+            {
+                side.color = from.color;
+            }
+        }
+        "border-collapse" => style.border_collapse = parent.border_collapse,
+        "border-spacing" => style.border_spacing = parent.border_spacing,
+        "caption-side" => style.caption_side = parent.caption_side,
+        "counter-reset" => style.counter_reset = parent.counter_reset.clone(),
+        "counter-increment" => style.counter_increment = parent.counter_increment.clone(),
+        "content" => style.content = parent.content.clone(),
+        "outline" => style.outline = parent.outline,
+        "outline-width" => style.outline.width = parent.outline.width,
+        "outline-style" => style.outline.style = parent.outline.style,
+        "outline-color" => style.outline.color = parent.outline.color,
+        "empty-cells" => style.empty_cells = parent.empty_cells,
+        "table-layout" => style.table_layout = parent.table_layout,
+        name => {
+            if let Some(side) = name.strip_prefix("margin-") {
+                copy_edge(&mut style.margin, &parent.margin, side);
+            } else if let Some(side) = name.strip_prefix("padding-") {
+                copy_edge(&mut style.padding, &parent.padding, side);
+            } else if let Some(rest) = name.strip_prefix("border-") {
+                inherit_border_longhand(&mut style.border, rest, &parent.border);
+            }
+        }
+    }
+}
+
+/// The parent's four border sides, in the order [`border_sides`] gives them.
+fn border_sides_of(style: &ComputedStyle) -> [BorderSide; 4] {
+    [
+        style.border.top,
+        style.border.right,
+        style.border.bottom,
+        style.border.left,
+    ]
+}
+
+/// Copies one side of an [`Edges`].
+fn copy_edge(into: &mut Edges, from: &Edges, side: &str) {
+    match side {
+        "top" => into.top = from.top,
+        "right" => into.right = from.right,
+        "bottom" => into.bottom = from.bottom,
+        "left" => into.left = from.left,
+        _ => {}
+    }
+}
+
+/// `border-left-width: inherit` and friends, plus `border-left: inherit`.
+fn inherit_border_longhand(borders: &mut Borders, rest: &str, from: &Borders) {
+    let (side_name, property) = match rest.split_once('-') {
+        Some((side, property)) => (side, Some(property)),
+        None => (rest, None),
+    };
+    let (into, source) = match side_name {
+        "top" => (&mut borders.top, from.top),
+        "right" => (&mut borders.right, from.right),
+        "bottom" => (&mut borders.bottom, from.bottom),
+        "left" => (&mut borders.left, from.left),
+        _ => return,
+    };
+    match property {
+        None => *into = source,
+        Some("width") => into.width = source.width,
+        Some("style") => into.style = source.style,
+        Some("color") => into.color = source.color,
+        _ => {}
     }
 }
 
@@ -2065,6 +2235,79 @@ mod tests {
         let map = cascade_as(&doc, &sheets, zoom, colours);
         let node = doc.find_element(tag).expect("element present");
         map.get(node).expect("element styled").clone()
+    }
+
+    #[test]
+    fn inherit_takes_a_property_that_does_not_inherit_by_default() {
+        let css = "div { width: 300px; border: 2px solid red } \
+                   p { width: inherit; border: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.width, Length::Px(300.0));
+        assert_eq!(style.border.top.width, Length::Px(2.0));
+        assert_eq!(style.border.left.style, BorderStyle::Solid);
+        assert_eq!(style.border.bottom.color, Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn inherit_beats_a_later_rule_it_precedes_no_more_than_any_other_value() {
+        // `inherit` is a value, not a directive: the cascade orders it like
+        // anything else, so the second declaration wins.
+        let css = "div { color: red } p { color: inherit; color: blue }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn inherit_copies_the_parents_computed_value_not_the_declared_one() {
+        // The parent's font-size is 50% of the *grandparent*, so a child that
+        // inherits gets 12px, not the string "50%" re-resolved against itself.
+        let css = "body { font-size: 24px } div { font-size: 50% } \
+                   p { font-size: inherit }";
+        let style = style_of("<body><div><p>x</p></div></body>", css, "p");
+
+        assert_eq!(style.font_size, 12.0);
+    }
+
+    #[test]
+    fn inherit_on_a_longhand_leaves_the_other_sides_alone() {
+        let css = "div { margin: 10px } \
+                   p { margin: 1px; margin-left: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.margin.left, Length::Px(10.0));
+        assert_eq!(style.margin.top, Length::Px(1.0));
+    }
+
+    #[test]
+    fn inherit_on_a_border_longhand_takes_only_that_side_and_facet() {
+        let css = "div { border-left: 5px dashed lime } \
+                   p { border: 1px solid red; border-left-width: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.border.left.width, Length::Px(5.0));
+        assert_eq!(style.border.left.style, BorderStyle::Solid);
+        assert_eq!(style.border.right.width, Length::Px(1.0));
+    }
+
+    #[test]
+    fn inherit_at_the_root_gets_the_initial_value() {
+        // The root element's parent is the initial style, so `inherit` there is
+        // the same as `initial` — and must not be mistaken for a colour name.
+        let style = style_of("<p>x</p>", "html { color: inherit }", "html");
+
+        assert_eq!(style.color, ComputedStyle::default().color);
+    }
+
+    #[test]
+    fn inherit_is_not_read_as_a_font_family_or_a_counter_name() {
+        let css = "div { font-family: Verdana; counter-reset: page 3 } \
+                   p { font-family: inherit; counter-reset: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.font_family.families, vec!["verdana".to_string()]);
+        assert_eq!(style.counter_reset, vec![("page".to_string(), 3)]);
     }
 
     #[test]

@@ -340,6 +340,17 @@ const PROPERTIES: &[Property] = &[
         expected: Verdict::Honoured,
     },
     Property {
+        // `border` does not inherit, and its initial value draws nothing, so a
+        // child that grows a blue border can only have got it from `inherit`.
+        // A width would not do: a block child's auto width already matches its
+        // parent, so the declaration could be dropped with no visible effect.
+        name: "inherit as a value",
+        scaffold: "#p { border: 10px solid blue }",
+        declaration: "#t { border: inherit }",
+        body: "<div id=p><div id=t>a</div></div>",
+        expected: Verdict::Honoured,
+    },
+    Property {
         name: "direction: rtl",
         scaffold: "",
         declaration: "#t { direction: rtl }",
