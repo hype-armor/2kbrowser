@@ -204,7 +204,17 @@ pub fn intrinsic_size(
     label: Option<&str>,
 ) -> (f32, f32) {
     let font_size = style.font_size;
-    let line = style.line_height.max(font_size);
+    // `line-height: normal` is the face's own ascent, descent and line gap, and
+    // measuring those needs the shaper, which a control's *intrinsic* size is
+    // computed too far from to reach. The constant the cascade used to apply to
+    // everything stands in, which is about 1.5% tall for the faces bundled here
+    // — a rounding error on a box whose height is `rows` lines of a field
+    // nobody can type in, and which this module already sizes in the era's own
+    // approximate units.
+    let line = style
+        .line_height
+        .resolve(font_size, font_size * css::style::NORMAL_LINE_HEIGHT)
+        .max(font_size);
     let columns = |name: &str, fallback: f32| -> f32 {
         doc.element(node)
             .and_then(|element| element.attr(name))
@@ -484,12 +494,12 @@ mod tests {
         let (doc, node) = node_of(r#"<input size="10">"#, "input");
         let small = ComputedStyle {
             font_size: 10.0,
-            line_height: 12.0,
+            line_height: css::style::LineHeight::Px(12.0),
             ..ComputedStyle::default()
         };
         let large = ComputedStyle {
             font_size: 20.0,
-            line_height: 24.0,
+            line_height: css::style::LineHeight::Px(24.0),
             ..ComputedStyle::default()
         };
         let (narrow, short) = intrinsic_size(&doc, node, &small, Control::Text, None);

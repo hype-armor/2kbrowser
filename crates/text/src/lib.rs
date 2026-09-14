@@ -142,24 +142,36 @@ fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
 /// between 0.52 and 0.53, and the value is halved before it is used.
 const X_HEIGHT: f32 = 0.5;
 
-/// The ascent and descent of an inline box's content area, as fractions of the
-/// font size.
+/// A face's vertical metrics, as fractions of the font size.
 ///
-/// §10.6.1 leaves the content area's height up to the user agent, and every
-/// browser answers with the font's own ascent and descent. These are those, for
-/// the faces bundled here: Liberation Serif is 0.891 over 0.216, Sans 0.905
-/// over 0.212, and Mono 0.833 over 0.300 — three fonts whose *sums* agree to
-/// within 0.026 even where the split does not.
-///
-/// Constants rather than a lookup because `cosmic-text` does not hand back the
-/// face's metrics with a shaped run: it reports a baseline that already has the
-/// line box's half-leading folded in, and the CSS `line-height` as the height.
-/// Deriving the content area from that would make a double-spaced paragraph
-/// highlight its phrases in bands that touch each other rather than at the size
-/// of the words, which is exactly what §10.6.1 says not to do.
-const ASCENT: f32 = 0.89;
-/// See [`ASCENT`].
-const DESCENT: f32 = 0.22;
+/// Two questions are answered from these and they are not the same question.
+/// §10.8.1's `line-height: normal` is the whole of it — ascent, descent and the
+/// gap the face asks for between one line and the next. §10.6.1's content area,
+/// which is what an inline box's background covers, is the ascent and descent
+/// *without* the gap: the gap is space between two lines rather than part of
+/// either, and a background drawn over it would run into the line above.
+#[derive(Debug, Clone, Copy)]
+struct FaceMetrics {
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+}
+
+impl FaceMetrics {
+    /// For text with no face to measure — an empty span, a line of spaces, a
+    /// script no bundled face covers.
+    ///
+    /// The numbers are the bundled faces' own, near enough: Liberation Serif is
+    /// 0.891 over 0.216, Sans 0.905 over 0.212, and Mono 0.833 over 0.300, and
+    /// all three ask for no line gap at all. Their *sums* agree to within 0.026
+    /// even where the split does not, which is why a single fallback is
+    /// defensible and why it comes to about the same 1.11 a real face reports.
+    const FALLBACK: Self = Self {
+        ascent: 0.89,
+        descent: 0.22,
+        leading: 0.0,
+    };
+}
 
 /// An atomic inline box that takes up room on a line without contributing
 /// glyphs — an image, in practice.
@@ -456,6 +468,11 @@ struct Segment {
     edge: Option<InlineEdge>,
     /// The drawn inline boxes this segment sits inside, outermost first.
     boxes: Vec<usize>,
+    /// The content area of the face this segment is set in: its ascent above
+    /// the baseline and its descent below it, in pixels (§10.6.1). What an
+    /// inline box's background covers, and not the line box, which
+    /// `line-height` moves around independently.
+    content: (f32, f32),
 }
 
 impl Segment {
@@ -503,6 +520,12 @@ pub struct FontStore {
     /// pages against baselines byte for byte, so a cache that returned the
     /// wrong glyphs would fail them rather than pass quietly.
     shaped: std::collections::HashMap<(AttrsOwned, String), Shaped>,
+    /// What `line-height: normal` comes to for a set of attributes, per em.
+    ///
+    /// Asked once per line of every page and answered from a face's metrics,
+    /// which means finding the face — so it is cached by the attributes rather
+    /// than by the size, and multiplied by the size on the way out.
+    face_metrics: std::collections::HashMap<AttrsOwned, FaceMetrics>,
 }
 
 impl Default for FontStore {
@@ -540,6 +563,7 @@ impl FontStore {
             system,
             cache: SwashCache::new(),
             shaped: std::collections::HashMap::new(),
+            face_metrics: std::collections::HashMap::new(),
         }
     }
 
@@ -603,16 +627,97 @@ impl FontStore {
 
     /// The line height to lay out with.
     ///
-    /// A line height reaches here from the cascade, and the cascade computes it
-    /// from the font size — so `font-size: 1e40px`, which parses to infinity in
-    /// an `f32`, arrives as an infinite line height and poisons every
-    /// coordinate downstream. Geometry that leaves this crate is finite.
-    fn line_height_for(style: &ComputedStyle) -> f32 {
-        if style.line_height.is_finite() && style.line_height >= 0.0 {
-            style.line_height
+    /// `normal` arrives unresolved from the cascade, which has no fonts, and is
+    /// answered here from the face's own metrics (§10.8.1). Everything else is
+    /// already a number of pixels — and is checked, because the cascade computes
+    /// it from the font size and `font-size: 1e40px` parses to infinity in an
+    /// `f32`. Geometry that leaves this crate is finite.
+    pub fn used_line_height(&mut self, style: &ComputedStyle) -> f32 {
+        // Measured only where it is needed: `normal` is the one form that costs
+        // a font lookup, and the other two are arithmetic.
+        let normal = if style.line_height.is_normal() {
+            self.normal_line_height(style)
         } else {
             0.0
+        };
+        style.line_height.resolve(style.font_size, normal)
+    }
+
+    /// What `normal` comes to for the face this style resolves to: its ascent,
+    /// its descent and the line gap between one line and the next, which is
+    /// what §10.8.1's "based on the font" means and what every browser uses.
+    fn normal_line_height(&mut self, style: &ComputedStyle) -> f32 {
+        let (ascent, descent) = self.content_box(style);
+        let face = self.face_metrics_for(style);
+        // Rounded, like the halves it is built from. A line box a fraction of a
+        // pixel tall accumulates down a page: forty lines of a third of a pixel
+        // is a line's worth of drift by the bottom, and it lands differently
+        // depending on how many lines came first.
+        (ascent + descent + face.leading * style.font_size.max(0.0)).round()
+    }
+
+    /// The content area an inline box covers: the face's ascent above the
+    /// baseline and its descent below it, in pixels (§10.6.1).
+    ///
+    /// The line *gap* is deliberately absent. It is space between one line and
+    /// the next, not part of either — so a background drawn over it would run
+    /// into the line above.
+    /// Rounded to whole pixels, which is what every browser built on FreeType
+    /// does and is not cosmetic: the ascent decides where a baseline sits, and
+    /// a baseline on a half pixel is a line of text rendered through a filter.
+    /// It is also what makes a line height stable — the same font at the same
+    /// size gives the same integer however many lines precede it.
+    pub fn content_box(&mut self, style: &ComputedStyle) -> (f32, f32) {
+        let face = self.face_metrics_for(style);
+        let size = style.font_size.max(0.0);
+        ((face.ascent * size).round(), (face.descent * size).round())
+    }
+
+    /// The face's vertical metrics, per em.
+    ///
+    /// The face is found by shaping one character rather than by asking the
+    /// font database, because `cosmic-text` keeps its matching to itself: the
+    /// id inside a `FontMatchKey` is private and a glyph's is not. `x` is the
+    /// probe — present in every face bundled here, and cheap because the
+    /// shaping cache answers the second request for it.
+    ///
+    /// Cached, because it is asked once per line of every page. A run with no
+    /// glyphs — an empty span, a line of spaces, a script no bundled face
+    /// covers — has no face to ask and gets [`FaceMetrics::FALLBACK`].
+    fn face_metrics_for(&mut self, style: &ComputedStyle) -> FaceMetrics {
+        if !(style.font_size.is_finite() && style.font_size > 0.0) {
+            return FaceMetrics::FALLBACK;
         }
+        let key = AttrsOwned::new(&Self::attrs_for(style, style.font_size));
+        if let Some(found) = self.face_metrics.get(&key) {
+            return *found;
+        }
+        let measured = self.measure_face(style).unwrap_or(FaceMetrics::FALLBACK);
+        self.face_metrics.insert(key, measured);
+        measured
+    }
+
+    /// Reads the face's metrics, or `None` when no face could be found.
+    fn measure_face(&mut self, style: &ComputedStyle) -> Option<FaceMetrics> {
+        // A line height that cannot come back round to `normal`: this is what
+        // answers that question, so it must not ask it.
+        let probe = self.shape_with("x", style, style.font_size);
+        let font = self.system.get_font(probe.glyphs.first()?.font_id)?;
+        let metrics = font.as_swash().metrics(&[]);
+        let units = f32::from(metrics.units_per_em);
+        if units <= 0.0 {
+            return None;
+        }
+        let face = FaceMetrics {
+            ascent: metrics.ascent / units,
+            descent: metrics.descent / units,
+            leading: metrics.leading.max(0.0) / units,
+        };
+        let sane = face.ascent.is_finite()
+            && face.descent.is_finite()
+            && face.leading.is_finite()
+            && face.ascent + face.descent > 0.0;
+        sane.then_some(face)
     }
 
     /// Metrics cosmic-text will accept.
@@ -631,7 +736,7 @@ impl FontStore {
     ///
     /// Non-finite values are floored for the same reason: a `NaN` size would
     /// propagate silently into every coordinate downstream of it.
-    fn metrics_for(style: &ComputedStyle) -> Metrics {
+    fn metrics_for(style: &ComputedStyle, line_height: f32) -> Metrics {
         /// Small enough to be invisible, large enough that no arithmetic
         /// downstream divides by something near zero.
         const FLOOR: f32 = 0.01;
@@ -640,8 +745,8 @@ impl FontStore {
         } else {
             FLOOR
         };
-        let line = if style.line_height.is_finite() && style.line_height > FLOOR {
-            style.line_height
+        let line = if line_height.is_finite() && line_height > FLOOR {
+            line_height
         } else {
             FLOOR
         };
@@ -649,7 +754,7 @@ impl FontStore {
     }
 
     /// Attributes for one inline span.
-    fn attrs_for(style: &ComputedStyle) -> Attrs<'static> {
+    fn attrs_for(style: &ComputedStyle, line_height: f32) -> Attrs<'static> {
         Attrs::new()
             // Part of the shaping key, which is what makes this safe to cache:
             // the same words at two spacings are two different shapings and
@@ -675,7 +780,7 @@ impl FontStore {
                 FontStyle::Italic => Style::Italic,
                 FontStyle::Normal => Style::Normal,
             })
-            .metrics(Self::metrics_for(style))
+            .metrics(Self::metrics_for(style, line_height))
             .color(cosmic_text::Color::rgba(
                 style.color.r,
                 style.color.g,
@@ -696,6 +801,15 @@ impl FontStore {
     /// scripts and ligatures within a segment stay correct; segments are cut
     /// only at Unicode break opportunities, where shaping does not carry over.
     fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Shaped {
+        let line_height = self.used_line_height(style);
+        self.shape_with(text, style, line_height)
+    }
+
+    /// The same, at a line height already resolved.
+    ///
+    /// Split out so that measuring what `normal` means can shape its probe
+    /// without asking what `normal` means.
+    fn shape_with(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Shaped {
         if text.is_empty() {
             return Shaped::default();
         }
@@ -709,7 +823,7 @@ impl FontStore {
                 ..Shaped::default()
             };
         }
-        let attrs = Self::attrs_for(style);
+        let attrs = Self::attrs_for(style, line_height);
         // Keyed on the attributes themselves rather than on a list of the style
         // properties that matter. `AttrsOwned` carries exactly what `Attrs`
         // carries — the family, the weight, the slant, the colour, and the
@@ -728,7 +842,7 @@ impl FontStore {
             return shaped.clone();
         }
 
-        let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style));
+        let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style, line_height));
         let mut buffer = buffer.borrow_with(&mut self.system);
         // No width limit: a segment is by definition not broken further.
         buffer.set_size(None, None);
@@ -822,7 +936,7 @@ impl FontStore {
         let mut y = 0.0f32;
         let mut current: Vec<Segment> = Vec::new();
         let mut x = 0.0f32;
-        let mut line_height = Self::line_height_for(default_style);
+        let mut line_height = self.used_line_height(default_style);
         let mut ascent = if default_style.font_size.is_finite() {
             default_style.font_size * 0.8
         } else {
@@ -874,7 +988,7 @@ impl FontStore {
                 Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
-                line_height = Self::line_height_for(default_style);
+                line_height = self.used_line_height(default_style);
                 ascent = default_style.font_size * 0.8;
                 descent = 0.0;
                 available = constraints(y, line_height).1;
@@ -926,7 +1040,7 @@ impl FontStore {
                 Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
                 y += line_height;
                 x = 0.0;
-                line_height = Self::line_height_for(default_style);
+                line_height = self.used_line_height(default_style);
                 ascent = default_style.font_size * 0.8;
                 descent = 0.0;
                 available = constraints(y, line_height).1;
@@ -1021,15 +1135,14 @@ impl FontStore {
                 // An atomic box hangs from the baseline by its own; the inline
                 // box around it has to cover all of it.
                 Some(box_) => (baseline - box_.baseline, box_.height),
-                // §10.6.1: the content area, which `line-height` moves the
-                // lines around but does not grow. Taken as the em box — the
-                // same 0.8 ascent the line breaker already assumes — rather
-                // than from the shaped metrics, which carry the CSS line
-                // height and would put a double-spaced paragraph's highlights
-                // in bands that touch.
+                // §10.6.1: the content area, from the face's own ascent and
+                // descent. Not from the shaped metrics, which carry the CSS
+                // line height — that would put a double-spaced paragraph's
+                // highlights in bands that touch each other rather than at the
+                // size of the words.
                 None => (
-                    baseline - segment.font_size * ASCENT,
-                    segment.font_size * (ASCENT + DESCENT),
+                    baseline - segment.content.0,
+                    segment.content.0 + segment.content.1,
                 ),
             };
             for &source in &segment.boxes {
@@ -1222,6 +1335,9 @@ impl FontStore {
     fn segment(&mut self, runs: &[InlineRun]) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::new();
         for run in runs {
+            // Measured once per run rather than once per segment: a paragraph
+            // is one run and dozens of segments, all in the same face.
+            let content = self.content_box(&run.style);
             // An atomic inline box is one unbreakable segment of its own size,
             // aligned on the baseline it declares. For an image that is its
             // bottom edge, which is what `vertical-align: baseline` means for a
@@ -1248,6 +1364,7 @@ impl FontStore {
                     hidden: run.style.visibility == Visibility::Hidden,
                     edge: None,
                     boxes: run.boxes.clone(),
+                    content,
                 });
                 continue;
             }
@@ -1286,6 +1403,7 @@ impl FontStore {
                     hidden: run.style.visibility == Visibility::Hidden,
                     edge: Some(edge),
                     boxes: run.boxes.clone(),
+                    content,
                 });
                 continue;
             }
@@ -1339,9 +1457,10 @@ impl FontStore {
                         last.trailing_space += space_width;
                         last.mandatory_break |= mandatory;
                     } else if mandatory {
+                        let height = self.used_line_height(&run.style);
                         out.push(Segment {
                             shaped: Shaped {
-                                height: Self::line_height_for(&run.style),
+                                height,
                                 ascent: run.style.font_size * 0.8,
                                 ..Shaped::default()
                             },
@@ -1357,6 +1476,7 @@ impl FontStore {
                             hidden: run.style.visibility == Visibility::Hidden,
                             edge: None,
                             boxes: run.boxes.clone(),
+                            content,
                         });
                     }
                     continue;
@@ -1377,6 +1497,7 @@ impl FontStore {
                     hidden: run.style.visibility == Visibility::Hidden,
                     edge: None,
                     boxes: run.boxes.clone(),
+                    content,
                 });
             }
         }
@@ -1465,12 +1586,12 @@ impl FontStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use css::style::{FontStack, GenericFamily};
+    use css::style::{FontStack, GenericFamily, LineHeight};
 
     fn style(size: f32) -> ComputedStyle {
         ComputedStyle {
             font_size: size,
-            line_height: size * 1.2,
+            line_height: LineHeight::Px(size * 1.2),
             ..Default::default()
         }
     }
@@ -1519,7 +1640,7 @@ mod tests {
         // Line height alone, with the size held still: it rides in the metrics
         // `attrs_for` folds in, and nothing about the glyphs shows it.
         let mut taller = style(16.0);
-        taller.line_height = 40.0;
+        taller.line_height = LineHeight::Px(40.0);
         styles.push(taller);
         for weight in [300u16, 400, 700] {
             let mut bold = style(16.0);
@@ -1732,7 +1853,7 @@ mod tests {
         let mut fonts = FontStore::new();
         let flat = ComputedStyle {
             font_size: 16.0,
-            line_height: 0.0,
+            line_height: LineHeight::Px(0.0),
             ..Default::default()
         };
         let laid = fonts.layout("visible", &flat, 400.0);
@@ -2025,7 +2146,7 @@ mod tests {
         let mut store = FontStore::new();
         let tight = style(16.0);
         let airy = ComputedStyle {
-            line_height: 40.0,
+            line_height: LineHeight::Px(40.0),
             ..style(16.0)
         };
         let mut of = |style: &ComputedStyle| {
@@ -2092,7 +2213,7 @@ mod tests {
         let small = style(12.0);
         let large = ComputedStyle {
             font_size: 30.0,
-            line_height: 36.0,
+            line_height: LineHeight::Px(36.0),
             ..style(30.0)
         };
         let uniform = store.layout("small text", &small, 1000.0);
@@ -2184,7 +2305,7 @@ mod tests {
         let small = style(12.0);
         let large = ComputedStyle {
             font_size: 28.0,
-            line_height: 34.0,
+            line_height: LineHeight::Px(34.0),
             ..style(28.0)
         };
         let runs = [
@@ -2211,14 +2332,14 @@ mod tests {
 #[cfg(test)]
 mod decoration_tests {
     use super::*;
-    use css::style::TextDecoration;
+    use css::style::{LineHeight, TextDecoration};
 
     fn run(text: &str, decoration: TextDecoration) -> InlineRun {
         InlineRun::text(
             text,
             ComputedStyle {
                 font_size: 16.0,
-                line_height: 19.2,
+                line_height: LineHeight::Px(19.2),
                 text_decoration: decoration,
                 ..Default::default()
             },

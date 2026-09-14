@@ -1206,8 +1206,8 @@ pub struct ComputedStyle {
     pub font_weight: u16,
     /// `font-style`, inherited.
     pub font_style: FontStyle,
-    /// `line-height` in pixels, inherited.
-    pub line_height: f32,
+    /// `line-height`, inherited. `normal` until a font resolves it.
+    pub line_height: LineHeight,
     /// `text-align`, inherited.
     pub text_align: TextAlign,
     /// `white-space`, inherited.
@@ -1271,8 +1271,67 @@ pub const DEFAULT_BORDER_SPACING: f32 = 2.0;
 /// The initial font size, and the basis for `em` at the root.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
-/// `line-height: normal`, as a multiple of font size.
+/// `line-height: normal` as a multiple of font size, for the one case where
+/// the font's own answer cannot be had.
+///
+/// §10.8.1 leaves `normal` to the user agent and asks for a "reasonable" value
+/// "based on the font". The real value is the face's ascent plus its descent
+/// plus its line gap, which only the shaper can report — see
+/// `text::FontStore::used_line_height`. This is the fallback for a run with no
+/// glyphs to name a face with, and the number every browser used before anyone
+/// measured: close enough that nothing jumps, wrong enough to be worth not
+/// using.
 pub const NORMAL_LINE_HEIGHT: f32 = 1.2;
+
+/// A used `line-height`.
+///
+/// `normal` stays unresolved through the cascade, which is the whole point: it
+/// depends on the face the text is set in, and the cascade has no fonts. Every
+/// other form — a length, a percentage, a unitless multiplier — is a number of
+/// pixels the moment the font size is known, and is resolved where it is read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// The font's own: ascent + descent + line gap, at this size.
+    Normal,
+    /// A unitless multiplier.
+    ///
+    /// It inherits as the *number* and resolves against each element's own font
+    /// size (§10.8.1), which is the whole reason the era's sheets write
+    /// `line-height: 1.4` rather than `line-height: 1.4em`: a heading inside a
+    /// body set that way gets a line proportional to the heading. Resolved to
+    /// pixels it would not — every heading on every page would be given the
+    /// body's line and its text would overlap.
+    Number(f32),
+    /// A used value in pixels, from a length or a percentage.
+    Px(f32),
+}
+
+impl LineHeight {
+    /// The value in pixels, given the font size it resolves against and what
+    /// `normal` comes to for that font.
+    ///
+    /// Non-finite and negative values fall back to `normal` as well: they can
+    /// only come from a font size that overflowed, and a line height of `NaN`
+    /// poisons every coordinate downstream of it.
+    pub fn resolve(self, font_size: f32, normal: f32) -> f32 {
+        let used = match self {
+            Self::Normal => normal,
+            Self::Number(n) => n * font_size,
+            Self::Px(px) => px,
+        };
+        if used.is_finite() && used >= 0.0 {
+            used
+        } else {
+            normal
+        }
+    }
+
+    /// Whether resolving this needs a font measured, which the cascade cannot
+    /// do and everything downstream of it can.
+    pub fn is_normal(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
 
 impl Default for ComputedStyle {
     fn default() -> Self {
@@ -1302,7 +1361,7 @@ impl Default for ComputedStyle {
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
             font_style: FontStyle::Normal,
-            line_height: DEFAULT_FONT_SIZE * NORMAL_LINE_HEIGHT,
+            line_height: LineHeight::Normal,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::default(),

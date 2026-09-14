@@ -7,8 +7,8 @@ use dom::{Document, ElementData, NodeId};
 use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, ListStyleType,
-    MEDIUM_BORDER, NORMAL_LINE_HEIGHT, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
+    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, LineHeight,
+    ListStyleType, MEDIUM_BORDER, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
     parse_background_position, parse_background_repeat, parse_border_collapse, parse_border_style,
     parse_caption_side, parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type,
     parse_overflow, parse_position, parse_text_decoration, parse_text_transform,
@@ -726,17 +726,19 @@ fn apply(
                 style.font_style = font.style;
                 style.font_weight = font.weight;
                 style.font_size = font.size;
-                style.line_height = font.line_height.unwrap_or(font.size * NORMAL_LINE_HEIGHT);
+                style.line_height = font.line_height.unwrap_or(LineHeight::Normal);
                 style.font_family = font.family;
             }
         }
         // font-size resolves em and % against the *parent's* size, not its own.
+        //
+        // Nothing to do to the line height any more. It used to be recomputed
+        // here whenever it still matched the parent's, as a way of asking "was
+        // that `normal`, inherited?" — `normal` is now carried as itself and
+        // resolves against whatever font size it finds at the far end.
         "font-size" => {
             if let Some(size) = parse_font_size(first, parent.font_size, zoom) {
                 style.font_size = size;
-                if style.line_height == parent.line_height {
-                    style.line_height = size * NORMAL_LINE_HEIGHT;
-                }
             }
         }
         "font-weight" => {
@@ -760,12 +762,10 @@ fn apply(
         "font-family" => style.font_family = parse_font_family(values),
         "line-height" => {
             style.line_height = match first {
-                // A unitless number is a multiplier, and inherits as a
-                // multiplier rather than as a resolved length.
-                Raw::Number(n) => style.font_size * n,
-                Raw::Ident(name) if name == "normal" => style.font_size * NORMAL_LINE_HEIGHT,
+                Raw::Number(n) => LineHeight::Number(*n),
+                Raw::Ident(name) if name == "normal" => LineHeight::Normal,
                 other => match parse_length(other) {
-                    Some(length) => length.to_px(style.font_size, style.font_size),
+                    Some(length) => LineHeight::Px(length.to_px(style.font_size, style.font_size)),
                     None => style.line_height,
                 },
             };
@@ -1083,7 +1083,7 @@ struct FontShorthand {
     size: f32,
     /// `None` where the shorthand wrote no `/ line-height`, which means
     /// `normal` rather than "leave the old one".
-    line_height: Option<f32>,
+    line_height: Option<LineHeight>,
     family: FontStack,
 }
 
@@ -1145,9 +1145,12 @@ fn parse_font_shorthand(
         line_height = Some(match values.get(index)? {
             // Resolved against this shorthand's own size, not the parent's:
             // `font: 20px/1.5 serif` is a 30px line whatever the parent is.
-            Raw::Number(number) => size * number,
-            Raw::Ident(name) if name == "normal" => size * NORMAL_LINE_HEIGHT,
-            other => parse_length(other)?.scaled(zoom).to_px(size, size),
+            // Resolved against this shorthand's own size rather than kept as
+            // a number: `font: 20px/1.5 serif` is a 30px line, and a child of
+            // it that sets a larger size does not get a larger line from it.
+            Raw::Number(number) => LineHeight::Px(size * number),
+            Raw::Ident(name) if name == "normal" => LineHeight::Normal,
+            other => LineHeight::Px(parse_length(other)?.scaled(zoom).to_px(size, size)),
         });
         index += 1;
     }
@@ -2040,10 +2043,10 @@ mod tests {
         let doubled = zoomed_style_of("<body><p>x</p></body>", "", "p", 2.0);
 
         assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0);
-        assert_eq!(
-            doubled.line_height,
-            DEFAULT_FONT_SIZE * 2.0 * NORMAL_LINE_HEIGHT
-        );
+        // Still `normal`, which is the point: it is not a length for zoom to
+        // scale, it is a question asked of whatever font the text lands in at
+        // whatever size it ends up being.
+        assert_eq!(doubled.line_height, LineHeight::Normal);
     }
 
     #[test]
@@ -2170,7 +2173,7 @@ mod tests {
     fn the_font_shorthand_sets_size_line_height_and_family() {
         let style = style_of("<p>x</p>", "p { font: 20px/1.5 Georgia, serif }", "p");
         assert_eq!(style.font_size, 20.0);
-        assert_eq!(style.line_height, 30.0);
+        assert_eq!(style.line_height, LineHeight::Px(30.0));
         assert_eq!(style.font_family.families, vec!["georgia".to_owned()]);
         assert_eq!(style.font_family.generic, GenericFamily::Serif);
     }
@@ -2203,7 +2206,7 @@ mod tests {
         assert_eq!(style.font_style, FontStyle::Normal, "style survived it");
         assert_eq!(
             style.line_height,
-            20.0 * NORMAL_LINE_HEIGHT,
+            LineHeight::Normal,
             "line-height survived it"
         );
     }
@@ -2257,7 +2260,7 @@ mod tests {
             "p",
         );
         assert_eq!(style.font_size, 20.0);
-        assert_eq!(style.line_height, 30.0);
+        assert_eq!(style.line_height, LineHeight::Px(30.0));
     }
 
     #[test]
@@ -2265,7 +2268,7 @@ mod tests {
         // Before `Raw::Slash` existed the separator arrived as an unmodelled
         // token, which is how the whole declaration came to be dropped.
         let style = style_of("<p>x</p>", "p { font: 20px/10px serif }", "p");
-        assert_eq!(style.line_height, 10.0);
+        assert_eq!(style.line_height, LineHeight::Px(10.0));
     }
 
     fn content_of(html: &str, css: &str, tag: &str, which: PseudoElement) -> Option<String> {
