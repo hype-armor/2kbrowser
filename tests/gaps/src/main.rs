@@ -210,7 +210,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { word-spacing: 20px }",
         body: "<p id=t>spaced words here</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "text-transform",
@@ -231,7 +231,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { width: 120px }",
         declaration: "#t { outline: 4px solid red }",
         body: "<p id=t>outlined</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "font (shorthand)",
@@ -287,7 +287,7 @@ const PROPERTIES: &[Property] = &[
         declaration: "#t { text-align: justify }",
         body: "<p id=t>a paragraph long enough that justification has some slack \
                to distribute across several lines of text</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "list-style-position",

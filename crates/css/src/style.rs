@@ -1017,6 +1017,50 @@ pub fn parse_table_layout(name: &str) -> Option<TableLayout> {
     }
 }
 
+/// `outline`: a ring drawn outside the border edge that takes up no room.
+///
+/// §18.4. Not a fifth border: it is drawn *outside* the border box, it is the
+/// same on all four sides, and it does not influence layout at all — which is
+/// the whole point of it, since an outline that moved the page could not be
+/// used to mark focus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outline {
+    /// Declared width, used only when the style draws.
+    pub width: Length,
+    /// Line style. `none` by default, so an `outline-width` alone draws
+    /// nothing — the same trap as `border-width`.
+    pub style: BorderStyle,
+    /// Colour, or `None` for the element's own `color`.
+    ///
+    /// CSS 2.1's initial value is `invert`, which inverts whatever is under the
+    /// outline so that it is visible against any background. That needs the
+    /// pixels already drawn and the display list is built before anything is
+    /// rasterised, so `invert` is taken as the element's colour — visible
+    /// against the page for the same reason its text is.
+    pub color: Option<Color>,
+}
+
+impl Default for Outline {
+    fn default() -> Self {
+        Self {
+            width: Length::Px(MEDIUM_BORDER),
+            style: BorderStyle::None,
+            color: None,
+        }
+    }
+}
+
+impl Outline {
+    /// How thick the ring is drawn. Outside the box, so it occupies nothing.
+    pub fn used_width(&self, font_size: f32) -> f32 {
+        if self.style.reserves_space() {
+            self.width.to_px(font_size, 0.0).max(0.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Parses a `border-collapse` keyword.
 pub fn parse_border_collapse(name: &str) -> Option<BorderCollapse> {
     match name {
@@ -1213,6 +1257,8 @@ pub struct ComputedStyle {
     pub empty_cells: EmptyCells,
     /// `table-layout`, on a table, where its column widths come from.
     pub table_layout: TableLayout,
+    /// `outline`, drawn outside the border box and taking up no room.
+    pub outline: Outline,
     /// `caption-side`, inherited, which side of a table its caption sits on.
     pub caption_side: CaptionSide,
     /// `visibility`, inherited. A hidden box keeps its space.
@@ -1221,6 +1267,8 @@ pub struct ComputedStyle {
     pub text_transform: TextTransform,
     /// `letter-spacing` in pixels, inherited. Zero is `normal`.
     pub letter_spacing: f32,
+    /// `word-spacing` in pixels, inherited: extra room added at every space.
+    pub word_spacing: f32,
     /// `text-indent`, inherited, applied to a block's first line.
     ///
     /// Kept as a length because it may be a percentage, which resolves against
@@ -1406,10 +1454,12 @@ impl Default for ComputedStyle {
             border_collapse: BorderCollapse::Separate,
             empty_cells: EmptyCells::Show,
             table_layout: TableLayout::Auto,
+            outline: Outline::default(),
             caption_side: CaptionSide::Top,
             visibility: Visibility::Visible,
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
+            word_spacing: 0.0,
             text_indent: Length::Px(0.0),
             min_height: Length::Auto,
             max_height: Length::Auto,
@@ -1467,6 +1517,7 @@ impl ComputedStyle {
             visibility: parent.visibility,
             text_transform: parent.text_transform,
             letter_spacing: parent.letter_spacing,
+            word_spacing: parent.word_spacing,
             text_indent: parent.text_indent,
             ..Self::default()
         }

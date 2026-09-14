@@ -386,8 +386,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden: forms that draw but do not work —
 no control can be typed into, clicked or submitted — the properties that parse
 and are then ignored
-(`word-spacing`, `font-variant`, `outline`,
-`text-align: justify`, `list-style-position`, `list-style-image`,
+(`font-variant`, `list-style-position`, `list-style-image`,
 `position: fixed`, and `direction`), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —

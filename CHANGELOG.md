@@ -16,6 +16,38 @@ record for everything earlier.
 
 ## Unreleased
 
+**`word-spacing`, `outline` and `text-align: justify`**, three of the properties
+PLAN.md has been listing as parsed and then ignored since M2 opened. And `ex`,
+a CSS 2.1 length unit that parsed as nothing at all — `outline-width: 0ex` left
+a medium outline standing where the suite asked for none.
+
+`word-spacing` adds its length at every space, which for preformatted text means
+at *each* of a row of them. `outline` (§18.4) is a ring drawn outside the border
+box that takes up no room: not a fifth border, since it is the same on all four
+sides and does not influence layout — an outline that moved the page could not
+be used to mark focus. `invert`, its initial colour, is taken as the element's
+own; inverting what is underneath needs pixels that are not rasterised until
+after the display list is built. `text-align: justify` (§16.2) stretches the
+spaces until a line fills its box, on every line but the last — the last line of
+a paragraph keeps its natural width, which is the difference between justified
+text and a page of stretched fragments.
+
+**And the measurement goes down: 3356 of 4821 to 3352.** Four newly failing and
+none newly passing, which wants explaining rather than burying.
+
+There are 174 `outline` tests in the suite and **every one of them was passing**
+before this. They pass by drawing nothing on both sides — the same "identically
+blank" trap as the CDATA pairs and the inline boxes before them — and 171 still
+pass now that something is drawn, which is the real result. Of the four that
+broke, two want an outline on a `display: table-column-group`, which generates no
+box here; one wants `outline-width: inherit`, which is #87; and one is a
+`word-spacing` subtlety about where the extra space falls relative to a span's
+background. None of them is the property this entry is about.
+
+Shipping a negative number is the honest option here. Holding the work back
+would leave three M2 gaps open to keep a figure tidy, and the figure is supposed
+to be evidence rather than a score.
+
 **Three table gaps the plan had been carrying since M2 opened** — fixed layout,
 `empty-cells`, and a `border-spacing` per axis. Together they are worth **85
 newly passing tests and none newly failing**, 3271 of 4821 to 3356, which is the

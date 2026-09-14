@@ -855,6 +855,16 @@ fn apply(
                 style.letter_spacing = length.to_px(style.font_size, 0.0);
             }
         }
+        // The same shape as `letter-spacing`, and added at every space rather
+        // than at every glyph. Resolved here for the same reason: it is a used
+        // length by the time text is shaped.
+        "word-spacing" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("normal")) {
+                style.word_spacing = 0.0;
+            } else if let Some(length) = parse_length(first) {
+                style.word_spacing = length.to_px(style.font_size, 0.0);
+            }
+        }
         "text-indent" => {
             if let Some(length) = parse_length(first) {
                 style.text_indent = length;
@@ -937,6 +947,38 @@ fn apply(
         // Ahead of the `border-*` longhand fallback at the bottom of this
         // match, which would otherwise hand `collapse` to the code that parses
         // edge names and get nothing for it.
+        // §18.4. A ring outside the border box that takes up no room, so it
+        // needs no layout at all — only parsing and paint. The shorthand
+        // resets what it does not mention, like `border`.
+        "outline" => {
+            let parsed = parse_border_shorthand(values, zoom);
+            style.outline = crate::style::Outline {
+                width: parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER * zoom)),
+                style: parsed.style.unwrap_or_default(),
+                color: parsed.color,
+            };
+        }
+        "outline-width" => {
+            if let Some(width) = parse_border_width(first, zoom) {
+                style.outline.width = width;
+            }
+        }
+        "outline-style" => {
+            if let Raw::Ident(name) = first
+                && let Some(parsed) = parse_border_style(name)
+            {
+                style.outline.style = parsed;
+            }
+        }
+        // `invert` is the initial value and is taken as the element's own
+        // colour; see `Outline::color`.
+        "outline-color" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("invert")) {
+                style.outline.color = None;
+            } else if let Some(color) = parse_color(first) {
+                style.outline.color = Some(color);
+            }
+        }
         "border-collapse" => {
             if let Raw::Ident(name) = first
                 && let Some(collapse) = parse_border_collapse(name)
@@ -3839,5 +3881,66 @@ mod tests {
         let style = map.get(body).expect("a styled body");
         assert_eq!(style.margin.top, Length::Px(0.0));
         assert_eq!(style.margin.bottom, Length::Px(0.0));
+    }
+    #[test]
+    fn word_spacing_parses_like_letter_spacing() {
+        let style = style_of("<p>x</p>", "p { word-spacing: 20px }", "p");
+        assert_eq!(style.word_spacing, 20.0);
+        let normal = style_of("<p>x</p>", "p { word-spacing: normal }", "p");
+        assert_eq!(normal.word_spacing, 0.0);
+        // Resolved against the element's own font size, like `letter-spacing`.
+        let em = style_of(
+            "<p>x</p>",
+            "p { font-size: 20px; word-spacing: 0.5em }",
+            "p",
+        );
+        assert_eq!(em.word_spacing, 10.0);
+    }
+
+    #[test]
+    fn an_outline_is_parsed_whole_and_in_parts() {
+        let shorthand = style_of("<p>x</p>", "p { outline: 4px solid red }", "p");
+        assert_eq!(shorthand.outline.width, Length::Px(4.0));
+        assert_eq!(shorthand.outline.style, BorderStyle::Solid);
+        assert_eq!(shorthand.outline.color, Some(Color::rgb(255, 0, 0)));
+
+        // The shorthand resets what it does not mention, like `border`.
+        let reset = style_of(
+            "<p>x</p>",
+            "p { outline-width: 9px; outline: solid green }",
+            "p",
+        );
+        assert_eq!(reset.outline.width, Length::Px(MEDIUM_BORDER));
+
+        // And `invert`, which this engine takes as the element's own colour,
+        // is a colour the parser must not simply drop.
+        let inverted = style_of(
+            "<p>x</p>",
+            "p { outline: solid red; outline-color: invert }",
+            "p",
+        );
+        assert_eq!(inverted.outline.color, None);
+    }
+
+    #[test]
+    fn an_outline_width_alone_draws_nothing() {
+        // The same trap as `border-width`: without a style there is no line.
+        let style = style_of("<p>x</p>", "p { outline-width: 9px }", "p");
+        assert_eq!(style.outline.used_width(16.0), 0.0);
+    }
+
+    #[test]
+    fn an_ex_is_half_an_em() {
+        // CSS 2.1 has `ex` and this engine parsed it as nothing, which meant
+        // `outline-width: 0ex` left a medium outline standing where the suite
+        // asked for none.
+        let style = style_of("<p>x</p>", "p { font-size: 20px; margin-left: 2ex }", "p");
+        assert_eq!(style.margin.left.to_px(20.0, 0.0), 20.0);
+        let zero = style_of(
+            "<p>x</p>",
+            "p { outline: solid red; outline-width: 0ex }",
+            "p",
+        );
+        assert_eq!(zero.outline.used_width(16.0), 0.0);
     }
 }
