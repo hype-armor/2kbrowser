@@ -16,6 +16,29 @@ record for everything earlier.
 
 ## Unreleased
 
+**Two things absolutely positioned boxes were measured against, neither of
+them what CSS 2.1 says.** Worth **43 conformance tests** between them, with
+nothing lost the other way, and both showed up as a box in the wrong place
+rather than as anything recognisably about containing blocks.
+
+§10.1 says the containing block a positioned ancestor establishes is its
+*padding* box. This used its border box, so `left: 0` landed on top of the
+border rather than inside it and a percentage was measured against a box two
+paddings too narrow. That is the larger half: 38 tests, most of them the
+`absolute-*-height` and `absolute-*-width` families, which put a border on the
+container precisely because it is the thing that tells the three boxes apart.
+
+The other half is the box with no positioned ancestor at all, whose containing
+block is the initial one — the page. Two corrections were missing there. A
+box's own margins move it inside its parent and were never counted, so
+`position: absolute; top: 0; left: 0` came out at the body's 8px margin instead
+of the page corner. And a top margin is not final until it has finished
+collapsing: a `<p>` with `margin-top: 1in` pushes the body down an inch *after*
+the box has been placed against it, and took the box along.
+
+New `containing-blocks` reference fixture holds all three: the page corner, the
+inside of a border, and a percentage of a padding box.
+
 **`list-style-position`**, which PLAN.md has been listing as parsed and ignored
 since M2 opened. An `inside` marker is not a box in the list's padding but the
 first inline box of the item's *own* content, which is why it could not be a
