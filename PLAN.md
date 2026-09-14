@@ -467,6 +467,16 @@ which is where nearly all of its coverage comes from. What is *not* tested is
 the event loop itself: CI has no display server, so key and pointer handling are
 exercised by hand and a regression in them would not be caught by `cargo test`.
 
+One thing this milestone was assigned and did not build: **the per-site override
+for ADR-0006's third-party rule** (#118). The ADR does not offer that as an
+extra — it names the override as the reason the rule is allowed to be absolute
+in the first place, and puts it here. Without it the policy has no escape hatch,
+and a refused image leaves nothing on the page and nothing in the chrome to say
+why, so the browser is indistinguishable from one that is simply broken. Said
+here rather than quietly left out of the list, because "done" that omits a
+milestone's own commitment is the kind of claim §10 spends a paragraph warning
+about.
+
 Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
 Discarding the author's layout without also discarding the author's furniture
 turned out not to be reader mode at all: the navigation, the sidebar and the
