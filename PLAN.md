@@ -359,8 +359,11 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    dimensions, floatable, and sitting *on* a line rather than interrupting it.
    Links, scrolling, and hit testing remain
 6. **Positioned layout** — *done.* Relative shifts, absolute placement against
-   the nearest positioned ancestor, `top`/`right`/`bottom`/`left`, shrink-to-fit
-   widths. **Quirks mode** — *started;* unitless lengths and hash-less hex
+   the nearest positioned ancestor's **padding box** (§10.1),
+   `top`/`right`/`bottom`/`left`, shrink-to-fit widths. `position: fixed` takes
+   the viewport as its containing block whatever is positioned above it —
+   though it still scrolls with the page, which needs the display list to be
+   re-placed per scroll position rather than blitted. **Quirks mode** — *started;* unitless lengths and hash-less hex
    colours parse, other quirks outstanding. **Framesets** — *done*
 7. **Presentational attributes** — *done.* `bgcolor`, `text`, `link`, `align`,
    `valign`, `hspace`/`vspace`, `<font>`, `background`, and the table
@@ -391,8 +394,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden: forms that draw but do not work —
 no control can be typed into, clicked or submitted — the properties that parse
 and are then ignored
-(`list-style-image`,
-`position: fixed`, and `direction`), a caption wider than its table — which overhangs rather than widening
+(`list-style-image` and `direction`), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
 the corner where
@@ -1078,6 +1080,14 @@ implements, so it had been passing because both sides were wrong in the same
 way — the reftest weakness this section opens with, met in person. Changing the
 margins broke the coincidence. Left failing, because the honest fix is to
 implement `direction` and fixed positioning, not to restore the accident.
+
+It is passing again, and not because either half was implemented: it was
+already passing before `position: fixed` got its own containing block, and
+`direction: rtl` still is not implemented at all. So it is back to the
+coincidence this note was written to warn about, by some other change to the
+margins, and it should be read as telling us nothing. Recorded here because a
+number that goes up for no reason is worth as much suspicion as one that goes
+down.
 
 Still missing: an empty block collapsing through itself. That one needs the
 running collapsed margin kept *uncommitted* as the walk proceeds rather than

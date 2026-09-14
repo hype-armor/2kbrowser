@@ -55,6 +55,20 @@ pub struct ContainingBlock {
     offset: (f32, f32),
     /// The containing block's content size.
     size: (f32, f32),
+    /// The viewport's own size, carried down through every containing block
+    /// below it.
+    ///
+    /// §10.1 gives a `position: fixed` box the viewport as its containing
+    /// block and nothing else — not the nearest positioned ancestor, which is
+    /// the whole of what separates `fixed` from `absolute` at layout time. So
+    /// the viewport has to still be reachable from wherever the box turns up.
+    viewport: (f32, f32),
+    /// Where this box sits in the viewport's own coordinates.
+    ///
+    /// The same quantity as `offset` and accumulated the same way, with the one
+    /// difference that matters: a box that establishes a containing block
+    /// resets `offset` and never resets this.
+    from_viewport: (f32, f32),
     /// The containing block's height, where it has a definite one.
     ///
     /// §10.5 turns on this and nothing else: a percentage `height` resolves
@@ -68,13 +82,32 @@ pub struct ContainingBlock {
 
 impl ContainingBlock {
     /// The initial containing block: the viewport.
-    fn viewport(width: f32, height: f32) -> Self {
+    fn viewport(width: f32, height: f32, window: (f32, f32)) -> Self {
         Self {
             offset: (0.0, 0.0),
             size: (width, height),
+            viewport: window,
+            from_viewport: (0.0, 0.0),
             // The initial containing block is the viewport, whose height is
             // as definite as a height gets: `height: 100%` on the root fills
             // the window.
+            definite_height: Some(height),
+        }
+    }
+
+    /// A containing block with nothing above it, for a box measured on its own
+    /// before it is placed — a float, an inline-block, a caption.
+    ///
+    /// Named apart from [`Self::viewport`] because it is not one: a probe has
+    /// no idea where the window is, so a `position: fixed` box inside one is
+    /// measured against the probe instead. Rare enough to leave, and said here
+    /// rather than discovered later.
+    fn independent(width: f32, height: f32) -> Self {
+        Self {
+            offset: (0.0, 0.0),
+            size: (width, height),
+            viewport: (width, height),
+            from_viewport: (0.0, 0.0),
             definite_height: Some(height),
         }
     }
@@ -84,8 +117,8 @@ impl ContainingBlock {
     fn descend(self, dx: f32, dy: f32) -> Self {
         Self {
             offset: (self.offset.0 + dx, self.offset.1 + dy),
-            size: self.size,
-            definite_height: self.definite_height,
+            from_viewport: (self.from_viewport.0 + dx, self.from_viewport.1 + dy),
+            ..self
         }
     }
 
@@ -102,11 +135,16 @@ impl ContainingBlock {
     /// Its height is definite: a positioned box has been sized by the time it
     /// becomes a containing block, so a percentage height inside it has a
     /// real number to resolve against.
-    fn establish(size: (f32, f32)) -> Self {
+    fn establish(self, origin: (f32, f32), size: (f32, f32)) -> Self {
         Self {
             offset: (0.0, 0.0),
+            from_viewport: (
+                self.from_viewport.0 + origin.0,
+                self.from_viewport.1 + origin.1,
+            ),
             size,
             definite_height: Some(size.1),
+            viewport: self.viewport,
         }
     }
 
@@ -117,12 +155,40 @@ impl ContainingBlock {
     /// coordinates, which are the border box's — so the origin is negative,
     /// and `left: 0` puts a child against the inside of the border rather than
     /// on top of it.
-    fn establish_padding_box(content: (f32, f32), padding: (f32, f32), border: (f32, f32)) -> Self {
+    fn establish_padding_box(
+        self,
+        origin: (f32, f32),
+        content: (f32, f32),
+        padding: (f32, f32),
+        border: (f32, f32),
+    ) -> Self {
         let size = (content.0 + padding.0, content.1 + padding.1);
         Self {
             offset: (-border.0, -border.1),
+            from_viewport: (
+                self.from_viewport.0 + origin.0,
+                self.from_viewport.1 + origin.1,
+            ),
             size,
             definite_height: Some(size.1),
+            viewport: self.viewport,
+        }
+    }
+
+    /// The viewport, seen from a box whose content origin is `origin` past this
+    /// containing block's own — what a `position: fixed` child measures against
+    /// however many positioned ancestors sit in between.
+    fn fixed(self, origin: (f32, f32)) -> Self {
+        let offset = (
+            self.from_viewport.0 + origin.0,
+            self.from_viewport.1 + origin.1,
+        );
+        Self {
+            offset,
+            from_viewport: offset,
+            size: self.viewport,
+            definite_height: Some(self.viewport.1),
+            viewport: self.viewport,
         }
     }
 }
@@ -847,6 +913,7 @@ pub fn layout(
     fonts: &mut FontStore,
     intrinsic: &IntrinsicSizes,
     viewport_width: f32,
+    viewport_height: f32,
 ) -> Layout {
     let body = doc.find_element("body").unwrap_or_else(|| doc.root());
     let body_style = styles.get(body).cloned().unwrap_or_default();
@@ -915,7 +982,16 @@ pub fn layout(
         0.0,
         viewport_width,
         FloatContext::new(viewport_width),
-        ContainingBlock::viewport(viewport_width, viewport_width),
+        // The height passed for `size` is the *width*, deliberately and from
+        // before this change: a normal-flow percentage height needs a basis
+        // and the document's own height is not known yet. The window's real
+        // height goes in beside it, where `position: fixed` can find it and
+        // nothing else has to.
+        ContainingBlock::viewport(
+            viewport_width,
+            viewport_width,
+            (viewport_width, viewport_height),
+        ),
         &mut root,
     );
     root.rect.height = height.outer();
@@ -1287,7 +1363,7 @@ fn layout_inline_block(
         // An inline-block establishes a formatting context of its own, so no
         // float declared outside it reaches in.
         FloatContext::new(effective),
-        ContainingBlock::establish((effective, 0.0)),
+        ContainingBlock::independent(effective, 0.0),
         &mut holder,
     );
     let mut box_ = match holder.children.pop() {
@@ -2386,7 +2462,7 @@ fn layout_block(
                     at,
                     width,
                     FloatContext::new(width),
-                    ContainingBlock::viewport(width, width),
+                    ContainingBlock::independent(width, width),
                     &mut holder,
                 );
                 if let Some(caption_box) = holder.children.pop() {
@@ -2872,8 +2948,19 @@ fn layout_block(
     // it and behind the ones that do not.
     let mut reinserted = 0;
     for (child, child_style, static_y, at) in absolutes {
-        let child_containing = if style.position.is_positioned() {
-            ContainingBlock::establish_padding_box(
+        let child_containing = if child_style.position == Position::Fixed {
+            // §10.1: the viewport, whatever is positioned in between. This is
+            // the whole of what separates `fixed` from `absolute` in layout —
+            // the rest of the difference is that a fixed box does not scroll,
+            // which this engine cannot honour while it paints a whole document
+            // and scrolls by blitting a band of it.
+            // The *border-box* origin, not the content one `inherited_origin`
+            // carries: a child's rect is measured from its parent's border box,
+            // so that is the point the viewport has to be expressed against.
+            containing.fixed((margin_left, settled_top))
+        } else if style.position.is_positioned() {
+            containing.establish_padding_box(
+                (margin_left, settled_top),
                 own_size,
                 (padding_left + padding_right, padding_top + padding_bottom),
                 (border_left, border_top),
@@ -2948,7 +3035,7 @@ fn layout_block(
             0.0,
             width_basis,
             FloatContext::new(width_basis),
-            ContainingBlock::viewport(width_basis, child_containing.size.1),
+            child_containing.establish((0.0, 0.0), (width_basis, child_containing.size.1)),
             &mut probe,
         );
         let Some(mut child_box) = probe.children.pop() else {
@@ -3263,7 +3350,7 @@ fn layout_table(
                 0.0,
                 width,
                 FloatContext::new(width),
-                ContainingBlock::viewport(width, width),
+                ContainingBlock::independent(width, width),
                 &mut holder,
             );
             if let Some(mut box_) = holder.children.pop() {
@@ -3781,7 +3868,7 @@ fn place_float(
         0.0,
         float_width,
         FloatContext::new(float_width),
-        ContainingBlock::viewport(float_width, float_width),
+        ContainingBlock::independent(float_width, float_width),
         &mut probe,
     );
     // The space a float reserves is its *margin* box, not its border box: an
@@ -4483,7 +4570,7 @@ mod tests {
         let sheets = [Stylesheet::parse(css::ua::UA_STYLESHEET)];
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
-        let layout = layout(&doc, &styles, &mut fonts, &Default::default(), width);
+        let layout = layout(&doc, &styles, &mut fonts, &Default::default(), width, width);
         (doc, styles, layout)
     }
 
@@ -4610,12 +4697,25 @@ mod tests {
     }
 
     fn run(html: &str, css_text: &str, width: f32) -> Rendered {
+        run_in(html, css_text, width, width)
+    }
+
+    /// The same, in a window of a stated height — which only `position: fixed`
+    /// reads, and which is why every other test can leave it alone.
+    fn run_in(html: &str, css_text: &str, width: f32, height: f32) -> Rendered {
         let doc = dom::parse(html);
         let sheets = [Stylesheet::parse(css_text)];
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
         Rendered {
-            layout: layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), width),
+            layout: layout(
+                &doc,
+                &styles,
+                &mut fonts,
+                &IntrinsicSizes::new(),
+                width,
+                height,
+            ),
         }
     }
 
@@ -5691,7 +5791,7 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
         let mut fonts = FontStore::new();
         let rendered = Rendered {
-            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
         };
 
         let all = content_boxes(&rendered);
@@ -5727,7 +5827,7 @@ mod tests {
             .map(|css| {
                 let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css)]);
                 let rendered = Rendered {
-                    layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+                    layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
                 };
                 content_boxes(&rendered)
                     .into_iter()
@@ -5845,7 +5945,7 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
         let mut fonts = FontStore::new();
         let rendered = Rendered {
-            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
         };
         assert_eq!(first_line(&rendered).text, " word");
     }
@@ -5904,7 +6004,7 @@ mod tests {
         );
         let mut fonts = FontStore::new();
         let rendered = Rendered {
-            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0),
+            layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
         };
         let boxes = replaced_boxes(&rendered);
         assert_eq!(boxes.len(), 1);
@@ -8224,7 +8324,7 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &[]);
         let mut fonts = FontStore::new();
         let sizes = IntrinsicSizes::new();
-        let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 500.0);
+        let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 500.0, 500.0);
         let image = laid_out
             .root
             .children
@@ -8314,7 +8414,14 @@ mod tests {
         )];
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
-        let laid = layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 400.0);
+        let laid = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            400.0,
+        );
 
         let rendered = Rendered { layout: laid };
         let boxes = content_boxes(&rendered);
@@ -8500,6 +8607,51 @@ mod tests {
         });
 
         assert_eq!(at.0, 80.0);
+    }
+
+    #[test]
+    fn a_fixed_box_measures_from_the_viewport_past_every_positioned_ancestor() {
+        // The whole of what separates `fixed` from `absolute` at layout time.
+        // The two boxes are written identically inside the same relatively
+        // positioned container, and they land in different places.
+        let rendered = run(
+            "<body><div class=\"rel\"><div class=\"fix\">x</div>\
+             <div class=\"abs\">x</div></div></body>",
+            "body { margin: 0 } \
+             .rel { position: relative; margin: 60px; border: 5px solid blue } \
+             .fix { position: fixed; top: 0; left: 0; width: 10px; height: 10px } \
+             .abs { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            400.0,
+        );
+        let at =
+            |want: Position| on_the_page(&rendered.layout.root, move |b| b.style.position == want);
+
+        assert_eq!(at(Position::Fixed), (0.0, 0.0), "fixed is the page corner");
+        assert_eq!(
+            at(Position::Absolute),
+            (65.0, 65.0),
+            "absolute is the container's padding box"
+        );
+    }
+
+    #[test]
+    fn a_fixed_boxs_far_edges_are_the_windows() {
+        // `bottom` and `right` need the viewport's real height, which is not
+        // the number the initial containing block carries for percentage
+        // heights — that one is the width standing in for a height nobody
+        // knows yet.
+        let rendered = run_in(
+            "<body><div class=\"fix\">x</div></body>",
+            "body { margin: 0 } \
+             .fix { position: fixed; bottom: 0; right: 0; width: 10px; height: 10px }",
+            400.0,
+            300.0,
+        );
+        let at = on_the_page(&rendered.layout.root, |b| {
+            b.style.position == Position::Fixed
+        });
+
+        assert_eq!(at, (390.0, 290.0));
     }
 
     #[test]
@@ -8976,7 +9128,15 @@ mod clipped_overflow_tests {
         let sheets = [Stylesheet::parse(css::ua::UA_STYLESHEET)];
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
-        layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 800.0).height
+        layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            800.0,
+            800.0,
+        )
+        .height
     }
 
     #[test]
@@ -9096,7 +9256,14 @@ mod hit_tests {
         let doc = dom::parse(html);
         let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
         let mut fonts = FontStore::new();
-        let layout = layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 600.0);
+        let layout = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            600.0,
+            600.0,
+        );
         Page { doc, layout }
     }
 
@@ -9203,7 +9370,7 @@ mod hit_tests {
         sizes.insert(image, (40.0, 40.0));
         let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("body { margin: 0 }")]);
         let mut fonts = FontStore::new();
-        let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 600.0);
+        let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0);
 
         let rect = *laid_out
             .rects_for(image)
@@ -9239,7 +9406,15 @@ mod find_tests {
         let doc = dom::parse(html);
         let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
         let mut fonts = FontStore::new();
-        layout(&doc, &styles, &mut fonts, &IntrinsicSizes::new(), 600.0).find(query)
+        layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            600.0,
+            600.0,
+        )
+        .find(query)
     }
 
     #[test]

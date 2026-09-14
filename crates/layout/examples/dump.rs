@@ -47,6 +47,7 @@ fn main() {
         &mut fonts,
         &layout::IntrinsicSizes::new(),
         width,
+        width,
     );
     println!("--- boxes");
     walk(&laid_out.root, 0, 0.0, 0.0);

@@ -779,7 +779,18 @@ pub(crate) fn render_sized(
     // had its turn, and the rest of the pipeline reads.
     let styles = styles;
 
-    let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
+    // The band is the window's page area, which is what `position: fixed`
+    // measures against. For a plain `render` it is the cap on the canvas
+    // instead — the nearest thing to a viewport a caller with no window has,
+    // and the same number a test harness means by one.
+    let laid_out = layout::layout(
+        &doc,
+        &styles,
+        fonts,
+        &intrinsic,
+        width as f32,
+        band_height.max(1) as f32,
+    );
     let list = build_display_list(&laid_out);
     // The band asked for, clipped to what the document actually has below it.
     // A page shorter than the band gets a canvas its own height, which is what

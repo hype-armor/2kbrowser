@@ -1483,7 +1483,14 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
         let sizes = layout::IntrinsicSizes::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
+        let layout = layout::layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &sizes,
+            width as f32,
+            width as f32,
+        );
         let list = build_display_list(&layout);
         let height = layout.height.ceil().max(1.0) as u32;
         let images = ImageStore::new();
@@ -1706,7 +1713,14 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
         let sizes = layout::IntrinsicSizes::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
+        let layout = layout::layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &sizes,
+            width as f32,
+            width as f32,
+        );
         let height = layout.height.ceil().max(1.0) as u32;
         (build_display_list(&layout), fonts, height)
     }
@@ -2639,7 +2653,7 @@ mod canvas_background_tests {
         let styles = css::cascade::cascade(&doc, &[Stylesheet::default()]);
         let mut fonts = FontStore::new();
         let sizes = layout::IntrinsicSizes::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, 200.0);
+        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, 200.0, 200.0);
         (build_display_list(&layout), doc)
     }
 
