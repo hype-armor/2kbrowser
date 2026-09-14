@@ -241,6 +241,15 @@ so nothing is re-placed per scroll position. That is a change to how painting
 works rather than to what `fixed` means, and it is recorded rather than
 pretended away.
 
+§10.8.1's strut is on the line now, and with the face's own metrics rather
+than a fraction of the font size. It decides how far a line reaches *below* its
+baseline, which is what puts the few pixels of descender space under an image
+sitting alone in a table cell — and it is exactly what quirks mode takes away
+again, because a line box with no text on it has no strut there. Pages of the
+era were authored against that: a sliced image with a gap under every tile is
+not a near miss, it is the page coming apart. Both modes now land on the same
+pixel row as Chromium.
+
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by
 `counter-reset` covers the element, its **following siblings**, and all of

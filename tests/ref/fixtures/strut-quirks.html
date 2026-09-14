@@ -1,0 +1,13 @@
+<title>line box strut, quirks mode</title>
+<style>
+  body { margin: 10px; font: 16px serif; background: #fff }
+  table { border-collapse: collapse; background: #c00 }
+  td { padding: 0 }
+  img { display: inline; border: 0 }
+</style>
+<!-- No doctype, so quirks mode: a line box holding no text has no strut and
+     the cell is exactly as tall as the image. No red anywhere. This is what
+     the era's sliced-image tables were built on. -->
+<table><tr><td><img src="assets/logo.png" width="40" height="40"></td></tr></table>
+<!-- A line with text on it still gets one, in either mode. -->
+<table><tr><td>x<img src="assets/logo.png" width="40" height="40"></td></tr></table>

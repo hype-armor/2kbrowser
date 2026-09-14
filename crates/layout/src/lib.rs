@@ -2009,9 +2009,11 @@ fn flush_inline(
     // block child still flows around a float that reaches down to it.
     let local = context.translated(0.0, at.1 - content_top, content_width);
     let layout = if local.is_empty() {
-        fonts.layout_runs(&runs, style, content_width)
+        fonts.layout_runs_with(&runs, style, strut_for(doc), content_width)
     } else {
-        fonts.layout_runs_constrained(&runs, style, |y, height| local.line_box(y, height))
+        fonts.layout_runs_in(&runs, style, strut_for(doc), |y, height| {
+            local.line_box(y, height)
+        })
     };
     let height = layout.height;
 
@@ -2328,9 +2330,11 @@ fn layout_block(
         .any(|run| !run.text.trim().is_empty() || run.replaced.is_some())
     {
         let layout = if context.is_empty() {
-            fonts.layout_runs(&runs, style, content_width)
+            fonts.layout_runs_with(&runs, style, strut_for(doc), content_width)
         } else {
-            fonts.layout_runs_constrained(&runs, style, |y, height| context.line_box(y, height))
+            fonts.layout_runs_in(&runs, style, strut_for(doc), |y, height| {
+                context.line_box(y, height)
+            })
         };
         content_height = layout.height;
         emit_replaced_boxes(
@@ -3971,6 +3975,19 @@ fn collect_inline_runs(
         push_generated(after, node, &[], &mut numbering, available_width, &mut runs);
     }
     runs
+}
+
+/// Which strut rule this document's line boxes follow.
+///
+/// Quirks mode is not a detail here: the era this engine renders is almost
+/// entirely quirks mode, and the quirk in question is the one that decides
+/// whether a sliced-image table has a hairline gap under every tile.
+fn strut_for(doc: &Document) -> text::Strut {
+    if doc.is_quirks() {
+        text::Strut::WhereThereIsText
+    } else {
+        text::Strut::Always
+    }
 }
 
 /// Gives the `::first-letter` box its own run, split out of the first run that
