@@ -1,0 +1,27 @@
+<!doctype html>
+<title>containing blocks</title>
+<style>
+  body { margin: 20px; font: 14px serif }
+  /* A paragraph whose top margin escapes the body, moving it after the
+     absolute box below has been placed against the page. */
+  p { margin-top: 60px }
+  .corner {
+    position: absolute; top: 0; left: 0;
+    width: 40px; height: 40px; background: #c33;
+  }
+  /* CSS 2.1 10.1: the containing block is the ancestor's *padding* box, so `left: 0`
+     sits inside the border and outside the padding, and `50%` is half of the
+     padding box rather than half of the content box. */
+  .outer {
+    position: relative; width: 160px; height: 90px;
+    border: 10px solid #036; padding: 20px; background: #cde;
+  }
+  .inside { position: absolute; top: 0; left: 0; width: 24px; height: 24px; background: #063 }
+  .half { position: absolute; top: 0; left: 50%; width: 8px; height: 90px; background: #630 }
+</style>
+<p>The red square is at the page corner, not at the body's margin.</p>
+<div class="outer">
+  <div class="inside"></div>
+  <div class="half"></div>
+</div>
+<div class="corner"></div>

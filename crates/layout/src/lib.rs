@@ -109,6 +109,22 @@ impl ContainingBlock {
             definite_height: Some(size.1),
         }
     }
+
+    /// The same, as §10.1 actually defines it: the *padding* box, not the
+    /// content box and not the border box.
+    ///
+    /// `border` is where the padding box sits inside this box's own
+    /// coordinates, which are the border box's — so the origin is negative,
+    /// and `left: 0` puts a child against the inside of the border rather than
+    /// on top of it.
+    fn establish_padding_box(content: (f32, f32), padding: (f32, f32), border: (f32, f32)) -> Self {
+        let size = (content.0 + padding.0, content.1 + padding.1);
+        Self {
+            offset: (-border.0, -border.1),
+            size,
+            definite_height: Some(size.1),
+        }
+    }
 }
 
 /// Resolves an absolutely positioned box's offset within its containing block.
@@ -2821,6 +2837,29 @@ fn layout_block(
     // legend's slot in flow had made.
     let legend_overhang = forms::break_the_rule_for_a_legend(doc, node, border_top, &mut box_);
 
+    // Where this box's content origin sits inside the containing block it
+    // *inherited*, for out-of-flow children that are still measured against
+    // that one rather than against this box.
+    //
+    // Two corrections, both of which were missing and both of which show up as
+    // an absolutely positioned box landing at the wrong place rather than as
+    // anything to do with margins. The box's own margins move it inside its
+    // parent and were never counted, so `position: absolute; top: 0; left: 0`
+    // came out at the body's 8px margin instead of the page corner. And the
+    // top margin is not final until it has finished collapsing — a `<p>` with
+    // `margin-top: 1in` pushes the body down an inch after the box below has
+    // already been placed against it, which put it an inch low. A legend
+    // lifted out of its fieldset's rule moves the box at the same late moment
+    // and for the same reason.
+    let settled_top = match escaped_top {
+        Some(escaped) => collapse(margin_top, escaped),
+        None => margin_top,
+    } + legend_overhang;
+    let inherited_origin = (
+        margin_left + padding_left + border_left,
+        settled_top + padding_top + border_top,
+    );
+
     // Absolutely positioned children, now that this block's size is known.
     // A positioned box becomes the containing block for its own descendants;
     // otherwise the one inherited from an ancestor still applies.
@@ -2834,9 +2873,13 @@ fn layout_block(
     let mut reinserted = 0;
     for (child, child_style, static_y, at) in absolutes {
         let child_containing = if style.position.is_positioned() {
-            ContainingBlock::establish(own_size)
+            ContainingBlock::establish_padding_box(
+                own_size,
+                (padding_left + padding_right, padding_top + padding_bottom),
+                (border_left, border_top),
+            )
         } else {
-            containing.descend(padding_left + border_left, padding_top + border_top)
+            containing.descend(inherited_origin.0, inherited_origin.1)
         };
 
         let mut probe = LayoutBox {
@@ -2945,11 +2988,8 @@ fn layout_block(
     // Whatever escaped from the first child is this box's margin now. The box
     // was positioned with its own margin long before that was known, so it
     // moves by the difference rather than being placed again.
-    let collapsed_top = match escaped_top {
-        Some(escaped) => collapse(margin_top, escaped),
-        None => margin_top,
-    };
-    box_.rect.y += collapsed_top + legend_overhang - margin_top;
+    let collapsed_top = settled_top - legend_overhang;
+    box_.rect.y += settled_top - margin_top;
 
     let own_bottom = style.margin.bottom.to_px(font_size, available_width);
     let consumed = Consumed {
@@ -8364,6 +8404,102 @@ mod tests {
             after(&positioned),
             after(&plain)
         );
+    }
+
+    /// A box's position on the page, rather than inside its parent.
+    fn on_the_page(root: &LayoutBox, want: impl Fn(&LayoutBox) -> bool) -> (f32, f32) {
+        fn walk(
+            box_: &LayoutBox,
+            at: (f32, f32),
+            want: &impl Fn(&LayoutBox) -> bool,
+            found: &mut Option<(f32, f32)>,
+        ) {
+            let here = (at.0 + box_.rect.x, at.1 + box_.rect.y);
+            if found.is_none() && want(box_) {
+                *found = Some(here);
+            }
+            for child in &box_.children {
+                walk(child, here, want, found);
+            }
+        }
+        let mut found = None;
+        walk(root, (0.0, 0.0), &want, &mut found);
+        found.expect("no box matched")
+    }
+
+    #[test]
+    fn an_absolute_box_with_no_positioned_ancestor_measures_from_the_page() {
+        // §10.1: with nothing positioned above it the containing block is the
+        // initial one, so `top: 0; left: 0` is the corner of the page — not
+        // the corner of whichever box happens to hold the element. The body's
+        // own margins are the ones that used to leak in.
+        let rendered = run(
+            "<body><div class=\"a\">x</div></body>",
+            "body { margin: 25px } \
+             .a { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            400.0,
+        );
+        let at = on_the_page(&rendered.layout.root, |b| {
+            b.style.position == Position::Absolute
+        });
+
+        assert_eq!(at, (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_collapsed_margin_does_not_drag_an_absolute_box_down_with_it() {
+        // The paragraph's top margin escapes the body and moves it an inch
+        // down — after the absolute box below has already been placed against
+        // the page. The box must stay where it was put.
+        let rendered = run(
+            "<body><p>text</p><div class=\"a\">x</div></body>",
+            "body { margin: 0 } p { margin-top: 96px } \
+             .a { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            400.0,
+        );
+        let at = on_the_page(&rendered.layout.root, |b| {
+            b.style.position == Position::Absolute
+        });
+
+        assert_eq!(at, (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_containing_block_is_the_ancestors_padding_box() {
+        // §10.1 says padding box, which is neither of the two boxes it is easy
+        // to reach for: `left: 0` lands inside the border and outside the
+        // padding, so a 12px border moves the child and a 30px padding does
+        // not.
+        let rendered = run(
+            "<body><div class=\"outer\"><div class=\"inner\">x</div></div></body>",
+            "body { margin: 0 } \
+             .outer { position: relative; border: 12px solid blue; padding: 30px } \
+             .inner { position: absolute; left: 0; top: 0; width: 10px; height: 10px }",
+            400.0,
+        );
+        let at = on_the_page(&rendered.layout.root, |b| {
+            b.style.position == Position::Absolute
+        });
+
+        assert_eq!(at, (12.0, 12.0));
+    }
+
+    #[test]
+    fn a_percentage_against_a_containing_block_uses_its_padding_box_too() {
+        // The same rule, measured by size rather than by origin: 50% of a
+        // 100px content box plus 60px of padding is 80, not 50.
+        let rendered = run(
+            "<body><div class=\"outer\"><div class=\"inner\">x</div></div></body>",
+            "body { margin: 0 } \
+             .outer { position: relative; width: 100px; padding: 30px } \
+             .inner { position: absolute; left: 50%; top: 0; width: 10px; height: 10px }",
+            400.0,
+        );
+        let at = on_the_page(&rendered.layout.root, |b| {
+            b.style.position == Position::Absolute
+        });
+
+        assert_eq!(at.0, 80.0);
     }
 
     #[test]
