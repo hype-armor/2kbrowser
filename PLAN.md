@@ -355,7 +355,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    it faces. Captions, above or below per `caption-side`, outside the table's
    border box. `table-layout: fixed`, where the columns and the first row decide
    the widths and nothing below them is measured (§17.5.2.1); `empty-cells`;
-   and a `border-spacing` per axis
+   and a `border-spacing` per axis. A table is never narrower than its own
+   caption — §17.4's wrapper box, folded into the table's width rather than
+   built as a box of its own
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
@@ -400,10 +402,7 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden: forms that draw but do not work —
 no control can be typed into, clicked or submitted — the properties that parse
 and are then ignored
-(`list-style-image`), a caption wider than its table — which overhangs rather than widening
-the wrapper box CSS 2.1 puts around a table and its caption, since there is no
-such box here, so the table sits further left than a browser draws it —
-the corner where
+(`list-style-image`), the corner where
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
 settled here by width rather than by a diagonal mitre, and proper
 block-in-inline splitting — an inline element containing a block is

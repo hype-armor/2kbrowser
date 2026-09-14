@@ -351,6 +351,14 @@ const PROPERTIES: &[Property] = &[
         expected: Verdict::Honoured,
     },
     Property {
+        // The scaffold is narrow enough that the phrase must wrap without it.
+        name: "white-space: nowrap",
+        scaffold: "#t { width: 80px; background: #ccc }",
+        declaration: "#t { white-space: nowrap }",
+        body: "<div id=t>several words that would otherwise wrap</div>",
+        expected: Verdict::Honoured,
+    },
+    Property {
         name: "direction: rtl",
         scaffold: "",
         declaration: "#t { direction: rtl }",
