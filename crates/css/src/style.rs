@@ -968,6 +968,55 @@ pub enum BorderCollapse {
     Collapse,
 }
 
+/// `empty-cells`: whether a cell with nothing in it draws itself.
+///
+/// Separated model only (§17.6.1.1). In the collapsing model a cell has no
+/// border of its own to hide — it shares the grid line — and CSS 2.1 says the
+/// property does not apply there at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmptyCells {
+    /// An empty cell draws its border and background like any other. The
+    /// initial value, and what the era's table layouts depend on: a spacer cell
+    /// with a `bgcolor` and no content is how a coloured rule was drawn.
+    #[default]
+    Show,
+    /// An empty cell draws neither, leaving the table's background showing.
+    Hide,
+}
+
+/// Parses an `empty-cells` keyword.
+pub fn parse_empty_cells(name: &str) -> Option<EmptyCells> {
+    match name {
+        "show" => Some(EmptyCells::Show),
+        "hide" => Some(EmptyCells::Hide),
+        _ => None,
+    }
+}
+
+/// `table-layout`: where a table's column widths come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableLayout {
+    /// Measured from every cell's content (§17.5.2.2). The initial value, and
+    /// the one the era's pages are built on — a layout table sized by what is
+    /// in it is the whole technique.
+    #[default]
+    Auto,
+    /// Taken from the columns and the first row alone (§17.5.2.1), so the rest
+    /// of the table never has to be measured. Faster, and what an author reaches
+    /// for when they want the widths they wrote rather than the widths their
+    /// content implies.
+    Fixed,
+}
+
+/// Parses a `table-layout` keyword.
+pub fn parse_table_layout(name: &str) -> Option<TableLayout> {
+    match name {
+        "auto" => Some(TableLayout::Auto),
+        "fixed" => Some(TableLayout::Fixed),
+        _ => None,
+    }
+}
+
 /// Parses a `border-collapse` keyword.
 pub fn parse_border_collapse(name: &str) -> Option<BorderCollapse> {
     match name {
@@ -1147,14 +1196,23 @@ pub struct ComputedStyle {
     pub background_position: BackgroundPosition,
     /// `vertical-align`, as it applies to a table cell.
     pub vertical_align: VerticalAlign,
-    /// `border-spacing`, the gap between cell borders in the separated model.
+    /// `border-spacing`, the gap between cell borders in the separated model:
+    /// horizontal first, then vertical.
     ///
-    /// On a table only. Kept as a length rather than pixels because it is
+    /// On a table only. Kept as lengths rather than pixels because they are
     /// resolved against the table's own font size, like any other length.
     /// Ignored entirely when `border_collapse` is `Collapse`.
-    pub border_spacing: Length,
+    ///
+    /// Two values, because §17.6.1 allows two and a page that writes
+    /// `border-spacing: 0 8px` means the rows to be spaced and the columns not
+    /// to be. One value applies to both axes.
+    pub border_spacing: (Length, Length),
     /// `border-collapse`, inherited, which model a table's borders use.
     pub border_collapse: BorderCollapse,
+    /// `empty-cells`, inherited, whether an empty cell draws itself.
+    pub empty_cells: EmptyCells,
+    /// `table-layout`, on a table, where its column widths come from.
+    pub table_layout: TableLayout,
     /// `caption-side`, inherited, which side of a table its caption sits on.
     pub caption_side: CaptionSide,
     /// `visibility`, inherited. A hidden box keeps its space.
@@ -1344,8 +1402,10 @@ impl Default for ComputedStyle {
             background_position: BackgroundPosition::default(),
             overflow: Overflow::Visible,
             vertical_align: VerticalAlign::Baseline,
-            border_spacing: Length::Px(0.0),
+            border_spacing: (Length::Px(0.0), Length::Px(0.0)),
             border_collapse: BorderCollapse::Separate,
+            empty_cells: EmptyCells::Show,
+            table_layout: TableLayout::Auto,
             caption_side: CaptionSide::Top,
             visibility: Visibility::Visible,
             text_transform: TextTransform::None,
@@ -1399,6 +1459,7 @@ impl ComputedStyle {
             // §17.6: inherited, so a rule on `table` reaches the cells that
             // have to agree with it about where their borders are.
             border_collapse: parent.border_collapse,
+            empty_cells: parent.empty_cells,
             // §17.4.1: set on the table, read on the caption.
             caption_side: parent.caption_side,
             // §11.2: hiding a container hides what is inside it, and a

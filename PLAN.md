@@ -347,7 +347,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    conflict resolution in full, resolved per grid line *segment* so that one
    edge of a spanning cell can carry a different border against each neighbour
    it faces. Captions, above or below per `caption-side`, outside the table's
-   border box. Missing: fixed layout
+   border box. `table-layout: fixed`, where the columns and the first row decide
+   the widths and nothing below them is measured (§17.5.2.1); `empty-cells`;
+   and a `border-spacing` per axis
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
@@ -381,17 +383,15 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    margins centre a block; and an inline element wrapping a block one still
    lays that block out
 
-Known-wrong and recorded rather than hidden: fixed table
-layout, forms that draw but do not work — no control can be typed into, clicked
-or submitted — the properties that parse and are then ignored
-(`word-spacing`, `font-variant`, `outline`, `max-height`,
-`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
-`position: fixed`, `border-spacing`'s second value, `direction`, and generated
-content), a caption wider than its table — which overhangs rather than widening
+Known-wrong and recorded rather than hidden: forms that draw but do not work —
+no control can be typed into, clicked or submitted — the properties that parse
+and are then ignored
+(`word-spacing`, `font-variant`, `outline`,
+`text-align: justify`, `list-style-position`, `list-style-image`,
+`position: fixed`, and `direction`), a caption wider than its table — which overhangs rather than widening
 the wrapper box CSS 2.1 puts around a table and its caption, since there is no
 such box here, so the table sits further left than a browser draws it —
-`empty-cells` — ignored in the separated model, where it applies, and
-correctly ignored in the collapsing one, where it does not — the corner where
+the corner where
 two collapsed borders cross, which CSS 2.1 leaves undefined and which is
 settled here by width rather than by a diagonal mitre, and proper
 block-in-inline splitting — an inline element containing a block is

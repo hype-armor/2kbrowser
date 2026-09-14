@@ -895,6 +895,124 @@ pub fn with_reserved_borders(
     out
 }
 
+/// Column widths under `table-layout: fixed` (§17.5.2.1).
+///
+/// The columns and the *first row* decide, and nothing else in the table is
+/// measured at all — which is the point of the property: a table whose widths
+/// are declared should not cost a pass over every cell to find out what they
+/// already are. A column with no width of its own takes an equal share of
+/// whatever is left.
+///
+/// `usable` is the room the columns have between them, with the border spacing
+/// already taken out.
+pub fn fixed_widths(
+    grid: &Grid,
+    font_size: f32,
+    usable: f32,
+    stretch: bool,
+    intrinsic: &[f32],
+    cell_borders: impl Fn(&Cell) -> (f32, f32),
+) -> Vec<f32> {
+    let mut widths: Vec<Option<f32>> = vec![None; grid.columns];
+    let resolve = |length: css::value::Length| match length {
+        css::value::Length::Auto => None,
+        length => Some(length.to_px(font_size, usable).max(0.0)),
+    };
+
+    // A `<col>` or `<colgroup>` first: it speaks for its columns whatever the
+    // cells below it say.
+    for band in grid.column_groups.iter().chain(&grid.columns_declared) {
+        let Some(width) = resolve(band.style.width) else {
+            continue;
+        };
+        let end = band.end.min(grid.columns);
+        let span = end.saturating_sub(band.start);
+        if span == 0 {
+            continue;
+        }
+        let each = width / span as f32;
+        for slot in widths.iter_mut().take(end).skip(band.start) {
+            *slot = Some(each);
+        }
+    }
+
+    // Then the first row, for the columns no band claimed. A spanning cell
+    // divides its width evenly, which is what the spec says to do and the only
+    // answer available without measuring anything.
+    //
+    // A cell contributes its *border box*: §17.5.2.1 sizes the column to hold
+    // the whole cell, so a `width: 80px` cell with 24px of padding and a 36px
+    // border either side makes a 200px column. Taking the content width alone
+    // is the difference between a column that fits its cell and one the cell
+    // hangs out of on both sides.
+    if let Some(row) = grid.rows.first() {
+        for cell in &row.cells {
+            let Some(width) = resolve(cell.style.width).map(|width| {
+                let font_size = cell.style.font_size;
+                // The borders come from the caller because they are not always
+                // the ones the cell declared: in the collapsing model it keeps
+                // half of each grid line and the other half is its neighbour's.
+                let (left, right) = cell_borders(cell);
+                width
+                    + cell.style.padding.left.to_px(font_size, usable).max(0.0)
+                    + cell.style.padding.right.to_px(font_size, usable).max(0.0)
+                    + left
+                    + right
+            }) else {
+                continue;
+            };
+            let end = (cell.column + cell.colspan).min(grid.columns);
+            let span = end.saturating_sub(cell.column);
+            if span == 0 {
+                continue;
+            }
+            let each = width / span as f32;
+            for slot in widths.iter_mut().take(end).skip(cell.column) {
+                slot.get_or_insert(each);
+            }
+        }
+    }
+
+    let claimed: f32 = widths.iter().flatten().sum();
+    let undeclared = widths.iter().filter(|slot| slot.is_none()).count();
+    let leftover = (usable - claimed).max(0.0);
+    if undeclared > 0 {
+        // §17.5.2.1 gives the columns that declared nothing an equal share of
+        // what is left — which is only an answer where there is a table width
+        // to have a remainder *of*. A table that declared none has no surplus
+        // to share out, so a column with nothing of its own falls back to what
+        // its content wants, exactly as it would under automatic layout.
+        // Without that, one undeclared column takes the whole window.
+        let each = leftover / undeclared as f32;
+        return widths
+            .into_iter()
+            .enumerate()
+            .map(|(column, slot)| {
+                slot.unwrap_or(if stretch {
+                    each
+                } else {
+                    intrinsic.get(column).copied().unwrap_or(each)
+                })
+            })
+            .collect();
+    }
+    // Every column asked for a width. If the table was given one too, the
+    // surplus is shared out rather than left as a gap — that is what keeps
+    // `width: 100%` meaning the whole width. If it was not, the table is as
+    // wide as its columns said and no wider: stretching them to the container
+    // turns `<col width="50">` twice over into a table the width of the
+    // window.
+    let share = if stretch && grid.columns > 0 {
+        leftover / grid.columns as f32
+    } else {
+        0.0
+    };
+    widths
+        .into_iter()
+        .map(|slot| slot.unwrap_or(0.0) + share)
+        .collect()
+}
+
 /// Distributes `available` width across columns given their intrinsic widths.
 ///
 /// This is the heart of automatic table layout. Below the minimum the table

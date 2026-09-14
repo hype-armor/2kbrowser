@@ -16,6 +16,46 @@ record for everything earlier.
 
 ## Unreleased
 
+**Three table gaps the plan had been carrying since M2 opened** — fixed layout,
+`empty-cells`, and a `border-spacing` per axis. Together they are worth **85
+newly passing tests and none newly failing**, 3271 of 4821 to 3356, which is the
+largest single move since the suite started being measured in both directions.
+
+**`table-layout: fixed`** (§17.5.2.1). The columns and the *first row* decide
+the widths and nothing below them is measured, which is the point of the
+property: a table whose widths are declared should not cost a pass over every
+cell to find out what they already are.
+
+Two things in it are easy to get wrong and both were caught by measuring rather
+than by reading. A column takes the cell's **border box** — a `width: 80px` cell
+with 24px of padding and a 36px border either side makes a 200px column, not an
+80px one — and in the collapsing model the borders it adds are the *used* ones,
+half of each grid line rather than what the cell declared. The first was worth 35
+tests and the second 8.
+
+And a fixed table that declared no width of its own does not stretch its columns
+to the window: it is as wide as they asked to be, and a column that asked for
+nothing falls back to what its content wants, exactly as it would under
+automatic layout. Without that, `<col width="50">` twice over made a table the
+width of the window.
+
+**`empty-cells: hide`** (§17.6.1.1): a cell with nothing in it draws neither its
+background nor its border, so the table's own shows through. It keeps its room —
+the property decides what is painted, not what is laid out — which is why it is
+applied to the finished box rather than to the style it was laid out with. The
+collapsing model has no cell border to hide and CSS 2.1 says the property does
+not apply there, so it does not.
+
+**And `border-spacing` takes a length per axis.** Only the first was read, so
+`border-spacing: 0 8px` — the rows spaced and the columns not — came out with
+the axes the wrong way round on one of them. A band's background has to stop at
+a gap on either axis now, which the row-group work of the previous entry had
+only had to think about horizontally.
+
+`cargo run -p gaps` is what caught the documentation drifting behind the code
+here: three rows recorded as ignored started being honoured, and it refuses to
+pass until README.md and PLAN.md say so too.
+
 **`line-height: normal` comes from the font** (#89). It was a flat 1.2 times the
 font size, applied in the cascade, where there are no fonts to ask. §10.8.1
 leaves the value to the user agent and says it should be "based on the font",
