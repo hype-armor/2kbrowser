@@ -16,6 +16,31 @@ record for everything earlier.
 
 ## Unreleased
 
+**`list-style-position`**, which PLAN.md has been listing as parsed and ignored
+since M2 opened. An `inside` marker is not a box in the list's padding but the
+first inline box of the item's *own* content, which is why it could not be a
+tweak to the existing marker: only something on the line pushes the first
+line's text along and leaves the rest where they were, so the second line of a
+wrapped item comes back under the marker instead of beside it. That is the
+whole visible difference between the two values, and it is what the new
+`list-style-position` reference fixture holds.
+
+The marker run carries the item's font and colour and none of its box. Cloning
+the item's style whole gave it the margin too, and §8.4 then charged that to
+the line — a list item with `margin-left: 1in` bought a second inch of inline
+edge and came out an inch too wide. Eleven `list-style-position-applies-to`
+tests failed on exactly that and said nothing about markers.
+
+**`counter(c, square)` prints a square.** §12.4.3 supports every
+`list-style-type`, the glyph ones included; this printed nothing for `disc`,
+`circle` and `square`, with a doc comment confidently citing the section it was
+contradicting. The suite could not catch it, because the test's reference is
+built out of `list-style-position: inside` markers that this engine also drew
+nowhere — a blank matched a blank, and the pair passed. Fixing the marker is
+what made the blank on one side go away.
+
+Five conformance tests together, nothing lost in the other direction.
+
 **`inherit` is a value now**, which it was not before — the cascade read it as
 a length, a colour or a font family name, failed to parse it, and dropped the
 declaration. §6.2.1 makes it universal: every property takes it, including the

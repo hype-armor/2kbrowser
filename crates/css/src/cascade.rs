@@ -10,9 +10,9 @@ use crate::style::{
     DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, LineHeight,
     ListStyleType, MEDIUM_BORDER, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
     parse_background_position, parse_background_repeat, parse_border_collapse, parse_border_style,
-    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type,
-    parse_overflow, parse_position, parse_text_decoration, parse_text_transform,
-    parse_vertical_align, parse_visibility,
+    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float,
+    parse_list_style_position, parse_list_style_type, parse_overflow, parse_position,
+    parse_text_decoration, parse_text_transform, parse_vertical_align, parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -813,12 +813,32 @@ fn apply(
         }
         // `list-style` is a shorthand; only the type is modelled, so scan the
         // whole value for a keyword we recognise rather than reading the first.
+        // The shorthand takes type, position and image in any order, so each
+        // is looked for across all the values rather than by position. An
+        // absent one is left alone rather than reset: `list-style-image` is
+        // not implemented, and resetting a component this engine cannot honour
+        // would only mean forgetting the type the author did set.
         "list-style-type" | "list-style" => {
             if let Some(kind) = values.iter().find_map(|raw| match raw {
                 Raw::Ident(name) => parse_list_style_type(name),
                 _ => None,
             }) {
                 style.list_style_type = kind;
+            }
+            if declaration.name == "list-style"
+                && let Some(position) = values.iter().find_map(|raw| match raw {
+                    Raw::Ident(name) => parse_list_style_position(name),
+                    _ => None,
+                })
+            {
+                style.list_style_position = position;
+            }
+        }
+        "list-style-position" => {
+            if let Raw::Ident(name) = first
+                && let Some(position) = parse_list_style_position(name)
+            {
+                style.list_style_position = position;
             }
         }
         // Two values are allowed — horizontal then vertical — but a table
@@ -2784,6 +2804,33 @@ mod tests {
                 &format!("{sheet} li::before {{ content: counters(s, \".\") }}")
             ),
             ["1", "1.1", "1.2", "2"]
+        );
+    }
+
+    #[test]
+    fn a_counter_in_a_glyph_style_prints_the_glyph() {
+        // §12.4.3 supports every list-style-type, so `counter(c, square)` is a
+        // square — the count is thrown away, but the glyph is not.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 7 } p::before { content: counter(c, square) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("\u{25aa}")
+        );
+        // `none` is the one style that prints nothing.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 7 } p::before { content: counter(c, none) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("")
         );
     }
 
