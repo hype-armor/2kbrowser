@@ -10,9 +10,10 @@ use crate::style::{
     DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, FontVariant, GenericFamily,
     LineHeight, ListStyleType, MEDIUM_BORDER, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
     parse_background_position, parse_background_repeat, parse_border_collapse, parse_border_style,
-    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float, parse_font_variant,
-    parse_list_style_position, parse_list_style_type, parse_overflow, parse_position,
-    parse_text_decoration, parse_text_transform, parse_vertical_align, parse_visibility,
+    parse_caption_side, parse_clear, parse_clip, parse_direction, parse_display, parse_float,
+    parse_font_variant, parse_list_style_position, parse_list_style_type, parse_overflow,
+    parse_position, parse_text_decoration, parse_text_transform, parse_unicode_bidi,
+    parse_vertical_align, parse_visibility,
 };
 use crate::value::{
     Color, Length, Raw, parse_color, parse_color_quirky, parse_length, parse_length_quirky,
@@ -755,6 +756,20 @@ fn apply(
                 style.font_size = size;
             }
         }
+        "direction" => {
+            if let Raw::Ident(name) = first
+                && let Some(direction) = parse_direction(name)
+            {
+                style.direction = direction;
+            }
+        }
+        "unicode-bidi" => {
+            if let Raw::Ident(name) = first
+                && let Some(bidi) = parse_unicode_bidi(name)
+            {
+                style.unicode_bidi = bidi;
+            }
+        }
         "font-variant" => {
             if let Raw::Ident(name) = first
                 && let Some(variant) = parse_font_variant(name)
@@ -1188,6 +1203,8 @@ fn inherit_property(style: &mut ComputedStyle, name: &str, parent: &ComputedStyl
         "font-weight" => style.font_weight = parent.font_weight,
         "font-style" => style.font_style = parent.font_style,
         "font-variant" => style.font_variant = parent.font_variant,
+        "direction" => style.direction = parent.direction,
+        "unicode-bidi" => style.unicode_bidi = parent.unicode_bidi,
         "line-height" => style.line_height = parent.line_height,
         "font" => {
             style.font_variant = parent.font_variant;
@@ -2238,6 +2255,7 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool, zoom: f32, n
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::Direction;
     use crate::style::{
         BackgroundPosition, BackgroundRepeat, BorderCollapse, CaptionSide, Display, ListStyleType,
         VerticalAlign, Visibility,
@@ -2338,6 +2356,13 @@ mod tests {
 
         assert_eq!(style.font_family.families, vec!["verdana".to_string()]);
         assert_eq!(style.counter_reset, vec![("page".to_string(), 3)]);
+    }
+
+    #[test]
+    fn direction_is_read_and_inherited() {
+        let style = style_of("<div><p>x</p></div>", "div { direction: rtl }", "p");
+        assert_eq!(style.direction, Direction::Rtl);
+        assert_eq!(style.text_align.against(style.direction), TextAlign::Right);
     }
 
     #[test]
@@ -3687,7 +3712,10 @@ mod tests {
         );
         assert_eq!(style.margin.left, Length::Auto);
         assert_eq!(style.margin.right, Length::Auto);
-        assert_eq!(style.text_align, TextAlign::Left);
+        // Untouched: the initial value, which settles to `left` in a
+        // left-to-right document and is not what `align="center"` set.
+        assert_eq!(style.text_align, TextAlign::Start);
+        assert_eq!(style.text_align.against(Direction::Ltr), TextAlign::Left);
     }
 
     #[test]

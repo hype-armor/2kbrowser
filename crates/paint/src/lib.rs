@@ -321,9 +321,12 @@ fn paint_box(
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
         let content_y = y + box_.content_origin.1;
-        let content_width = box_.content_width;
         for line in &layout.lines {
-            let dx = line_offset(box_.style.text_align, line.width, content_width);
+            let dx = line_offset(
+                box_.style.text_align.against(box_.style.direction),
+                line.width,
+                line.available.min(box_.content_width),
+            );
             // An inline box's own background and border, under everything the
             // line draws. Outermost first, which is the order the fragments
             // come in, so a nested span's background covers its parent's.

@@ -17,9 +17,10 @@ use cosmic_text::{
     Weight,
 };
 use css::style::{
-    ComputedStyle, FontStyle, FontVariant, GenericFamily, TextDecoration, VerticalAlign,
-    Visibility, WhiteSpace,
+    ComputedStyle, Direction, FontStyle, FontVariant, GenericFamily, TextDecoration, UnicodeBidi,
+    VerticalAlign, Visibility, WhiteSpace,
 };
+use unicode_bidi::{BidiClass, BidiInfo, Level};
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
 const SANS: &[(&str, &[u8])] = &[
@@ -197,6 +198,189 @@ pub enum Strut {
     WhereThereIsText,
 }
 
+/// A paragraph's bidi embedding levels, one per byte of the text analysed.
+///
+/// Owned rather than a borrowed `BidiInfo`, because the text it was computed
+/// over is built here and thrown away: the levels are the only part anything
+/// downstream needs, and keeping them by value spares every caller a lifetime.
+struct Bidi {
+    levels: Vec<Level>,
+    base: Level,
+}
+
+impl Bidi {
+    /// The level at a byte offset, or the paragraph's own past the end.
+    fn at(&self, offset: usize) -> Level {
+        self.levels.get(offset).copied().unwrap_or(self.base)
+    }
+}
+
+/// Runs the bidi algorithm over a whole inline formatting context, and says
+/// where each run's text landed in the string it was run over.
+///
+/// That string is not the text that will be drawn. §8.6 defines `unicode-bidi`
+/// by saying which control characters an element is equivalent to, so `embed`
+/// and `bidi-override` are implemented by writing those characters: they steer
+/// the algorithm and are never shaped. An atomic inline box becomes U+FFFC,
+/// the object replacement character UAX #9 asks for, so an image between two
+/// Hebrew words is ordered along with them instead of cutting the run in two.
+///
+/// One analysis for the whole context rather than one per run, because
+/// reordering is a property of the paragraph: a run measured on its own has no
+/// way to know that the word before it was Hebrew.
+fn analyse_bidi(runs: &[InlineRun], base: Direction) -> (Bidi, Vec<usize>) {
+    let base = match base {
+        Direction::Ltr => Level::ltr(),
+        Direction::Rtl => Level::rtl(),
+    };
+    let mut text = String::new();
+    let mut starts = Vec::with_capacity(runs.len());
+    for run in runs {
+        let (open, close) = match (run.style.unicode_bidi, run.style.direction) {
+            (UnicodeBidi::Normal, _) => ("", ""),
+            (UnicodeBidi::Embed, Direction::Ltr) => ("\u{202a}", "\u{202c}"),
+            (UnicodeBidi::Embed, Direction::Rtl) => ("\u{202b}", "\u{202c}"),
+            (UnicodeBidi::BidiOverride, Direction::Ltr) => ("\u{202d}", "\u{202c}"),
+            (UnicodeBidi::BidiOverride, Direction::Rtl) => ("\u{202e}", "\u{202c}"),
+        };
+        text.push_str(open);
+        starts.push(text.len());
+        if run.replaced.is_some() {
+            text.push('\u{fffc}');
+        } else {
+            text.push_str(&run.text);
+        }
+        text.push_str(close);
+    }
+    let info = BidiInfo::new(&text, Some(base));
+    (
+        Bidi {
+            levels: info.levels,
+            base,
+        },
+        starts,
+    )
+}
+
+/// Splits a piece of text into maximal stretches of one embedding level, with
+/// the level each carries.
+///
+/// `at` is where the text begins in the string [`analyse_bidi`] ran over.
+/// Always at least one stretch, so a caller can treat the last one as the end
+/// of the word without checking.
+fn level_runs<'a>(bidi: &Bidi, at: usize, text: &'a str) -> Vec<(Level, &'a str)> {
+    let mut out: Vec<(Level, &str)> = Vec::new();
+    let mut start = 0;
+    let mut level = bidi.at(at);
+    for (offset, _) in text.char_indices() {
+        let here = bidi.at(at + offset);
+        if here != level && offset > start {
+            out.push((level, &text[start..offset]));
+            start = offset;
+            level = here;
+        }
+    }
+    out.push((level, &text[start..]));
+    out
+}
+
+/// The text without the bidi formatting characters.
+///
+/// They steer the algorithm and are never drawn: UAX #9 removes them, and a
+/// shaper handed one either draws a box for it or — worse here — acts on it.
+/// Kept out of the shaped text as well as out of the glyphs, so a search of
+/// the page matches what a reader sees.
+fn without_bidi_controls(text: &str) -> String {
+    text.chars().filter(|&c| !is_bidi_control(c)).collect()
+}
+
+/// Whether a character is one of UAX #9's explicit formatting codes.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether a character is strongly right-to-left in its own right, rather than
+/// having been put that way by an override.
+fn is_strongly_rtl(c: char) -> bool {
+    matches!(
+        unicode_bidi::bidi_class(c),
+        BidiClass::R | BidiClass::AL | BidiClass::AN
+    )
+}
+
+/// The text with UAX #9's mirrored characters swapped for their pairs.
+///
+/// Only the pairs that turn up in running text: brackets, braces, angle
+/// brackets and the two sets of quotation guillemets. The full
+/// `Bidi_Mirroring_Glyph` property is a few hundred entries of mathematics
+/// that no page of this era contains, and the table below is data rather than
+/// an algorithm — which is the line this project draws around what it writes
+/// itself.
+///
+/// Every mapping is its own inverse, so this is safe to apply once and no more.
+fn mirrored(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '(' => ')',
+            ')' => '(',
+            '[' => ']',
+            ']' => '[',
+            '{' => '}',
+            '}' => '{',
+            '<' => '>',
+            '>' => '<',
+            '\u{00ab}' => '\u{00bb}',
+            '\u{00bb}' => '\u{00ab}',
+            '\u{2039}' => '\u{203a}',
+            '\u{203a}' => '\u{2039}',
+            other => other,
+        })
+        .collect()
+}
+
+/// Where a line sits and how much of the width it had.
+///
+/// Two numbers that always travel together and that a float pulls apart from
+/// the block's own content box: the line starts at `offset` and is `available`
+/// wide, which is what alignment measures against.
+#[derive(Debug, Clone, Copy)]
+struct Room {
+    offset: f32,
+    available: f32,
+}
+
+/// Turns a forwards-shaped run back to front, in place.
+///
+/// Each glyph keeps its own advance and takes the place its mirror image had:
+/// the last glyph starts at zero and the first ends at the run's width. The
+/// advances are read back out of the positions, which is what the shaper leaves
+/// behind — the final one is whatever is left between the last glyph and the
+/// end of the run.
+fn mirror(shaped: &mut Shaped) {
+    let width = shaped.width;
+    let mut advances: Vec<f32> = Vec::with_capacity(shaped.glyphs.len());
+    for at in 0..shaped.glyphs.len() {
+        let next = shaped.glyphs.get(at + 1).map_or(width, |glyph| glyph.x);
+        advances.push((next - shaped.glyphs[at].x).max(0.0));
+    }
+    for (glyph, advance) in shaped.glyphs.iter_mut().zip(&advances) {
+        glyph.x = width - glyph.x - advance;
+    }
+    // Left to right again, so anything downstream that walks the glyphs in
+    // order walks them across the page.
+    shaped.glyphs.reverse();
+}
+
+/// The order to draw a line's segments in, left to right (UAX #9's rule L2).
+///
+/// Indices into `levels`. An all-even line comes back in its own order, which
+/// is why this can run on every line rather than behind a test for
+/// right-to-left content — one code path that every page exercises beats a
+/// rare one that nothing does.
+fn visual_order(levels: &[Level]) -> Vec<usize> {
+    BidiInfo::reorder_visual(levels)
+}
+
 /// A face's vertical metrics, as fractions of the font size.
 ///
 /// Two questions are answered from these and they are not the same question.
@@ -299,6 +483,13 @@ pub struct InlineEdge {
     pub width: f32,
     /// Whether this is the box's opening side rather than its closing one.
     pub opening: bool,
+    /// Whether the box's own `direction` is right-to-left.
+    ///
+    /// Which side "opening" means, and not answerable from the bidi level the
+    /// side happens to sit at: an override inside a left-to-right `<span>`
+    /// puts the span's own closing side at a right-to-left level, and the
+    /// border still belongs on the right.
+    pub rtl: bool,
 }
 
 /// A run of text with its own style, within a block's inline content.
@@ -456,6 +647,14 @@ pub struct Line {
     pub text: String,
     /// Width of the line's inked content.
     pub width: f32,
+    /// Room this line actually had, which is not always the block's content
+    /// width: a float narrows it, and `text-align: right` beside one must
+    /// measure from the edge of the room rather than from the edge of the box.
+    ///
+    /// Never wider than the content box in practice, but not guaranteed to be:
+    /// a form control's label is shaped at an unwrapped width on purpose, so
+    /// callers take the smaller of this and the box they are aligning within.
+    pub available: f32,
     /// Top of the line box, relative to the text origin.
     pub y: f32,
     /// Distance from the line box top to the baseline.
@@ -510,6 +709,22 @@ struct Segment {
     align: VerticalAlign,
     /// Horizontal position within the line, filled in during placement.
     x: f32,
+    /// The embedding level of the whitespace that follows this segment, which
+    /// is not always the segment's own.
+    ///
+    /// A space between two Hebrew words is right-to-left and travels with
+    /// them; the space between the last Hebrew word and the English after it
+    /// is a neutral that takes the paragraph's direction, and belongs at the
+    /// far end of the Hebrew rather than inside it. Same character, same
+    /// place in the source, two different answers — which is why it needs a
+    /// level of its own rather than borrowing the segment's.
+    space_level: Level,
+    /// This segment's bidi embedding level (§8.6 / UAX #9).
+    ///
+    /// Even is left-to-right, odd is right-to-left. Carried per segment because
+    /// reordering happens per *line*, and which segments share a line is not
+    /// known until the line has been filled.
+    level: Level,
     /// Decoration the segment's style asks for.
     decoration: TextDecoration,
     /// The segment's font size, which sets where its rules sit and how thick
@@ -855,6 +1070,48 @@ impl FontStore {
     /// Shaping happens per segment rather than per character, so joining
     /// scripts and ligatures within a segment stay correct; segments are cut
     /// only at Unicode break opportunities, where shaping does not carry over.
+    /// Shapes a segment that the bidi algorithm has put at `level`.
+    ///
+    /// Right-to-left *script* needs nothing: `cosmic-text` shapes Hebrew and
+    /// Arabic in their own direction from the characters themselves, which is
+    /// why they came out right long before any of this existed.
+    ///
+    /// What needs handling is left-to-right text that an override has put at a
+    /// right-to-left level — `unicode-bidi: bidi-override`, or a U+202E in the
+    /// source. The shaper does not act on the explicit formatting codes at all:
+    /// handed `<RLO>abcdef<PDF>` it shapes two blank glyphs and six letters
+    /// forwards, which was worth measuring before believing. So the run is
+    /// shaped forwards and then mirrored here.
+    ///
+    /// That is rule L2 applied to glyphs rather than to segments, and it is the
+    /// one piece of UAX #9 this engine does itself. It is not the part the
+    /// plan says to leave alone — the levels still come from `unicode-bidi` —
+    /// and there is nowhere else to put it: no shaper will reverse letters it
+    /// has been given no reason to reverse.
+    fn shape_directed(&mut self, text: &str, style: &ComputedStyle, level: Level) -> Shaped {
+        // The controls have done their work in `analyse_bidi` and are not
+        // content. Left in, they shape as blank boxes that take real width.
+        let bare = without_bidi_controls(text);
+        if bare.is_empty() {
+            return Shaped::default();
+        }
+        if level.is_ltr() || bare.chars().any(is_strongly_rtl) {
+            return self.shape_segment(&bare, style);
+        }
+        // Rule L4 as well as L2: a bracket in right-to-left text is drawn as
+        // the bracket that faces the other way, so that `(x)` reads as `(x)`
+        // once the run has been turned round rather than as `)x(`. Done by
+        // shaping the mirrored characters rather than by substituting glyphs,
+        // which leaves the shaper to find them — it is the one that knows what
+        // is in the face.
+        let mut shaped = self.shape_segment(&mirrored(&bare), style);
+        mirror(&mut shaped);
+        // The offsets index the text the author wrote, and mirroring is
+        // character for character, so they still line up.
+        shaped.text = bare;
+        shaped
+    }
+
     fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Shaped {
         let line_height = self.used_line_height(style);
         if style.font_variant == FontVariant::SmallCaps {
@@ -1065,7 +1322,7 @@ impl FontStore {
     where
         F: Fn(f32, f32) -> (f32, f32),
     {
-        let segments = self.segment(runs);
+        let segments = self.segment(runs, default_style.direction);
         if segments.is_empty() {
             return TextLayout::default();
         }
@@ -1164,13 +1421,16 @@ impl FontStore {
                 // last line of its paragraph and §16.2 justifies it.
                 let justify = (default_style.text_align == css::style::TextAlign::Justify)
                     .then_some(available);
-                let (offset, _) = constraints(y, line_height);
+                let (offset, room) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
                 Self::push_line(
                     &mut layout,
                     &mut current,
-                    offset,
+                    Room {
+                        offset,
+                        available: room,
+                    },
                     y,
                     ascent,
                     line_height,
@@ -1234,13 +1494,16 @@ impl FontStore {
             // A newline in `pre`, or any other mandatory opportunity, ends the
             // line regardless of how much room is left.
             if forced {
-                let (offset, _) = constraints(y, line_height);
+                let (offset, room) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
                 Self::push_line(
                     &mut layout,
                     &mut current,
-                    offset,
+                    Room {
+                        offset,
+                        available: room,
+                    },
                     y,
                     ascent,
                     line_height,
@@ -1256,12 +1519,15 @@ impl FontStore {
         }
 
         if !current.is_empty() {
-            let (offset, _) = constraints(y, line_height);
+            let (offset, room) = constraints(y, line_height);
             let offset = offset + if first_line { indent } else { 0.0 };
             Self::push_line(
                 &mut layout,
                 &mut current,
-                offset,
+                Room {
+                    offset,
+                    available: room,
+                },
                 y,
                 ascent,
                 line_height,
@@ -1282,38 +1548,83 @@ impl FontStore {
     fn push_line(
         layout: &mut TextLayout,
         current: &mut Vec<Segment>,
-        offset: f32,
+        room: Room,
         line_y: f32,
         ascent: f32,
         line_height: f32,
         justify_to: Option<f32>,
     ) {
+        // UAX #9's rule L2, and the whole of what bidi costs this engine: the
+        // segments were filled in *logical* order, and a line is drawn in
+        // visual order. `reorder_visual` returns its input's own order for an
+        // all-left-to-right line, so this runs unconditionally rather than
+        // behind a test for right-to-left content — one code path that is
+        // exercised by every page rather than a rare one that is not.
+        //
+        // The x positions are recomputed here rather than trusted from the
+        // fill loop, which assigned them left to right as each word arrived
+        // and could not have known what would land beside them.
+        let order = Self::visual_line(current);
+        let mut pen = 0.0;
+        // Whitespace owed to the far end of a right-to-left run: it follows the
+        // run in logical order and so follows it visually too, which is past
+        // every segment of the run rather than beside the one that carries it.
+        let mut owed = 0.0;
+        for &at in &order {
+            let segment = &mut current[at];
+            if segment.level.is_rtl() {
+                // A space *inside* a right-to-left run is drawn before the word
+                // it follows, "after" being the logical side and this the
+                // visual one. Keeping it on the right in both cases sends the
+                // space between two Hebrew words to the end of the line, where
+                // it is invisible and the two words end up touching.
+                if segment.space_level.is_rtl() {
+                    pen += segment.trailing_space;
+                    segment.x = pen;
+                    pen += segment.shaped.width;
+                } else {
+                    segment.x = pen;
+                    pen += segment.shaped.width;
+                    owed += segment.trailing_space;
+                }
+            } else {
+                pen += std::mem::take(&mut owed);
+                segment.x = pen;
+                pen += segment.shaped.width + segment.trailing_space;
+            }
+        }
+
         // §16.2: `justify` stretches the spaces until the line fills its box.
         // Only the spaces — letters stay where the shaper put them — and only
         // on a line that was ended because the next word would not fit. The
         // last line of a paragraph, and the line before a forced break, keep
         // their natural width, which is why the caller decides rather than this.
         if let Some(target) = justify_to {
-            let inked = current
+            let inked = order
                 .last()
-                .map_or(0.0, |segment| segment.x + segment.shaped.width);
-            let gaps = current
+                .map_or(0.0, |&at| current[at].x + current[at].shaped.width);
+            let gaps = order
                 .iter()
-                .take(current.len().saturating_sub(1))
-                .filter(|segment| segment.trailing_space > 0.0)
+                .take(order.len().saturating_sub(1))
+                .filter(|&&at| current[at].trailing_space > 0.0)
                 .count();
             let slack = target - inked;
             if gaps > 0 && slack > 0.0 {
                 let each = slack / gaps as f32;
                 let mut shift = 0.0;
-                for segment in current.iter_mut() {
-                    segment.x += shift;
-                    if segment.trailing_space > 0.0 {
+                // In visual order, because that is the order the gaps appear
+                // in: walking the logical one would widen the space after a
+                // Hebrew word by however much the words drawn to its *right*
+                // had claimed.
+                for &at in &order {
+                    current[at].x += shift;
+                    if current[at].trailing_space > 0.0 {
                         shift += each;
                     }
                 }
             }
         }
+        let Room { offset, available } = room;
         let mut glyphs = Vec::new();
         let mut text = String::new();
         let mut width = 0.0f32;
@@ -1348,10 +1659,11 @@ impl FontStore {
             glyphs,
             replaced: Self::replaced_for(current, offset, line_y, ascent, line_height),
             spans: Self::spans_for(current, offset, line_y, line_height),
-            boxes: Self::boxes_for(current, offset, line_y + ascent),
+            boxes: Self::boxes_for(current, &order, offset, line_y + ascent),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
             text,
             width,
+            available,
             y: line_y,
             baseline: ascent,
         });
@@ -1372,6 +1684,82 @@ impl FontStore {
         ((ascent + leading).max(0.0), (descent + leading).max(0.0))
     }
 
+    /// The order to draw this line's segments in, left to right.
+    ///
+    /// UAX #9's rule L2 over the *text*, and then the inline boxes' own sides
+    /// put back where they belong. An `<a>`'s left border is not a character
+    /// and does not reorder like one: §8.4 puts it at the start edge of the
+    /// box, which is the left of its leftmost fragment for a left-to-right
+    /// box and the right of its rightmost for a right-to-left one, however the
+    /// text inside it was rearranged.
+    ///
+    /// Reordering the sides along with the text is what put a span's left
+    /// padding on the wrong side of the word it belonged to, and it only
+    /// showed up once `direction` was honoured at all — before that, no line
+    /// was ever reordered and every side happened to be in the right place.
+    fn visual_line(current: &[Segment]) -> Vec<usize> {
+        let content: Vec<usize> = (0..current.len())
+            .filter(|&at| current[at].edge.is_none())
+            .collect();
+        let levels: Vec<Level> = content.iter().map(|&at| current[at].level).collect();
+        // Visual position of each content segment, by its index in `current`.
+        let mut visual = vec![0usize; current.len()];
+        for (position, &at) in visual_order(&levels).iter().enumerate() {
+            visual[content[at]] = position;
+        }
+
+        // Where a box's content sits on this line, visually.
+        let span_of = |box_: usize| {
+            content
+                .iter()
+                .filter(|&&at| current[at].boxes.contains(&box_))
+                .fold(None, |found: Option<(usize, usize)>, &at| {
+                    let here = visual[at];
+                    Some(match found {
+                        Some((first, last)) => (first.min(here), last.max(here)),
+                        None => (here, here),
+                    })
+                })
+        };
+
+        let mut keys: Vec<(f32, usize)> = Vec::with_capacity(current.len());
+        for (at, segment) in current.iter().enumerate() {
+            let key = match segment.edge {
+                None => visual[at] as f32,
+                Some(edge) => {
+                    let Some(&box_) = segment.boxes.last() else {
+                        continue;
+                    };
+                    // How deeply nested this box is, so that when two boxes
+                    // share an edge the outer one's side stays outside the
+                    // inner one's. A *larger* depth sits nearer the content,
+                    // which is why it moves the key inwards on both sides —
+                    // getting that backwards nests `<div><div>` the wrong way
+                    // round and is not a bidi bug at all: it shows up on a
+                    // plain left-to-right page with two borders in a row.
+                    let depth = (segment.boxes.len() as f32 / 1000.0).min(0.4);
+                    match span_of(box_) {
+                        // An empty box has no content to hang from and keeps
+                        // the place the source gave it.
+                        None => visual.get(at).copied().unwrap_or(at) as f32,
+                        Some((first, last)) => {
+                            if edge.opening != edge.rtl {
+                                first as f32 - 0.5 + depth
+                            } else {
+                                last as f32 + 0.5 - depth
+                            }
+                        }
+                    }
+                }
+            };
+            keys.push((key, at));
+        }
+        // Stable, so segments that tie keep source order — which is what
+        // settles two empty boxes side by side.
+        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+        keys.into_iter().map(|(_, at)| at).collect()
+    }
+
     /// One fragment per inline box crossing this line.
     ///
     /// Measured over every segment *inside* the box rather than over the ones
@@ -1383,9 +1771,22 @@ impl FontStore {
     /// line box. §10.6.1: `line-height` does not grow an inline box's
     /// background, so a paragraph set double-spaced highlights its phrases at
     /// the size of the words rather than in bands that touch.
-    fn boxes_for(segments: &[Segment], offset: f32, baseline: f32) -> Vec<InlineBoxFragment> {
+    fn boxes_for(
+        segments: &[Segment],
+        order: &[usize],
+        offset: f32,
+        baseline: f32,
+    ) -> Vec<InlineBoxFragment> {
         let mut out: Vec<InlineBoxFragment> = Vec::new();
-        for segment in segments {
+        // In *visual* order, and merging only into a fragment the previous
+        // segment was also part of. Reordering can cut a box in two on one
+        // line — a `<span>` around text an override sends to the far side of
+        // its neighbours is drawn as two boxes with the neighbours between
+        // them — and merging by element alone would draw one box spanning the
+        // gap, with a border straight through the text that is not inside it.
+        let mut previous: Vec<usize> = Vec::new();
+        for &at in order {
+            let segment = &segments[at];
             let left = segment.x + offset;
             let right = left + segment.shaped.width;
             let (top, height) = match segment.replaced {
@@ -1403,7 +1804,13 @@ impl FontStore {
                 ),
             };
             for &source in &segment.boxes {
-                match out.iter_mut().find(|box_| box_.source == source) {
+                let joins = previous.contains(&source);
+                match out
+                    .iter_mut()
+                    .rev()
+                    .find(|box_| box_.source == source)
+                    .filter(|_| joins)
+                {
                     Some(found) => {
                         found.width = right - found.x;
                         let bottom = (found.y + found.height).max(top + height);
@@ -1423,6 +1830,7 @@ impl FontStore {
                     }),
                 }
             }
+            previous.clone_from(&segment.boxes);
         }
         out
     }
@@ -1589,9 +1997,14 @@ impl FontStore {
     /// spaces. Scripts without spaces — CJK above all — break between
     /// characters, and a space-splitting breaker would hand them one
     /// unbreakable segment per paragraph that could never wrap.
-    fn segment(&mut self, runs: &[InlineRun]) -> Vec<Segment> {
+    fn segment(&mut self, runs: &[InlineRun], base: Direction) -> Vec<Segment> {
+        let (bidi, starts) = analyse_bidi(runs, base);
         let mut out: Vec<Segment> = Vec::new();
-        for run in runs {
+        for (index, run) in runs.iter().enumerate() {
+            // Where this run's text begins in the string the algorithm saw,
+            // which is not where it begins in the text that will be drawn: the
+            // control characters `unicode-bidi` stands for sit in between.
+            let run_start = starts[index];
             // Measured once per run rather than once per segment: a paragraph
             // is one run and dozens of segments, all in the same face.
             let content = self.content_box(&run.style);
@@ -1613,6 +2026,8 @@ impl FontStore {
                     mandatory_break: false,
                     align: run.style.vertical_align,
                     x: 0.0,
+                    level: bidi.at(run_start),
+                    space_level: bidi.at(run_start),
                     replaced: Some(box_),
                     source: run.source,
                     decoration: run.style.text_decoration,
@@ -1652,6 +2067,11 @@ impl FontStore {
                     mandatory_break: false,
                     align: run.style.vertical_align,
                     x: 0.0,
+                    // An inline box's own side is not text and has no level of
+                    // its own; it takes the one where it stands so that it
+                    // travels with the words it brackets.
+                    level: bidi.at(run_start),
+                    space_level: bidi.at(run_start),
                     replaced: None,
                     source: run.source,
                     decoration: TextDecoration::default(),
@@ -1669,9 +2089,10 @@ impl FontStore {
             }
             let preserve = run.style.white_space == WhiteSpace::Pre;
             let mut start = 0usize;
-            for (index, opportunity) in unicode_linebreak::linebreaks(&run.text) {
-                let piece = &run.text[start..index];
-                start = index;
+            for (at, opportunity) in unicode_linebreak::linebreaks(&run.text) {
+                let piece = &run.text[start..at];
+                let piece_start = start;
+                start = at;
                 // The algorithm reports Mandatory at end of text as well as at
                 // hard line breaks. Requiring an actual break character tells
                 // them apart — otherwise every run boundary would end a line,
@@ -1715,6 +2136,7 @@ impl FontStore {
                         && !already_breaking
                     {
                         last.trailing_space += space_width;
+                        last.space_level = bidi.at(run_start + piece_start);
                         last.mandatory_break |= mandatory;
                     } else if mandatory {
                         let height = self.used_line_height(&run.style);
@@ -1728,6 +2150,8 @@ impl FontStore {
                             mandatory_break: true,
                             align: run.style.vertical_align,
                             x: 0.0,
+                            level: bidi.at(run_start + piece_start),
+                            space_level: bidi.at(run_start + piece_start),
                             replaced: None,
                             source: run.source,
                             decoration: run.style.text_decoration,
@@ -1742,23 +2166,38 @@ impl FontStore {
                     continue;
                 }
 
-                let shaped = self.shape_segment(trimmed, &run.style);
-                out.push(Segment {
-                    shaped,
-                    trailing_space: space_width,
-                    mandatory_break: mandatory,
-                    align: run.style.vertical_align,
-                    x: 0.0,
-                    replaced: None,
-                    source: run.source,
-                    decoration: run.style.text_decoration,
-                    font_size: run.style.font_size,
-                    color: span_color(&run.style),
-                    hidden: run.style.visibility == Visibility::Hidden,
-                    edge: None,
-                    boxes: run.boxes.clone(),
-                    content,
-                });
+                // Split again, at every change of embedding level. A piece
+                // is the text between two line-break opportunities, and there
+                // is no rule that the algorithm holds one level across it:
+                // `AAA<RLO>BBB` is one unbreakable word and two directions.
+                // Without this the whole word takes the level it started at
+                // and the override does nothing at all.
+                let pieces = level_runs(&bidi, run_start + piece_start, trimmed);
+                let last_piece = pieces.len() - 1;
+                for (at, (level, part)) in pieces.into_iter().enumerate() {
+                    let tail = at == last_piece;
+                    let shaped = self.shape_directed(part, &run.style, level);
+                    out.push(Segment {
+                        shaped,
+                        // Only the last piece of a word carries what follows
+                        // the word.
+                        trailing_space: if tail { space_width } else { 0.0 },
+                        mandatory_break: mandatory && tail,
+                        align: run.style.vertical_align,
+                        x: 0.0,
+                        level,
+                        space_level: bidi.at(run_start + piece_start + trimmed.len()),
+                        replaced: None,
+                        source: run.source,
+                        decoration: run.style.text_decoration,
+                        font_size: run.style.font_size,
+                        color: span_color(&run.style),
+                        hidden: run.style.visibility == Visibility::Hidden,
+                        edge: None,
+                        boxes: run.boxes.clone(),
+                        content,
+                    });
+                }
             }
         }
         // The algorithm reports a mandatory break at end of text; that is the
@@ -1881,6 +2320,91 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn two_hebrew_words_are_drawn_in_the_other_order() {
+        // The case that showed the gap: each word was already shaped
+        // right-to-left, and the two words were placed left to right.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let runs = [InlineRun::text(
+            "\u{5d0}\u{5d1} \u{5d2}\u{5d3}",
+            style.clone(),
+        )];
+        let laid = fonts.layout_runs(&runs, &style, 400.0);
+        let line = laid.lines.first().expect("a line");
+
+        let first = line
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.start == 0)
+            .expect("the first word's glyphs");
+        let second = line
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.start > 4)
+            .expect("the second word's glyphs");
+        assert!(
+            first.x > second.x,
+            "the word written first is at {} and the next at {}; the first belongs further right",
+            first.x,
+            second.x
+        );
+    }
+
+    #[test]
+    fn an_override_turns_latin_round() {
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let plain = fonts.shape_directed("abc", &style, Level::ltr());
+        let forced = fonts.shape_directed("abc", &style, Level::rtl());
+
+        assert_eq!(plain.width, forced.width, "reversing must not resize");
+        let ids = |shaped: &Shaped| {
+            shaped
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.glyph_id)
+                .collect::<Vec<_>>()
+        };
+        let mut backwards = ids(&plain);
+        backwards.reverse();
+        assert_eq!(ids(&forced), backwards);
+    }
+
+    #[test]
+    fn right_to_left_script_is_left_to_the_shaper() {
+        // Hebrew is already shaped right-to-left from its own characters, and
+        // reversing it a second time here would put it back the way it came.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let natural = fonts.shape_segment("\u{5d0}\u{5d1}\u{5d2}", &style);
+        let directed = fonts.shape_directed("\u{5d0}\u{5d1}\u{5d2}", &style, Level::rtl());
+
+        let xs = |shaped: &Shaped| shaped.glyphs.iter().map(|g| g.x).collect::<Vec<_>>();
+        assert_eq!(xs(&natural), xs(&directed));
+    }
+
+    #[test]
+    fn a_bracket_in_right_to_left_text_faces_the_other_way() {
+        // Rule L4. Without it `(x)` reads as `)x(` once the run has been
+        // turned round, which is the sort of wrongness a reader sees at once.
+        assert_eq!(mirrored("(x)"), ")x(");
+        assert_eq!(mirrored("[a]{b}"), "]a[}b{");
+        // Every mapping is its own inverse, so applying it twice changes
+        // nothing.
+        assert_eq!(
+            mirrored(&mirrored("\u{00ab}q\u{00bb}")),
+            "\u{00ab}q\u{00bb}"
+        );
+        assert_eq!(mirrored("abc123"), "abc123");
+    }
+
+    #[test]
+    fn bidi_controls_are_steering_and_not_content() {
+        assert_eq!(without_bidi_controls("a\u{202e}b\u{202c}c"), "abc");
+        assert_eq!(without_bidi_controls("plain"), "plain");
     }
 
     #[test]
@@ -2440,6 +2964,7 @@ mod tests {
                 InlineEdge {
                     width: edge,
                     opening,
+                    rtl: false,
                 },
                 style.clone(),
             )
@@ -2521,6 +3046,7 @@ mod tests {
                 InlineEdge {
                     width: 0.0,
                     opening: true,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -2533,6 +3059,7 @@ mod tests {
                 InlineEdge {
                     width: 0.0,
                     opening: false,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -2601,6 +3128,7 @@ mod tests {
                 InlineEdge {
                     width: 10.0,
                     opening: true,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -2610,6 +3138,7 @@ mod tests {
                 InlineEdge {
                     width: 10.0,
                     opening: false,
+                    rtl: false,
                 },
                 plain.clone(),
             )

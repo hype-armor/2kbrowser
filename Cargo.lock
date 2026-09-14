@@ -2264,6 +2264,7 @@ version = "0.3.0"
 dependencies = [
  "cosmic-text",
  "css",
+ "unicode-bidi",
  "unicode-linebreak",
 ]
 

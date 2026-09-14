@@ -355,7 +355,16 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { direction: rtl }",
         body: "<p id=t>abc def ghi</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
+    },
+    Property {
+        // The characters reorder, which `direction` alone would not show: a
+        // line of Latin only moves to the other edge.
+        name: "unicode-bidi: bidi-override",
+        scaffold: "#t { direction: rtl }",
+        declaration: "#t { unicode-bidi: bidi-override }",
+        body: "<p id=t>abcdef</p>",
+        expected: Verdict::Honoured,
     },
     Property {
         name: "generated content",
