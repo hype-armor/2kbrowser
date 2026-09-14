@@ -1566,6 +1566,28 @@ fn emit_replaced_boxes(
     }
 }
 
+/// Whether §9.2.1.1 breaks this inline element around a block inside it.
+///
+/// Shared by everything that has to agree about it, because disagreeing is how
+/// a box ends up reached by nobody: the walk stops treating the element as a
+/// block child the moment this is true, so anything that was relying on the
+/// element's own layout pass to find what is inside it has to descend here
+/// instead.
+///
+/// Only a plain, in-flow inline element is broken. A float or an out-of-flow
+/// box is blockified by §9.7 and placed against an edge, so nothing is broken
+/// around it; a positioned one is a containing block for its descendants,
+/// which taking it apart would lose.
+fn splits_around_a_block(doc: &Document, styles: &StyleMap, node: NodeId) -> bool {
+    styles.get(node).is_some_and(|style| {
+        style.display == Display::Inline
+            && style.float == Float::None
+            && !style.position.is_positioned()
+            && forms::control_of(doc, node).is_none()
+            && contains_block(doc, styles, node, 0)
+    })
+}
+
 /// Sorts the floats a block has to place into those declared before any in-flow
 /// block child and those declared after, so each is placed at the height it
 /// actually appears.
@@ -1597,9 +1619,17 @@ fn collect_floats(
                 &mut *early
             };
             into.push((child, child_style.clone()));
-        } else if is_inline_child(doc, styles, child, child_style) {
+        } else if is_inline_child(doc, styles, child, child_style)
+            || splits_around_a_block(doc, styles, child)
+        {
             // An inline-block places its own floats, in its own formatting
             // context; a form control has no children to look inside.
+            //
+            // An element §9.2.1.1 splits is descended into for a sharper
+            // reason: it no longer has a layout pass of its own to place them.
+            // Before the split it was laid out as a block and found its own
+            // floats; now the walk takes it apart, and a float inside it is
+            // reached by nothing at all unless it is reached from here.
             if child_style.display != Display::InlineBlock
                 && forms::control_of(doc, child).is_none()
             {
@@ -2084,7 +2114,7 @@ fn flush_inline(
     doc: &Document,
     styles: &StyleMap,
     fonts: &mut FontStore,
-    pending: &mut Vec<NodeId>,
+    pending: &mut Vec<Inlines>,
     holder: NodeId,
     style: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
@@ -2110,7 +2140,16 @@ fn flush_inline(
     if pending.is_empty() && lead.is_none() && tail.is_none() {
         return 0.0;
     }
-    let children = std::mem::take(pending);
+    let items = std::mem::take(pending);
+    // The inline-blocks among them, which are laid out whole before the line
+    // is broken. A bracket is not a node and contributes none.
+    let children: Vec<NodeId> = items
+        .iter()
+        .filter_map(|item| match *item {
+            Inlines::Child(child) => Some(child),
+            _ => None,
+        })
+        .collect();
     let mut blocks = InlineBlocks::new();
     layout_inline_blocks(
         doc,
@@ -2123,10 +2162,10 @@ fn flush_inline(
     );
     let mut runs = Vec::new();
     runs.extend(lead);
-    runs.extend(inline_runs_for(
+    runs.extend(inline_runs_of(
         doc,
         styles,
-        &children,
+        &items,
         style,
         holder,
         intrinsic,
@@ -2687,7 +2726,7 @@ fn layout_block(
         height
     });
 
-    let mut pending: Vec<NodeId> = Vec::new();
+    let mut pending: Vec<Inlines> = Vec::new();
     // §12.1: the generated boxes bracket the element's content, so they go on
     // the first and last stretch of it and nowhere else. `all_inline` has its
     // own path through `collect_inline_runs`; these are for the mixed case,
@@ -2714,11 +2753,33 @@ fn layout_block(
     // something between the margin and this box's bottom edge.
     let mut trailing_bottom: Option<f32> = None;
 
-    for &child in doc.children(node) {
+    // Which split inline elements the walk is currently inside, so a block
+    // child can close them and the stretch after it can pick them up again.
+    let mut open: Vec<NodeId> = Vec::new();
+    for step in walk_order(doc, styles, node, !all_inline) {
+        let child = match step {
+            Step::Node(child) => child,
+            Step::Opens(element) => {
+                pending.push(Inlines::Opens {
+                    node: element,
+                    starts: true,
+                });
+                open.push(element);
+                continue;
+            }
+            Step::Closes(element) => {
+                pending.push(Inlines::Closes {
+                    node: element,
+                    ends: true,
+                });
+                open.pop();
+                continue;
+            }
+        };
         let Some(child_style) = styles.get(child) else {
             // A text node has no style but is very much inline content.
             if doc.text(child).is_some() && !all_inline {
-                pending.push(child);
+                pending.push(Inlines::Child(child));
             }
             continue;
         };
@@ -2746,7 +2807,7 @@ fn layout_block(
         }
         if inline && !replaced {
             if !all_inline {
-                pending.push(child);
+                pending.push(Inlines::Child(child));
             }
             continue;
         }
@@ -2754,13 +2815,28 @@ fn layout_block(
         // A block child ends the run of inline content before it. Content
         // between two blocks stops their margins touching, so it also ends the
         // run of collapsing.
+        //
+        // Any inline element the walk is inside ends here too — not for real,
+        // which is what keeps its border off the break (§8.4).
+        interrupt_boxes(&mut pending, &open);
+        // The anonymous block a stretch lands in takes the *innermost split
+        // element's* style, not the container's, when it is inside one. The
+        // line's strut comes from it, and a `<font size=2>` broken around an
+        // `<hr>` — the era's own markup, and what this turned up on — has its
+        // links spaced by the container's larger font otherwise. Which is
+        // arguably what §9.2.1.1's anonymous boxes inherit, and is not what any
+        // browser draws.
+        let stretch_style = open
+            .last()
+            .and_then(|&element| styles.get(element))
+            .unwrap_or(style);
         let flushed = flush_inline(
             doc,
             styles,
             fonts,
             &mut pending,
             node,
-            style,
+            stretch_style,
             intrinsic,
             (padding_left + border_left, cursor_y),
             content_width,
@@ -2770,6 +2846,11 @@ fn layout_block(
             (lead.take(), None),
             &mut first_letter,
         );
+        // `flush_inline` drains what was pending, so the stretch on the far
+        // side of this block starts with the same elements open again. Done
+        // here rather than after the block is laid out because that branch has
+        // several exits and none of them touches `pending`.
+        resume_boxes(&mut pending, &open);
         cursor_y += flushed;
         if flushed > 0.0 {
             previous_bottom = None;
@@ -4059,10 +4140,275 @@ fn place_float(
 /// Whether `first` comes before `second` among `parent`'s children.
 fn precedes(doc: &Document, parent: NodeId, first: NodeId, second: NodeId) -> bool {
     let children = doc.children(parent);
-    let index = |target: NodeId| children.iter().position(|&c| c == target);
+    // Through the ancestor each one sits under, not by looking for the nodes
+    // themselves. §9.2.1.1's split hands this block's walk a *grandchild* — the
+    // block that broke an inline element open — and a grandchild is not in the
+    // list. Reading that as "does not precede" is how a float declared beside
+    // such a block stopped being placed before it and fell through to the end
+    // of the container instead.
+    let under = |target: NodeId| {
+        if children.contains(&target) {
+            return Some(target);
+        }
+        doc.ancestors(target).find(|node| children.contains(node))
+    };
+    let index =
+        |target: NodeId| under(target).and_then(|node| children.iter().position(|&c| c == node));
     match (index(first), index(second)) {
         (Some(a), Some(b)) => a < b,
         _ => false,
+    }
+}
+
+/// A block container's children in walk order, with split inline elements
+/// expanded in place.
+///
+/// §9.2.1.1: an inline element holding a block is broken around it, and the
+/// block becomes a sibling of the anonymous blocks its two halves land in. So
+/// the element does not appear here at all — its content does, bracketed by
+/// the markers that tell the runs builder which element it was inside.
+///
+/// Only a plain, in-flow inline element is expanded. A float or an out-of-flow
+/// box is blockified by §9.7 and placed against an edge, so nothing is broken
+/// around it; and a positioned one is a containing block for its descendants,
+/// which taking it apart here would lose.
+fn walk_order(doc: &Document, styles: &StyleMap, node: NodeId, split: bool) -> Vec<Step> {
+    let mut out = Vec::new();
+    for &child in doc.children(node) {
+        if split && splits_around_a_block(doc, styles, child) {
+            out.push(Step::Opens(child));
+            out.extend(walk_order(doc, styles, child, split));
+            out.push(Step::Closes(child));
+        } else {
+            out.push(Step::Node(child));
+        }
+    }
+    out
+}
+
+/// One entry in [`walk_order`].
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// A child to classify and lay out as the walk normally would.
+    Node(NodeId),
+    /// A split inline element's content starts here.
+    Opens(NodeId),
+    /// And ends here.
+    Closes(NodeId),
+}
+
+/// Closes every inline box still open, because a block child is about to end
+/// this stretch. None of them ends *for real* — they carry on in the next.
+fn interrupt_boxes(pending: &mut Vec<Inlines>, open: &[NodeId]) {
+    for &node in open.iter().rev() {
+        pending.push(Inlines::Closes { node, ends: false });
+    }
+}
+
+/// Reopens them on the far side of the block, likewise not for real.
+fn resume_boxes(pending: &mut Vec<Inlines>, open: &[NodeId]) {
+    for &node in open {
+        pending.push(Inlines::Opens {
+            node,
+            starts: false,
+        });
+    }
+}
+
+/// One entry in a block container's run of pending inline content.
+///
+/// A plain list of nodes was enough while an inline element was either wholly
+/// inline or wholly a block. §9.2.1.1 breaks that: an inline element holding a
+/// block is split around it, so one stretch holds *part* of that element's
+/// children and has to remember which element they were inside.
+#[derive(Debug, Clone, Copy)]
+enum Inlines {
+    /// An inline child, gathered whole.
+    Child(NodeId),
+    /// Where a split inline element's content begins in this stretch.
+    /// `starts` is false when an earlier stretch already began it and a block
+    /// child interrupted.
+    Opens { node: NodeId, starts: bool },
+    /// Where it ends. `ends` is false when a block child interrupted and the
+    /// element carries on in the next stretch.
+    Closes { node: NodeId, ends: bool },
+}
+
+/// The style an inline box's fragment draws with in one stretch of content.
+///
+/// §8.4: a box broken into fragments puts its start side on the first and its
+/// end side on the last, and nothing at either break. Applied by handing each
+/// stretch a style with the sides it does not own zeroed, which is all it takes
+/// — the room reserved on the line and the border painted later both read the
+/// same style, so neither has to be told about the split separately.
+fn fragment_style(style: &ComputedStyle, starts: bool, ends: bool) -> ComputedStyle {
+    let mut out = style.clone();
+    if !starts {
+        out.margin.left = Length::Px(0.0);
+        out.padding.left = Length::Px(0.0);
+        out.border.left.width = Length::Px(0.0);
+    }
+    if !ends {
+        out.margin.right = Length::Px(0.0);
+        out.padding.right = Length::Px(0.0);
+        out.border.right.width = Length::Px(0.0);
+    }
+    out
+}
+
+/// Collects one stretch of inline content, bracketing the split elements it
+/// sits inside.
+///
+/// The brackets are paired up first, because a stretch that neither opens nor
+/// closes a box still has to draw it — and what its fragment draws depends on
+/// whether the box began here, ended here, or merely passed through.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn inline_runs_of(
+    doc: &Document,
+    styles: &StyleMap,
+    items: &[Inlines],
+    inherited: &ComputedStyle,
+    holder: NodeId,
+    intrinsic: &IntrinsicSizes,
+    blocks: &InlineBlocks,
+    available_width: f32,
+    numbering: &mut Numbering,
+) -> Vec<InlineRun> {
+    // Which brackets pair with which, so an `Opens` knows whether its box also
+    // ends here — and ends for real, rather than being cut off by a block.
+    let mut ends_here = vec![false; items.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        match *item {
+            Inlines::Opens { .. } => open.push(at),
+            Inlines::Closes { ends, .. } => {
+                if let Some(start) = open.pop() {
+                    ends_here[start] = ends;
+                }
+            }
+            Inlines::Child(_) => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut boxes: Vec<usize> = Vec::new();
+    // What the content inside the open boxes inherits. A split element's own
+    // colour and font reach its text through this and nowhere else: the text
+    // nodes are gathered as children of the *container*, so without it a
+    // `<span style="color: black">` broken around a block draws its halves in
+    // whatever the container's colour was.
+    let mut within = inherited.clone();
+    // Per open box: the style its brackets were drawn with, the box list
+    // outside it, and what its content was inheriting before it opened.
+    let mut stack: Vec<(ComputedStyle, Vec<usize>, ComputedStyle)> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        match *item {
+            Inlines::Child(child) => gather_one(
+                doc,
+                styles,
+                child,
+                &within,
+                holder,
+                intrinsic,
+                blocks,
+                available_width,
+                &boxes,
+                numbering,
+                &mut out,
+            ),
+            Inlines::Opens { node, starts } => {
+                let Some(style) = styles.get(node) else {
+                    continue;
+                };
+                let outside = std::mem::replace(&mut within, style.clone());
+                let style = fragment_style(style, starts, ends_here[at]);
+                let outer = boxes.clone();
+                boxes = open_a_box(
+                    &style,
+                    Some(node.0),
+                    &boxes,
+                    numbering,
+                    available_width,
+                    &mut out,
+                );
+                stack.push((style, outer, outside));
+            }
+            Inlines::Closes { node, .. } => {
+                let Some((style, outer, outside)) = stack.pop() else {
+                    continue;
+                };
+                within = outside;
+                close_a_box(
+                    &style,
+                    Some(node.0),
+                    &boxes,
+                    &outer,
+                    available_width,
+                    &mut out,
+                );
+                boxes = outer;
+            }
+        }
+    }
+    collapse_across_runs(&mut out);
+    out
+}
+
+/// Collapses whitespace across a whole sequence of runs, and trims the ends.
+///
+/// Shared by the two ways a block's inline content is gathered, because it is
+/// the same text stream either way and collapsing it twice — or in two
+/// different places that drift apart — is how `<b>bold</b> <i>italic</i>`
+/// loses the space between the words.
+fn collapse_across_runs(runs: &mut [InlineRun]) {
+    // Whitespace collapsing spans run boundaries: `<b>bold</b> <i>italic</i>`
+    // must not lose the space between the runs, and `a <b> b</b>` must not keep
+    // two. Collapsing each run in isolation would get both wrong, so the runs
+    // are collapsed as one stream with the boundary state carried across.
+    let mut previous_ended_in_space = true;
+    for run in runs.iter_mut() {
+        if run.style.white_space == WhiteSpace::Pre {
+            previous_ended_in_space = run.text.ends_with(char::is_whitespace);
+            continue;
+        }
+        // An edge is not part of the text stream at all, so the state carries
+        // straight across it: `<p><span> text` opens with a space that §16.6.1
+        // removes for being at the start of a line, and treating the edge as
+        // content would keep it — visibly, once the span draws a border for it
+        // to sit inside.
+        if run.edge.is_some() {
+            continue;
+        }
+        // An atomic inline box carries no text but is content all the same, so
+        // the space after `<img> text` is between two things and survives.
+        if run.replaced.is_some() {
+            previous_ended_in_space = false;
+            continue;
+        }
+        let collapsed = collapse_whitespace_from(&run.text, previous_ended_in_space);
+        // A run that collapsed to nothing did not end in a space, but it did
+        // not end in anything else either: what precedes the next run is still
+        // whatever preceded this one. Reading the empty string as "no space
+        // here" is what let `<p>\n  <span> text` keep two spaces' worth of
+        // nothing and then a third real one.
+        previous_ended_in_space =
+            collapsed.ends_with(' ') || (collapsed.is_empty() && previous_ended_in_space);
+        run.text = collapsed;
+    }
+    // Leading and trailing whitespace of the whole block is dropped. An edge
+    // run is skipped over rather than trimmed: it carries no text, so the space
+    // at the start of `<p><span> text</span>` is on the run *after* it and
+    // trimming the edge would trim nothing. Replaced runs are deliberately not
+    // skipped — the space after a leading image is real text between two
+    // things, not the block's own leading whitespace.
+    if let Some(first) = runs.iter_mut().find(|run| run.edge.is_none()) {
+        first.text = first.text.trim_start().to_owned();
+    }
+    if let Some(last) = runs.iter_mut().rev().find(|run| run.edge.is_none()) {
+        last.text = last.text.trim_end().to_owned();
     }
 }
 
@@ -4292,52 +4638,7 @@ fn inline_runs_for(
         );
     }
 
-    // Whitespace collapsing spans run boundaries: `<b>bold</b> <i>italic</i>`
-    // must not lose the space between the runs, and `a <b> b</b>` must not keep
-    // two. Collapsing each run in isolation would get both wrong, so the runs
-    // are collapsed as one stream with the boundary state carried across.
-    let mut previous_ended_in_space = true;
-    for run in &mut runs {
-        if run.style.white_space == WhiteSpace::Pre {
-            previous_ended_in_space = run.text.ends_with(char::is_whitespace);
-            continue;
-        }
-        // An edge is not part of the text stream at all, so the state carries
-        // straight across it: `<p><span> text` opens with a space that §16.6.1
-        // removes for being at the start of a line, and treating the edge as
-        // content would keep it — visibly, once the span draws a border for it
-        // to sit inside.
-        if run.edge.is_some() {
-            continue;
-        }
-        // An atomic inline box carries no text but is content all the same, so
-        // the space after `<img> text` is between two things and survives.
-        if run.replaced.is_some() {
-            previous_ended_in_space = false;
-            continue;
-        }
-        let collapsed = collapse_whitespace_from(&run.text, previous_ended_in_space);
-        // A run that collapsed to nothing did not end in a space, but it did
-        // not end in anything else either: what precedes the next run is still
-        // whatever preceded this one. Reading the empty string as "no space
-        // here" is what let `<p>\n  <span> text` keep two spaces' worth of
-        // nothing and then a third real one.
-        previous_ended_in_space =
-            collapsed.ends_with(' ') || (collapsed.is_empty() && previous_ended_in_space);
-        run.text = collapsed;
-    }
-    // Leading and trailing whitespace of the whole block is dropped. An edge
-    // run is skipped over rather than trimmed: it carries no text, so the space
-    // at the start of `<p><span> text</span>` is on the run *after* it and
-    // trimming the edge would trim nothing. Replaced runs are deliberately not
-    // skipped — the space after a leading image is real text between two
-    // things, not the block's own leading whitespace.
-    if let Some(first) = runs.iter_mut().find(|run| run.edge.is_none()) {
-        first.text = first.text.trim_start().to_owned();
-    }
-    if let Some(last) = runs.iter_mut().rev().find(|run| run.edge.is_none()) {
-        last.text = last.text.trim_end().to_owned();
-    }
+    collapse_across_runs(&mut runs);
     runs
 }
 
@@ -6184,6 +6485,144 @@ mod tests {
                 pair[1].rect
             );
         }
+    }
+
+    #[test]
+    fn an_inline_element_is_broken_around_a_block_inside_it() {
+        // §9.2.1.1. The block is a *sibling* of the two halves, not a child of
+        // the span — so the span's border stops either side of it rather than
+        // wrapping it, which is the whole visible difference.
+        let rendered = run(
+            "<body><p>before <span>one <b>a block</b> two</span> after</p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             span { border: 3px solid blue; padding: 0 8px } \
+             b { display: block }",
+            400.0,
+        );
+        // Which side each fragment owns is carried by the style it was
+        // bracketed with — the sides it does not own are zeroed, which is what
+        // both the room on the line and the border painted later read.
+        let sides: Vec<(f32, f32)> = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|text| {
+                text.lines
+                    .iter()
+                    .flat_map(|line| line.boxes.iter())
+                    .filter_map(|fragment| {
+                        text.inline_boxes
+                            .iter()
+                            .find(|(source, _)| *source == fragment.source)
+                            .map(|(_, style)| {
+                                (
+                                    style.border.left.used_width(style.font_size),
+                                    style.border.right.used_width(style.font_size),
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(sides.len(), 2, "the span should draw two fragments");
+        assert_eq!(
+            sides[0],
+            (3.0, 0.0),
+            "the first fragment owns the start side and not the end one"
+        );
+        assert_eq!(
+            sides[1],
+            (0.0, 3.0),
+            "and the last owns the end side and not the start one"
+        );
+    }
+
+    #[test]
+    fn a_block_that_breaks_an_inline_is_not_inside_its_border() {
+        // The same thing said in geometry: the block fills the paragraph,
+        // where a child of the span would have been inset by its padding and
+        // border.
+        let rendered = run(
+            "<body><p><span>one <b>a block</b> two</span></p></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             span { border: 3px solid blue; padding: 0 8px } \
+             b { display: block }",
+            400.0,
+        );
+        let block = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Block && b.node.is_some())
+            .expect("the block");
+
+        assert_eq!(block.rect.x, 0.0);
+        assert_eq!(block.rect.width, 400.0);
+    }
+
+    #[test]
+    fn a_float_inside_a_broken_inline_is_still_placed() {
+        // The element no longer has a layout pass of its own, so a float
+        // inside it is reached by nothing unless the container goes looking.
+        // It vanished entirely the first time.
+        let rendered = run(
+            "<body><div><span><b>block</b><i>float</i></span></div></body>",
+            "body { margin: 0 } b { display: block } \
+             i { float: left; width: 40px; height: 40px }",
+            400.0,
+        );
+        let floats = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float != Float::None)
+            .count();
+
+        assert_eq!(floats, 1, "the float inside the broken span was lost");
+    }
+
+    #[test]
+    fn a_broken_inlines_stretches_keep_its_own_font() {
+        // The era's own shape: `<font size=2>` broken around an `<hr>`. The
+        // line's strut comes from the stretch's style, and taking the
+        // container's spaces a sidebar's links out by the difference.
+        let rendered = run(
+            "<body><div><span>one<br>two<hr>three</span></div></body>",
+            "body { margin: 0; font-size: 32px } span { font-size: 12px } \
+             hr { margin: 0; border: 0 }",
+            400.0,
+        );
+        let first = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .find(|text| text.lines.len() > 1)
+            .expect("the stretch before the rule");
+
+        let height = first.lines[1].y - first.lines[0].y;
+        assert!(
+            height < 20.0,
+            "the lines are {height} apart, which is the container's font and not the span's"
+        );
+    }
+
+    #[test]
+    fn a_block_that_breaks_an_inline_is_still_in_document_order() {
+        // `precedes` has to map a grandchild back to the child it sits under,
+        // or a float declared beside the block is never placed before it and
+        // falls through to the end of the container.
+        let rendered = run(
+            "<body><div><span><b>first</b></span>\
+             <i></i><span><b>second</b></span></div></body>",
+            "body { margin: 0 } b { display: block; height: 20px } \
+             i { float: left; width: 30px; height: 30px }",
+            400.0,
+        );
+        let float = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.float != Float::None)
+            .expect("the float");
+
+        assert!(
+            float.rect.y < 40.0,
+            "the float landed at {}, below both blocks instead of beside the second",
+            float.rect.y
+        );
     }
 
     #[test]
