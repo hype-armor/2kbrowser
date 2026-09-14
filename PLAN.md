@@ -399,19 +399,33 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    margins centre a block; and an inline element wrapping a block one still
    lays that block out
 
-Known-wrong and recorded rather than hidden: forms that draw but do not work —
-no control can be typed into, clicked or submitted — the properties that parse
-and are then ignored
-(`list-style-image`), the corner where
-two collapsed borders cross, which CSS 2.1 leaves undefined and which is
-settled here by width rather than by a diagonal mitre, and proper
-block-in-inline splitting — an inline element containing a block is
-laid out as a block instead, which is not what CSS 2.1 §9.2.1.1 describes. The
-geometry is right now: a box is measured one inline *stretch* at a time, so the
-words before the block and the words after it no longer ask for room to share
-a line. What is left is the box: the inline element's background and border
-wrap the block child instead of stopping either side of it, and its vertical
-margins apply where an inline box has none.
+Known-wrong and recorded rather than hidden, each with the issue that carries
+it:
+
+- **Forms draw but do not work** — no control can be typed into, clicked or
+  submitted. The stopping point this milestone chose, not an oversight: a
+  control that draws correctly makes the page read correctly, and interaction
+  is separate work with a separate risk.
+- **`list-style-image`** parses and is ignored, the last property still on that
+  list. It needs an image fetched for a box that is not an element, which is
+  the same blocker `url()` in `content` has and the same scope decision.
+- **The corner where two collapsed borders cross** is settled by width rather
+  than by a diagonal mitre. CSS 2.1 leaves it undefined.
+- **Block-in-inline splitting** (§9.2.1.1, #116). The geometry is right: a box
+  is measured one inline *stretch* at a time, so the words before the block and
+  the words after it no longer ask for room to share a line. The box is not:
+  an inline element containing a block is laid out as a block, so its
+  background and border wrap the block child instead of stopping either side of
+  it, and its vertical margins apply where an inline box has none.
+- **`position: fixed` scrolls with the page** (#108). Its containing block is
+  the viewport, which is the layout half; staying put needs the display list to
+  know which items are anchored to the window, which is a change to how
+  painting works.
+- **Stacking contexts are not modelled** (#107) — each parent's children are
+  sorted by `(z-index, positioned)`, so every positioned box behaves as a
+  context and a negative `z-index` never escapes one that should not be.
+- **Two right-to-left residues**: §10.3.3's over-constrained margin (#112) and
+  an inline box split across lines (#113).
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes
