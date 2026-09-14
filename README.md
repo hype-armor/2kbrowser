@@ -62,7 +62,11 @@ centred on the grid line between them, which is what a Wikipedia infobox or
 wikitable is built out of; §17.5.1's six background layers, so that a
 `<tbody>`, a `<col>` or a `<colgroup>` paints behind the rows and cells the way
 a `<tr>` already did — and stops at each `border-spacing` gap, where §17.6.1
-shows the table's own background instead; table captions, which sit outside the
+shows the table's own background instead; `table-layout: fixed`, where the
+columns and the first row decide the widths and nothing below them is measured
+(§17.5.2.1); `empty-cells`, so a cell with nothing in it can be told not to draw
+its border; a `border-spacing` per axis, since `border-spacing: 0 8px` means the
+rows spaced and the columns not; table captions, which sit outside the
 table's border box on whichever side `caption-side` names; `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
@@ -107,9 +111,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3271 of 4821 reference tests pass,
-67.8%**, with no panics across roughly ten thousand renders. That is an upper
-bound rather than a score — a reftest passes when both sides look the same, and
+The CSS 2.1 suite has been run against it: **3356 of 4821 reference tests pass,
+69.6%**, with no panics across roughly ten thousand renders. That is an upperbound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
 vendored.
@@ -156,12 +159,10 @@ widening a wrapper box this engine does not have, so the table sits a little
 left of where a browser puts it; a float, which grows the block
 that contains it instead of hanging out below its bottom edge as §10.6.3 says
 (issue #41), so a container wraps its float where a browser lets it overhang;
-`empty-cells`, which is parsed by nobody here and so is ignored in the
-separated model where it applies — it is correctly ignored in the collapsing
-one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
+where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to
-the wider of them rather than mitring it diagonally as browsers do; fixed
-table layout; raising or lowering *text* off the baseline, so a `<sub>` or a
+the wider of them rather than mitring it diagonally as browsers do; raising or
+lowering *text* off the baseline, so a `<sub>` or a
 `<sup>` sits level with the words around it; and `::first-letter` taking the
 pseudo-element's style whole, so with `<p><b>Bold</b>…` the first letter loses
 the `<b>` — the box should inherit from the innermost inline element around the
@@ -206,7 +207,7 @@ this file used to admit: `word-spacing`, `font-variant`, `outline`,
 `clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
 page, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
-leave the page's own styling standing, the second value of `border-spacing`, `direction` and everything else
+leave the page's own styling standing, `direction` and everything else
 about right-to-left text, and the parts of generated content still out of
 scope: `open-quote` and its family, which needs the nesting depth of quotation
 marks, and `url()` in `content`, which needs an image fetched for a box that is

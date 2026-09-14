@@ -957,6 +957,21 @@ pub fn layout(
 /// Text is measured separately from the box, and that is the case that matters:
 /// a box's rectangle can be shorter than the lines inside it, which is exactly
 /// what `height: 0` produces.
+/// Whether a box has nothing in it to draw: no boxes inside, and no glyph or
+/// atomic inline on any line it laid out.
+///
+/// §17.6.1.1's "empty" for a table cell. Whitespace does not count as content —
+/// a cell holding a newline between two tags is empty, which is most of the
+/// cells any of this applies to.
+fn draws_nothing(box_: &LayoutBox) -> bool {
+    box_.children.is_empty()
+        && box_.text.as_ref().is_none_or(|text| {
+            text.lines
+                .iter()
+                .all(|line| line.glyphs.is_empty() && line.replaced.is_empty())
+        })
+}
+
 fn ink_bottom(box_: &LayoutBox, offset_y: f32) -> f32 {
     let top = offset_y + box_.rect.y;
     let mut bottom = top + box_.rect.height;
@@ -1727,6 +1742,7 @@ fn table_widths(
     } else {
         style
             .border_spacing
+            .0
             .to_px(style.font_size, available)
             .max(0.0)
     };
@@ -2997,13 +3013,14 @@ fn layout_table(
     // is how a table used for page layout closed the seams between its cells.
     // It does not apply in the collapsing model, where there is no gap for it
     // to describe — the cells share their borders rather than being separated.
-    let spacing = if collapsed.is_some() {
-        0.0
+    // §17.6.1 allows a gap per axis, and a page that writes
+    // `border-spacing: 0 8px` means its rows spaced and its columns not.
+    let (spacing, spacing_y) = if collapsed.is_some() {
+        (0.0, 0.0)
     } else {
-        style
-            .border_spacing
-            .to_px(style.font_size, available_width)
-            .max(0.0)
+        let of =
+            |length: css::value::Length| length.to_px(style.font_size, available_width).max(0.0);
+        (of(style.border_spacing.0), of(style.border_spacing.1))
     };
 
     // In the collapsing model a cell's used border is half of the grid line it
@@ -3078,7 +3095,31 @@ fn layout_table(
 
     let spacing_total = spacing * (grid.columns + 1) as f32;
     let usable = (available_width - spacing_total).max(0.0);
-    let mut widths = table::distribute_widths(&mins, &maxes, Some(usable));
+    // §17.5.2.1: `table-layout: fixed` takes the widths from the columns and
+    // the first row and never looks at the rest, so the measuring above is
+    // thrown away rather than skipped — the grid had to be built either way,
+    // and the intrinsic widths are what a fixed table's *minimum* is still
+    // judged against if it overflows.
+    let fixed = style.table_layout == css::style::TableLayout::Fixed;
+    let mut widths = if fixed {
+        table::fixed_widths(
+            grid,
+            style.font_size,
+            usable,
+            style.width != Length::Auto,
+            &maxes,
+            |cell| {
+                let used = effective(cell, 0);
+                let font_size = used.font_size;
+                (
+                    used.border.left.used_width(font_size),
+                    used.border.right.used_width(font_size),
+                )
+            },
+        )
+    } else {
+        table::distribute_widths(&mins, &maxes, Some(usable))
+    };
 
     // A table with no declared width shrinks to fit its content. One with a
     // declared width fills it, which is exactly what `<table width="100%">`
@@ -3184,7 +3225,23 @@ fn layout_table(
                 ContainingBlock::viewport(width, width),
                 &mut holder,
             );
-            if let Some(box_) = holder.children.pop() {
+            if let Some(mut box_) = holder.children.pop() {
+                // §17.6.1.1: in the separated model a cell with nothing in it
+                // draws neither its background nor its border, so the table's
+                // own shows through. It keeps its room — the property is about
+                // what is painted, not about what is laid out — which is why
+                // this is applied to the finished box rather than to the style
+                // it was laid out with. The collapsing model has no cell
+                // border to hide, and CSS 2.1 says the property does not apply
+                // there at all.
+                if collapsed.is_none()
+                    && cell_style.empty_cells == css::style::EmptyCells::Hide
+                    && draws_nothing(&box_)
+                {
+                    box_.style.background_color = css::Color::TRANSPARENT;
+                    box_.style.background_image = None;
+                    box_.style.border = css::style::Borders::default();
+                }
                 placed.push(Placed {
                     box_,
                     row: index,
@@ -3214,7 +3271,7 @@ fn layout_table(
             continue;
         }
         let covered: f32 =
-            heights[cell.row..end].iter().sum::<f32>() + spacing * (end - cell.row - 1) as f32;
+            heights[cell.row..end].iter().sum::<f32>() + spacing_y * (end - cell.row - 1) as f32;
         if covered < cell.height {
             // The shortfall goes on the last row it covers. Spreading it evenly
             // would push apart rows whose own content already fits, which reads
@@ -3224,10 +3281,10 @@ fn layout_table(
     }
 
     let mut tops = Vec::with_capacity(heights.len());
-    let mut cursor_y = y + spacing;
+    let mut cursor_y = y + spacing_y;
     for height in &heights {
         tops.push(cursor_y);
-        cursor_y += height + spacing;
+        cursor_y += height + spacing_y;
     }
 
     let row_width: f32 =
@@ -3262,8 +3319,11 @@ fn layout_table(
         height: tops[rows.end - 1] + heights[rows.end - 1] - tops[rows.start],
     };
     // The cell areas it covers: what its background *colour* is painted on.
+    // Either axis having a gap is enough to need them apart: with
+    // `border-spacing: 0 8px` the columns touch and the rows do not.
+    let separated = spacing > 0.0 || spacing_y > 0.0;
     let areas = |rows: &std::ops::Range<usize>, columns: &std::ops::Range<usize>| -> Vec<Rect> {
-        if spacing == 0.0 {
+        if !separated {
             return vec![whole(rows, columns)];
         }
         let mut out = Vec::with_capacity(rows.len() * columns.len());
@@ -3394,7 +3454,7 @@ fn layout_table(
         // it moves onto boxes of its own and off this one.
         let rows = index..index + 1;
         let columns = 0..grid.columns;
-        if spacing > 0.0 && draws(&row_style) && grid.columns > 0 {
+        if separated && draws(&row_style) && grid.columns > 0 {
             band_background(
                 &row_style,
                 &areas(&rows, &columns),
@@ -3424,7 +3484,7 @@ fn layout_table(
     for mut cell in placed {
         let end = (cell.row + cell.rowspan).min(heights.len());
         let spanned: f32 =
-            heights[cell.row..end].iter().sum::<f32>() + spacing * (end - cell.row - 1) as f32;
+            heights[cell.row..end].iter().sum::<f32>() + spacing_y * (end - cell.row - 1) as f32;
         cell.box_.rect.y = tops[cell.row];
         let stretched = cell.box_.rect.height.max(spanned);
 
@@ -6952,6 +7012,141 @@ mod tests {
         assert_eq!(
             gap("body { margin: 0 } table { border-spacing: 12px }"),
             12.0
+        );
+    }
+
+    #[test]
+    fn border_spacing_takes_a_gap_per_axis() {
+        // §17.6.1's second value. `border-spacing: 0 8px` means the rows spaced
+        // and the columns not, which reading only the first value gets exactly
+        // backwards on one of the two axes.
+        let rendered = run(
+            "<body><table><tr><td>a</td><td>b</td></tr>             <tr><td>c</td><td>d</td></tr></table></body>",
+            "body { margin: 0 } table { border-spacing: 4px 20px }",
+            600.0,
+        );
+        let cells: Vec<Rect> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(
+            cells[1].x - (cells[0].x + cells[0].width),
+            4.0,
+            "the horizontal gap is the first value"
+        );
+        assert_eq!(
+            cells[2].y - (cells[0].y + cells[0].height),
+            20.0,
+            "the vertical gap is the second"
+        );
+
+        // One value still applies to both.
+        let rendered = run(
+            "<body><table><tr><td>a</td></tr><tr><td>b</td></tr></table></body>",
+            "body { margin: 0 } table { border-spacing: 6px }",
+            600.0,
+        );
+        let cells: Vec<Rect> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(cells[1].y - (cells[0].y + cells[0].height), 6.0);
+    }
+
+    #[test]
+    fn empty_cells_hide_stops_an_empty_cell_drawing_itself() {
+        // §17.6.1.1, and only in the separated model. The cell keeps its room —
+        // the property decides what is painted, not what is laid out.
+        let boxes_of = |css: &str| {
+            let rendered = run(
+                "<body><table><tr><td>a</td><td></td></tr></table></body>",
+                css,
+                600.0,
+            );
+            content_boxes(&rendered)
+                .into_iter()
+                .map(|b| (b.rect, b.style.background_color))
+                .collect::<Vec<_>>()
+        };
+        let blue = css::Color::rgb(0, 0, 255);
+        let shown = boxes_of("body { margin: 0 } td { background: #0000ff }");
+        assert_eq!(
+            shown.iter().filter(|(_, c)| *c == blue).count(),
+            2,
+            "both cells draw by default"
+        );
+
+        let hidden =
+            boxes_of("body { margin: 0 } td { background: #0000ff } table { empty-cells: hide }");
+        assert_eq!(
+            hidden.iter().filter(|(_, c)| *c == blue).count(),
+            1,
+            "the empty cell still drew its background"
+        );
+        // And it kept its room: the same rectangles, one of them just bare.
+        let rects = |v: &[(Rect, css::Color)]| v.iter().map(|(r, _)| *r).collect::<Vec<_>>();
+        assert_eq!(rects(&shown), rects(&hidden), "hiding moved a box");
+    }
+
+    #[test]
+    fn a_fixed_table_takes_its_widths_from_the_first_row() {
+        // §17.5.2.1: the columns and the first row decide, and nothing below
+        // them is measured. The second row here is far wider than the first and
+        // must not widen anything.
+        let rendered = run(
+            "<body><table><tr><td style=\"width: 100px\">a</td><td>b</td></tr>\
+             <tr><td>wwwwwwwwwwwwwwwwwwwwwwwwwwww</td><td>x</td></tr></table></body>",
+            "body { margin: 0 } table { table-layout: fixed; width: 400px; border-spacing: 0 } \
+             td { padding: 0 }",
+            600.0,
+        );
+        let first: Vec<Rect> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .map(|b| b.rect)
+            .collect();
+        assert_eq!(first[0].width, 100.0, "the declared width of column one");
+        assert_eq!(
+            first[1].width, 300.0,
+            "the undeclared column takes the rest of the 400"
+        );
+        assert_eq!(
+            first[2].width, 100.0,
+            "the second row's long text did not widen its column"
+        );
+    }
+
+    #[test]
+    fn a_fixed_column_is_wide_enough_for_the_whole_cell() {
+        // §17.5.2.1 sizes the column to hold the cell's *border box*, so a
+        // `width: 80px` cell with padding and a border either side makes a
+        // wider column than 80. Taking the content width alone is the
+        // difference between a column that fits its cell and one the cell hangs
+        // out of on both sides.
+        let rendered = run(
+            "<body><table><tr><td style=\"width: 80px; padding: 0 10px; \
+             border-left: 5px solid red; border-right: 5px solid red\">a</td>\
+             <td>b</td></tr></table></body>",
+            "body { margin: 0 } table { table-layout: fixed; width: 400px; border-spacing: 0 } \
+             td { padding: 0 }",
+            600.0,
+        );
+        let cells: Vec<Rect> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.text.is_some())
+            .map(|b| b.rect)
+            .collect();
+        // The *column*, not the cell: a cell's own border box is 110 by the box
+        // model whatever the column does, so measuring that would pass however
+        // wide the column came out. Where the second cell starts is where the
+        // first column ended.
+        assert_eq!(cells[1].x, 110.0, "80 + 20 of padding + 10 of border");
+        assert_eq!(
+            cells[1].width, 290.0,
+            "and the rest of the 400 is column two"
         );
     }
 

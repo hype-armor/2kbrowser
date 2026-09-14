@@ -818,9 +818,17 @@ fn apply(
                 style.vertical_align = align;
             }
         }
+        // One length applies to both axes, two give horizontal then vertical
+        // (§17.6.1). A second value that does not parse takes the declaration
+        // with it rather than leaving half of it applied.
         "border-spacing" => {
-            if let Some(length) = parse_size(first) {
-                style.border_spacing = length;
+            let horizontal = parse_size(first);
+            let vertical = match values.get(1) {
+                Some(second) => parse_size(second),
+                None => horizontal,
+            };
+            if let (Some(horizontal), Some(vertical)) = (horizontal, vertical) {
+                style.border_spacing = (horizontal, vertical);
             }
         }
         "text-transform" => {
@@ -934,6 +942,20 @@ fn apply(
                 && let Some(collapse) = parse_border_collapse(name)
             {
                 style.border_collapse = collapse;
+            }
+        }
+        "empty-cells" => {
+            if let Raw::Ident(name) = first
+                && let Some(empty) = crate::style::parse_empty_cells(name)
+            {
+                style.empty_cells = empty;
+            }
+        }
+        "table-layout" => {
+            if let Raw::Ident(name) = first
+                && let Some(layout) = crate::style::parse_table_layout(name)
+            {
+                style.table_layout = layout;
             }
         }
         "white-space" => {
@@ -3428,10 +3450,11 @@ mod tests {
             "",
             "table",
         );
-        assert_eq!(style.border_spacing, Length::Px(0.0));
+        // Both axes: the attribute is one number and means the gap on each.
+        assert_eq!(style.border_spacing, (Length::Px(0.0), Length::Px(0.0)));
 
         let default = standards_style_of("<table><tr><td>x</td></tr></table>", "", "table");
-        assert_eq!(default.border_spacing, Length::Px(2.0));
+        assert_eq!(default.border_spacing, (Length::Px(2.0), Length::Px(2.0)));
     }
 
     #[test]
