@@ -59,7 +59,10 @@ model with borders and backgrounds, on inline boxes as well as block ones — a
 `<span>` with a background and padding draws them, one fragment per line it
 crosses (§8.4), and its horizontal padding and border take room on the line so
 the text after it wraps where a browser wraps it; inline layout with per-span
-styles and Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`,
+styles and Unicode line breaking; floats, including §9.5's rule that a box with
+a formatting context of its own may not overlap one — `overflow: hidden` beside
+a float narrows the *box* where a plain block only narrows its lines, and a box
+that cannot fit beside the float goes below it; tables with automatic column sizing, `colspan` and `rowspan`,
 `cellspacing`, and **both border models** — including
 `border-collapse: collapse`, where adjoining borders resolve into one line
 centred on the grid line between them, which is what a Wikipedia infobox or

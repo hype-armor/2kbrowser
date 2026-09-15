@@ -474,6 +474,20 @@ fn collapse(first: f32, second: f32) -> f32 {
 /// cancels the child if it stays inside and reveals a red block if it escapes.
 /// It escaped. The property was not modelled at all until then, so the box did
 /// not know it was a formatting context.
+/// Whether a block-level, in-flow box establishes a block formatting context
+/// of its own — and so, per §9.5, may not overlap a float.
+///
+/// A narrower question than [`keeps_its_childrens_margins`], which also says
+/// yes to boxes that are not in the block walk at all: a float, an out-of-flow
+/// box, a table cell, a caption and an inline-block are each placed by
+/// something else, and a float has already been told to sit beside its
+/// neighbours.
+fn establishes_a_context(style: &ComputedStyle) -> bool {
+    style.float == Float::None
+        && !style.position.is_out_of_flow()
+        && (style.overflow != Overflow::Visible || style.display == Display::Table)
+}
+
 fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
     style.float != Float::None
         || style.position.is_out_of_flow()
@@ -3118,7 +3132,66 @@ fn layout_block(
         // from the floats above it by construction, so it cannot end up higher
         // than it would have without the collapse.
         cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
-        let child_context = context.translated(0.0, cursor_y - into_context, content_width);
+        // §9.5: the border box of an element that establishes a new block
+        // formatting context must not overlap the margin box of a float in the
+        // formatting context it sits in. It narrows and moves beside the float
+        // instead of flowing under it, which is the whole difference between a
+        // plain `<div>` beside a float and one with `overflow: hidden`: the
+        // first has its *lines* shortened and its box left full width, the
+        // second has the box itself shortened.
+        //
+        // Asked for a one-pixel band at the box's top rather than for its whole
+        // height, which is not known until it has been laid out — and laying it
+        // out is what the answer is for. A float the box only meets further
+        // down is one §9.5 would have it move below rather than beside, which
+        // is a refinement this does not attempt.
+        let (beside, room) = if establishes_a_context(child_style) {
+            let (offset, available) = context.line_box(cursor_y - into_context, 1.0);
+            // And where it does not *fit* beside the float, it goes below it
+            // instead of overflowing the gap. The narrowest the box can be is
+            // its own min-content width, which is what decides that — measured
+            // only here, for a box that both establishes a context and has a
+            // float beside it, which is rare enough to pay for.
+            let (minimum, _) = subtree_widths(
+                doc,
+                styles,
+                fonts,
+                child,
+                child_style,
+                intrinsic,
+                content_width,
+                0,
+            );
+            // The margins count, and they can be negative: a box pulled left
+            // by `margin-left: -50px` occupies fifty pixels less than it
+            // declares, and a test of exactly that is what caught this.
+            let sideways = child_style
+                .margin
+                .left
+                .to_px(child_style.font_size, content_width)
+                + child_style
+                    .margin
+                    .right
+                    .to_px(child_style.font_size, content_width);
+            if available < content_width && minimum + sideways > available {
+                cursor_y = context.clearance(css::style::Clear::Both, cursor_y - into_context)
+                    + into_context;
+                (0.0, content_width)
+            } else {
+                (offset, available)
+            }
+        } else {
+            (0.0, content_width)
+        };
+        // A box with a formatting context of its own is not only placed beside
+        // the floats — it cannot see them at all. Handing it the outer context
+        // shifts its *inline* content by the float's width a second time, on
+        // top of the shift its own box already took.
+        let child_context = if establishes_a_context(child_style) {
+            FloatContext::new(room)
+        } else {
+            context.translated(0.0, cursor_y - into_context, content_width)
+        };
         // A normal-flow child's containing block is *this* box, so the
         // definite height it may resolve a percentage against is this box's,
         // not an ancestor's. Carrying the ancestor's down instead would let
@@ -3134,9 +3207,9 @@ fn layout_block(
             child,
             child_style,
             intrinsic,
-            padding_left + border_left,
+            padding_left + border_left + beside,
             cursor_y,
-            content_width,
+            room,
             child_context,
             child_containing,
             &mut box_,
@@ -8872,6 +8945,49 @@ mod tests {
                 .height
         };
         assert_eq!(height(&tall), height(&squeezed));
+    }
+
+    #[test]
+    fn a_box_with_its_own_formatting_context_sits_beside_a_float() {
+        // §9.5: the border box of an element that establishes a new block
+        // formatting context must not overlap a float's margin box. A plain
+        // block has its *lines* shortened beside a float and keeps a full-width
+        // box; one with `overflow: hidden` has the box itself shortened.
+        let rendered = run(
+            "<body><div class=f></div><div class=plain>x</div>             <div class=bfc>y</div></body>",
+            "body { margin: 0 } .f { float: left; width: 100px; height: 100px }              .plain, .bfc { height: 20px } .bfc { overflow: hidden }",
+            300.0,
+        );
+        let boxes_: Vec<_> = content_boxes(&rendered);
+        let plain = boxes_
+            .iter()
+            .find(|b| b.style.overflow == Overflow::Visible && b.rect.height == 20.0)
+            .expect("the plain block");
+        let bfc = boxes_
+            .iter()
+            .find(|b| b.style.overflow == Overflow::Clipped)
+            .expect("the block with a context of its own");
+        assert_eq!((plain.rect.x, plain.rect.width), (0.0, 300.0));
+        assert_eq!((bfc.rect.x, bfc.rect.width), (100.0, 200.0));
+    }
+
+    #[test]
+    fn a_context_that_cannot_fit_beside_a_float_goes_below_it() {
+        // And where it does not fit, it goes below rather than overflowing the
+        // gap. The narrowest it can be is its own min-content width, which is
+        // what decides that.
+        let rendered = run(
+            "<body><div class=f></div><div class=bfc>aaaaaaaaaaaaaaaaaaaa</div></body>",
+            "body { margin: 0 } .f { float: left; width: 250px; height: 100px }              .bfc { overflow: hidden }",
+            300.0,
+        );
+        let bfc = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.overflow == Overflow::Clipped)
+            .expect("the block with a context of its own");
+        assert_eq!(bfc.rect.x, 0.0, "it went below rather than beside");
+        assert_eq!(bfc.rect.width, 300.0);
+        assert!(bfc.rect.y >= 100.0, "below the float: {}", bfc.rect.y);
     }
 
     #[test]
