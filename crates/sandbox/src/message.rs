@@ -106,6 +106,28 @@ pub struct Submission {
     pub body: String,
 }
 
+/// What has the keyboard on the page, in as little detail as the parent needs.
+///
+/// This was one bit — "a control is taking the typing" — which was all the
+/// parent needed while only text fields could be focused. It cannot stay one
+/// bit now that a checkbox can be (#151): a focused checkbox takes keystrokes
+/// while having nothing to type, and Up and Down mean something to a focused
+/// `<select>` and nothing to a field, where they still scroll the page.
+///
+/// Three states and no more. *Which* control it is, what is in it and what it
+/// would send stay on the side that holds the document — what a reader is
+/// answering is the page's business (ADR-0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focused {
+    /// Nothing on the page. Every key is the window's.
+    Nothing,
+    /// A control being typed in, so a character is a character.
+    Typing,
+    /// A control that is pressed rather than typed in, so a space presses it
+    /// and the arrows move through what it offers.
+    Pressable,
+}
+
 /// A dropdown the reader has opened, and what is in it.
 ///
 /// A closed `<select>` is a list nobody can see until it is opened, and there
@@ -262,6 +284,14 @@ pub enum Key {
     },
     /// Give up the focus.
     Escape,
+    /// Move up: through a `<select>`'s options, without opening its list.
+    ///
+    /// Only sent when the page has a control focused that is pressed rather
+    /// than typed in, because otherwise the arrows are the window's and the
+    /// page scrolls under the caret (#151).
+    Up,
+    /// Move down, by the same rule.
+    Down,
 }
 
 impl Key {
@@ -297,6 +327,8 @@ impl Key {
                 writer.some(*back);
             }
             Key::Escape => writer.tag(9),
+            Key::Up => writer.tag(10),
+            Key::Down => writer.tag(11),
         }
     }
 
@@ -324,6 +356,8 @@ impl Key {
                 back: reader.some()?,
             },
             9 => Key::Escape,
+            10 => Key::Up,
+            11 => Key::Down,
             _ => return Err(WireError::Unknown),
         })
     }
@@ -710,13 +744,12 @@ pub struct Rendered {
     /// happened, the page itself did not change, and something outside it is
     /// being asked for.
     pub open: Option<Dropdown>,
-    /// Whether a form control on this page currently has the typing (#110).
+    /// What on this page has the keyboard (#110, #151).
     ///
-    /// One bit, and deliberately no more: the parent needs to know whether a
-    /// keystroke belongs to the page or to the window, and has no business
-    /// knowing which field it is or what is in it. What a reader types into a
-    /// page is the page's business.
-    pub editing: bool,
+    /// The parent needs to know whether a keystroke belongs to the page or to
+    /// the window, and which keys the page would even use. It has no business
+    /// knowing which control it is or what is in it.
+    pub focused: Focused,
     /// How many images were fetched and decoded for this page.
     ///
     /// A diagnostic rather than something the window uses: `2kbrowser render`
@@ -800,7 +833,11 @@ impl ToParent {
                     writer.u32(open.on);
                 }
                 writer.some(page.can_toggle_layout);
-                writer.some(page.editing);
+                writer.tag(match page.focused {
+                    Focused::Nothing => 0,
+                    Focused::Typing => 1,
+                    Focused::Pressable => 2,
+                });
                 writer.u32(page.images_loaded);
                 writer.u32(page.background);
             }
@@ -920,7 +957,12 @@ impl ToParent {
                     None
                 };
                 let can_toggle_layout = reader.some()?;
-                let editing = reader.some()?;
+                let focused = match reader.tag()? {
+                    0 => Focused::Nothing,
+                    1 => Focused::Typing,
+                    2 => Focused::Pressable,
+                    _ => return Err(WireError::Unknown),
+                };
                 let images_loaded = reader.u32()?;
                 // Masked rather than rejected: the child is the untrusted side,
                 // and a stray high byte here is a colour question, not a
@@ -952,7 +994,7 @@ impl ToParent {
                     submit,
                     open,
                     can_toggle_layout,
-                    editing,
+                    focused,
                     images_loaded,
                     background,
                 }))
@@ -1040,7 +1082,7 @@ mod tests {
             can_toggle_layout: true,
             open: None,
             pressables: Vec::new(),
-            editing: false,
+            focused: Focused::Nothing,
             images_loaded: 3,
             background: 0x001c_1b22,
         }

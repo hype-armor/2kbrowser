@@ -100,8 +100,8 @@ pub struct PageRenderer {
     /// What the reader has ticked, chosen or unticked, by node. Re-applied
     /// after a parse the same way, and for the same reason, as `values`.
     chosen: Vec<(dom::NodeId, bool)>,
-    /// The control being typed in, and its editing state.
-    focus: Option<(dom::NodeId, crate::field::Field)>,
+    /// The control the keyboard is on, and whatever it needs remembering.
+    focus: Option<Focus>,
     /// A form the reader asked to send, waiting for the next render to carry
     /// it out (#110).
     ///
@@ -114,6 +114,43 @@ pub struct PageRenderer {
     /// Taken rather than held, like `submit`: one press opens one list, and a
     /// dropdown left lying here would spring open again on the next resize.
     open: Option<sandbox::message::Dropdown>,
+}
+
+/// What the keyboard is on, and what that control needs remembered about it.
+///
+/// Two shapes because there are two kinds of control and they need different
+/// things kept. A field is being *edited*, so it carries a caret and a
+/// selection that no re-render may lose. A checkbox is not being edited at
+/// all: it is somewhere the keyboard is pointing, and the only thing worth
+/// remembering is which one (#151).
+///
+/// Before this there was one shape — a node and a text editing state — and so
+/// only the controls that had one could be reached. A form could be filled in
+/// with a pointer and not with a keyboard.
+#[derive(Debug, Clone)]
+enum Focus {
+    /// A text field or `<textarea>`, with what is being typed in it.
+    Typing {
+        /// The control.
+        node: dom::NodeId,
+        /// Its caret, selection and text.
+        field: crate::field::Field,
+    },
+    /// A control that is pressed rather than typed in: a checkbox, a radio, a
+    /// `<select>`, a button.
+    Pressable {
+        /// The control.
+        node: dom::NodeId,
+    },
+}
+
+impl Focus {
+    /// Which control it is on, whichever shape it has.
+    fn node(&self) -> dom::NodeId {
+        match self {
+            Focus::Typing { node, .. } | Focus::Pressable { node } => *node,
+        }
+    }
 }
 
 impl Default for PageRenderer {
@@ -232,20 +269,21 @@ impl PageRenderer {
             .as_ref()
             .and_then(|page| page.button_at(at.0, at.1))
         {
-            self.set_focus(None);
+            self.set_focus(Some(button));
             self.ask_to_send(button);
             return;
         }
         // Then a control that changes when it is pressed: a checkbox, a radio,
         // a row of a list box. It answers the press *instead of* taking the
-        // typing, because there is nothing to type into one.
-        let changed = self
+        // typing, because there is nothing to type into one — and it takes the
+        // keyboard, so that Tab carries on from what was just pressed rather
+        // than from the top of the page (#151).
+        let pressed = self
             .page
             .as_ref()
-            .map(|page| page.choice_at(at.0, at.1))
-            .unwrap_or_default();
-        if !changed.is_empty() {
-            self.set_focus(None);
+            .and_then(|page| page.choice_at(at.0, at.1));
+        if let Some((control, changed)) = pressed {
+            self.set_focus(Some(control));
             self.record(changed);
             return;
         }
@@ -257,7 +295,7 @@ impl PageRenderer {
             .as_ref()
             .and_then(|page| page.dropdown_at(at.0, at.1))
         {
-            self.set_focus(None);
+            self.set_focus(Some(node));
             self.open = Some(sandbox::message::Dropdown {
                 rect,
                 node: node.0 as u32,
@@ -327,23 +365,37 @@ impl PageRenderer {
         });
     }
 
-    /// Moves the focus to a control, starting its editing state from what the
-    /// control currently holds.
+    /// Moves the focus to a control, in whichever shape that control needs.
+    ///
+    /// A field starts its editing state from what the control currently holds,
+    /// so that focusing `<input value="Smith">` and pressing a key appends
+    /// rather than replaces. Everything else is remembered by name alone: there
+    /// is nothing in a checkbox to put a caret in.
     fn set_focus(&mut self, node: Option<dom::NodeId>) {
         self.flush_focus();
         self.focus = node.map(|node| {
-            let value = self
-                .page
-                .as_ref()
-                .map(|page| page.control_value(node))
-                .unwrap_or_default();
-            (node, crate::field::Field::with_cursor_at_end(value))
+            let page = self.page.as_ref();
+            if page.is_some_and(|page| page.takes_typing(node)) {
+                let value = page
+                    .map(|page| page.control_value(node))
+                    .unwrap_or_default();
+                Focus::Typing {
+                    node,
+                    field: crate::field::Field::with_cursor_at_end(value),
+                }
+            } else {
+                Focus::Pressable { node }
+            }
         });
     }
 
     /// Writes what is being edited back into the values the next render reads.
+    ///
+    /// Nothing to write for a control that is not being typed in: what a
+    /// checkbox holds was recorded when it was pressed, not while it was
+    /// focused.
     fn flush_focus(&mut self) {
-        let Some((node, field)) = &self.focus else {
+        let Some(Focus::Typing { node, field }) = &self.focus else {
             return;
         };
         let (node, text) = (*node, field.text().to_owned());
@@ -353,28 +405,31 @@ impl PageRenderer {
         }
     }
 
-    /// Moves to the next text control in document order, or the previous one.
+    /// Moves to the next control in document order, or the previous one.
+    ///
+    /// *Every* control, not only the ones with something to type in (#151): a
+    /// form whose boxes can be ticked with a pointer and by no other means is
+    /// a form half its readers cannot fill in.
+    ///
+    /// Each radio of a group is its own stop. A browser enters the group once
+    /// and moves within it with the arrows, which is fewer stops to tab
+    /// through; it is also a second rule to learn, and this way every control
+    /// on the page behaves the same. Worth revisiting on a page with thirty
+    /// radios in it.
     ///
     /// Past the end it gives up the focus rather than wrapping. Wrapping is
-    /// what a browser does inside a *form*, and this engine has no form
-    /// submission to make that boundary mean anything yet — so falling out is
-    /// the honest behaviour, and it hands Tab back to the window, which walks
-    /// the page's links with it.
+    /// what a browser does inside a *form*, and falling out hands Tab back to
+    /// the window, which walks the page's links with it.
     fn step_focus(&mut self, back: bool) {
         let controls: Vec<dom::NodeId> = self
             .page
             .as_ref()
-            .map(|page| {
-                page.text_controls()
-                    .into_iter()
-                    .map(|(node, _)| node)
-                    .collect()
-            })
+            .map(|page| page.focusable().into_iter().map(|(node, _)| node).collect())
             .unwrap_or_default();
         let at = self
             .focus
             .as_ref()
-            .and_then(|(node, _)| controls.iter().position(|it| it == node));
+            .and_then(|focus| controls.iter().position(|it| *it == focus.node()));
         let next = match (at, back) {
             (Some(at), false) => controls.get(at + 1).copied(),
             (Some(at), true) => at.checked_sub(1).and_then(|at| controls.get(at).copied()),
@@ -392,13 +447,19 @@ impl PageRenderer {
             Key::Escape => return self.set_focus(None),
             _ => {}
         }
+        // A control that is pressed rather than typed in answers a different
+        // set of keys, so it is answered before the editing below rather than
+        // inside it — there is no field there to reach.
+        if let Some(Focus::Pressable { node }) = &self.focus {
+            return self.press_key(*node, key);
+        }
         let multiline = self
             .focus
             .as_ref()
             .zip(self.page.as_ref())
-            .is_some_and(|((node, _), page)| page.is_multiline(*node));
+            .is_some_and(|(focus, page)| page.is_multiline(focus.node()));
         let mut submitting = false;
-        let Some((node, field)) = &mut self.focus else {
+        let Some(Focus::Typing { node, field }) = &mut self.focus else {
             return;
         };
         let node = *node;
@@ -427,7 +488,10 @@ impl PageRenderer {
             Key::Home { extend } => field.home(*extend),
             Key::End { extend } => field.end(*extend),
             Key::SelectAll => field.select_all(),
-            Key::Tab { .. } | Key::Escape => {}
+            // Handled above, or not this control's: the arrows belong to a
+            // `<select>`, and in a field they are the window's, so the page
+            // still scrolls under a caret.
+            Key::Tab { .. } | Key::Escape | Key::Up | Key::Down => {}
         }
         self.flush_focus();
         if submitting {
@@ -435,6 +499,81 @@ impl PageRenderer {
             // is HTML's own rule and it is the difference between a search box
             // and a form with two buttons meaning opposite things.
             self.ask_to_send(node);
+        }
+    }
+
+    /// What has the keyboard, in the terms the parent is told it in.
+    fn focused(&self) -> sandbox::message::Focused {
+        use sandbox::message::Focused;
+        match &self.focus {
+            None => Focused::Nothing,
+            Some(Focus::Typing { .. }) => Focused::Typing,
+            Some(Focus::Pressable { .. }) => Focused::Pressable,
+        }
+    }
+
+    /// One keystroke on a control that is pressed rather than typed in (#151).
+    ///
+    /// The keys a reader already knows, and no others:
+    ///
+    /// * **Space** presses it — a box ticks, a radio is chosen, a button is
+    ///   pressed, a dropdown opens. It arrives as a space character because the
+    ///   parent has no idea what is focused and should not have to; deciding
+    ///   what a space means is this side's job, exactly as it already is for a
+    ///   newline in a one-line field.
+    /// * **Enter** sends the form. On a button it presses *that* button, which
+    ///   is the difference between a form with one button and a form with two
+    ///   meaning opposite things.
+    /// * **Up and Down** move a `<select>` through its options without opening
+    ///   the list, which is what a dropdown has always done and is the quickest
+    ///   way to answer one.
+    ///
+    /// Everything else falls through and does nothing, rather than being
+    /// swallowed. A control with the keyboard must not stop the page scrolling
+    /// with keys that mean nothing to it.
+    fn press_key(&mut self, node: dom::NodeId, key: &sandbox::message::Key) {
+        use sandbox::message::Key;
+        let is_button = self.page.as_ref().is_some_and(|page| page.is_button(node));
+        match key {
+            Key::Insert(text) if text.contains('\n') => {
+                if is_button {
+                    return self.ask_to_send(node);
+                }
+                // Nothing was pressed, so no button is a successful control —
+                // the same rule Enter in a one-line field follows.
+                self.ask_to_send(node);
+            }
+            Key::Insert(text) if text == " " => {
+                if is_button {
+                    return self.ask_to_send(node);
+                }
+                if let Some((select, rect, options, on)) =
+                    self.page.as_ref().and_then(|page| page.dropdown_of(node))
+                {
+                    self.open = Some(sandbox::message::Dropdown {
+                        rect,
+                        node: select.0 as u32,
+                        options,
+                        on: on as u32,
+                    });
+                    return;
+                }
+                let changed = self
+                    .page
+                    .as_ref()
+                    .map(|page| page.press(node))
+                    .unwrap_or_default();
+                self.record(changed);
+            }
+            Key::Up | Key::Down => {
+                let changed = self
+                    .page
+                    .as_ref()
+                    .map(|page| page.step_option(node, matches!(key, Key::Up)))
+                    .unwrap_or_default();
+                self.record(changed);
+            }
+            _ => {}
         }
     }
 }
@@ -512,10 +651,13 @@ impl Render for PageRenderer {
                 zoom: *zoom,
                 values: self.values.clone(),
                 chosen: self.chosen.clone(),
-                focus: self
-                    .focus
-                    .as_ref()
-                    .map(|(node, field)| (*node, field.cursor())),
+                focus: self.focus.as_ref().map(|focus| match focus {
+                    Focus::Typing { node, field } => (*node, Some(field.cursor())),
+                    // A ring and no caret: there is nothing in a checkbox to
+                    // put one in, and a caret drawn in one would be a cursor
+                    // promising an insertion point that does not exist.
+                    Focus::Pressable { node } => (*node, None),
+                }),
             },
             &mut self.fonts,
             &mut loader,
@@ -544,7 +686,7 @@ impl Render for PageRenderer {
             submit: self.submit.take(),
             open: self.open.take(),
             can_toggle_layout: self.can_toggle_layout(&page),
-            editing: self.focus.is_some(),
+            focused: self.focused(),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
         };
@@ -602,7 +744,7 @@ impl Render for PageRenderer {
             submit: None,
             open: None,
             can_toggle_layout: self.can_toggle_layout(page),
-            editing: self.focus.is_some(),
+            focused: self.focused(),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
         })

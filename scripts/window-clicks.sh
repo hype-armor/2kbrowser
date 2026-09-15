@@ -139,6 +139,23 @@ opened one, so no click below would have meant anything"
 \"$ready\", so no click below would have meant anything"
 }
 
+# Gives the window the *keyboard* focus, which pointer-driven checks never need:
+# XTEST clicks go wherever the pointer is whether or not the window is focused,
+# and keystrokes go to whatever the window manager last focused — which under a
+# bare Xvfb with no window manager at all is nothing. Without this the keys are
+# delivered to the void and the failure reads exactly like a browser that
+# ignores the keyboard.
+#
+# A function rather than three copies of the incantation, because two of those
+# copies had lost the fallback and the only one that needed it still had it. The
+# next keyboard check would have been written from whichever copy was nearest.
+focus_window() {
+    DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null \
+        || DISPLAY=$display xdotool windowfocus --sync "$window" 2>/dev/null \
+        || true
+    sleep 0.3
+}
+
 # Stops the browser and waits for its window to actually go, which is not the
 # same thing. `kill` returns as soon as the signal is sent; the window survives
 # it by however long the process takes to tear down. A `start` that ran in that
@@ -717,16 +734,7 @@ done
 [ -n "$focused" ] || fail "clicking a text field drew no focus ring, so the \
 click never reached the control"
 
-# The window has to hold the *keyboard* focus, which no check before this one
-# has ever needed: they are all pointer-driven, and XTEST clicks go wherever the
-# pointer is whether or not the window is focused. Keystrokes do not — they go
-# to whatever the window manager last focused, which under a bare Xvfb with no
-# window manager at all is nothing. Without this the keys are delivered to the
-# void and the failure reads exactly like a browser that ignores the keyboard.
-DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null \
-    || DISPLAY=$display xdotool windowfocus --sync "$window" 2>/dev/null \
-    || true
-sleep 0.3
+focus_window
 DISPLAY=$display xdotool type --delay 60 "hello"
 typed=""
 for _ in $(seq 1 25); do
@@ -809,8 +817,7 @@ for _ in $(seq 1 40); do
 done
 
 start_on "http://127.0.0.1:$form_port/form" "A form"
-DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null || true
-sleep 0.3
+focus_window
 # Where the button is, asked of the screen: the fixture has the field and the
 # button on one line, so the rightmost ink below the chrome is the button.
 box=$(DISPLAY=$display xwd -silent -id "$window" \
@@ -863,8 +870,7 @@ cat > "$choosing/p.html" <<'FIXTURE'
 FIXTURE
 
 start_on "$choosing/p.html" "Choosing"
-DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null || true
-sleep 0.3
+focus_window
 
 # The box is at document (40, 40) and is about a line tall, so the middle of it
 # is a few pixels in. Asked of the screen rather than assumed, the same rule
@@ -937,6 +943,99 @@ done
 [ -n "$chose" ] || fail "choosing a row left the dropdown showing what it \
 showed before, so what the form would send has not changed"
 echo "ok: a checkbox ticked and unticked, and a dropdown opened and was chosen from"
+stop
+
+# N. The keyboard reaches the controls a pointer can (#151).
+#
+#    The near half of the path, which nothing below the window drives: winit's
+#    key events, the modifier state, the window's own decision about which keys
+#    are the page's, and — for the list a dropdown opens — a surface the window
+#    draws itself, so no test in the child can see it at all.
+keys="$here/target/window-keys"
+mkdir -p "$keys"
+cat > "$keys/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Keys</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: absolute; left: 40px; top: 40px">
+<input type="checkbox">
+</div>
+<div style="position: absolute; left: 40px; top: 120px">
+<select>
+<option>MMMMMMMMMMMM</option>
+<option selected>i</option>
+</select>
+</div>
+</body>
+FIXTURE
+
+start_on "$keys/p.html" "Keys"
+focus_window
+
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 40)) $((chrome + 80)))
+[ -n "$box" ] || fail "the checkbox never reached the screen"
+set -- $box
+tick_x=$((($1 + $3) / 2)) tick_y=$((($2 + $4) / 2))
+empty=$(pixel "$tick_x" "$tick_y")
+
+# Tab to the box and press it, with the pointer parked somewhere that is not
+# over anything — so a tick can only have come from the keyboard.
+DISPLAY=$display xdotool mousemove 900 900
+DISPLAY=$display xdotool key Tab
+DISPLAY=$display xdotool key space
+ticked=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    [ "$(pixel "$tick_x" "$tick_y")" != "$empty" ] && { ticked=yes; break; }
+done
+[ -n "$ticked" ] || fail "Tab and Space did not tick the box, so a form still \
+cannot be filled in without a pointer"
+
+# Tab again to the dropdown, and Down to walk it. The option below the one it
+# opens on is *wider*, so the box growing is the answer changing.
+drop=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+[ -n "$drop" ] || fail "the dropdown never reached the screen"
+set -- $drop
+was=$(($3 - $1))
+DISPLAY=$display xdotool key Tab
+DISPLAY=$display xdotool key Up
+walked=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    now=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+    [ -n "$now" ] || continue
+    set -- $now
+    [ $(($3 - $1)) -gt "$was" ] && { walked=yes; break; }
+done
+[ -n "$walked" ] || fail "an arrow on the focused dropdown did not move it, so \
+a dropdown still cannot be answered from the keyboard"
+
+# And Space opens the list it did not open while walking.
+DISPLAY=$display xdotool key space
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    below=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 165)) $((chrome + 210)))
+    [ -n "$below" ] && { opened=yes; break; }
+done
+[ -n "$opened" ] || fail "Space did not open the focused dropdown's list"
+
+# Escape closes it again, which is the other half of a list you can open with a
+# key: one that only the pointer could dismiss would be a trap.
+DISPLAY=$display xdotool key Escape
+closed=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    below=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 165)) $((chrome + 210)))
+    [ -z "$below" ] && { closed=yes; break; }
+done
+[ -n "$closed" ] || fail "Escape left the dropdown's list open"
+echo "ok: the keyboard ticked a box, walked a dropdown, and opened and closed its list"
 stop
 
 echo "all window click checks passed"

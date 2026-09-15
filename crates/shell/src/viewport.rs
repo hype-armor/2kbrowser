@@ -369,7 +369,7 @@ impl Viewport {
         match self.session.focus((x, y)) {
             Ok(page) => {
                 self.page = page;
-                self.page.editing
+                self.page.focused != sandbox::message::Focused::Nothing
             }
             // A child that cannot answer is not one to start routing keystrokes
             // at. The page on screen stays as it was, which is the same answer
@@ -424,9 +424,19 @@ impl Viewport {
         }
     }
 
-    /// Whether a form control on this page is taking the typing.
+    /// Whether a form control on this page has the keyboard.
+    ///
+    /// Any control, not only one being typed in: the question the window asks
+    /// with this is whether a keystroke belongs to the page, and a focused
+    /// checkbox answers Space and Enter while having nothing to type.
     pub fn editing(&self) -> bool {
-        self.page.editing
+        self.page.focused != sandbox::message::Focused::Nothing
+    }
+
+    /// Whether what has the keyboard is pressed rather than typed in, so the
+    /// window knows the arrows are the page's rather than the scroll's (#151).
+    pub fn focus_is_pressable(&self) -> bool {
+        self.page.focused == sandbox::message::Focused::Pressable
     }
 
     /// Re-renders at a new width, in the same child.
