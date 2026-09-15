@@ -112,7 +112,12 @@ external stylesheets, including
 desktop rules apply at a desktop width instead of being dropped; and legacy
 character encodings, which most of the surviving old web needs — a page in
 windows-1252 read as UTF-8 is replacement characters where every accented
-letter and curly quote should be.
+letter and curly quote should be. A stylesheet's encoding is decided by
+§4.4's own order rather than a document's: the header, then a byte-order mark
+or the sheet's `@charset` rule, then the `charset` on the `<link>` that asked
+for it, then the referring document's encoding, and only then UTF-8 — which is
+what lets a rule whose selector is spelled in Shift_JIS match the element it
+was written for.
 
 Rendering is deterministic across Linux, macOS, and Windows, checked by
 reference tests against one shared baseline set — verified, not assumed: all

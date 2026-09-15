@@ -378,6 +378,28 @@ impl Loaded {
         let (text, ..) = net::encoding::decode_document(&self.bytes, self.content_type.as_deref());
         text
     }
+
+    /// The bytes decoded as a *stylesheet*, which §4.4 decides differently: it
+    /// has no `<meta>`, so its own `@charset` rule and whatever the link said
+    /// are most of what a browser has to go on, and an unlabelled one is UTF-8
+    /// rather than the era's windows-1252.
+    ///
+    /// `linked` is the `charset` attribute of the `<link>` that asked for it,
+    /// or the charset on an `@import` — the step §4.4 puts between the
+    /// stylesheet's own declaration and the referring document's encoding.
+    fn stylesheet_text(
+        &self,
+        linked: Option<&str>,
+        referrer: Option<&'static net::encoding::Encoding>,
+    ) -> String {
+        let (text, _) = net::encoding::decode_stylesheet(
+            &self.bytes,
+            self.content_type.as_deref(),
+            linked,
+            referrer,
+        );
+        text
+    }
 }
 
 /// Loads subresources in this process, subject to the network policy.
@@ -1308,6 +1330,9 @@ fn push_with_imports(
     base: Option<(&Origin, &str)>,
     depth: usize,
     viewport_width: f32,
+    // §4.4's fourth step for an imported sheet, which is the sheet that
+    // imported it — and so, up the chain, the document.
+    referrer: Option<&'static net::encoding::Encoding>,
 ) {
     if depth < MAX_IMPORT_DEPTH
         && let Some((origin, path)) = base
@@ -1325,11 +1350,12 @@ fn push_with_imports(
             };
             push_with_imports(
                 sheets,
-                Stylesheet::parse_at(&resource.text(), viewport_width),
+                Stylesheet::parse_at(&resource.stylesheet_text(None, referrer), viewport_width),
                 loader,
                 Some((&sheet_origin, &sheet_path)),
                 depth + 1,
                 viewport_width,
+                referrer,
             );
         }
     }
@@ -1354,6 +1380,40 @@ fn is_applied_stylesheet(rel: Option<&str>) -> bool {
     stylesheet
 }
 
+/// The encoding the document says it is in, for §4.4's fourth step.
+///
+/// Read from the `<meta>` the document carries rather than from the bytes,
+/// because by this point the bytes are gone: the shell is handed decoded text.
+/// That loses the two steps above a `<meta>` — a byte-order mark and the
+/// transport's header — so a page that declared its encoding only there hands
+/// its stylesheets the era's default instead. That is exactly what they were
+/// handed before any of this existed, so it is a gap rather than a regression,
+/// and it only matters for a stylesheet that declares nothing itself.
+fn declared_encoding(doc: &dom::Document) -> Option<&'static net::encoding::Encoding> {
+    for node in doc.descendants(doc.root()) {
+        let Some(element) = doc.element(node) else {
+            continue;
+        };
+        if element.local_name() != "meta" {
+            continue;
+        }
+        if let Some(label) = element.attr("charset")
+            && let Some(encoding) = net::encoding::for_label(label)
+        {
+            return Some(encoding);
+        }
+        if element
+            .attr("http-equiv")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("content-type"))
+            && let Some(content) = element.attr("content")
+            && let Some(encoding) = net::encoding::charset_from_content_type(content)
+        {
+            return Some(encoding);
+        }
+    }
+    None
+}
+
 fn collect_stylesheets(
     doc: &dom::Document,
     loader: &mut dyn Loader,
@@ -1363,6 +1423,11 @@ fn collect_stylesheets(
     viewport_width: f32,
 ) -> Vec<Stylesheet> {
     let mut sheets = Vec::new();
+    // §4.4's fourth step, below the stylesheet's own declaration and above the
+    // assumption of UTF-8: a legacy page's unlabelled stylesheet decodes the
+    // way the page does. Falling back to the era's default keeps that true for
+    // the pages that declare nothing at all, which is most of them.
+    let referrer = declared_encoding(doc).or(Some(net::encoding::ERA_DEFAULT));
 
     for node in doc.descendants(doc.root()) {
         let Some(element) = doc.element(node) else {
@@ -1372,7 +1437,15 @@ fn collect_stylesheets(
             "style" => {
                 let sheet = Stylesheet::parse_at(&doc.text_content(node), viewport_width);
                 // A `<style>` block's imports resolve against the document.
-                push_with_imports(&mut sheets, sheet, loader, base, 0, viewport_width);
+                push_with_imports(
+                    &mut sheets,
+                    sheet,
+                    loader,
+                    base,
+                    0,
+                    viewport_width,
+                    referrer,
+                );
             }
             // An external stylesheet is how a site of this era shared one look
             // across every page; skipping them leaves those pages unstyled.
@@ -1390,7 +1463,10 @@ fn collect_stylesheets(
                 if let Some(resource) = loader.load(&url, Some(origin), RequestKind::Subresource)
                     && let Ok((sheet_origin, sheet_path)) = net::parse_url(&url)
                 {
-                    let sheet = Stylesheet::parse_at(&resource.text(), viewport_width);
+                    let sheet = Stylesheet::parse_at(
+                        &resource.stylesheet_text(element.attr("charset"), referrer),
+                        viewport_width,
+                    );
                     // An imported sheet's URLs resolve against the sheet that
                     // imported it, not against the document.
                     push_with_imports(
@@ -1400,6 +1476,7 @@ fn collect_stylesheets(
                         Some((&sheet_origin, &sheet_path)),
                         0,
                         viewport_width,
+                        referrer,
                     );
                 }
             }

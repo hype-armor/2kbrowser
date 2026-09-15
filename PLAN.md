@@ -398,7 +398,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    Feature queries are CSS 3 and do not apply
 11. **Legacy character encodings** — *done.* Byte-order mark, `Content-Type`,
    a `<meta>` prescan, then windows-1252 — which most of the surviving old web
-   needs and which the plan called required rather than optional
+   needs and which the plan called required rather than optional. A *stylesheet*
+   is decided by §4.4's different order: the header, then a byte-order mark or
+   the sheet's own `@charset` rule, then what the link said, then the referring
+   document's encoding, and only then UTF-8
 
 12. **Intrinsic sizing over whole subtrees** — *done.* A cell holding a nested
    table, an image, or a block is measured by what is inside it rather than by

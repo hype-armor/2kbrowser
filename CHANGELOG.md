@@ -16,6 +16,36 @@ record for everything earlier.
 
 ## Unreleased
 
+**A stylesheet decides its own encoding** (§4.4), which is a different
+question from a document's and was being answered with a document's rules.
+**Worth 18 conformance tests against nothing lost.**
+
+A stylesheet has no `<meta>` and no locale to fall back on, so the
+declarations it does carry are the whole of what a browser has. §4.4 puts them
+in this order: the transport's `charset` parameter, then a byte-order mark or
+the `@charset` rule at the very start, then whatever the link said — a
+`<link charset>` or the charset on an `@import` — then the encoding of the
+document that referred to it, and only then an assumption of UTF-8.
+
+None of the middle three existed here. An external stylesheet went through the
+document decoder, which looks for a `<meta>` a stylesheet cannot have and then
+assumes windows-1252. A sheet declaring `@charset "shift-jis"` was read as
+windows-1252, so a selector spelled in Japanese matched nothing and the rule
+was silently dropped.
+
+`@charset` is read only at byte zero and only in the one spelling §4.4 allows
+— `@charset "…";`, a single space, no comment before it. Anywhere else it is
+an ordinary at-rule, which is what keeps a stylesheet from redecoding itself
+out of the inside of a string.
+
+The referring document's encoding is read from the `<meta>` the document
+carries, because by the time the shell sees a page the bytes are gone. That
+loses the two steps above a `<meta>` — a byte-order mark and the transport's
+header — so a page that declared its encoding only there hands its stylesheets
+the era's default instead. Which is exactly what they were handed before any of
+this existed, so it is a gap rather than a regression, and it only matters for
+a stylesheet that declares nothing itself.
+
 **The root element is a box of its own.** The walk started at `<body>`, so
 everything `<html>` declared about its own box was dropped:
 `html { border: solid blue }` drew nothing at all and `html { margin: 1in }`
