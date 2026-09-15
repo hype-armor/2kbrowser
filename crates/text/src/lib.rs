@@ -121,6 +121,14 @@ pub struct PositionedGlyph {
     pub y: f32,
     /// Font size in pixels.
     pub font_size: f32,
+    /// How far the pen moves for this glyph.
+    ///
+    /// Carried so that paint can draw a box of the right size where the font
+    /// has no glyph at all (#97). Everything else about a `.notdef` is known
+    /// from the font size, but its width is the shaper's answer rather than a
+    /// fraction of anything — a CJK notdef is close to square where a Latin
+    /// one is not.
+    pub advance: f32,
     /// Colour from the inline span this glyph came from.
     ///
     /// `None` means inherit the block's colour. Carried per glyph because a
@@ -1265,6 +1273,7 @@ impl FontStore {
                     x: glyph.x,
                     y: 0.0,
                     font_size: glyph.font_size,
+                    advance: glyph.w,
                     color: glyph.color_opt.map(|c| (c.r(), c.g(), c.b(), c.a())),
                     // Stamped per segment when the line is assembled: keeping
                     // it out of the shaping cache is what lets one cached

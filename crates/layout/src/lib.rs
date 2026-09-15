@@ -3154,6 +3154,59 @@ fn layout_block(
             }
         }
 
+        // An out-of-flow child of a table, for the same reason the captions
+        // above are here: this branch returns before the child walk, and the
+        // walk is where out-of-flow children are collected and placed. §9.7 has
+        // already made such a child a block, so `table::collect_rows` skips it
+        // as not table-internal and nothing else reaches it either — it was not
+        // misplaced, it was gone (#132).
+        //
+        // Their static position is the table's content top. A table has no flow
+        // for them to have been seen partway through, so there is no cursor to
+        // read; the top of the content box is where flow would have started.
+        let absolutes: Vec<(NodeId, ComputedStyle, f32, usize)> = doc
+            .children(node)
+            .iter()
+            .filter_map(|&child| Some((child, styles.get(child)?)))
+            .filter(|(_, child_style)| child_style.position.is_out_of_flow())
+            .map(|(child, child_style)| {
+                (
+                    child,
+                    child_style.clone(),
+                    padding_top + border_top,
+                    box_.children.len(),
+                )
+            })
+            .collect();
+        if !absolutes.is_empty() {
+            let own_size = (
+                content_width,
+                (box_.rect.height - padding_top - padding_bottom - border_top - border_bottom)
+                    .max(0.0),
+            );
+            place_absolutes(
+                doc,
+                styles,
+                fonts,
+                intrinsic,
+                absolutes,
+                &Placement {
+                    containing,
+                    origin: (margin_left, margin_top),
+                    own_size,
+                    padding: (padding_left, padding_right, padding_top, padding_bottom),
+                    border: (border_left, border_top),
+                    inherited_origin: (
+                        margin_left + padding_left + border_left,
+                        margin_top + padding_top + border_top,
+                    ),
+                    content_width,
+                    positioned: style.position.is_positioned(),
+                },
+                &mut box_,
+            );
+        }
+
         let consumed = Consumed {
             // The captions are part of what this box occupies even though they
             // sit outside its border box, or the content after the table would
@@ -3818,6 +3871,110 @@ fn layout_block(
         content_width,
         (box_.rect.height - padding_top - padding_bottom - border_top - border_bottom).max(0.0),
     );
+    place_absolutes(
+        doc,
+        styles,
+        fonts,
+        intrinsic,
+        absolutes,
+        &Placement {
+            containing,
+            origin: (margin_left, settled_top),
+            own_size,
+            padding: (padding_left, padding_right, padding_top, padding_bottom),
+            border: (border_left, border_top),
+            inherited_origin,
+            content_width,
+            positioned: style.position.is_positioned(),
+        },
+        &mut box_,
+    );
+
+    // `position: relative` shifts the box after everything around it has been
+    // placed, so siblings keep the space it would have occupied.
+    if style.position == Position::Relative {
+        let (dx, dy) = relative_shift(style, (available_width, available_width));
+        box_.rect.x += dx;
+        box_.rect.y += dy;
+    }
+
+    // Computed here rather than taken from `outer_height`, which resolves
+    // percentages against a basis of zero — harmless while the answer was only
+    // ever summed, wrong the moment the two ends are told apart.
+    // Whatever escaped from the first child is this box's margin now. The box
+    // was positioned with its own margin long before that was known, so it
+    // moves by the difference rather than being placed again.
+    let collapsed_top = settled_top - legend_overhang;
+    box_.rect.y += settled_top - margin_top;
+
+    let own_bottom = style.margin.bottom.to_px(font_size, available_width);
+    let consumed = Consumed {
+        height: box_.rect.height,
+        // A lifted legend stands above the border box, so the box moves down by
+        // what sticks out and the space it needs is reported as margin — the
+        // one field a caller already reads as "room above this box".
+        margin_top: collapsed_top + legend_overhang,
+        margin_bottom: match escaped_bottom {
+            Some(escaped) => collapse(own_bottom, escaped),
+            None => own_bottom,
+        },
+        // Nothing stands between this box's two edges: a zero border-box
+        // height already means no content, no border and no padding, since any
+        // of those would have given it height. What is left to rule out is a
+        // height it was told to have, and a formatting context of its own —
+        // a float or an `overflow` container keeps its margins to itself.
+        collapses_through: box_.rect.height == 0.0
+            && matches!(style.height, Length::Auto | Length::Px(0.0))
+            && !keeps_its_childrens_margins(style),
+    };
+    parent.children.push(box_);
+    consumed
+}
+
+/// What placing a box's out-of-flow children needs to know about that box.
+///
+/// A bundle rather than a dozen more arguments, because the placement below is
+/// now called from two places and the two must not be able to drift — which is
+/// the same reasoning `control_parts` was extracted under, and the same bug
+/// shape it was extracted to prevent.
+struct Placement {
+    /// The containing block the box itself was laid out in.
+    containing: ContainingBlock,
+    /// Where the box's border box starts within that containing block.
+    origin: (f32, f32),
+    /// The box's own content size, which a *positioned* box hands on as the
+    /// containing block for these children.
+    own_size: (f32, f32),
+    /// Left, right, top and bottom padding.
+    padding: (f32, f32, f32, f32),
+    /// Left and top border widths.
+    border: (f32, f32),
+    /// The content origin an unpositioned box passes straight through.
+    inherited_origin: (f32, f32),
+    /// The box's content width, for measuring a shrink-to-fit child.
+    content_width: f32,
+    /// Whether the box is positioned, and so is the containing block for these.
+    positioned: bool,
+}
+
+/// Lays out and places a box's absolutely positioned children, once the box's
+/// own size is known.
+///
+/// Extracted so that a table can run it too (#132). `layout_block`'s table
+/// branch returns before the child walk, and the walk is where this used to
+/// live — so an absolutely positioned child of a `display: table` box was not
+/// misplaced, it was *gone*. That is the same shape of bug as the dropped
+/// caption this file already carries a comment about, and the reason this is a
+/// function rather than a second copy.
+fn place_absolutes(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    intrinsic: &IntrinsicSizes,
+    absolutes: Vec<(NodeId, ComputedStyle, f32, usize)>,
+    at_: &Placement,
+    into: &mut LayoutBox,
+) {
     // `at` is non-decreasing across these, so a running count of what has
     // already gone back in keeps each one in front of the siblings that follow
     // it and behind the ones that do not.
@@ -3832,16 +3989,17 @@ fn layout_block(
             // The *border-box* origin, not the content one `inherited_origin`
             // carries: a child's rect is measured from its parent's border box,
             // so that is the point the viewport has to be expressed against.
-            containing.fixed((margin_left, settled_top))
-        } else if style.position.is_positioned() {
-            containing.establish_padding_box(
-                (margin_left, settled_top),
-                own_size,
-                (padding_left + padding_right, padding_top + padding_bottom),
-                (border_left, border_top),
+            at_.containing.fixed(at_.origin)
+        } else if at_.positioned {
+            at_.containing.establish_padding_box(
+                at_.origin,
+                at_.own_size,
+                (at_.padding.0 + at_.padding.1, at_.padding.2 + at_.padding.3),
+                at_.border,
             )
         } else {
-            containing.descend(inherited_origin.0, inherited_origin.1)
+            at_.containing
+                .descend(at_.inherited_origin.0, at_.inherited_origin.1)
         };
 
         let mut probe = LayoutBox {
@@ -3900,7 +4058,7 @@ fn layout_block(
                     &child_style,
                     intrinsic,
                     &InlineBlocks::new(),
-                    content_width,
+                    at_.content_width,
                 );
                 let (min, max) = fonts.intrinsic_widths(&runs, &child_style);
                 let surround = child_style
@@ -3948,57 +4106,17 @@ fn layout_block(
             size,
             // With no offsets given the box stays where flow would have put it.
             (
-                child_containing.offset.0 + padding_left + border_left,
+                child_containing.offset.0 + at_.padding.0 + at_.border.0,
                 child_containing.offset.1 + static_y,
             ),
         );
         // Convert from containing-block coordinates to this box's own.
         child_box.rect.x = cb_x - child_containing.offset.0;
         child_box.rect.y = cb_y - child_containing.offset.1;
-        box_.children
-            .insert((at + reinserted).min(box_.children.len()), child_box);
+        into.children
+            .insert((at + reinserted).min(into.children.len()), child_box);
         reinserted += 1;
     }
-
-    // `position: relative` shifts the box after everything around it has been
-    // placed, so siblings keep the space it would have occupied.
-    if style.position == Position::Relative {
-        let (dx, dy) = relative_shift(style, (available_width, available_width));
-        box_.rect.x += dx;
-        box_.rect.y += dy;
-    }
-
-    // Computed here rather than taken from `outer_height`, which resolves
-    // percentages against a basis of zero — harmless while the answer was only
-    // ever summed, wrong the moment the two ends are told apart.
-    // Whatever escaped from the first child is this box's margin now. The box
-    // was positioned with its own margin long before that was known, so it
-    // moves by the difference rather than being placed again.
-    let collapsed_top = settled_top - legend_overhang;
-    box_.rect.y += settled_top - margin_top;
-
-    let own_bottom = style.margin.bottom.to_px(font_size, available_width);
-    let consumed = Consumed {
-        height: box_.rect.height,
-        // A lifted legend stands above the border box, so the box moves down by
-        // what sticks out and the space it needs is reported as margin — the
-        // one field a caller already reads as "room above this box".
-        margin_top: collapsed_top + legend_overhang,
-        margin_bottom: match escaped_bottom {
-            Some(escaped) => collapse(own_bottom, escaped),
-            None => own_bottom,
-        },
-        // Nothing stands between this box's two edges: a zero border-box
-        // height already means no content, no border and no padding, since any
-        // of those would have given it height. What is left to rule out is a
-        // height it was told to have, and a formatting context of its own —
-        // a float or an `overflow` container keeps its margins to itself.
-        collapses_through: box_.rect.height == 0.0
-            && matches!(style.height, Length::Auto | Length::Px(0.0))
-            && !keeps_its_childrens_margins(style),
-    };
-    parent.children.push(box_);
-    consumed
 }
 
 /// Lays out a table's rows and cells, appending them to `parent`.
@@ -11687,6 +11805,135 @@ mod list_box_tests {
         let mut found = None;
         walk(&rendered.root, select, &mut found);
         assert_eq!(found, Some(vec![1]));
+    }
+}
+
+#[cfg(test)]
+mod abspos_in_table_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    fn boxes(html: &str, css_text: &str) -> Vec<LayoutBox> {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            600.0,
+            600.0,
+        );
+        fn walk(box_: &LayoutBox, x: f32, y: f32, out: &mut Vec<LayoutBox>) {
+            let mut moved = box_.clone();
+            moved.rect.x += x;
+            moved.rect.y += y;
+            out.push(moved);
+            for child in &box_.children {
+                walk(child, x + box_.rect.x, y + box_.rect.y, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&rendered.root, 0.0, 0.0, &mut out);
+        out
+    }
+
+    /// The box laid out for the one element carrying `id`.
+    fn box_of(html: &str, css_text: &str, id: &str) -> Option<LayoutBox> {
+        let doc = dom::parse(html);
+        let wanted = (0..doc.len()).map(NodeId).find(|node| {
+            doc.element(*node)
+                .is_some_and(|element| element.id() == Some(id))
+        })?;
+        boxes(html, css_text)
+            .into_iter()
+            .find(|box_| box_.node == Some(wanted))
+    }
+
+    #[test]
+    fn an_absolutely_positioned_child_of_a_table_is_laid_out_at_all() {
+        // #132. Not misplaced — gone: the table branch returns before the walk
+        // that collects out-of-flow children, and §9.7 has already made this a
+        // block, so the grid builder skips it as not table-internal.
+        let found = box_of(
+            "<body><div class=\"t\"><div id=\"a\"></div></div></body>",
+            "body { margin: 0 } .t { display: table } \
+             #a { position: absolute; top: 0; left: 0; width: 100px; height: 100px }",
+            "a",
+        );
+        let box_ = found.expect("the absolutely positioned child generated no box at all");
+        assert_eq!((box_.rect.width, box_.rect.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn it_is_placed_against_the_containing_block_and_not_the_table() {
+        // The table is not positioned, so the containing block is the one the
+        // table inherited — here the initial containing block.
+        let box_ = box_of(
+            "<body><div class=\"t\"><div id=\"a\"></div></div></body>",
+            "body { margin: 0 } .t { display: table; margin: 50px } \
+             #a { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            "a",
+        )
+        .expect("laid out");
+        assert_eq!(
+            (box_.rect.x, box_.rect.y),
+            (0.0, 0.0),
+            "`top: 0; left: 0` is the page corner, not the table's",
+        );
+    }
+
+    #[test]
+    fn a_positioned_table_is_the_containing_block_for_its_own_abspos_child() {
+        let box_ = box_of(
+            "<body><div class=\"t\"><div id=\"a\"></div></div></body>",
+            "body { margin: 0 } \
+             .t { display: table; position: relative; margin: 50px; padding: 5px } \
+             #a { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            "a",
+        )
+        .expect("laid out");
+        assert_eq!(
+            (box_.rect.x, box_.rect.y),
+            (50.0, 50.0),
+            "a positioned table hands its padding box on as the containing block",
+        );
+    }
+
+    #[test]
+    fn a_fixed_child_of_a_table_takes_the_viewport() {
+        let box_ = box_of(
+            "<body><div class=\"t\"><div id=\"a\"></div></div></body>",
+            "body { margin: 0 } .t { display: table; margin: 40px } \
+             #a { position: fixed; top: 0; left: 0; width: 10px; height: 10px }",
+            "a",
+        )
+        .expect("laid out");
+        assert_eq!((box_.rect.x, box_.rect.y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_table_still_lays_its_own_cells_out() {
+        // The new branch runs beside the grid rather than instead of it.
+        let found = box_of(
+            "<body><div class=\"t\"><div class=\"r\"><div id=\"c\">cell</div></div>\
+             <div id=\"a\"></div></div></body>",
+            "body { margin: 0 } .t { display: table } .r { display: table-row } \
+             #c { display: table-cell } \
+             #a { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            "a",
+        );
+        assert!(found.is_some(), "the absolute child is still laid out");
+        let cell = box_of(
+            "<body><div class=\"t\"><div class=\"r\"><div id=\"c\">cell</div></div>\
+             <div id=\"a\"></div></div></body>",
+            "body { margin: 0 } .t { display: table } .r { display: table-row } \
+             #c { display: table-cell } \
+             #a { position: absolute; top: 0; left: 0; width: 10px; height: 10px }",
+            "c",
+        );
+        assert!(cell.is_some(), "and the cell beside it still is too");
     }
 }
 
