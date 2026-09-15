@@ -568,6 +568,11 @@ Getting it across is a security design of its own, and doing it while the
 boundary is still being built would mean doing it twice. It is also the only
 item in this milestone that is not itself security work, which is what made it
 the one to move.
+
+That design is now settled — [ADR-0019](docs/adr/0019-accessibility-tree-crosses-as-data.md):
+the tree crosses as data with a closed set of roles and measured bounds on
+depth, node count and text, and the parent builds the native objects. What
+remains is building it.
 **Until M4 lands, this is a tool for its authors, and the README should say so.**
 
 Where that stands: the work in this milestone is done. All three platforms
@@ -1012,9 +1017,12 @@ decides; the browser explains its reasoning.
   [issue #9](https://github.com/hype-armor/2kbrowser/issues/9), deferred to
   after M4 rather than dropped — ADR-0012 moved the semantic tree to the far
   side of a process boundary that carries only pixels, so getting it across is
-  a security design of its own. The risk this bullet names is *exactly* the one
-  that materialised: a milestone moved and accessibility was the thing that
-  slipped. It is filed so that slipping again has to be a decision.
+  a security design of its own — now made, in
+  [ADR-0019](docs/adr/0019-accessibility-tree-crosses-as-data.md). The risk this
+  bullet names is *exactly* the one that materialised: a milestone moved and
+  accessibility was the thing that slipped. It is filed so that slipping again
+  has to be a decision, and the design is written down so that the next excuse
+  cannot be that nobody knows how.
 - **Solo-maintainer risk.** Every dependency avoided is code we maintain
   forever. The "do not write these" list in §3 is the main defence.
 

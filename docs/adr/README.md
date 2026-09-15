@@ -23,3 +23,5 @@ that ADRs are superseded rather than edited.
 | [0015](0015-local-roots-marked.md) | Accept this computer's roots, and say when they were needed | accepted |
 | [0016](0016-syscall-allowlist-measured.md) | The renderer's syscall filter is an allowlist, and the list was measured | accepted |
 | [0017](0017-one-unsafe-crate-for-macos.md) | One crate may write `unsafe`, so that macOS can be confined | accepted |
+| [0018](0018-cache-across-pages.md) | A cache that outlives a page, partitioned by site | accepted |
+| [0019](0019-accessibility-tree-crosses-as-data.md) | The accessibility tree crosses as data, and the parent builds the objects | accepted |
