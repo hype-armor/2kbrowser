@@ -16,6 +16,34 @@ record for everything earlier.
 
 ## Unreleased
 
+**A non-breaking space no longer collapses.** §16.6.1 collapses spaces, tabs
+and newlines; `&nbsp;` is none of them. It is a character with a width, and the
+whole point of writing one is that it survives. **Worth 17 conformance tests
+against 1 lost.**
+
+The cause was `char::is_whitespace`, which answers Unicode's White_Space
+question and so says yes to U+00A0. Four places asked it: the collapsing pass,
+the block's leading and trailing trim, the state carried across run boundaries,
+and the intrinsic-width split that decides a column's minimum. So
+`x&nbsp;&nbsp;&nbsp;y` came out with one space, `&nbsp;Heading` lost its
+indent, and `a&nbsp;b` was measured as two words a column could take apart.
+
+This matters more for the pages this engine is for than for anything modern.
+`&nbsp;` is how the era indented a paragraph, spaced a row of navigation links
+and held an empty table cell open — the repository's own `era-page` fixture
+opens with one, and its heading has been four pixels out of place for as long
+as there has been a baseline. Checked against Chromium, which puts it where the
+new baseline does.
+
+The one test lost is `generated-content/content-175`, recorded as #126. It was
+passing because both sides were equally wrong: its reference ends in three
+non-breaking spaces that used to collapse away. They are kept now, and the test
+side is still short, because a `white-space: pre` run's trailing spaces are
+taken by the same block-level trim. Keeping *those* was tried and measured — it
+fixes nothing and breaks two, since the line break beside them then draws a
+second empty inline box, which needs §9.4.2's rule that a line box holding
+nothing generates none.
+
 **A pseudo-element carries its own counters** (§12.4), and every one of CSS
 2.1's counter styles is spelled. **Worth 30 conformance tests against 1 lost.**
 

@@ -77,7 +77,10 @@ collected into one and laid out side by side rather than stacked;
 `visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
-`letter-spacing`, `text-indent` on a block's first line, `min-height` and
+`letter-spacing`, `text-indent` on a block's first line, whitespace collapsing
+that leaves a **non-breaking space** alone — §16.6.1 collapses spaces, tabs and
+newlines and a `&nbsp;` is none of them, which is what the era's markup relied
+on to indent a paragraph, space a nav bar and hold an empty cell open — `min-height` and
 `max-height` — applied in the order §10.7 gives them, so a box asked for both
 at once takes the minimum — `clip`, where every side of the `rect()` is an
 offset from the box's top-left corner rather than an inset from the far edges,

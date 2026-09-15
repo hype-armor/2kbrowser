@@ -57,6 +57,16 @@ three lines, four.</div>
   <p class="flow">in flow</p>
 </div>
 
+<h3>A non-breaking space does not collapse</h3>
+<!-- CSS 2.1 16.6.1 collapses spaces, tabs and newlines. A non-breaking space is
+     none of those, and the era's markup leans on that: it is how a page
+     indented a paragraph, spaced a nav bar, and held an empty cell open. -->
+<p>[&nbsp;&nbsp;&nbsp;three of them, and a leading one that the block's own
+trimming must not take]</p>
+<p>[   versus three ordinary spaces, which collapse to one]</p>
+<div style="width: 150px; border: 1px solid #036">one&nbsp;unbreakable&nbsp;phrase
+that a narrow column may not take apart, beside ordinary words it may</div>
+
 <h3>None of it disturbs an ordinary paragraph</h3>
 <p>Plain text, a <b>bold</b> run, and an <i>italic</i> one, all unchanged.</p>
 
