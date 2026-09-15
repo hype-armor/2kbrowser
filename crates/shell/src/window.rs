@@ -170,6 +170,20 @@ fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Optio
 /// allowance rather than a measurement, and it is only ever a shrink — a
 /// monitor smaller than the floor leaves the request alone rather than
 /// producing a window too small to use.
+/// The window icon, decoded from the copy built into the binary.
+///
+/// Generated from `assets/icon.png` by `cargo run -p icons`; see that tool for
+/// why there is one master and everything else is derived from it.
+///
+/// winit wants straight alpha and one size, and scaling to a title bar or a
+/// taskbar is the compositor's job from there.
+fn window_icon() -> Option<winit::window::Icon> {
+    const BYTES: &[u8] = include_bytes!("../../../assets/generated/window-256.png");
+    let decoded = image::load_from_memory(BYTES).ok()?.into_rgba8();
+    let (width, height) = (decoded.width(), decoded.height());
+    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
+}
+
 fn clamp_to_monitor(requested: (u32, u32), monitor: (u32, u32)) -> (u32, u32) {
     const EDGES: u32 = 96;
     const FLOOR: (u32, u32) = (360, 320);
@@ -2428,10 +2442,16 @@ impl ApplicationHandler<BandReady> for App {
             Some(monitor) => clamp_to_monitor(self.size, monitor),
             None => self.size,
         };
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
             .with_window_icon(app_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
+        // A window with no icon gets whatever the desktop uses for "unknown
+        // program", which on a taskbar of a dozen windows is the one that looks
+        // like it crashed. Not fatal if it fails: an icon is decoration, and a
+        // browser that refused to open over one would be worse than a plain
+        // one.
+        attributes = attributes.with_window_icon(window_icon());
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
             return;
@@ -3168,6 +3188,21 @@ mod tests {
         // Shrinking to fit is only worth doing while what is left is usable; a
         // 200px-tall screen is not a reason to hand back a 104px window.
         assert_eq!(clamp_to_monitor((800, 800), (300, 200)), (800, 800));
+    }
+
+    #[test]
+    fn the_window_icon_is_there_and_decodes() {
+        // `window_icon` swallows a failure on purpose — a browser that refused
+        // to open over a decoration would be worse than a plain one — so
+        // nothing at runtime would ever say the icon had gone missing. A
+        // mistyped path, a truncated regeneration, or a master saved in a
+        // format `image` was not built to read would all show up as a window
+        // that quietly has no icon, on somebody else's desktop.
+        let icon = window_icon();
+        assert!(
+            icon.is_some(),
+            "the embedded window icon did not decode; regenerate with `cargo run -p icons`"
+        );
     }
 
     #[test]
