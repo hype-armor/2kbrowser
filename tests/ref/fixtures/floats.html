@@ -5,6 +5,13 @@
   .right { float: right; width: 100px; height: 70px; background-color: #ffe0cc;
            border: 1px solid #cc8855; padding: 4px; margin-left: 10px; }
   .cleared { clear: both; background-color: #eeeeee; padding: 6px; }
+  /* CSS 2.1 9.5: a box with a formatting context of its own may not overlap a
+     float. Its *box* is shortened and moved beside it, where a plain block
+     only has its lines shortened. */
+  .aside { float: left; width: 120px; height: 90px; background: #cde;
+           border: 1px solid #036; }
+  .own { overflow: hidden; background: #ffd; padding: 4px; }
+  .wide { overflow: hidden; background: #dfd; padding: 4px; width: 400px; }
 </style></head><body>
 <div class="left">Floated left</div>
 <p>Text flows down the right-hand side of a left float, taking a narrower line
@@ -15,4 +22,16 @@
    where each line starts. Again there is enough text here to run past the
    bottom of the float and widen out again.</p>
 <p class="cleared">This block clears both floats, so it starts below them.</p>
+
+<h3 style="font: bold 14px serif">A formatting context of its own</h3>
+<div class="aside">An aside</div>
+<div class="own">This box has <code>overflow: hidden</code>, so its background
+stops where the float begins rather than running underneath it. A plain
+paragraph beside the same float keeps a full-width box and only shortens its
+lines.</div>
+<p style="clear: both">&nbsp;</p>
+<div class="aside" style="width: 300px">A wider aside</div>
+<div class="wide">This one asks for four hundred pixels and cannot have them
+beside a float that wide, so it goes below the float instead of overflowing the
+gap.</div>
 </body></html>

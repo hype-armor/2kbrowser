@@ -368,7 +368,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    so `display: table-cell` on three spans lays them out side by side rather
    than stacked
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
-   narrow beside them, `clear`, and containers that enclose their floats
+   narrow beside them, `clear`, containers that enclose their floats, and
+   §9.5's rule for a box with a formatting context of its own: its *box*
+   narrows and moves beside the float rather than its lines, and where it
+   cannot fit beside it goes below
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
    dimensions, floatable, and sitting *on* a line rather than interrupting it.
    Links, scrolling, and hit testing remain

@@ -16,6 +16,31 @@ record for everything earlier.
 
 ## Unreleased
 
+**A box with a formatting context of its own does not overlap a float**
+(§9.5). Its border box narrows and moves beside the float; where it cannot fit
+beside it, it goes below. **Worth 15 conformance tests against nothing lost.**
+
+This is the whole visible difference between a plain `<div>` beside a float and
+one with `overflow: hidden`. The first has its *lines* shortened and keeps a
+full-width box, so its background runs underneath the float. The second has the
+box itself shortened, so the background stops where the float begins — which is
+how a two-column layout was built out of a float and an `overflow: hidden`
+before anybody had flexbox, and this engine drew the second exactly like the
+first.
+
+Two halves, and the second is the one that is easy to leave out. Such a box
+cannot see the floats *inside* it either, so it gets a formatting context of its
+own rather than the one it sits in — without which its inline content is shifted
+by the float's width a second time, on top of the shift its own box already
+took.
+
+Whether it fits is decided by its min-content width plus its horizontal margins,
+which can be negative: a box pulled left by `margin-left: -50px` occupies fifty
+pixels less than it declares, and a test of exactly that is what caught the
+margins being left out. The band is measured at the box's top rather than over
+its whole height, which is not known until it has been laid out — and laying it
+out is what the answer is for.
+
 **An absolutely positioned root element takes its offsets** (§10.1). Its
 containing block is the initial one — the viewport — and `layout_block` applies
 a *relative* shift itself, but absolute placement is a parent's business and
