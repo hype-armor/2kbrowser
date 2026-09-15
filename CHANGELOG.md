@@ -16,6 +16,24 @@ record for everything earlier.
 
 ## Unreleased
 
+**A table's `height` is a minimum** (§17.5.3), not its height. Where the rows do
+not fill it the excess is shared out among them. **Worth 27 conformance tests
+against nothing lost.**
+
+It was ignored outright, so a `<table height="200">` was as tall as its text.
+That shape is what a great many of the suite's own *reference* files are built
+out of — a cell with `vertical-align: bottom` holding an image at the foot of
+a two-hundred-pixel box is how a reference draws "a green rectangle above a
+blue stripe" without using the property under test — which is why a rule about
+tables was worth twenty-two tests in the backgrounds chapter.
+
+How the excess is distributed is left undefined by §17.5.3. It goes in
+proportion to the heights the rows already have, which is what browsers do, or
+evenly when they have none to be in proportion to. A percentage height is left
+alone: it resolves against the table's containing block height, which is
+usually `auto`, and §10.5 then makes the percentage behave as `auto` — which is
+what leaving it alone produces.
+
 **A stylesheet decides its own encoding** (§4.4), which is a different
 question from a document's and was being answered with a document's rules.
 **Worth 18 conformance tests against nothing lost.**

@@ -50,4 +50,23 @@
 <table cellspacing="10" border="1">
   <tr><td>A wide</td><td>gap</td><td>instead</td></tr>
 </table>
+
+<h3>a declared height is a minimum</h3>
+<!-- CSS 2.1 17.5.3: the rows take the excess, so a cell's content can be
+     aligned against the height the table was asked for rather than against
+     its own text. A table asked for less than its rows need keeps them. -->
+<table border="1" height="120" cellspacing="0" style="width: 300px">
+  <tr>
+    <td valign="top">top of a 120-pixel table</td>
+    <td valign="middle">middle</td>
+    <td valign="bottom">bottom</td>
+  </tr>
+</table>
+<table border="1" height="120" cellspacing="0" style="width: 300px">
+  <tr><td valign="top">two rows</td></tr>
+  <tr><td valign="bottom">share it</td></tr>
+</table>
+<table border="1" height="10" cellspacing="0" style="width: 300px">
+  <tr><td>ten pixels is less than this line needs, so the line wins</td></tr>
+</table>
 </body></html>

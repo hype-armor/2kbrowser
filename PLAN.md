@@ -359,7 +359,9 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    it faces. Captions, above or below per `caption-side`, outside the table's
    border box. `table-layout: fixed`, where the columns and the first row decide
    the widths and nothing below them is measured (§17.5.2.1); `empty-cells`;
-   and a `border-spacing` per axis. A table is never narrower than its own
+   a `border-spacing` per axis; and §17.5.3's *minimum* height, where a
+   declared height the rows do not fill is shared out among them. A table is
+   never narrower than its own
    caption — §17.4's wrapper box, folded into the table's width rather than
    built as a box of its own. **Anonymous tables** (§17.2.1): a run of
    table-internal boxes with no table above them gets one generated around it,

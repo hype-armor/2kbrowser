@@ -70,7 +70,10 @@ shows the table's own background instead; `table-layout: fixed`, where the
 columns and the first row decide the widths and nothing below them is measured
 (§17.5.2.1); `empty-cells`, so a cell with nothing in it can be told not to draw
 its border; a `border-spacing` per axis, since `border-spacing: 0 8px` means the
-rows spaced and the columns not; table captions, which sit outside the
+rows spaced and the columns not; a table's `height` as the *minimum* §17.5.3
+makes it, with whatever the rows do not fill shared out among them — which is
+what lets a cell's `valign="bottom"` sit at the foot of the box the author
+asked for rather than at the foot of its own text; table captions, which sit outside the
 table's border box on whichever side `caption-side` names; §17.2.1's anonymous
 tables, so a run of `display: table-cell` spans with no table above them is
 collected into one and laid out side by side rather than stacked;
