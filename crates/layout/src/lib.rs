@@ -455,6 +455,13 @@ pub struct LayoutBox {
     /// rather than above it and so has to have the rule cut away behind it.
     /// See [`forms::break_the_rule_for_a_legend`].
     pub top_border_gap: Option<(f32, f32)>,
+    /// Which rows of this box's own text are drawn as chosen.
+    ///
+    /// Only a list box has any: its options are lines of one text layout rather
+    /// than boxes, so the one thing that can say which are selected is the box
+    /// that shaped them. Empty for everything else, which is every box on an
+    /// ordinary page.
+    pub chosen_rows: Vec<usize>,
 }
 
 /// The single margin that two adjoining ones collapse into (CSS 2.1 §8.3.1).
@@ -732,6 +739,39 @@ impl Layout {
             height: line.baseline + box_.style.font_size * 0.25,
         })
     }
+
+    /// Which row of a control's own text a canvas point falls on.
+    ///
+    /// For a list box, whose options are drawn stacked inside one atomic box:
+    /// each option is a line of the label, so the row under the pointer is the
+    /// option under the pointer. Hit-testing it here rather than by arithmetic
+    /// in the caller is the difference between reading the lines the engine
+    /// actually laid out and guessing at a line height.
+    ///
+    /// `None` when the point is outside the box, or past its last row — a
+    /// press on the empty space below a short list picks nothing, which is
+    /// what it should do.
+    pub fn row_in(&self, node: NodeId, x: f32, y: f32) -> Option<usize> {
+        let (box_, left, top) = find_box_of(&self.root, node, 0.0, 0.0)?;
+        if x < left || x >= left + box_.rect.width || y < top || y >= top + box_.rect.height {
+            return None;
+        }
+        let within = y - top - box_.content_origin.1;
+        let text = box_.text.as_ref()?;
+        text.lines
+            .iter()
+            .position(|line| within >= line.y && within < line.y + line_height(line))
+    }
+}
+
+/// How tall a line box is, from its own geometry.
+///
+/// The line carries where it starts and where its baseline is but not where it
+/// ends, so the descender is added back — the same quarter of the font size the
+/// caret uses, for the same reason: a row that stopped at the baseline would
+/// leave a gap between rows that a press could fall into and hit nothing.
+fn line_height(line: &text::Line) -> f32 {
+    line.baseline * 1.25
 }
 
 /// How wide the caret is drawn.
@@ -1193,6 +1233,7 @@ pub fn layout(
         replaced_image: false,
         node: None,
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     };
 
@@ -1489,6 +1530,7 @@ fn marker_box(
         replaced_image: false,
         node: None,
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     })
 }
@@ -1607,6 +1649,7 @@ fn layout_inline_block(
         replaced_image: false,
         node: None,
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     };
     let consumed = layout_block(
@@ -1722,8 +1765,8 @@ fn emit_replaced_boxes(
             // width is finally known.
             let control = forms::control_of(doc, node);
             let inner = (placed.width - left - right).max(0.0);
-            let (label, children, round) = match control {
-                Some(control) => control_parts(
+            let parts = control.map(|control| {
+                control_parts(
                     doc,
                     fonts,
                     node,
@@ -1731,8 +1774,11 @@ fn emit_replaced_boxes(
                     child_style,
                     (placed.width, placed.height),
                     inner,
-                ),
-                None => (None, Vec::new(), false),
+                )
+            });
+            let (label, children, round, chosen_rows) = match parts {
+                Some(parts) => (parts.label, parts.children, parts.round, parts.chosen_rows),
+                None => (None, Vec::new(), false, Vec::new()),
             };
 
             parent.children.push(LayoutBox {
@@ -1754,10 +1800,23 @@ fn emit_replaced_boxes(
                         .is_some_and(|element| element.local_name() == "img"),
                 node: Some(node),
                 round,
+                chosen_rows,
                 top_border_gap: None,
             });
         }
     }
+}
+
+/// What a control's box needs beyond its own rectangle.
+struct ControlParts {
+    /// Its label, shaped to fit.
+    label: Option<text::TextLayout>,
+    /// The tick inside a checked box, where there is one.
+    children: Vec<LayoutBox>,
+    /// Whether the box is drawn round, which is how a radio says it is one.
+    round: bool,
+    /// Which rows of the label are drawn as chosen — a list box's selection.
+    chosen_rows: Vec<usize>,
 }
 
 /// A control's used content size: what it asks for, unless the style says.
@@ -1808,7 +1867,7 @@ fn control_parts(
     style: &ComputedStyle,
     border_box: (f32, f32),
     inner: f32,
-) -> (Option<text::TextLayout>, Vec<LayoutBox>, bool) {
+) -> ControlParts {
     let label = forms::label_of(doc, node, control).map(|text| {
         let single_line = forms::is_single_line(doc, node, control);
         // A list box and a textarea hold their lines apart with newlines, so
@@ -1835,10 +1894,23 @@ fn control_parts(
     // against "any of these" — and drawing both square leaves a reader unable
     // to tell which they are answering.
     let round = control == forms::Control::Radio;
-    let checked = matches!(control, forms::Control::Checkbox | forms::Control::Radio)
-        && doc
-            .element(node)
-            .is_some_and(|element| element.attr("checked").is_some());
+    let checked =
+        matches!(control, forms::Control::Checkbox | forms::Control::Radio) && doc.is_on(node);
+    // A list box's options are lines of the one label rather than boxes, so the
+    // only thing that can say which of them are selected is this. Without it a
+    // reader can click a row and see nothing happen, which is worse than a
+    // list box that could not be clicked at all.
+    let chosen_rows =
+        if control == forms::Control::Select && doc.element(node).is_some_and(forms::is_list_box) {
+            forms::options_of(doc, node)
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, option)| doc.is_on(option))
+                .map(|(row, _)| row)
+                .collect()
+        } else {
+            Vec::new()
+        };
     let mut children = Vec::new();
     if checked {
         // A dot needs more room inside the ring than a square mark needs inside
@@ -1866,10 +1938,16 @@ fn control_parts(
             replaced_image: false,
             node: None,
             round,
+            chosen_rows: Vec::new(),
             top_border_gap: None,
         });
     }
-    (label, children, round)
+    ControlParts {
+        label,
+        children,
+        round,
+        chosen_rows,
+    }
 }
 
 /// Whether §9.2.1.1 breaks this inline element around a block inside it.
@@ -2529,6 +2607,7 @@ fn flush_inline(
         replaced_image: false,
         node: None,
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     };
     if let Some(laid_out) = &anonymous.text {
@@ -2676,8 +2755,7 @@ fn layout_block(
             width + surround,
             height + padding_top + padding_bottom + border_top + border_bottom,
         );
-        let (label, children, round) =
-            control_parts(doc, fonts, node, control, style, border_box, width);
+        let parts = control_parts(doc, fonts, node, control, style, border_box, width);
         let box_ = LayoutBox {
             rect: Rect {
                 x: x + margin_left,
@@ -2686,16 +2764,17 @@ fn layout_block(
                 height: border_box.1,
             },
             style: style.clone(),
-            text: label,
+            text: parts.label,
             content_origin: (padding_left + border_left, padding_top + border_top),
             content_width: width,
-            children,
+            children: parts.children,
             // Painted from its own border and background, so there is nothing
             // for the image path to go looking for.
             replaced: None,
             replaced_image: false,
             node: Some(node),
-            round,
+            round: parts.round,
+            chosen_rows: parts.chosen_rows,
             top_border_gap: None,
         };
         let consumed = Consumed {
@@ -2735,6 +2814,7 @@ fn layout_block(
                 .is_some_and(|element| element.local_name() == "img"),
             node: Some(node),
             round: false,
+            chosen_rows: Vec::new(),
             top_border_gap: None,
         };
         let consumed = Consumed {
@@ -2766,6 +2846,7 @@ fn layout_block(
         replaced_image: false,
         node: Some(node),
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     };
 
@@ -2993,6 +3074,7 @@ fn layout_block(
                     replaced_image: false,
                     node: None,
                     round: false,
+                    chosen_rows: Vec::new(),
                     top_border_gap: None,
                 };
                 let taken = layout_block(
@@ -3243,6 +3325,7 @@ fn layout_block(
                 replaced_image: false,
                 node: None,
                 round: false,
+                chosen_rows: Vec::new(),
                 top_border_gap: None,
             };
             let (table_width, table_height) = layout_table(
@@ -3730,6 +3813,7 @@ fn layout_block(
             replaced_image: false,
             node: None,
             round: false,
+            chosen_rows: Vec::new(),
             top_border_gap: None,
         };
         // An absolutely positioned box with `width: auto` shrinks to fit its
@@ -4121,6 +4205,7 @@ fn layout_table(
                 replaced_image: false,
                 node: None,
                 round: false,
+                chosen_rows: Vec::new(),
                 top_border_gap: None,
             };
             // A cell establishes its own formatting context, so floats outside
@@ -4298,6 +4383,7 @@ fn layout_table(
         replaced_image: false,
         node: Some(node),
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     };
 
@@ -4534,6 +4620,7 @@ fn emit_collapsed_borders(
             replaced_image: false,
             node: None,
             round: false,
+            chosen_rows: Vec::new(),
             top_border_gap: None,
         }
     };
@@ -4678,6 +4765,7 @@ fn place_float(
         replaced_image: false,
         node: None,
         round: false,
+        chosen_rows: Vec::new(),
         top_border_gap: None,
     };
     let float_height = layout_block(
@@ -11451,5 +11539,106 @@ mod block_control_tests {
             block.rect.height, inline.rect.height,
             "a four-row textarea is four rows tall either way",
         );
+    }
+}
+
+#[cfg(test)]
+mod list_box_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// The `<select>`'s box, laid out with the UA sheet that gives it one.
+    fn select_box(html: &str) -> LayoutBox {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css::ua::UA_STYLESHEET)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            600.0,
+        );
+        let wanted = doc.find_element("select").expect("the fixture has one");
+        fn walk(box_: &LayoutBox, node: NodeId, out: &mut Option<LayoutBox>) {
+            if box_.node == Some(node) && box_.text.is_some() {
+                *out = Some(box_.clone());
+            }
+            for child in &box_.children {
+                walk(child, node, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, wanted, &mut found);
+        found.expect("the select was laid out")
+    }
+
+    #[test]
+    fn a_list_box_marks_the_row_that_is_selected() {
+        // Otherwise clicking a row does nothing a reader can see, which is
+        // worse than a list box that could not be clicked at all.
+        let box_ = select_box(
+            "<select multiple size=\"3\">\
+             <option>English</option>\
+             <option selected>French</option>\
+             <option>Japanese</option></select>",
+        );
+        assert_eq!(box_.chosen_rows, vec![1]);
+    }
+
+    #[test]
+    fn a_list_box_can_mark_more_than_one() {
+        let box_ = select_box(
+            "<select multiple size=\"3\">\
+             <option selected>English</option>\
+             <option>French</option>\
+             <option selected>Japanese</option></select>",
+        );
+        assert_eq!(box_.chosen_rows, vec![0, 2]);
+    }
+
+    #[test]
+    fn a_closed_dropdown_marks_nothing() {
+        // It draws one option and that option is the answer; a bar under the
+        // only line in the box would say nothing and look like a highlight.
+        let box_ =
+            select_box("<select><option>English</option><option selected>French</option></select>");
+        assert!(box_.chosen_rows.is_empty(), "{:?}", box_.chosen_rows);
+    }
+
+    #[test]
+    fn choosing_a_row_moves_the_mark() {
+        let html = "<select multiple size=\"2\">\
+                    <option>English</option><option>French</option></select>";
+        let doc = dom::parse(html);
+        let select = doc.find_element("select").expect("the select");
+        let french = forms::options_of(&doc, select)[1];
+        let mut doc = doc;
+        for (node, on) in forms::press(&doc, french) {
+            doc.set_chosen(node, on);
+        }
+
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css::ua::UA_STYLESHEET)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            600.0,
+        );
+        fn walk(box_: &LayoutBox, node: NodeId, out: &mut Option<Vec<usize>>) {
+            if box_.node == Some(node) && box_.text.is_some() {
+                *out = Some(box_.chosen_rows.clone());
+            }
+            for child in &box_.children {
+                walk(child, node, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, select, &mut found);
+        assert_eq!(found, Some(vec![1]));
     }
 }

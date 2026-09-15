@@ -2062,20 +2062,16 @@ fn is_list_box(select: Option<&ElementData>) -> bool {
 
 /// Whether this is the one option a closed dropdown displays.
 ///
-/// The last option carrying `selected` wins, which is what browsers do with the
-/// malformed case of several; with none, the first option is shown, because
-/// that is what a dropdown opens on.
+/// The last option that is on wins, which is what browsers do with the
+/// malformed case of several `selected`; with none, the first option is shown,
+/// because that is what a dropdown opens on.
+///
+/// "On" rather than "carrying `selected`" because a reader can choose one, and
+/// then what the markup said is only where the dropdown started.
 fn is_shown_option(doc: &Document, select: NodeId, option: NodeId) -> bool {
     let mut options = Vec::new();
     collect_options(doc, select, &mut options);
-    let selected = options
-        .iter()
-        .rev()
-        .find(|&&id| {
-            doc.element(id)
-                .is_some_and(|element| element.attr("selected").is_some())
-        })
-        .copied();
+    let selected = options.iter().rev().find(|&&id| doc.is_on(id)).copied();
     match selected {
         Some(id) => id == option,
         None => options.first() == Some(&option),

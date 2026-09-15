@@ -97,6 +97,9 @@ pub struct PageRenderer {
     /// arena in the same order — and the bytes are the same bytes, since they
     /// are the ones in `last`.
     values: Vec<(dom::NodeId, String)>,
+    /// What the reader has ticked, chosen or unticked, by node. Re-applied
+    /// after a parse the same way, and for the same reason, as `values`.
+    chosen: Vec<(dom::NodeId, bool)>,
     /// The control being typed in, and its editing state.
     focus: Option<(dom::NodeId, crate::field::Field)>,
     /// A form the reader asked to send, waiting for the next render to carry
@@ -105,6 +108,12 @@ pub struct PageRenderer {
     /// Taken rather than held: one press sends one form, and a submission left
     /// lying here would be re-sent by the next resize.
     submit: Option<sandbox::message::Submission>,
+    /// A dropdown the reader opened, waiting for the next render to carry it
+    /// out to the parent.
+    ///
+    /// Taken rather than held, like `submit`: one press opens one list, and a
+    /// dropdown left lying here would spring open again on the next resize.
+    open: Option<sandbox::message::Dropdown>,
 }
 
 impl Default for PageRenderer {
@@ -124,8 +133,10 @@ impl PageRenderer {
             force_document: false,
             last: None,
             values: Vec::new(),
+            chosen: Vec::new(),
             focus: None,
             submit: None,
+            open: None,
         }
     }
 
@@ -225,11 +236,72 @@ impl PageRenderer {
             self.ask_to_send(button);
             return;
         }
+        // Then a control that changes when it is pressed: a checkbox, a radio,
+        // a row of a list box. It answers the press *instead of* taking the
+        // typing, because there is nothing to type into one.
+        let changed = self
+            .page
+            .as_ref()
+            .map(|page| page.choice_at(at.0, at.1))
+            .unwrap_or_default();
+        if !changed.is_empty() {
+            self.set_focus(None);
+            self.record(changed);
+            return;
+        }
+        // Then a closed dropdown, which is opened rather than changed: what is
+        // in it has to be drawn over the page, and only the parent has
+        // anywhere to draw that.
+        if let Some((node, rect, options, on)) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.dropdown_at(at.0, at.1))
+        {
+            self.set_focus(None);
+            self.open = Some(sandbox::message::Dropdown {
+                rect,
+                node: node.0 as u32,
+                options,
+                on: on as u32,
+            });
+            return;
+        }
         let found = self
             .page
             .as_ref()
             .and_then(|page| page.control_at(at.0, at.1));
         self.set_focus(found);
+    }
+
+    /// Chooses one option of a `<select>`, named the way this side named it.
+    ///
+    /// Everything the parent hands back is checked rather than trusted. The id
+    /// is an index into this process's arena and the index is a position in a
+    /// list only this process has; either could be stale by the time it
+    /// returns, because a render in between re-parsed the document. A name
+    /// that no longer fits changes nothing, which is what a message that no
+    /// longer makes sense should do.
+    fn choose(&mut self, node: u32, index: u32) {
+        let changed = self
+            .page
+            .as_ref()
+            .map(|page| page.choose_in(dom::NodeId(node as usize), index as usize))
+            .unwrap_or_default();
+        self.record(changed);
+    }
+
+    /// Records what a press changed, for the next render to apply.
+    ///
+    /// Kept beside the document rather than written into it, the same way a
+    /// typed value is and for the same reason: the document is re-parsed on
+    /// every render, and anything written into the old one would be gone.
+    fn record(&mut self, changes: Vec<(dom::NodeId, bool)>) {
+        for (node, on) in changes {
+            match self.chosen.iter_mut().find(|(at, _)| *at == node) {
+                Some(entry) => entry.1 = on,
+                None => self.chosen.push((node, on)),
+            }
+        }
     }
 
     /// Collects the form `node` is in, for the parent to send.
@@ -373,8 +445,8 @@ impl Render for PageRenderer {
         request: &ToChild,
         fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
     ) -> Result<Rendered, String> {
-        // Typing and focusing are re-renders of the page already held, so they
-        // borrow the request it came from. Kept here rather than asked for
+        // Typing, focusing and choosing are re-renders of the page already
+        // held, so they borrow the request it came from. Kept here rather than asked for
         // again: a keystroke that had to go back over the pipe for the
         // document's bytes would cross the boundary twice to move a cursor.
         let held;
@@ -386,6 +458,11 @@ impl Render for PageRenderer {
             }
             ToChild::Type { key } => {
                 self.apply(key);
+                held = self.last.clone();
+                held.as_ref().ok_or("nothing has been rendered yet")?
+            }
+            ToChild::Choose { node, index } => {
+                self.choose(*node, *index);
                 held = self.last.clone();
                 held.as_ref().ok_or("nothing has been rendered yet")?
             }
@@ -434,6 +511,7 @@ impl Render for PageRenderer {
                 force_document: *force_document,
                 zoom: *zoom,
                 values: self.values.clone(),
+                chosen: self.chosen.clone(),
                 focus: self
                     .focus
                     .as_ref()
@@ -458,7 +536,13 @@ impl Render for PageRenderer {
             links: links_of(&page),
             missing: missing_of(&page),
             buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            pressables: page
+                .pressables()
+                .into_iter()
+                .map(|(_, rect)| rect)
+                .collect(),
             submit: self.submit.take(),
+            open: self.open.take(),
             can_toggle_layout: self.can_toggle_layout(&page),
             editing: self.focus.is_some(),
             images_loaded: page.images_loaded as u32,
@@ -507,9 +591,16 @@ impl Render for PageRenderer {
             links: links_of(page),
             missing: missing_of(page),
             buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            pressables: page
+                .pressables()
+                .into_iter()
+                .map(|(_, rect)| rect)
+                .collect(),
             // A band is a repaint of rows already laid out, and repainting is
-            // not a thing anybody asked a form to be sent by.
+            // not a thing anybody asked a form to be sent by, or a dropdown to
+            // be opened by.
             submit: None,
+            open: None,
             can_toggle_layout: self.can_toggle_layout(page),
             editing: self.focus.is_some(),
             images_loaded: page.images_loaded as u32,

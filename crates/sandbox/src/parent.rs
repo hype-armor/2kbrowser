@@ -413,6 +413,7 @@ enum Job {
     Select { from: (f32, f32), to: (f32, f32) },
     Focus { at: (f32, f32) },
     Type { key: crate::message::Key },
+    Choose { node: u32, index: u32 },
 }
 
 /// A render request, boxed because it carries the whole document.
@@ -683,6 +684,23 @@ impl Session {
         }
     }
 
+    /// Tells the child which row of the dropdown it opened was chosen.
+    ///
+    /// `node` is the child's own name for the `<select>`, from the [`Dropdown`]
+    /// it sent, handed back untouched. This side does not read it: it is an
+    /// index into an arena in another process, and the only correct thing to do
+    /// with it is give it back.
+    ///
+    /// [`Dropdown`]: crate::message::Dropdown
+    pub fn choose(&mut self, node: u32, index: u32) -> Result<Rendered, Error> {
+        self.submit(Job::Choose { node, index }, Kind::Page)?;
+        match self.wait_for(Kind::Page)? {
+            Answer::Rendered(page) => Ok(*page),
+            Answer::Failed(error) => Err(error),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
     /// The renderer's process id.
     ///
     /// Exposed for one reason: so a test can go and look. Dropping a session is
@@ -927,6 +945,9 @@ impl Conversation {
                 .map(|page| Answer::Rendered(Box::new(page))),
             Job::Type { key } => self
                 .converse(ToChild::Type { key })
+                .map(|page| Answer::Rendered(Box::new(page))),
+            Job::Choose { node, index } => self
+                .converse(ToChild::Choose { node, index })
                 .map(|page| Answer::Rendered(Box::new(page))),
         };
         outcome.unwrap_or_else(Answer::Failed)

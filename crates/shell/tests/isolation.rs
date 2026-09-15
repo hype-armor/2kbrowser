@@ -2266,3 +2266,144 @@ fn enter_in_a_textarea_is_a_newline_rather_than_a_send() {
         "Enter in a textarea sent the form instead of starting a line"
     );
 }
+
+#[test]
+fn ticking_a_checkbox_changes_what_the_form_sends() {
+    // Through a real renderer child, because the point of this is that the
+    // change survives the re-parse a render does: the press is recorded beside
+    // the document and applied to the next one, and a bug there would show as
+    // a box that ticks and then unticks itself on the next keystroke.
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"post\" checked>\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a checkbox");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    assert!(
+        !page.editing(),
+        "a checkbox is pressed rather than typed in, so it takes no typing",
+    );
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(
+        sent.body, "go=Send",
+        "the box was unticked, so it is no longer a successful control",
+    );
+}
+
+#[test]
+fn a_box_stays_as_it_was_left_across_a_render() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"post\">\
+         <input name=\"q\" value=\"\">\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a checkbox");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    // Typing re-renders the whole page from the original bytes. A tick that
+    // lived in the document rather than beside it would be gone by now.
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    for letter in ["h", "i"] {
+        page.type_key(sandbox::message::Key::Insert(letter.to_owned()));
+    }
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(sent.body, "post=on&q=hi&go=Send");
+}
+
+#[test]
+fn pressing_a_dropdown_asks_the_parent_to_open_a_list() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <select name=\"where\">\
+         <option value=\"uk\">United Kingdom</option>\
+         <option value=\"fr\" selected>France</option>\
+         </select></form></body>",
+        400,
+    );
+    assert!(page.take_dropdown().is_none(), "nothing was pressed yet");
+    let box_ = page.pressables().first().copied().expect("a select");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    let open = page.take_dropdown().expect("the press opened a list");
+    assert_eq!(
+        open.options,
+        vec!["United Kingdom".to_owned(), "France".to_owned()],
+        "the list has to say what is in it — the parent has no document",
+    );
+    assert_eq!(open.on, 1, "and which one it is currently open on");
+    assert!(
+        page.take_dropdown().is_none(),
+        "one press opens one list, not every press after it",
+    );
+}
+
+#[test]
+fn choosing_a_row_changes_what_the_dropdown_shows_and_sends() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <select name=\"where\">\
+         <option value=\"uk\">United Kingdom</option>\
+         <option value=\"fr\" selected>France</option>\
+         </select>\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a select");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    let open = page.take_dropdown().expect("the press opened a list");
+    page.choose(open.node, 0);
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(sent.body, "where=uk&go=Send");
+}
+
+#[test]
+fn a_row_that_is_not_there_changes_nothing() {
+    // The index arrives from another process. Past the end it picks nothing
+    // rather than panicking or picking the last one, which is the honest
+    // answer to a message that does not make sense.
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <select name=\"where\"><option value=\"uk\">UK</option></select>\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a select");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    let open = page.take_dropdown().expect("the press opened a list");
+    page.choose(open.node, 99);
+    page.choose(u32::MAX, 0);
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    assert_eq!(
+        page.take_submission().expect("sent").body,
+        "where=uk&go=Send",
+    );
+}

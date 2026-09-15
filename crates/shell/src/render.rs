@@ -215,8 +215,8 @@ impl Page {
 
     /// Every text control on the page, in document order, with where it is.
     ///
-    /// Text controls only: a checkbox has nothing to type into, and a button
-    /// has nothing to type into *and* nothing yet to press. Tab order is
+    /// Text controls only: a checkbox and a button have nothing to type into,
+    /// and both are reached with the pointer instead. Tab order is
     /// document order, which is what HTML says when nothing declares otherwise
     /// and what this engine can honestly offer — `tabindex` is not read (#110).
     pub fn text_controls(&self) -> Vec<(dom::NodeId, layout::Rect)> {
@@ -246,9 +246,10 @@ impl Page {
 
     /// Every control that can be pressed, in document order, with where it is.
     ///
-    /// Buttons, so a form can be sent (#110). Checkboxes and radios are not
-    /// here: pressing one has to *change* it, and nothing can yet — offering a
-    /// target that does nothing would be worse than offering none.
+    /// Buttons, so a form can be sent (#110). Checkboxes, radios and
+    /// `<select>`s are in [`Page::pressables`] instead: they answer a press by
+    /// changing rather than by sending, which is a different question with a
+    /// different answer.
     pub fn buttons(&self) -> Vec<(dom::NodeId, layout::Rect)> {
         let mut out = Vec::new();
         for frame in &self.frames {
@@ -277,6 +278,153 @@ impl Page {
                 x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
             })
             .map(|(node, _)| node)
+    }
+
+    /// Every control that answers a press by changing: a checkbox, a radio, a
+    /// `<select>` of either shape.
+    ///
+    /// Document order, with where each one is. Buttons are not here — they
+    /// send rather than change, and [`Page::buttons`] already has them.
+    pub fn pressables(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                let pressable = matches!(
+                    layout::forms::control_of(&frame.doc, node),
+                    Some(
+                        layout::forms::Control::Checkbox
+                            | layout::forms::Control::Radio
+                            | layout::forms::Control::Select
+                    )
+                );
+                if !pressable {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// What a press at a point should change, as entries to record.
+    ///
+    /// Empty when the point is on nothing that can be changed, which includes
+    /// a point on a field or a button — both are pressed for other reasons and
+    /// both already have one.
+    ///
+    /// A closed `<select>` is not here either. Pressing one opens a list rather
+    /// than changing anything, and the list is drawn by the parent; see
+    /// [`Page::dropdown_at`].
+    pub fn choice_at(&self, x: f32, y: f32) -> Vec<(dom::NodeId, bool)> {
+        for frame in &self.frames {
+            let (x, y) = (x - frame.rect.x, y - frame.rect.y);
+            for node in frame.doc.descendants(frame.doc.root()).into_iter().rev() {
+                let Some(control) = layout::forms::control_of(&frame.doc, node) else {
+                    continue;
+                };
+                let hit = match control {
+                    layout::forms::Control::Checkbox | layout::forms::Control::Radio => {
+                        on_any(&frame.layout.rects_for(node), x, y).then_some(node)
+                    }
+                    // A list box shows its options stacked inside one atomic
+                    // box, so the row under the pointer is the option under
+                    // the pointer and the press lands on that option rather
+                    // than on the `<select>`.
+                    layout::forms::Control::Select
+                        if frame
+                            .doc
+                            .element(node)
+                            .is_some_and(layout::forms::is_list_box) =>
+                    {
+                        frame.layout.row_in(node, x, y).and_then(|row| {
+                            layout::forms::options_of(&frame.doc, node)
+                                .get(row)
+                                .copied()
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(hit) = hit {
+                    return layout::forms::press(&frame.doc, hit);
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// The closed dropdown at a point, and what is in it.
+    ///
+    /// Only a closed one: a list box shows its options already and is changed
+    /// in place by [`Page::choice_at`]. The rectangle is where the `<select>`
+    /// is, so the parent can open the list under it.
+    pub fn dropdown_at(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<(dom::NodeId, layout::Rect, Vec<String>, usize)> {
+        for frame in &self.frames {
+            let (local_x, local_y) = (x - frame.rect.x, y - frame.rect.y);
+            for node in frame.doc.descendants(frame.doc.root()).into_iter().rev() {
+                if layout::forms::control_of(&frame.doc, node)
+                    != Some(layout::forms::Control::Select)
+                {
+                    continue;
+                }
+                if frame
+                    .doc
+                    .element(node)
+                    .is_some_and(layout::forms::is_list_box)
+                {
+                    continue;
+                }
+                let rects = frame.layout.rects_for(node);
+                if !on_any(&rects, local_x, local_y) {
+                    continue;
+                }
+                let options = layout::forms::options_of(&frame.doc, node);
+                let on = options
+                    .iter()
+                    .position(|&id| frame.doc.is_on(id))
+                    .unwrap_or(0);
+                let labels = options
+                    .iter()
+                    .map(|&id| layout::forms::option_label(&frame.doc, id))
+                    .collect();
+                let mut rect = rects.into_iter().next()?;
+                rect.x += frame.rect.x;
+                rect.y += frame.rect.y;
+                return Some((node, rect, labels, on));
+            }
+        }
+        None
+    }
+
+    /// Choosing one option of a `<select>` by its position in the list.
+    ///
+    /// The index arrives from outside this process, so it is looked up rather
+    /// than indexed with: an index past the end picks nothing and changes
+    /// nothing, which is the honest answer to a message that does not make
+    /// sense.
+    pub fn choose_in(&self, node: dom::NodeId, index: usize) -> Vec<(dom::NodeId, bool)> {
+        self.frames
+            .iter()
+            // Bounds-checked before anything reads it: the id crossed a
+            // process boundary, `Document` indexes its arena directly, and an
+            // id past the end would take the renderer down rather than pick
+            // nothing.
+            .filter(|frame| node.0 < frame.doc.len())
+            .filter(|frame| {
+                layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Select)
+            })
+            .find_map(|frame| {
+                let option = *layout::forms::options_of(&frame.doc, node).get(index)?;
+                Some(layout::forms::press(&frame.doc, option))
+            })
+            .unwrap_or_default()
     }
 
     /// The form `node` belongs to, collected and ready to send (#110).
@@ -793,6 +941,12 @@ pub(crate) struct Settings {
     /// the node ids line up because parsing the same bytes builds the same
     /// arena in the same order.
     pub(crate) values: Vec<(dom::NodeId, String)>,
+    /// What the reader has ticked, chosen or unticked on this page, by node.
+    ///
+    /// Re-applied after a parse for the same reason `values` is, and kept
+    /// apart from it because they answer different questions about the same
+    /// control: one is what a field holds, the other whether a box is on.
+    pub(crate) chosen: Vec<(dom::NodeId, bool)>,
     /// The control the reader is typing in, and where its caret is.
     pub(crate) focus: Option<(dom::NodeId, usize)>,
     /// How much bigger than its own pixels the page is drawn.
@@ -812,6 +966,7 @@ impl Default for Settings {
             force_document: false,
             zoom: 1.0,
             values: Vec::new(),
+            chosen: Vec::new(),
             focus: None,
         }
     }
@@ -835,6 +990,9 @@ pub(crate) fn render_sized(
     let mut doc = dom::parse(html);
     for (node, value) in &settings.values {
         doc.set_value(*node, value.clone());
+    }
+    for (node, on) in &settings.chosen {
+        doc.set_chosen(*node, *on);
     }
     let doc = doc;
 
@@ -1490,6 +1648,13 @@ fn missing_images(
 
 /// Colour of the caret and the ring around the control being typed in.
 ///
+/// Whether a point is inside any of a node's rectangles.
+fn on_any(rects: &[layout::Rect], x: f32, y: f32) -> bool {
+    rects.iter().any(|rect| {
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    })
+}
+
 /// The chrome's focus blue, so a field on the page and the URL bar say "the
 /// typing goes here" the same way. Fixed rather than taken from the page: this
 /// is the browser speaking, and a focus ring tinted to match the author's

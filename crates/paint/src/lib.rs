@@ -338,6 +338,24 @@ fn paint_box(
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
         let content_y = y + box_.content_origin.1;
+        // A list box's chosen rows, under its own text rather than over it —
+        // and so before the loop that draws the glyphs rather than after it,
+        // which a child box could not be. A bar light enough to read dark text
+        // through, because inverting the text would mean shaping the line
+        // twice to say the one thing the bar already says.
+        for row in &box_.chosen_rows {
+            if let Some(line) = layout.lines.get(*row) {
+                list.items.push(DisplayItem::Rect {
+                    rect: Rect {
+                        x,
+                        y: content_y + line.y,
+                        width: box_.rect.width,
+                        height: line.baseline * 1.25,
+                    },
+                    color: CHOSEN_ROW,
+                });
+            }
+        }
         for line in &layout.lines {
             let dx = line_offset(
                 box_.style.text_align.against(box_.style.direction),
@@ -767,6 +785,18 @@ fn shaded(color: Color, factor: f32) -> Color {
 }
 
 /// How much darker a shadowed edge is drawn.
+/// The bar behind a chosen row of a list box.
+///
+/// UA furniture rather than anything the page asked for, like the control's own
+/// border — and it cannot come from the stylesheet the way that border does,
+/// because a `<select>`'s options are hidden and its rows are lines of one text
+/// layout rather than boxes the cascade can reach.
+///
+/// Light on purpose. A saturated bar would need the text on it inverted to stay
+/// legible, which would mean shaping that line a second time in a second colour
+/// to say the one thing the bar already says.
+const CHOSEN_ROW: Color = Color::rgb(0xcf, 0xdd, 0xee);
+
 const SHADOW: f32 = 0.5;
 
 /// A band across a side's *thickness*, measured from its outer edge.

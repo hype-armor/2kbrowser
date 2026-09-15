@@ -110,6 +110,21 @@ pub struct Document {
     /// Empty on a freshly parsed document, which is every document until a key
     /// is pressed in one.
     values: std::collections::HashMap<NodeId, String>,
+    /// Which controls the reader has turned on or off, where that is no longer
+    /// what the markup said.
+    ///
+    /// The same separation as `values`, for the same reason: `checked` and
+    /// `selected` in the markup are *defaults*, and what somebody has ticked is
+    /// a property of the control. A page styling `input:checked` or
+    /// `option[selected]` would otherwise restyle itself the moment a box was
+    /// ticked, which is a rule about the markup answered with a fact about the
+    /// session.
+    ///
+    /// One map covers a checkbox, a radio *and* an `<option>`, because all
+    /// three ask the same question — is this one on? — and keying an option by
+    /// its own node is what lets a `<select>` share this rather than need a
+    /// second record shaped differently.
+    chosen: std::collections::HashMap<NodeId, bool>,
 }
 
 impl Document {
@@ -124,6 +139,7 @@ impl Document {
             root: NodeId(0),
             quirks: QuirksMode::NoQuirks,
             values: std::collections::HashMap::new(),
+            chosen: std::collections::HashMap::new(),
         }
     }
 
@@ -145,9 +161,51 @@ impl Document {
         self.values.insert(id, value.into());
     }
 
-    /// Whether anything has been typed into this document at all.
+    /// Whether a control is on, if the reader has said either way.
+    ///
+    /// `None` means nobody has touched it and the caller falls back to the
+    /// markup — the `checked` or `selected` attribute. `Some(false)` is a
+    /// distinct answer from `None` and the reason this is an `Option` at all:
+    /// it is a box that *was* ticked by the markup and has been unticked, which
+    /// is the case a form with a pre-ticked "send me email" box turns on.
+    pub fn chosen(&self, id: NodeId) -> Option<bool> {
+        self.chosen.get(&id).copied()
+    }
+
+    /// Records that a control is on or off.
+    pub fn set_chosen(&mut self, id: NodeId, on: bool) {
+        self.chosen.insert(id, on);
+    }
+
+    /// Whether a control is on: a ticked box, a chosen radio, a selected
+    /// option.
+    ///
+    /// The reader's answer first, the markup's only as a default — the same
+    /// order [`Document::value_of`] is read in and for the same reason. It
+    /// lives here rather than in layout or in the cascade because both of those
+    /// ask it, of the same node, and must not be able to disagree: the cascade
+    /// decides which option a dropdown *shows* and layout decides which one it
+    /// *sends*, and a browser where those two differ is one that submits
+    /// something other than what is on screen.
+    ///
+    /// Which attribute carries the default is the element's business: an
+    /// `<option>` is `selected` and everything else is `checked`.
+    pub fn is_on(&self, id: NodeId) -> bool {
+        if let Some(chosen) = self.chosen(id) {
+            return chosen;
+        }
+        self.element(id).is_some_and(|element| {
+            let attribute = match element.local_name() {
+                "option" => "selected",
+                _ => "checked",
+            };
+            element.attr(attribute).is_some()
+        })
+    }
+
+    /// Whether the reader has changed anything in this document at all.
     pub fn is_edited(&self) -> bool {
-        !self.values.is_empty()
+        !self.values.is_empty() || !self.chosen.is_empty()
     }
 
     /// Quirks mode, as determined by the parser from the doctype.

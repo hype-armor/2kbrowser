@@ -825,4 +825,107 @@ arrived=$(cat /tmp/2kbrowser-form-seen 2>/dev/null || true)
 echo "ok: pressing submit sent the form and the server got its fields"
 stop
 
+# N. A checkbox can be ticked and unticked, and a dropdown can be opened and
+#    chosen from.
+#
+#    The near half of the same path the typing check covers, for the controls
+#    that are pressed rather than typed in. Two things here exist nowhere else:
+#    the dropdown's list is drawn by the *window* over the page, so no test
+#    below the window can see it at all; and the tick has to survive a re-render,
+#    which is what makes it a state rather than a flash.
+choosing="$here/target/window-choosing"
+mkdir -p "$choosing"
+cat > "$choosing/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Choosing</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: absolute; left: 40px; top: 40px">
+<input type="checkbox">
+</div>
+<div style="position: absolute; left: 40px; top: 120px">
+<select>
+<option>MMMMMMMMMMMM</option>
+<option selected>i</option>
+</select>
+</div>
+</body>
+FIXTURE
+
+start_on "$choosing/p.html" "Choosing"
+DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null || true
+sleep 0.3
+
+# The box is at document (40, 40) and is about a line tall, so the middle of it
+# is a few pixels in. Asked of the screen rather than assumed, the same rule
+# every other check here follows: the fixture puts nothing else in that band.
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 40)) $((chrome + 80)))
+[ -n "$box" ] || fail "the checkbox never reached the screen"
+set -- $box
+tick_x=$((($1 + $3) / 2)) tick_y=$((($2 + $4) / 2))
+empty=$(pixel "$tick_x" "$tick_y")
+
+DISPLAY=$display xdotool mousemove "$tick_x" "$tick_y"
+DISPLAY=$display xdotool click 1
+ticked=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    [ "$(pixel "$tick_x" "$tick_y")" != "$empty" ] && { ticked=yes; break; }
+done
+[ -n "$ticked" ] || fail "clicking the checkbox drew no tick, so a form with a \
+box to answer still cannot be answered"
+
+DISPLAY=$display xdotool click 1
+cleared=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    [ "$(pixel "$tick_x" "$tick_y")" = "$empty" ] && { cleared=yes; break; }
+done
+[ -n "$cleared" ] || fail "clicking the ticked box again left it ticked, so a \
+pre-ticked box still cannot be cleared"
+
+# The dropdown. Closed it shows "i" and nothing else; the list it opens holds a
+# row much wider than that, so both the list appearing and the choice landing
+# are visible as ink where there was none.
+drop=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+[ -n "$drop" ] || fail "the dropdown never reached the screen"
+set -- $drop
+drop_left=$1 drop_top=$2 drop_right=$3 drop_bottom=$4
+DISPLAY=$display xdotool mousemove $(((drop_left + drop_right) / 2)) \
+    $(((drop_top + drop_bottom) / 2))
+DISPLAY=$display xdotool click 1
+
+# The list opens under the control, so ink appears below where the page had
+# none. Its first row is the option to choose.
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    below=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((drop_bottom + 2)) $((drop_bottom + 40)))
+    [ -n "$below" ] && { opened=yes; break; }
+done
+[ -n "$opened" ] || fail "pressing the dropdown opened no list, so its other \
+options are still unreachable"
+
+set -- $below
+DISPLAY=$display xdotool mousemove $((drop_left + 8)) $(($2 + 6))
+DISPLAY=$display xdotool click 1
+
+# The box now reads the option that was chosen, which is many times wider than
+# the one it read before.
+chose=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    now=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+    [ -n "$now" ] || continue
+    set -- $now
+    [ $(($3 - $1)) -gt $((drop_right - drop_left)) ] && { chose=yes; break; }
+done
+[ -n "$chose" ] || fail "choosing a row left the dropdown showing what it \
+showed before, so what the form would send has not changed"
+echo "ok: a checkbox ticked and unticked, and a dropdown opened and was chosen from"
+stop
+
 echo "all window click checks passed"
