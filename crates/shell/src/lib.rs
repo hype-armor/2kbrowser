@@ -9,6 +9,7 @@ pub mod field;
 pub mod history;
 pub mod isolated;
 pub mod menu;
+pub mod preview;
 pub mod render;
 pub mod scrollbar;
 pub mod tabs;

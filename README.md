@@ -453,6 +453,12 @@ and its own bugs. `2kbrowser bookmarks` prints the same list. It is stored as a
 tab-separated file under your config directory: a few kilobytes, editable in
 anything, and the only state this browser keeps between runs.
 
+Hovering a link puts its address in the bottom-left corner. A link's text says
+whatever its author wanted it to say; only the address says where it goes, and
+without somewhere to read that the only way to find out is to follow it. It sits
+over the page rather than in a row of its own, because a strip of chrome that is
+empty almost all the time would cost every page a line of height.
+
 Links can be followed without a pointer: Tab walks them in document order,
 Shift+Tab goes back, Enter follows, Escape drops the focus. The focused link is
 outlined rather than tinted, so it does not read as a find match — both can be

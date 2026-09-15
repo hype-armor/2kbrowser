@@ -1052,7 +1052,7 @@ pub(crate) fn ui_style(size: f32) -> ComputedStyle {
     }
 }
 
-fn measure(fonts: &mut FontStore, text: &str, style: &ComputedStyle) -> f32 {
+pub(crate) fn measure(fonts: &mut FontStore, text: &str, style: &ComputedStyle) -> f32 {
     fonts.layout(text, style, f32::MAX).width
 }
 
@@ -1151,7 +1151,12 @@ const ELLIPSIS: &str = "\u{2026}";
 /// URL whose path is `behi`. A reader cannot tell they are missing something
 /// unless they are told, and the address bar is the last place to be quietly
 /// approximate.
-fn elided(fonts: &mut FontStore, text: &str, style: &ComputedStyle, max_width: f32) -> String {
+pub(crate) fn elided(
+    fonts: &mut FontStore,
+    text: &str,
+    style: &ComputedStyle,
+    max_width: f32,
+) -> String {
     if measure(fonts, text, style) <= max_width {
         return text.to_owned();
     }
