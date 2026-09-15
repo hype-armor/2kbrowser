@@ -861,10 +861,27 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                 url: "https://cdn.example.net/photo.jpg".to_owned(),
             }],
             buttons: Vec::new(),
+            pressables: vec![layout::Rect {
+                x: 2.0,
+                y: 3.0,
+                width: 13.0,
+                height: 13.0,
+            }],
             submit: Some(sandbox::Submission {
                 action: "/search".to_owned(),
                 post: true,
                 body: "q=tables".to_owned(),
+            }),
+            open: Some(sandbox::message::Dropdown {
+                rect: layout::Rect {
+                    x: 7.0,
+                    y: 8.0,
+                    width: 90.0,
+                    height: 20.0,
+                },
+                node: 42,
+                options: vec!["United Kingdom".to_owned(), "France".to_owned()],
+                on: 1,
             }),
             can_toggle_layout: true,
             editing: false,

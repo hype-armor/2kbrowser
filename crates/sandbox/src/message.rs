@@ -106,6 +106,30 @@ pub struct Submission {
     pub body: String,
 }
 
+/// A dropdown the reader has opened, and what is in it.
+///
+/// A closed `<select>` is a list nobody can see until it is opened, and there
+/// is nowhere on the page to open it — the list has to float over whatever is
+/// below. So the child says what the list holds and where the box is, and the
+/// parent draws it in the chrome's buffer beside the menu and the site panel,
+/// which is where everything that floats over a page already lives.
+///
+/// `node` is the child's own id for the `<select>`, echoed back untouched when
+/// a row is chosen. The parent does not read it and could not use it: it is an
+/// index into an arena on the other side of the boundary, and the child checks
+/// what it gets back rather than trusting it (ADR-0012).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dropdown {
+    /// The `<select>`'s box, in canvas coordinates, so the list opens under it.
+    pub rect: Rect,
+    /// The child's id for the `<select>`.
+    pub node: u32,
+    /// What each option reads as, in document order.
+    pub options: Vec<String>,
+    /// Which one it is currently open on.
+    pub on: u32,
+}
+
 /// A link's rectangle and where it leads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
@@ -402,6 +426,20 @@ pub enum ToChild {
         /// What was pressed.
         key: Key,
     },
+    /// The reader picked a row out of a dropdown the child opened.
+    ///
+    /// `node` is the child's own id for the `<select>`, echoed back exactly as
+    /// it was sent. The parent never reads it and could not use it if it did.
+    /// The child checks that it still names a `<select>` and that the index is
+    /// one of its options, rather than trusting either: the parent is not the
+    /// untrusted side here, but a message is a message, and the check costs a
+    /// comparison.
+    Choose {
+        /// The `<select>` this is about, as the child named it.
+        node: u32,
+        /// Which of its options, in document order.
+        index: u32,
+    },
 }
 
 impl ToChild {
@@ -447,6 +485,11 @@ impl ToChild {
                 writer.tag(6);
                 writer.f32(at.0);
                 writer.f32(at.1);
+            }
+            ToChild::Choose { node, index } => {
+                writer.tag(8);
+                writer.u32(*node);
+                writer.u32(*index);
             }
             ToChild::Type { key } => {
                 writer.tag(7);
@@ -546,6 +589,10 @@ impl ToChild {
             7 => ToChild::Type {
                 key: Key::read(&mut reader)?,
             },
+            8 => ToChild::Choose {
+                node: reader.u32()?,
+                index: reader.u32()?,
+            },
             4 => ToChild::Select {
                 from: (reader.f32()?, reader.f32()?),
                 to: (reader.f32()?, reader.f32()?),
@@ -641,6 +688,15 @@ pub struct Rendered {
     /// could reach a button. Rectangles only: which form each belongs to and
     /// what it would send stays on the side that holds the document.
     pub buttons: Vec<Rect>,
+    /// Where this page's other pressable controls are: a checkbox, a radio, a
+    /// `<select>`.
+    ///
+    /// Separate from `buttons` because they answer a press differently — one
+    /// sends a form and one changes what a form would send — and because the
+    /// parent asks a different question of each. Rectangles only, like the
+    /// buttons: which control each is, and what pressing it does, stays on the
+    /// side that holds the document.
+    pub pressables: Vec<Rect>,
     /// A form the reader asked to send, if they did (#110).
     ///
     /// Answered with the render rather than as a message of its own, because
@@ -648,6 +704,12 @@ pub struct Rendered {
     /// navigation is being asked for. The parent reads it after the pixels and
     /// decides.
     pub submit: Option<Submission>,
+    /// A dropdown the reader pressed, waiting to be drawn over the page.
+    ///
+    /// Answered with the render for the same reason `submit` is: a press
+    /// happened, the page itself did not change, and something outside it is
+    /// being asked for.
+    pub open: Option<Dropdown>,
     /// Whether a form control on this page currently has the typing (#110).
     ///
     /// One bit, and deliberately no more: the parent needs to know whether a
@@ -717,11 +779,25 @@ impl ToParent {
                 for rect in &page.buttons {
                     write_rect(&mut writer, rect);
                 }
+                writer.u32(page.pressables.len() as u32);
+                for rect in &page.pressables {
+                    write_rect(&mut writer, rect);
+                }
                 writer.some(page.submit.is_some());
                 if let Some(submit) = &page.submit {
                     writer.str(&submit.action);
                     writer.some(submit.post);
                     writer.str(&submit.body);
+                }
+                writer.some(page.open.is_some());
+                if let Some(open) = &page.open {
+                    write_rect(&mut writer, &open.rect);
+                    writer.u32(open.node);
+                    writer.u32(open.options.len() as u32);
+                    for option in &open.options {
+                        writer.str(option);
+                    }
+                    writer.u32(open.on);
                 }
                 writer.some(page.can_toggle_layout);
                 writer.some(page.editing);
@@ -810,11 +886,35 @@ impl ToParent {
                 for _ in 0..count {
                     buttons.push(read_rect(&mut reader)?);
                 }
+                let count = reader.count()?;
+                let mut pressables = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    pressables.push(read_rect(&mut reader)?);
+                }
                 let submit = if reader.some()? {
                     Some(Submission {
                         action: reader.str()?,
                         post: reader.some()?,
                         body: reader.str()?,
+                    })
+                } else {
+                    None
+                };
+                let open = if reader.some()? {
+                    let rect = read_rect(&mut reader)?;
+                    let node = reader.u32()?;
+                    // A count, so a claim of four billion options cannot
+                    // reserve for four billion options.
+                    let count = reader.count()?;
+                    let mut options = Vec::with_capacity(count.min(1024));
+                    for _ in 0..count {
+                        options.push(reader.str()?);
+                    }
+                    Some(Dropdown {
+                        rect,
+                        node,
+                        options,
+                        on: reader.u32()?,
                     })
                 } else {
                     None
@@ -848,7 +948,9 @@ impl ToParent {
                     links,
                     missing,
                     buttons,
+                    pressables,
                     submit,
+                    open,
                     can_toggle_layout,
                     editing,
                     images_loaded,
@@ -936,6 +1038,8 @@ mod tests {
                 body: "q=tables".to_owned(),
             }),
             can_toggle_layout: true,
+            open: None,
+            pressables: Vec::new(),
             editing: false,
             images_loaded: 3,
             background: 0x001c_1b22,

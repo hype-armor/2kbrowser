@@ -394,12 +394,34 @@ impl Viewport {
         self.page.buttons.clone()
     }
 
+    /// Where this page's other pressable controls are: a checkbox, a radio, a
+    /// `<select>`. Carried with the page for the same reason the buttons are.
+    pub fn pressables(&self) -> Vec<Rect> {
+        self.page.pressables.clone()
+    }
+
     /// A form the page asked to send, if it did (#110).
     ///
     /// Taken rather than read: one press sends one form, and a submission left
     /// here would be sent again by whatever asked next.
     pub fn take_submission(&mut self) -> Option<sandbox::message::Submission> {
         self.page.submit.take()
+    }
+
+    /// A dropdown the page asked to open, if it did.
+    ///
+    /// Taken rather than read, for the reason the submission above is: one
+    /// press opens one list, and a dropdown left here would spring open again
+    /// the next time anything asked.
+    pub fn take_dropdown(&mut self) -> Option<sandbox::message::Dropdown> {
+        self.page.open.take()
+    }
+
+    /// Tells the child which row of the dropdown it opened was chosen.
+    pub fn choose(&mut self, node: u32, index: u32) {
+        if let Ok(page) = self.session.choose(node, index) {
+            self.page = page;
+        }
     }
 
     /// Whether a form control on this page is taking the typing.

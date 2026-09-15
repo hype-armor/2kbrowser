@@ -118,13 +118,15 @@ fn answer_until_the_parent_goes(
         };
         let request = ToChild::decode(&frame)?;
         match &request {
-            // All three can change the layout, and a layout that changed may
+            // All four can change the layout, and a layout that changed may
             // want subresources — a field growing a line can bring an image
-            // into the band. So they go through the conversation that can
-            // answer a fetch rather than the single-answer path below.
-            ToChild::Render { .. } | ToChild::Focus { .. } | ToChild::Type { .. } => {
-                serve_render(input, output, renderer, request)?
-            }
+            // into the band, and choosing a longer option can widen a
+            // dropdown. So they go through the conversation that can answer a
+            // fetch rather than the single-answer path below.
+            ToChild::Render { .. }
+            | ToChild::Focus { .. }
+            | ToChild::Type { .. }
+            | ToChild::Choose { .. } => serve_render(input, output, renderer, request)?,
             ToChild::Select { from, to } => {
                 let (rects, text) = renderer.select(*from, *to);
                 write_frame(output, &ToParent::Selected { rects, text }.encode())?;
@@ -282,6 +284,8 @@ mod tests {
                 buttons: Vec::new(),
                 submit: None,
                 can_toggle_layout: false,
+                open: None,
+                pressables: Vec::new(),
                 editing: false,
                 images_loaded: 0,
                 background: 0x00ff_ffff,

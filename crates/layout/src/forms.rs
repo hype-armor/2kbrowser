@@ -24,18 +24,23 @@
 //!
 //! # What is here and what is not
 //!
-//! Text fields and `<textarea>`s can be typed into (#110). The editing itself
-//! is not here — it lives with the renderer child, which owns the focus and the
-//! cursor — but this is where a control's *value* is read, and that is where
-//! the two meet: what a reader has typed comes from the document's own record
-//! of it, and only then from the markup. The two are different things in HTML
-//! and are kept different here, because `<input value="x">` is the field's
-//! default rather than its contents.
+//! Text fields and `<textarea>`s can be typed into (#110), a checkbox or a
+//! radio can be ticked, a dropdown can be chosen from, and a form can be sent.
+//! The interaction itself is not here — it lives with the renderer child, which
+//! owns the focus and the pointer — but this is where a control's *answer* is
+//! read, and that is where the two meet: what a reader has typed or ticked
+//! comes from the document's own record of it, and only then from the markup.
+//! The two are different things in HTML and are kept different here, because
+//! `<input value="x" checked>` is the field's default rather than its contents.
 //!
-//! Nothing else works yet. A checkbox cannot be ticked, a button cannot be
-//! pressed, a dropdown cannot be opened, and no form can be submitted — which
-//! is a separate piece of work with a separate risk, since submitting is the
-//! first time this browser would send anything *up* to a server.
+//! [`press`] is the other half of that: what a press *means* for a control,
+//! which differs for each and is one function so that no caller has to know
+//! which rule applies to the thing under the pointer.
+//!
+//! What is still missing is the keyboard. Tab reaches the text controls and
+//! stops there, so a checkbox can be ticked with a pointer and by no other
+//! means — which is a gap in reach rather than in what a form can say, and is
+//! filed as #151 rather than fixed here.
 //!
 //! What *is* here besides the controls themselves is
 //! [`break_the_rule_for_a_legend`], because a `<fieldset>`'s rule and the
@@ -374,6 +379,105 @@ pub struct Submission {
     pub body: String,
 }
 
+/// What pressing a control should change, as entries to record.
+///
+/// Returns nothing when the press changes nothing, so a caller can skip a
+/// repaint. It reads the document rather than writing it, for the same reason
+/// typing does: what a reader has changed is kept beside the document and
+/// applied to it on the next render, so that a re-parse of the same markup
+/// lands in the same state rather than losing everything they answered.
+///
+/// One entry point, because the caller holding the document should not have to
+/// know which of three rules applies to the thing under the pointer:
+///
+/// * A **checkbox** flips. Both directions matter equally — the case this was
+///   written for is a form with a pre-ticked "send me email" box, which until
+///   now could only be submitted with the box still ticked.
+/// * A **radio** turns on, and turns off every other radio in its group. That
+///   exclusion is the whole difference between a radio and a second checkbox,
+///   and it belongs here rather than in the caller because a browser that
+///   forgot it would send two answers to a question that has one.
+/// * An **option** turns on. In a closed dropdown it turns its siblings off,
+///   for the same reason; in a `<select multiple>` list box it flips, because
+///   there the reader is picking a set.
+///
+/// Turning a radio *off* by pressing it again is deliberately not offered.
+/// HTML cannot express "none of these" once one is chosen, so a reader who
+/// reached that state would be submitting something no server expects.
+pub fn press(doc: &Document, node: NodeId) -> Vec<(NodeId, bool)> {
+    let Some(control) = control_of(doc, node) else {
+        if doc
+            .element(node)
+            .is_some_and(|element| element.local_name() == "option")
+        {
+            return press_option(doc, node);
+        }
+        return Vec::new();
+    };
+    match control {
+        Control::Checkbox => vec![(node, !doc.is_on(node))],
+        Control::Radio if doc.is_on(node) => Vec::new(),
+        Control::Radio => radio_group(doc, node)
+            .into_iter()
+            .map(|other| (other, other == node))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Choosing one option of a `<select>`.
+fn press_option(doc: &Document, option: NodeId) -> Vec<(NodeId, bool)> {
+    let Some(select) = enclosing_select(doc, option) else {
+        return Vec::new();
+    };
+    if doc.element(select).is_some_and(is_list_box) {
+        return vec![(option, !doc.is_on(option))];
+    }
+    if selected_option(doc, select) == Some(option) {
+        return Vec::new();
+    }
+    options_of(doc, select)
+        .into_iter()
+        .map(|other| (other, other == option))
+        .collect()
+}
+
+/// The `<select>` an option is in, descending back out through any `<optgroup>`.
+pub fn enclosing_select(doc: &Document, option: NodeId) -> Option<NodeId> {
+    doc.ancestors(option).find(|&id| {
+        doc.element(id)
+            .is_some_and(|it| it.local_name() == "select")
+    })
+}
+
+/// Every radio a radio shares its question with.
+///
+/// Same `name`, same form — which is what HTML says a group is. A radio with no
+/// name is in no group and is only ever itself: it can never be submitted, so
+/// grouping the unnamed ones together would make pressing one silently unset
+/// another for no gain.
+fn radio_group(doc: &Document, node: NodeId) -> Vec<NodeId> {
+    let name = doc
+        .element(node)
+        .and_then(|element| element.attr("name"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let Some(name) = name else {
+        return vec![node];
+    };
+    let form = form_of(doc, node);
+    doc.descendants(doc.root())
+        .into_iter()
+        .filter(|&id| control_of(doc, id) == Some(Control::Radio))
+        .filter(|&id| form_of(doc, id) == form)
+        .filter(|&id| {
+            doc.element(id)
+                .and_then(|element| element.attr("name"))
+                .is_some_and(|other| other == name)
+        })
+        .collect()
+}
+
 /// The `<form>` a control belongs to, if any.
 ///
 /// By containment only. HTML5's `form` attribute, which lets a control name a
@@ -441,7 +545,7 @@ pub fn submission(doc: &Document, form: NodeId, submitter: Option<NodeId>) -> Su
         let name = name.to_owned();
         match control {
             Control::Checkbox | Control::Radio => {
-                if element.attr("checked").is_some() {
+                if doc.is_on(node) {
                     // HTML's default for a ticked box with no value of its own.
                     pairs.push((name, element.attr("value").unwrap_or("on").to_owned()));
                 }
@@ -498,13 +602,27 @@ fn selected_options(doc: &Document, select: NodeId) -> Vec<NodeId> {
     if element.is_some_and(is_list_box) {
         return options_of(doc, select)
             .into_iter()
-            .filter(|&id| {
-                doc.element(id)
-                    .is_some_and(|option| option.attr("selected").is_some())
-            })
+            .filter(|&id| doc.is_on(id))
             .collect();
     }
     selected_option(doc, select).into_iter().collect()
+}
+
+/// What an `<option>` reads as: the text it shows, or its `label` attribute
+/// where it has one and no text.
+///
+/// The label a dropdown's list has to draw, which is not always what it sends —
+/// `<option value="uk">United Kingdom</option>` sends one and shows the other,
+/// and a list drawn from the values would be a list of codes.
+pub fn option_label(doc: &Document, option: NodeId) -> String {
+    let text = descendant_text(doc, option).trim().to_owned();
+    if !text.is_empty() {
+        return text;
+    }
+    doc.element(option)
+        .and_then(|element| element.attr("label"))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// What an `<option>` sends: its `value`, or the text it shows.
@@ -551,7 +669,7 @@ fn encode_into(text: &str, out: &mut String) {
 }
 
 /// Every `option` under a `select`, in document order.
-fn options_of(doc: &Document, node: NodeId) -> Vec<NodeId> {
+pub fn options_of(doc: &Document, node: NodeId) -> Vec<NodeId> {
     let mut out = Vec::new();
     collect_options(doc, node, &mut out);
     out
@@ -567,10 +685,7 @@ fn selected_option(doc: &Document, node: NodeId) -> Option<NodeId> {
     options
         .iter()
         .rev()
-        .find(|&&id| {
-            doc.element(id)
-                .is_some_and(|element| element.attr("selected").is_some())
-        })
+        .find(|&&id| doc.is_on(id))
         .or(options.first())
         .copied()
 }
@@ -1059,5 +1174,148 @@ mod tests {
             .find(|&node| control_of(&loose, node).is_some())
             .expect("a field");
         assert_eq!(form_of(&loose, node), None);
+    }
+
+    /// Applies a press, the way the render path does, so a test can press
+    /// twice and see the second press act on the result of the first.
+    fn apply(doc: &mut Document, node: NodeId) -> bool {
+        let changes = press(doc, node);
+        let changed = !changes.is_empty();
+        for (id, on) in changes {
+            doc.set_chosen(id, on);
+        }
+        changed
+    }
+
+    fn controls(doc: &Document) -> Vec<NodeId> {
+        doc.descendants(doc.root())
+            .into_iter()
+            .filter(|&id| control_of(doc, id).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn a_checkbox_ticks_and_unticks() {
+        let (mut doc, node) = node_of(r#"<input type="checkbox">"#, "input");
+        assert!(!doc.is_on(node));
+        assert!(apply(&mut doc, node));
+        assert!(doc.is_on(node), "pressing an empty box ticks it");
+        assert!(apply(&mut doc, node));
+        assert!(!doc.is_on(node), "pressing it again unticks it");
+    }
+
+    #[test]
+    fn a_box_the_markup_ticked_can_be_unticked() {
+        // The case this exists for: a form with a pre-ticked "send me email"
+        // box could until now only be sent with the box still ticked.
+        let (mut doc, node) = node_of(r#"<input type="checkbox" checked>"#, "input");
+        assert!(doc.is_on(node));
+        apply(&mut doc, node);
+        assert!(!doc.is_on(node));
+    }
+
+    #[test]
+    fn unticking_a_box_takes_it_out_of_what_is_sent() {
+        let mut doc = dom::parse(
+            r#"<form><input type="checkbox" name="post" checked>
+               <input type="text" name="q" value="x"></form>"#,
+        );
+        let form = doc.find_element("form").expect("the form");
+        let box_ = controls(&doc)[0];
+        assert_eq!(submission(&doc, form, None).body, "post=on&q=x");
+        apply(&mut doc, box_);
+        assert_eq!(
+            submission(&doc, form, None).body,
+            "q=x",
+            "an unticked box is not a successful control",
+        );
+    }
+
+    #[test]
+    fn choosing_a_radio_clears_the_rest_of_its_group() {
+        let mut doc = dom::parse(
+            r#"<form><input type="radio" name="size" value="s" checked>
+               <input type="radio" name="size" value="m">
+               <input type="radio" name="size" value="l"></form>"#,
+        );
+        let form = doc.find_element("form").expect("the form");
+        let radios = controls(&doc);
+        apply(&mut doc, radios[2]);
+        assert!(doc.is_on(radios[2]));
+        assert!(!doc.is_on(radios[0]), "the markup's answer was cleared");
+        assert!(!doc.is_on(radios[1]));
+        assert_eq!(submission(&doc, form, None).body, "size=l");
+    }
+
+    #[test]
+    fn a_radio_leaves_another_groups_answer_alone() {
+        let mut doc = dom::parse(
+            r#"<form><input type="radio" name="size" value="s" checked>
+               <input type="radio" name="hot" value="y" checked></form>"#,
+        );
+        let form = doc.find_element("form").expect("the form");
+        let radios = controls(&doc);
+        apply(&mut doc, radios[0]);
+        assert_eq!(submission(&doc, form, None).body, "size=s&hot=y");
+    }
+
+    #[test]
+    fn pressing_a_chosen_radio_does_not_unchoose_it() {
+        // HTML has no way to say "none of these" once one is chosen.
+        let (mut doc, node) = node_of(r#"<input type="radio" name="a" checked>"#, "input");
+        assert!(
+            !apply(&mut doc, node),
+            "nothing changed, so nothing repaints"
+        );
+        assert!(doc.is_on(node));
+    }
+
+    #[test]
+    fn choosing_an_option_is_what_the_dropdown_shows_and_sends() {
+        let mut doc = dom::parse(
+            r#"<form><select name="where">
+               <option value="uk">United Kingdom</option>
+               <option value="fr" selected>France</option>
+               </select></form>"#,
+        );
+        let form = doc.find_element("form").expect("the form");
+        let select = doc.find_element("select").expect("the select");
+        assert_eq!(submission(&doc, form, None).body, "where=fr");
+        let uk = options_of(&doc, select)[0];
+        apply(&mut doc, uk);
+        assert_eq!(submission(&doc, form, None).body, "where=uk");
+        assert_eq!(
+            label_of(&doc, select, Control::Select).as_deref(),
+            Some("United Kingdom"),
+            "what it sends and what it shows have to be the same option",
+        );
+    }
+
+    #[test]
+    fn a_list_box_picks_a_set_rather_than_one() {
+        let mut doc = dom::parse(
+            r#"<form><select name="where" multiple>
+               <option value="uk">UK</option>
+               <option value="fr">France</option>
+               </select></form>"#,
+        );
+        let form = doc.find_element("form").expect("the form");
+        let select = doc.find_element("select").expect("the select");
+        let options = options_of(&doc, select);
+        apply(&mut doc, options[0]);
+        apply(&mut doc, options[1]);
+        assert_eq!(submission(&doc, form, None).body, "where=uk&where=fr");
+        apply(&mut doc, options[0]);
+        assert_eq!(submission(&doc, form, None).body, "where=fr");
+    }
+
+    #[test]
+    fn pressing_a_field_or_a_button_changes_nothing() {
+        // They are pressed for other reasons, and both already have one.
+        for markup in [r#"<input type="text">"#, "<button>Go</button>"] {
+            let doc = dom::parse(markup);
+            let node = controls(&doc)[0];
+            assert!(press(&doc, node).is_empty(), "{markup}");
+        }
     }
 }

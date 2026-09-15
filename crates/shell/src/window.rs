@@ -464,6 +464,12 @@ struct App {
     bookmarks_path: std::path::PathBuf,
     /// The open site panel, if the padlock has been pressed (#118).
     panel: Option<crate::site_panel::Panel>,
+    /// The open dropdown, if a `<select>` on the page has been pressed.
+    ///
+    /// Held here rather than in the renderer because it floats over the page
+    /// and the page's canvas has no room for it. What is in it came from the
+    /// child; what it means is the child's to decide when a row is chosen.
+    dropdown: Option<crate::dropdown::Dropdown>,
     /// Where the granted exceptions are written back to.
     ///
     /// The policy itself lives on the two fetchers — this window's, for
@@ -888,6 +894,10 @@ impl App {
             return;
         };
         let was = self.page_is_editing();
+        // Asked before the press, because a control that changes when it is
+        // pressed changes the pixels without changing the focus — a ticked box
+        // takes no typing — and the redraw below would otherwise never happen.
+        let on_control = self.control_on_page_under_pointer();
         let Some(page) = self.tab_mut().page.as_mut() else {
             return;
         };
@@ -895,12 +905,33 @@ impl App {
         // A redraw only when something changed. Pressing the margin of a page
         // with nothing focused is the commonest click there is, and repainting
         // the window for it would be work nobody asked for.
-        if (was || now)
+        if (was || now || on_control)
             && let Some(window) = &self.window
         {
             window.request_redraw();
         }
         self.act_on_page();
+    }
+
+    /// Whether the pointer is over a control on the page that answers a press.
+    ///
+    /// The rectangles come from the child with the page, because the parent
+    /// has no box tree — so a control missing from those lists is one the
+    /// cursor says nothing about, which is exactly as wrong as it is honest.
+    fn control_on_page_under_pointer(&self) -> bool {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)
+        else {
+            return false;
+        };
+        let Some(page) = &self.tab().page else {
+            return false;
+        };
+        page.buttons()
+            .into_iter()
+            .chain(page.pressables())
+            .any(|rect| {
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
     }
 
     /// Sends a form the page asked to send (#110).
@@ -942,6 +973,14 @@ impl App {
 
     /// Carries out whatever the page asked for after a press or a keystroke.
     fn act_on_page(&mut self) {
+        let opened = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .and_then(crate::viewport::Viewport::take_dropdown);
+        if let Some(opened) = opened {
+            self.open_dropdown(opened);
+        }
         let asked = self
             .tab_mut()
             .page
@@ -950,6 +989,60 @@ impl App {
         if let Some(submission) = asked {
             self.submit(submission);
         }
+    }
+
+    /// Opens the list a `<select>` on the page asked for.
+    ///
+    /// The rectangle arrives in document coordinates, because that is the only
+    /// frame the child has, and is moved into the window's: down by the chrome,
+    /// up by the scroll. A list is pinned where it opened rather than following
+    /// the control, which is why it closes on a scroll.
+    fn open_dropdown(&mut self, asked: sandbox::message::Dropdown) {
+        let top = self.chrome_height() as f32 - self.tab().scroll;
+        let box_ = layout::Rect {
+            y: asked.rect.y + top,
+            ..asked.rect
+        };
+        self.dropdown = crate::dropdown::Dropdown::open(
+            box_,
+            asked.options,
+            asked.on as usize,
+            asked.node,
+            &mut self.fonts,
+            self.size,
+        );
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Acts on whatever row the pointer is over, and closes the list.
+    ///
+    /// A press outside it closes it and chooses nothing, which is what pressing
+    /// outside an open list means everywhere — and importantly does *not* then
+    /// fall through to the page, or dismissing a list would click whatever was
+    /// behind it.
+    fn choose_from_dropdown(&mut self) {
+        let Some(dropdown) = self.dropdown.take() else {
+            return;
+        };
+        if let Some(row) = dropdown.row_at(self.pointer.0, self.pointer.1)
+            && let Some(page) = self.tab_mut().page.as_mut()
+        {
+            page.choose(dropdown.node, row as u32);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Closes the dropdown if one is open. Whether there was one to close.
+    fn close_dropdown(&mut self) -> bool {
+        let had = self.dropdown.take().is_some();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
     }
 
     /// Whether a form control on the page is taking the typing (#110).
@@ -1857,6 +1950,11 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: f32) {
+        // A list is pinned where it opened, so a page that scrolled under it
+        // would leave it hanging over a control that had moved. Closing it is
+        // what every browser does and is the only one of the three that does
+        // not need the reader to have noticed.
+        self.close_dropdown();
         let Some(page) = &self.tab().page else { return };
         let before = self.tab().scroll;
         self.tab_mut().scroll = clamp_scroll(
@@ -1891,6 +1989,7 @@ impl App {
             theme,
             over_link,
             panel,
+            dropdown,
             ..
         } = self;
         let tab = tabs.active();
@@ -2018,6 +2117,20 @@ impl App {
         if let Some(panel) = panel {
             let pixmap = panel.render(fonts, *theme);
             let rect = panel.rect();
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
+        }
+        // A dropdown sits with the site panel: over the page, under the menu.
+        // Its rectangle is already in window coordinates — it was opened from
+        // where the control was drawn on screen, not from where it is in the
+        // document — so it does not move when the page scrolls under it.
+        if let Some(dropdown) = dropdown {
+            let pixmap = dropdown.render(fonts, *theme);
+            let rect = dropdown.rect();
             blit_over(
                 &mut buffer,
                 &pixmap,
@@ -2536,6 +2649,17 @@ impl ApplicationHandler<BandReady> for App {
                     }
                     return;
                 }
+                // And an open dropdown, the same way again.
+                if let Some(dropdown) = &mut self.dropdown {
+                    let hovered = dropdown.row_at(self.pointer.0, self.pointer.1);
+                    if hovered != dropdown.hovered {
+                        dropdown.hovered = hovered;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 if self.selecting.is_some() {
                     self.extend_selection();
                     return;
@@ -2555,12 +2679,15 @@ impl ApplicationHandler<BandReady> for App {
                     // shape change.
                     window.request_redraw();
                 }
-                // A placeholder is pressable too (#118), and a button that
-                // leaves the cursor an arrow reads as dead. Tracked separately
+                // A placeholder is pressable too (#118), and so is a form
+                // control — a button or a checkbox that leaves the cursor an
+                // arrow reads as dead. Tracked separately
                 // from the address above because it is a different question
                 // with a different answer: the strip says where a link goes,
                 // and a placeholder is not going anywhere.
-                let pressable = self.over_link.is_some() || self.missing_under_pointer().is_some();
+                let pressable = self.over_link.is_some()
+                    || self.missing_under_pointer().is_some()
+                    || self.control_on_page_under_pointer();
                 if pressable != self.over_pressable
                     && let Some(window) = &self.window
                 {
@@ -2631,6 +2758,15 @@ impl ApplicationHandler<BandReady> for App {
                         && self.control_under_pointer() != Some(crate::chrome::Control::Site)
                     {
                         self.choose_from_site_panel();
+                        return;
+                    }
+                    // And an open dropdown owns the next click the same way a
+                    // menu does: on a row it chooses, anywhere else it
+                    // dismisses, and either way the click does not also reach
+                    // the page — dismissing a list must not press whatever was
+                    // behind it.
+                    if self.dropdown.is_some() {
+                        self.choose_from_dropdown();
                         return;
                     }
                     // Letting go of the thumb is not a click on whatever the
@@ -2914,9 +3050,11 @@ impl ApplicationHandler<BandReady> for App {
                     Key::Named(NamedKey::Escape) => {
                         // An open menu is the innermost thing in progress, so
                         // it is the first thing Escape gives up — then the
-                        // site panel, which is opened the same deliberate way
-                        // and must not need a click somewhere else to close.
+                        // dropdown and the site panel, both opened the same
+                        // deliberate way and neither of which must need a click
+                        // somewhere else to close.
                         if !self.close_menu()
+                            && !self.close_dropdown()
                             && !self.close_site_panel()
                             && !self.clear_focused_link()
                         {
@@ -3025,6 +3163,7 @@ pub fn open(
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
         panel: None,
+        dropdown: None,
         sites_path: crate::sites::default_path(),
         waker: Some(event_loop.create_proxy()),
     };

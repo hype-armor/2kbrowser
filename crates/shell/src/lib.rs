@@ -5,6 +5,7 @@
 
 pub mod bookmarks;
 pub mod chrome;
+pub mod dropdown;
 pub mod field;
 pub mod history;
 pub mod icon;
