@@ -39,8 +39,8 @@
 //!
 //! What is still missing is the keyboard. Tab reaches the text controls and
 //! stops there, so a checkbox can be ticked with a pointer and by no other
-//! means — which is a gap in reach rather than in what a form can say, and it
-//! is filed rather than fixed here.
+//! means — which is a gap in reach rather than in what a form can say, and is
+//! filed as #151 rather than fixed here.
 //!
 //! What *is* here besides the controls themselves is
 //! [`break_the_rule_for_a_legend`], because a `<fieldset>`'s rule and the
