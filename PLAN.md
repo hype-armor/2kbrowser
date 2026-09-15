@@ -361,7 +361,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    the widths and nothing below them is measured (§17.5.2.1); `empty-cells`;
    and a `border-spacing` per axis. A table is never narrower than its own
    caption — §17.4's wrapper box, folded into the table's width rather than
-   built as a box of its own
+   built as a box of its own. **Anonymous tables** (§17.2.1): a run of
+   table-internal boxes with no table above them gets one generated around it,
+   so `display: table-cell` on three spans lays them out side by side rather
+   than stacked
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
    narrow beside them, `clear`, and containers that enclose their floats
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
@@ -424,6 +427,11 @@ it:
   context and a negative `z-index` never escapes one that should not be.
 - **Two right-to-left residues**: §10.3.3's over-constrained margin (#112) and
   an inline box split across lines (#113).
+- **§17.2.1's anonymous *cell* is not generated** (#121) — the box that goes
+  around a row's child that is not a cell. A run of table-internal boxes that
+  would yield no cells is left alone rather than wrapped in a table, because a
+  table built from it would swallow its content. The anonymous table and the
+  anonymous row are both generated.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes

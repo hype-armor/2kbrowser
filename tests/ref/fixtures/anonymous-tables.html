@@ -1,0 +1,53 @@
+<!doctype html>
+<title>anonymous tables</title>
+<style>
+  body { margin: 20px; font: 14px monospace }
+  h2 { font: bold 14px serif; margin: 16px 0 4px }
+  /* CSS 2.1 17.2.1: table-internal boxes with no table above them get an
+     anonymous one. None of the boxes below is inside a `table` element, so
+     every table here was inferred. */
+  .cell { display: table-cell; padding: 2px 6px; background: #cde; border: 1px solid #036 }
+  .row { display: table-row }
+  .group { display: table-row-group }
+  .t { display: table }
+  /* The anonymous box paints nothing of its own, so this colour must not
+     appear anywhere: it is the container the table was generated inside. */
+  .container { background: #fe9 }
+  /* 10.3.7: both offsets given with `width: auto` stretches the box between
+     them instead of shrinking it to fit. */
+  .frame { position: relative; height: 60px; border: 2px solid #630; margin-top: 8px }
+  .stretched { position: absolute; left: 20px; right: 40px; top: 8px; background: #9c6 }
+</style>
+
+<h2>cells with no row and no table</h2>
+<div class="container">
+  <span class="cell">one</span><span class="cell">two</span><span class="cell">three</span>
+</div>
+
+<h2>a block ends the run, starting a second table</h2>
+<div class="container">
+  <span class="cell">above</span><span class="cell">above</span>
+  <p style="margin: 0">a paragraph between them</p>
+  <span class="cell">below</span><span class="cell">below</span>
+</div>
+
+<h2>rows and a row group with no table</h2>
+<div class="container">
+  <span class="row"><span class="cell">r1c1</span><span class="cell">r1c2</span></span>
+  <span class="group">
+    <span class="row"><span class="cell">r2c1</span><span class="cell">r2c2</span></span>
+    <span class="row"><span class="cell">r3c1</span><span class="cell">r3c2</span></span>
+  </span>
+</div>
+
+<h2>a table element that is not a table</h2>
+<div class="container">
+  <span class="t">
+    <span class="row"><span class="cell">a</span><span class="cell">b</span></span>
+  </span>
+</div>
+
+<h2>left and right together</h2>
+<div class="frame">
+  <div class="stretched">stretched between the offsets</div>
+</div>

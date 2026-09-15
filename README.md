@@ -71,7 +71,10 @@ columns and the first row decide the widths and nothing below them is measured
 (§17.5.2.1); `empty-cells`, so a cell with nothing in it can be told not to draw
 its border; a `border-spacing` per axis, since `border-spacing: 0 8px` means the
 rows spaced and the columns not; table captions, which sit outside the
-table's border box on whichever side `caption-side` names; `visibility`, where a
+table's border box on whichever side `caption-side` names; §17.2.1's anonymous
+tables, so a run of `display: table-cell` spans with no table above them is
+collected into one and laid out side by side rather than stacked;
+`visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
 `letter-spacing`, `text-indent` on a block's first line, `min-height` and
