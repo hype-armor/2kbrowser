@@ -14,7 +14,33 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
-## Unreleased
+## 0.4.0
+
+A release about boxes this engine never generated. CSS 2.1 says several exist
+that nothing here was building: §17.2.1's anonymous tables, the root element's
+own box, the strut that gives a line its height, and the anonymous block an
+inline element leaves behind when a block is put inside it. An absent box does
+not read as a bug. It reads as a page that rendered — a little short, a little
+flat, nothing a reader would think to report — which is why most of these had
+been wrong since before there was a changelog to record them in.
+
+Right-to-left text is the other half, and the opposite kind of absence: not a
+box that was missing but an algorithm, and the one PLAN.md had been listing as
+unimplemented since M2 opened.
+
+**The CSS 2.1 conformance suite went from 66.9% to 76.0%** — 3226 of 4821
+reference tests to 3665, with no panics across roughly ten thousand renders.
+0.2.0 moved further and this file said plainly that the harness was why; this
+time fifteen of the 439 are the harness, learning to read an XHTML file's own
+encoding declaration, and the rest are the engine.
+
+Six tests were lost, across five of the changes below — right-to-left text
+cost two and four others cost one apiece. Every one of the six was passing
+because *both* sides of the pair were equally wrong: a reference that spells
+its expected result with three non-breaking spaces matches a test that loses
+them, for exactly as long as the engine loses them too. Each is recorded with
+the issue that carries it rather than quietly absorbed, and PLAN.md lists them
+beside the deviations that were already there.
 
 **An anonymous table sits beside a float** rather than on top of it. §9.5 says
 a table may not overlap one, and a table §17.2.1 generated is a table like any
