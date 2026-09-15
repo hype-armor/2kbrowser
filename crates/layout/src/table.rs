@@ -69,6 +69,8 @@ pub struct Row {
 /// is transparent, which is why the rows are still flattened.
 #[derive(Debug, Clone)]
 pub struct RowBand {
+    /// The `thead`, `tbody` or `tfoot` element.
+    pub node: NodeId,
     /// Its computed style.
     pub style: ComputedStyle,
     /// Index of its first row in [`Grid::rows`].
@@ -80,6 +82,8 @@ pub struct RowBand {
 /// A `col` or `colgroup`, and the columns it covers.
 #[derive(Debug, Clone)]
 pub struct ColumnBand {
+    /// The `col` or `colgroup` element.
+    pub node: NodeId,
     /// Its computed style.
     pub style: ComputedStyle,
     /// First column covered.
@@ -134,12 +138,27 @@ impl Grid {
 /// `tbody` whether or not the author wrote one, so rows are almost never direct
 /// children of the table.
 pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId) -> Grid {
+    build_grid_of(doc, styles, table, doc.children(table))
+}
+
+/// The same, for a table that is not an element.
+///
+/// §17.2.1 generates an anonymous table around table-internal boxes that have
+/// none, and an anonymous box has no node to read children from — so the
+/// children are handed in. `owner` is the box the anonymous table stands in
+/// for, which is what an anonymous *row* inside it is attributed to.
+pub fn build_grid_of(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    owner: NodeId,
+    children: &[NodeId],
+) -> Grid {
     let mut grid = Grid::default();
     // How many further rows each column is still occupied by a cell spanning
     // down from above. Without this a `rowspan` cell's column is handed to the
     // next row's first cell, and every row below it shifts left.
     let mut occupied: Vec<usize> = Vec::new();
-    collect_rows(doc, styles, table, None, &mut occupied, &mut grid);
+    collect_rows(doc, styles, owner, children, None, &mut occupied, &mut grid);
     // The rightmost column any cell reaches, not the widest row: with row
     // spanning a row's own cells no longer cover every column.
     grid.columns = grid
@@ -149,7 +168,7 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
         .map(|cell| cell.column + cell.colspan)
         .max()
         .unwrap_or(0);
-    collect_columns(doc, styles, table, &mut grid);
+    collect_columns(doc, styles, children, &mut grid);
     grid
 }
 
@@ -184,7 +203,7 @@ pub fn captions(
 fn collect_columns(
     doc: &Document,
     styles: &css::cascade::StyleMap,
-    table: NodeId,
+    children: &[NodeId],
     grid: &mut Grid,
 ) {
     let span_of = |element: &dom::ElementData| {
@@ -195,7 +214,7 @@ fn collect_columns(
             .clamp(1, MAX_SPAN)
     };
     let mut column = 0;
-    for &child in doc.children(table) {
+    for &child in children {
         let Some(element) = doc.element(child) else {
             continue;
         };
@@ -206,6 +225,7 @@ fn collect_columns(
             Display::TableColumn => {
                 let span = span_of(element);
                 grid.columns_declared.push(ColumnBand {
+                    node: child,
                     style: style.clone(),
                     start: column,
                     end: column + span,
@@ -230,6 +250,7 @@ fn collect_columns(
                     has_children = true;
                     let span = span_of(col);
                     grid.columns_declared.push(ColumnBand {
+                        node: inner,
                         style: col_style.clone(),
                         start: column,
                         end: column + span,
@@ -240,6 +261,7 @@ fn collect_columns(
                     column += span_of(element);
                 }
                 grid.column_groups.push(ColumnBand {
+                    node: child,
                     style: style.clone(),
                     start,
                     end: column,
@@ -354,13 +376,14 @@ fn collect_rows(
     doc: &Document,
     styles: &css::cascade::StyleMap,
     node: NodeId,
+    children: &[NodeId],
     group: Option<usize>,
     occupied: &mut Vec<usize>,
     grid: &mut Grid,
 ) {
     // Cells found where a row was expected, waiting for the run to end.
     let mut stray: Vec<NodeId> = Vec::new();
-    for &child in doc.children(node) {
+    for &child in children {
         let Some(style) = styles.get(child) else {
             continue;
         };
@@ -400,11 +423,20 @@ fn collect_rows(
                 let band = grid.row_groups.len();
                 let first = grid.rows.len();
                 grid.row_groups.push(RowBand {
+                    node: child,
                     style: style.clone(),
                     first,
                     end: first,
                 });
-                collect_rows(doc, styles, child, Some(band), occupied, grid);
+                collect_rows(
+                    doc,
+                    styles,
+                    child,
+                    doc.children(child),
+                    Some(band),
+                    occupied,
+                    grid,
+                );
                 // Set once the rows are in. A group that held none keeps an
                 // empty range, which no row points at and nothing reads.
                 grid.row_groups[band].end = grid.rows.len();
@@ -426,7 +458,15 @@ fn collect_rows(
             // the group it is nested in.
             _ => {
                 flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
-                collect_rows(doc, styles, child, group, occupied, grid);
+                collect_rows(
+                    doc,
+                    styles,
+                    child,
+                    doc.children(child),
+                    group,
+                    occupied,
+                    grid,
+                );
             }
         }
     }
@@ -885,6 +925,124 @@ pub fn with_reserved_borders(
         out.padding = Edges::ZERO;
     }
     out
+}
+
+/// Column widths under `table-layout: fixed` (§17.5.2.1).
+///
+/// The columns and the *first row* decide, and nothing else in the table is
+/// measured at all — which is the point of the property: a table whose widths
+/// are declared should not cost a pass over every cell to find out what they
+/// already are. A column with no width of its own takes an equal share of
+/// whatever is left.
+///
+/// `usable` is the room the columns have between them, with the border spacing
+/// already taken out.
+pub fn fixed_widths(
+    grid: &Grid,
+    font_size: f32,
+    usable: f32,
+    stretch: bool,
+    intrinsic: &[f32],
+    cell_borders: impl Fn(&Cell) -> (f32, f32),
+) -> Vec<f32> {
+    let mut widths: Vec<Option<f32>> = vec![None; grid.columns];
+    let resolve = |length: css::value::Length| match length {
+        css::value::Length::Auto => None,
+        length => Some(length.to_px(font_size, usable).max(0.0)),
+    };
+
+    // A `<col>` or `<colgroup>` first: it speaks for its columns whatever the
+    // cells below it say.
+    for band in grid.column_groups.iter().chain(&grid.columns_declared) {
+        let Some(width) = resolve(band.style.width) else {
+            continue;
+        };
+        let end = band.end.min(grid.columns);
+        let span = end.saturating_sub(band.start);
+        if span == 0 {
+            continue;
+        }
+        let each = width / span as f32;
+        for slot in widths.iter_mut().take(end).skip(band.start) {
+            *slot = Some(each);
+        }
+    }
+
+    // Then the first row, for the columns no band claimed. A spanning cell
+    // divides its width evenly, which is what the spec says to do and the only
+    // answer available without measuring anything.
+    //
+    // A cell contributes its *border box*: §17.5.2.1 sizes the column to hold
+    // the whole cell, so a `width: 80px` cell with 24px of padding and a 36px
+    // border either side makes a 200px column. Taking the content width alone
+    // is the difference between a column that fits its cell and one the cell
+    // hangs out of on both sides.
+    if let Some(row) = grid.rows.first() {
+        for cell in &row.cells {
+            let Some(width) = resolve(cell.style.width).map(|width| {
+                let font_size = cell.style.font_size;
+                // The borders come from the caller because they are not always
+                // the ones the cell declared: in the collapsing model it keeps
+                // half of each grid line and the other half is its neighbour's.
+                let (left, right) = cell_borders(cell);
+                width
+                    + cell.style.padding.left.to_px(font_size, usable).max(0.0)
+                    + cell.style.padding.right.to_px(font_size, usable).max(0.0)
+                    + left
+                    + right
+            }) else {
+                continue;
+            };
+            let end = (cell.column + cell.colspan).min(grid.columns);
+            let span = end.saturating_sub(cell.column);
+            if span == 0 {
+                continue;
+            }
+            let each = width / span as f32;
+            for slot in widths.iter_mut().take(end).skip(cell.column) {
+                slot.get_or_insert(each);
+            }
+        }
+    }
+
+    let claimed: f32 = widths.iter().flatten().sum();
+    let undeclared = widths.iter().filter(|slot| slot.is_none()).count();
+    let leftover = (usable - claimed).max(0.0);
+    if undeclared > 0 {
+        // §17.5.2.1 gives the columns that declared nothing an equal share of
+        // what is left — which is only an answer where there is a table width
+        // to have a remainder *of*. A table that declared none has no surplus
+        // to share out, so a column with nothing of its own falls back to what
+        // its content wants, exactly as it would under automatic layout.
+        // Without that, one undeclared column takes the whole window.
+        let each = leftover / undeclared as f32;
+        return widths
+            .into_iter()
+            .enumerate()
+            .map(|(column, slot)| {
+                slot.unwrap_or(if stretch {
+                    each
+                } else {
+                    intrinsic.get(column).copied().unwrap_or(each)
+                })
+            })
+            .collect();
+    }
+    // Every column asked for a width. If the table was given one too, the
+    // surplus is shared out rather than left as a gap — that is what keeps
+    // `width: 100%` meaning the whole width. If it was not, the table is as
+    // wide as its columns said and no wider: stretching them to the container
+    // turns `<col width="50">` twice over into a table the width of the
+    // window.
+    let share = if stretch && grid.columns > 0 {
+        leftover / grid.columns as f32
+    } else {
+        0.0
+    };
+    widths
+        .into_iter()
+        .map(|slot| slot.unwrap_or(0.0) + share)
+        .collect()
 }
 
 /// Distributes `available` width across columns given their intrinsic widths.

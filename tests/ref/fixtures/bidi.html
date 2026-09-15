@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>direction and unicode-bidi</title>
+<style>
+  body { margin: 12px; width: 420px; font: 18px serif }
+  p { margin: 0 0 10px }
+  .rtl { direction: rtl }
+  .over { direction: rtl; unicode-bidi: bidi-override }
+  .box { border: 2px solid #036; padding: 0 6px; background: #cde }
+</style>
+<!-- Two Hebrew words: the one written first is drawn on the right. -->
+<p>&#x5d0;&#x5d1;&#x5d2; &#x5d3;&#x5d4;&#x5d5; and some Latin</p>
+<!-- A right-to-left block starts its lines at the right edge. -->
+<p class="rtl">&#x5d0;&#x5d1;&#x5d2; &#x5d3;&#x5d4;&#x5d5;</p>
+<!-- An override turns Latin round, brackets and all (rule L4). -->
+<p class="over">(abc def)</p>
+<!-- An inline box cut in two by reordering draws two fragments, with its
+     border on the outside of each end and nothing at the join. -->
+<p>one <span class="box">two &#x5d0;&#x5d1;&#x5d2; three</span> four</p>

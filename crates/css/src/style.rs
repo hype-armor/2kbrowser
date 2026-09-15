@@ -141,10 +141,81 @@ pub enum FontStyle {
     Italic,
 }
 
+/// The `font-variant` property (§15.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontVariant {
+    /// Ordinary glyphs.
+    #[default]
+    Normal,
+    /// Lowercase letters drawn as smaller capitals.
+    SmallCaps,
+}
+
+/// Parses a `font-variant` keyword.
+pub fn parse_font_variant(name: &str) -> Option<FontVariant> {
+    match name.to_ascii_lowercase().as_str() {
+        "normal" => Some(FontVariant::Normal),
+        "small-caps" => Some(FontVariant::SmallCaps),
+        _ => None,
+    }
+}
+
+/// The `direction` property (§8.6): which way inline content runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    /// Left to right. The initial value.
+    #[default]
+    Ltr,
+    /// Right to left.
+    Rtl,
+}
+
+/// Parses a `direction` keyword.
+pub fn parse_direction(name: &str) -> Option<Direction> {
+    match name.to_ascii_lowercase().as_str() {
+        "ltr" => Some(Direction::Ltr),
+        "rtl" => Some(Direction::Rtl),
+        _ => None,
+    }
+}
+
+/// The `unicode-bidi` property (§8.6): how an element joins the bidi algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnicodeBidi {
+    /// The element's text takes part in the surrounding paragraph's ordering.
+    #[default]
+    Normal,
+    /// The element opens an embedding at its own `direction`.
+    Embed,
+    /// The element's characters are forced to its own `direction`, whatever
+    /// they are — the property's equivalent of U+202D/U+202E.
+    BidiOverride,
+}
+
+/// Parses a `unicode-bidi` keyword.
+pub fn parse_unicode_bidi(name: &str) -> Option<UnicodeBidi> {
+    match name.to_ascii_lowercase().as_str() {
+        "normal" => Some(UnicodeBidi::Normal),
+        "embed" => Some(UnicodeBidi::Embed),
+        "bidi-override" => Some(UnicodeBidi::BidiOverride),
+        _ => None,
+    }
+}
+
 /// The `text-align` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAlign {
-    /// Align to the start edge.
+    /// The initial value: whichever edge `direction` makes the start one.
+    ///
+    /// CSS 2.1 §16.2 writes the initial value as "`left` if `direction` is
+    /// `ltr`, `right` if it is `rtl`", which is not a value any stylesheet can
+    /// name and so has to be one this enum can hold. Resolving it at the point
+    /// of use rather than in the cascade is what keeps it right through
+    /// inheritance: `text-align` inherits and `direction` inherits separately,
+    /// so a child can be handed this from one ancestor and its direction from
+    /// another.
+    Start,
+    /// Align to the left edge.
     Left,
     /// Centre within the line box.
     Center,
@@ -167,6 +238,15 @@ impl TextAlign {
     /// Whether lines are centred.
     pub fn centres_text(self) -> bool {
         matches!(self, TextAlign::Center | TextAlign::CenterBlocks)
+    }
+
+    /// The value with [`TextAlign::Start`] settled against a direction.
+    pub fn against(self, direction: Direction) -> Self {
+        match (self, direction) {
+            (TextAlign::Start, Direction::Ltr) => TextAlign::Left,
+            (TextAlign::Start, Direction::Rtl) => TextAlign::Right,
+            (align, _) => align,
+        }
     }
 }
 
@@ -488,6 +568,8 @@ pub enum ListStyleType {
     Square,
     /// 1, 2, 3.
     Decimal,
+    /// 01, 02, 03 — padded to two digits, and no wider than the number needs.
+    DecimalLeadingZero,
     /// a, b, c.
     LowerAlpha,
     /// A, B, C.
@@ -496,6 +578,12 @@ pub enum ListStyleType {
     LowerRoman,
     /// I, II, III.
     UpperRoman,
+    /// Lowercase classical Greek: alpha, beta, gamma.
+    LowerGreek,
+    /// Traditional Armenian numbering, which is additive like Roman.
+    Armenian,
+    /// Traditional Georgian numbering, likewise additive.
+    Georgian,
     /// No marker at all.
     None,
 }
@@ -532,19 +620,28 @@ impl ListStyleType {
     /// in a list marker is the marker's, not the number's, and
     /// `content: counter(chapter) ". "` writes its own.
     ///
-    /// A bullet type has no number to print, so it prints nothing — which is
-    /// what §12.4.3 says `counter(n, disc)` does.
+    /// §12.4.3 supports every `list-style-type` here, the glyph ones included:
+    /// `counter(c, square)` prints a square, not nothing. It read the other way
+    /// here for a while, and the suite could not tell — the test that checks it
+    /// has a reference built out of `list-style-position: inside` markers,
+    /// which this engine also drew nowhere, so a blank matched a blank.
+    ///
+    /// `none` is the one that prints nothing, and it is the only one.
     pub fn counter(self, ordinal: usize) -> String {
         match self {
-            ListStyleType::Disc
-            | ListStyleType::Circle
-            | ListStyleType::Square
-            | ListStyleType::None => String::new(),
+            ListStyleType::Disc | ListStyleType::Circle | ListStyleType::Square => {
+                self.marker(ordinal)
+            }
+            ListStyleType::None => String::new(),
             ListStyleType::Decimal => format!("{ordinal}"),
+            ListStyleType::DecimalLeadingZero => format!("{ordinal:02}"),
             ListStyleType::LowerAlpha => alphabetic(ordinal, 'a'),
             ListStyleType::UpperAlpha => alphabetic(ordinal, 'A'),
             ListStyleType::LowerRoman => roman(ordinal).to_lowercase(),
             ListStyleType::UpperRoman => roman(ordinal),
+            ListStyleType::LowerGreek => greek(ordinal),
+            ListStyleType::Armenian => additive(ordinal, &ARMENIAN, 9999),
+            ListStyleType::Georgian => additive(ordinal, &GEORGIAN, 19999),
         }
     }
 }
@@ -604,6 +701,26 @@ pub fn parse_clip(values: &[Raw]) -> Option<Option<ClipRect>> {
     }))
 }
 
+/// `list-style-position` (§12.5.1): where the marker sits relative to the item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListStylePosition {
+    /// Outside the item's box, in the list's own padding. The initial value.
+    #[default]
+    Outside,
+    /// The first inline box of the item's content, which text flows after and
+    /// wraps *under* rather than beside.
+    Inside,
+}
+
+/// Parses a `list-style-position` keyword.
+pub fn parse_list_style_position(name: &str) -> Option<ListStylePosition> {
+    match name.to_ascii_lowercase().as_str() {
+        "outside" => Some(ListStylePosition::Outside),
+        "inside" => Some(ListStylePosition::Inside),
+        _ => None,
+    }
+}
+
 /// Parses a `list-style-type` keyword.
 pub fn parse_list_style_type(name: &str) -> Option<ListStyleType> {
     let value = match name {
@@ -611,10 +728,14 @@ pub fn parse_list_style_type(name: &str) -> Option<ListStyleType> {
         "circle" => ListStyleType::Circle,
         "square" => ListStyleType::Square,
         "decimal" => ListStyleType::Decimal,
+        "decimal-leading-zero" => ListStyleType::DecimalLeadingZero,
         "lower-alpha" | "lower-latin" => ListStyleType::LowerAlpha,
         "upper-alpha" | "upper-latin" => ListStyleType::UpperAlpha,
         "lower-roman" => ListStyleType::LowerRoman,
         "upper-roman" => ListStyleType::UpperRoman,
+        "lower-greek" => ListStyleType::LowerGreek,
+        "armenian" => ListStyleType::Armenian,
+        "georgian" => ListStyleType::Georgian,
         "none" => ListStyleType::None,
         _ => return None,
     };
@@ -638,6 +759,142 @@ fn alphabetic(ordinal: usize, first: char) -> String {
 }
 
 /// Roman numerals, in the subtractive form.
+/// The classical Greek alphabet, which is 24 letters and not 25.
+///
+/// Final sigma is absent: it is a positional form of the same letter, so a
+/// list numbered with it would count sigma twice. CSS 2.1 says "lowercase
+/// classical Greek" and means exactly this sequence.
+const GREEK: [char; 24] = [
+    '\u{3b1}', '\u{3b2}', '\u{3b3}', '\u{3b4}', '\u{3b5}', '\u{3b6}', '\u{3b7}', '\u{3b8}',
+    '\u{3b9}', '\u{3ba}', '\u{3bb}', '\u{3bc}', '\u{3bd}', '\u{3be}', '\u{3bf}', '\u{3c0}',
+    '\u{3c1}', '\u{3c3}', '\u{3c4}', '\u{3c5}', '\u{3c6}', '\u{3c7}', '\u{3c8}', '\u{3c9}',
+];
+
+/// Traditional Armenian numbering: nine ones, nine tens, nine hundreds, nine
+/// thousands, each its own letter, written largest first and added up.
+///
+/// Additive rather than positional, so there is no zero and nothing to carry:
+/// 1996 is 1000 + 900 + 90 + 6, four letters, one per non-zero digit.
+const ARMENIAN: [(usize, char); 36] = [
+    (9000, '\u{554}'),
+    (8000, '\u{553}'),
+    (7000, '\u{552}'),
+    (6000, '\u{551}'),
+    (5000, '\u{550}'),
+    (4000, '\u{54f}'),
+    (3000, '\u{54e}'),
+    (2000, '\u{54d}'),
+    (1000, '\u{54c}'),
+    (900, '\u{54b}'),
+    (800, '\u{54a}'),
+    (700, '\u{549}'),
+    (600, '\u{548}'),
+    (500, '\u{547}'),
+    (400, '\u{546}'),
+    (300, '\u{545}'),
+    (200, '\u{544}'),
+    (100, '\u{543}'),
+    (90, '\u{542}'),
+    (80, '\u{541}'),
+    (70, '\u{540}'),
+    (60, '\u{53f}'),
+    (50, '\u{53e}'),
+    (40, '\u{53d}'),
+    (30, '\u{53c}'),
+    (20, '\u{53b}'),
+    (10, '\u{53a}'),
+    (9, '\u{539}'),
+    (8, '\u{538}'),
+    (7, '\u{537}'),
+    (6, '\u{536}'),
+    (5, '\u{535}'),
+    (4, '\u{534}'),
+    (3, '\u{533}'),
+    (2, '\u{532}'),
+    (1, '\u{531}'),
+];
+
+/// Traditional Georgian numbering, built the same way and reaching ten
+/// thousand, which Armenian does not.
+const GEORGIAN: [(usize, char); 37] = [
+    (10000, '\u{10f5}'),
+    (9000, '\u{10f0}'),
+    (8000, '\u{10ef}'),
+    (7000, '\u{10f4}'),
+    (6000, '\u{10ee}'),
+    (5000, '\u{10ed}'),
+    (4000, '\u{10ec}'),
+    (3000, '\u{10eb}'),
+    (2000, '\u{10ea}'),
+    (1000, '\u{10e9}'),
+    (900, '\u{10e8}'),
+    (800, '\u{10e7}'),
+    (700, '\u{10e6}'),
+    (600, '\u{10e5}'),
+    (500, '\u{10e4}'),
+    (400, '\u{10f3}'),
+    (300, '\u{10e2}'),
+    (200, '\u{10e1}'),
+    (100, '\u{10e0}'),
+    (90, '\u{10df}'),
+    (80, '\u{10de}'),
+    (70, '\u{10dd}'),
+    (60, '\u{10f2}'),
+    (50, '\u{10dc}'),
+    (40, '\u{10db}'),
+    (30, '\u{10da}'),
+    (20, '\u{10d9}'),
+    (10, '\u{10d8}'),
+    (9, '\u{10d7}'),
+    (8, '\u{10f1}'),
+    (7, '\u{10d6}'),
+    (6, '\u{10d5}'),
+    (5, '\u{10d4}'),
+    (4, '\u{10d3}'),
+    (3, '\u{10d2}'),
+    (2, '\u{10d1}'),
+    (1, '\u{10d0}'),
+];
+
+/// Lowercase classical Greek, wrapping past omega the way the alphabetic
+/// systems do: alpha, … omega, then alpha alpha.
+///
+/// CSS 2.1 does not say what happens past the twenty-fourth item, and every
+/// browser repeats the letter. Doing something else would number a long list
+/// with digits halfway down it.
+fn greek(ordinal: usize) -> String {
+    if ordinal == 0 {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut n = ordinal;
+    while n > 0 {
+        out.push(GREEK[(n - 1) % GREEK.len()]);
+        n = (n - 1) / GREEK.len();
+    }
+    out.iter().rev().collect()
+}
+
+/// An additive numeral system: the largest letter that fits, repeatedly.
+///
+/// Outside `limit` the system has no notation at all — unlike Roman, where
+/// the convention merely runs out — so the number is written in digits, which
+/// is what a reader can still use.
+fn additive(ordinal: usize, table: &[(usize, char)], limit: usize) -> String {
+    if ordinal == 0 || ordinal > limit {
+        return ordinal.to_string();
+    }
+    let mut out = String::new();
+    let mut n = ordinal;
+    for &(value, letter) in table {
+        while n >= value {
+            out.push(letter);
+            n -= value;
+        }
+    }
+    out
+}
+
 fn roman(ordinal: usize) -> String {
     // Above this the numeral system has no agreed notation, and a list that
     // long is not going to be read by its numbers anyway.
@@ -968,6 +1225,99 @@ pub enum BorderCollapse {
     Collapse,
 }
 
+/// `empty-cells`: whether a cell with nothing in it draws itself.
+///
+/// Separated model only (§17.6.1.1). In the collapsing model a cell has no
+/// border of its own to hide — it shares the grid line — and CSS 2.1 says the
+/// property does not apply there at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmptyCells {
+    /// An empty cell draws its border and background like any other. The
+    /// initial value, and what the era's table layouts depend on: a spacer cell
+    /// with a `bgcolor` and no content is how a coloured rule was drawn.
+    #[default]
+    Show,
+    /// An empty cell draws neither, leaving the table's background showing.
+    Hide,
+}
+
+/// Parses an `empty-cells` keyword.
+pub fn parse_empty_cells(name: &str) -> Option<EmptyCells> {
+    match name {
+        "show" => Some(EmptyCells::Show),
+        "hide" => Some(EmptyCells::Hide),
+        _ => None,
+    }
+}
+
+/// `table-layout`: where a table's column widths come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableLayout {
+    /// Measured from every cell's content (§17.5.2.2). The initial value, and
+    /// the one the era's pages are built on — a layout table sized by what is
+    /// in it is the whole technique.
+    #[default]
+    Auto,
+    /// Taken from the columns and the first row alone (§17.5.2.1), so the rest
+    /// of the table never has to be measured. Faster, and what an author reaches
+    /// for when they want the widths they wrote rather than the widths their
+    /// content implies.
+    Fixed,
+}
+
+/// Parses a `table-layout` keyword.
+pub fn parse_table_layout(name: &str) -> Option<TableLayout> {
+    match name {
+        "auto" => Some(TableLayout::Auto),
+        "fixed" => Some(TableLayout::Fixed),
+        _ => None,
+    }
+}
+
+/// `outline`: a ring drawn outside the border edge that takes up no room.
+///
+/// §18.4. Not a fifth border: it is drawn *outside* the border box, it is the
+/// same on all four sides, and it does not influence layout at all — which is
+/// the whole point of it, since an outline that moved the page could not be
+/// used to mark focus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outline {
+    /// Declared width, used only when the style draws.
+    pub width: Length,
+    /// Line style. `none` by default, so an `outline-width` alone draws
+    /// nothing — the same trap as `border-width`.
+    pub style: BorderStyle,
+    /// Colour, or `None` for the element's own `color`.
+    ///
+    /// CSS 2.1's initial value is `invert`, which inverts whatever is under the
+    /// outline so that it is visible against any background. That needs the
+    /// pixels already drawn and the display list is built before anything is
+    /// rasterised, so `invert` is taken as the element's colour — visible
+    /// against the page for the same reason its text is.
+    pub color: Option<Color>,
+}
+
+impl Default for Outline {
+    fn default() -> Self {
+        Self {
+            width: Length::Px(MEDIUM_BORDER),
+            style: BorderStyle::None,
+            color: None,
+        }
+    }
+}
+
+impl Outline {
+    /// How thick the ring is drawn. Outside the box, so it occupies nothing.
+    pub fn used_width(&self, font_size: f32) -> f32 {
+        if self.style.reserves_space() {
+            self.width.to_px(font_size, 0.0).max(0.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Parses a `border-collapse` keyword.
 pub fn parse_border_collapse(name: &str) -> Option<BorderCollapse> {
     match name {
@@ -1147,14 +1497,25 @@ pub struct ComputedStyle {
     pub background_position: BackgroundPosition,
     /// `vertical-align`, as it applies to a table cell.
     pub vertical_align: VerticalAlign,
-    /// `border-spacing`, the gap between cell borders in the separated model.
+    /// `border-spacing`, the gap between cell borders in the separated model:
+    /// horizontal first, then vertical.
     ///
-    /// On a table only. Kept as a length rather than pixels because it is
+    /// On a table only. Kept as lengths rather than pixels because they are
     /// resolved against the table's own font size, like any other length.
     /// Ignored entirely when `border_collapse` is `Collapse`.
-    pub border_spacing: Length,
+    ///
+    /// Two values, because §17.6.1 allows two and a page that writes
+    /// `border-spacing: 0 8px` means the rows to be spaced and the columns not
+    /// to be. One value applies to both axes.
+    pub border_spacing: (Length, Length),
     /// `border-collapse`, inherited, which model a table's borders use.
     pub border_collapse: BorderCollapse,
+    /// `empty-cells`, inherited, whether an empty cell draws itself.
+    pub empty_cells: EmptyCells,
+    /// `table-layout`, on a table, where its column widths come from.
+    pub table_layout: TableLayout,
+    /// `outline`, drawn outside the border box and taking up no room.
+    pub outline: Outline,
     /// `caption-side`, inherited, which side of a table its caption sits on.
     pub caption_side: CaptionSide,
     /// `visibility`, inherited. A hidden box keeps its space.
@@ -1163,6 +1524,8 @@ pub struct ComputedStyle {
     pub text_transform: TextTransform,
     /// `letter-spacing` in pixels, inherited. Zero is `normal`.
     pub letter_spacing: f32,
+    /// `word-spacing` in pixels, inherited: extra room added at every space.
+    pub word_spacing: f32,
     /// `text-indent`, inherited, applied to a block's first line.
     ///
     /// Kept as a length because it may be a percentage, which resolves against
@@ -1206,8 +1569,17 @@ pub struct ComputedStyle {
     pub font_weight: u16,
     /// `font-style`, inherited.
     pub font_style: FontStyle,
-    /// `line-height` in pixels, inherited.
-    pub line_height: f32,
+    /// `font-variant`, which here means small capitals or not.
+    pub font_variant: FontVariant,
+    /// `direction` (§8.6), which decides the base level of a paragraph and
+    /// which end of the line its text starts from.
+    pub direction: Direction,
+    /// `unicode-bidi` (§8.6). Does *not* inherit, unlike `direction`: an
+    /// override applies to the element that declares it and to text directly
+    /// inside it, and a nested element opens its own.
+    pub unicode_bidi: UnicodeBidi,
+    /// `line-height`, inherited. `normal` until a font resolves it.
+    pub line_height: LineHeight,
     /// `text-align`, inherited.
     pub text_align: TextAlign,
     /// `white-space`, inherited.
@@ -1216,6 +1588,8 @@ pub struct ComputedStyle {
     pub text_decoration: TextDecoration,
     /// `list-style-type`, inherited so a list's items pick it up from the list.
     pub list_style_type: ListStyleType,
+    /// Where the marker sits (§12.5.1). Inherited, like the type.
+    pub list_style_position: ListStylePosition,
     /// `margin`.
     pub margin: Edges,
     /// `padding`.
@@ -1271,8 +1645,67 @@ pub const DEFAULT_BORDER_SPACING: f32 = 2.0;
 /// The initial font size, and the basis for `em` at the root.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
-/// `line-height: normal`, as a multiple of font size.
+/// `line-height: normal` as a multiple of font size, for the one case where
+/// the font's own answer cannot be had.
+///
+/// §10.8.1 leaves `normal` to the user agent and asks for a "reasonable" value
+/// "based on the font". The real value is the face's ascent plus its descent
+/// plus its line gap, which only the shaper can report — see
+/// `text::FontStore::used_line_height`. This is the fallback for a run with no
+/// glyphs to name a face with, and the number every browser used before anyone
+/// measured: close enough that nothing jumps, wrong enough to be worth not
+/// using.
 pub const NORMAL_LINE_HEIGHT: f32 = 1.2;
+
+/// A used `line-height`.
+///
+/// `normal` stays unresolved through the cascade, which is the whole point: it
+/// depends on the face the text is set in, and the cascade has no fonts. Every
+/// other form — a length, a percentage, a unitless multiplier — is a number of
+/// pixels the moment the font size is known, and is resolved where it is read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// The font's own: ascent + descent + line gap, at this size.
+    Normal,
+    /// A unitless multiplier.
+    ///
+    /// It inherits as the *number* and resolves against each element's own font
+    /// size (§10.8.1), which is the whole reason the era's sheets write
+    /// `line-height: 1.4` rather than `line-height: 1.4em`: a heading inside a
+    /// body set that way gets a line proportional to the heading. Resolved to
+    /// pixels it would not — every heading on every page would be given the
+    /// body's line and its text would overlap.
+    Number(f32),
+    /// A used value in pixels, from a length or a percentage.
+    Px(f32),
+}
+
+impl LineHeight {
+    /// The value in pixels, given the font size it resolves against and what
+    /// `normal` comes to for that font.
+    ///
+    /// Non-finite and negative values fall back to `normal` as well: they can
+    /// only come from a font size that overflowed, and a line height of `NaN`
+    /// poisons every coordinate downstream of it.
+    pub fn resolve(self, font_size: f32, normal: f32) -> f32 {
+        let used = match self {
+            Self::Normal => normal,
+            Self::Number(n) => n * font_size,
+            Self::Px(px) => px,
+        };
+        if used.is_finite() && used >= 0.0 {
+            used
+        } else {
+            normal
+        }
+    }
+
+    /// Whether resolving this needs a font measured, which the cascade cannot
+    /// do and everything downstream of it can.
+    pub fn is_normal(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
 
 impl Default for ComputedStyle {
     fn default() -> Self {
@@ -1285,12 +1718,16 @@ impl Default for ComputedStyle {
             background_position: BackgroundPosition::default(),
             overflow: Overflow::Visible,
             vertical_align: VerticalAlign::Baseline,
-            border_spacing: Length::Px(0.0),
+            border_spacing: (Length::Px(0.0), Length::Px(0.0)),
             border_collapse: BorderCollapse::Separate,
+            empty_cells: EmptyCells::Show,
+            table_layout: TableLayout::Auto,
+            outline: Outline::default(),
             caption_side: CaptionSide::Top,
             visibility: Visibility::Visible,
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
+            word_spacing: 0.0,
             text_indent: Length::Px(0.0),
             min_height: Length::Auto,
             max_height: Length::Auto,
@@ -1302,11 +1739,15 @@ impl Default for ComputedStyle {
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
             font_style: FontStyle::Normal,
-            line_height: DEFAULT_FONT_SIZE * NORMAL_LINE_HEIGHT,
-            text_align: TextAlign::Left,
+            font_variant: FontVariant::Normal,
+            direction: Direction::Ltr,
+            unicode_bidi: UnicodeBidi::Normal,
+            line_height: LineHeight::Normal,
+            text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             text_decoration: TextDecoration::default(),
             list_style_type: ListStyleType::Disc,
+            list_style_position: ListStylePosition::Outside,
             margin: Edges::ZERO,
             padding: Edges::ZERO,
             border: Borders::default(),
@@ -1333,13 +1774,18 @@ impl ComputedStyle {
             font_size: parent.font_size,
             font_weight: parent.font_weight,
             font_style: parent.font_style,
+            font_variant: parent.font_variant,
+            direction: parent.direction,
+            unicode_bidi: UnicodeBidi::Normal,
             line_height: parent.line_height,
             text_align: parent.text_align,
             white_space: parent.white_space,
             list_style_type: parent.list_style_type,
+            list_style_position: parent.list_style_position,
             // §17.6: inherited, so a rule on `table` reaches the cells that
             // have to agree with it about where their borders are.
             border_collapse: parent.border_collapse,
+            empty_cells: parent.empty_cells,
             // §17.4.1: set on the table, read on the caption.
             caption_side: parent.caption_side,
             // §11.2: hiding a container hides what is inside it, and a
@@ -1347,6 +1793,7 @@ impl ComputedStyle {
             visibility: parent.visibility,
             text_transform: parent.text_transform,
             letter_spacing: parent.letter_spacing,
+            word_spacing: parent.word_spacing,
             text_indent: parent.text_indent,
             ..Self::default()
         }
@@ -1430,6 +1877,49 @@ mod marker_tests {
         // Past the point where the notation is agreed, fall back to digits
         // rather than emitting a wall of Ms.
         assert_eq!(ListStyleType::UpperRoman.marker(4000), "4000.");
+    }
+
+    #[test]
+    fn decimal_leading_zero_pads_to_two_and_no_further() {
+        for (ordinal, expected) in [(1, "01"), (9, "09"), (10, "10"), (99, "99"), (100, "100")] {
+            assert_eq!(ListStyleType::DecimalLeadingZero.counter(ordinal), expected);
+        }
+    }
+
+    #[test]
+    fn lower_greek_skips_final_sigma() {
+        // Twenty-four letters, not twenty-five: final sigma is a positional
+        // form of the same letter and counting it would number two items
+        // sigma.
+        assert_eq!(ListStyleType::LowerGreek.counter(1), "\u{3b1}");
+        assert_eq!(ListStyleType::LowerGreek.counter(17), "\u{3c1}");
+        assert_eq!(ListStyleType::LowerGreek.counter(18), "\u{3c3}");
+        assert_eq!(ListStyleType::LowerGreek.counter(24), "\u{3c9}");
+        assert_eq!(
+            ListStyleType::LowerGreek.counter(25),
+            "\u{3b1}\u{3b1}",
+            "past omega it repeats, as the alphabetic systems do"
+        );
+    }
+
+    #[test]
+    fn armenian_and_georgian_are_additive() {
+        // 1996 is 1000 + 900 + 90 + 6: one letter per non-zero digit, largest
+        // first, and no subtractive pairs of the Roman kind.
+        assert_eq!(ListStyleType::Armenian.counter(1), "\u{531}");
+        assert_eq!(
+            ListStyleType::Armenian.counter(1996),
+            "\u{54c}\u{54b}\u{542}\u{536}"
+        );
+        assert_eq!(ListStyleType::Georgian.counter(1), "\u{10d0}");
+        assert_eq!(
+            ListStyleType::Georgian.counter(1996),
+            "\u{10e9}\u{10e8}\u{10df}\u{10d5}"
+        );
+        // Past the top of each system there is no notation at all, so the
+        // number is written in digits rather than in a wall of letters.
+        assert_eq!(ListStyleType::Armenian.counter(10000), "10000");
+        assert_eq!(ListStyleType::Georgian.counter(20000), "20000");
     }
 
     #[test]

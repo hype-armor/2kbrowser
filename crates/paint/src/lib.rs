@@ -100,10 +100,16 @@ pub struct DisplayList {
     /// page — and the background has to reach the bottom of it either way.
     pub canvas: Color,
     /// Image tiled across the whole canvas, for the same reason.
+    ///
+    /// The fourth field is the *positioning* area, which is not the canvas:
+    /// §14.2 places the tile "as if it was painted for the root element
+    /// alone", so an offset is measured from that element's padding box while
+    /// the tiling covers the window.
     pub canvas_image: Option<(
         dom::NodeId,
         css::style::BackgroundRepeat,
         css::style::BackgroundPosition,
+        Rect,
     )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
@@ -245,6 +251,62 @@ fn paint_box(
         paint_borders(box_, x, y, list);
     }
 
+    // §18.4: outside the border box, the same on all four sides, and taking up
+    // no room — so it is drawn after the border it surrounds and over whatever
+    // happens to be beside the box. An outline that moved the page could not be
+    // used to mark focus, which is what the property is for.
+    if drawn {
+        let width = box_.style.outline.used_width(box_.style.font_size);
+        if width > 0.0 && box_.style.outline.style.is_visible() {
+            let rect = Rect {
+                x: x - width,
+                y: y - width,
+                width: box_.rect.width + width * 2.0,
+                height: box_.rect.height + width * 2.0,
+            };
+            let color = box_.style.outline.color.unwrap_or(box_.style.color);
+            let style = box_.style.outline.style;
+            let sides = [
+                (
+                    Side::Top,
+                    Rect {
+                        height: width,
+                        ..rect
+                    },
+                ),
+                (
+                    Side::Bottom,
+                    Rect {
+                        y: rect.y + rect.height - width,
+                        height: width,
+                        ..rect
+                    },
+                ),
+                (
+                    Side::Left,
+                    Rect {
+                        y: rect.y + width,
+                        width,
+                        height: (rect.height - width * 2.0).max(0.0),
+                        ..rect
+                    },
+                ),
+                (
+                    Side::Right,
+                    Rect {
+                        x: rect.x + rect.width - width,
+                        y: rect.y + width,
+                        width,
+                        height: (rect.height - width * 2.0).max(0.0),
+                    },
+                ),
+            ];
+            for (side, edge) in sides {
+                push_border_side(list, &edge, style, width, side, color);
+            }
+        }
+    }
+
     if drawn && let Some(node) = box_.replaced {
         list.items.push(DisplayItem::Image {
             node,
@@ -265,9 +327,12 @@ fn paint_box(
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
         let content_y = y + box_.content_origin.1;
-        let content_width = box_.content_width;
         for line in &layout.lines {
-            let dx = line_offset(box_.style.text_align, line.width, content_width);
+            let dx = line_offset(
+                box_.style.text_align.against(box_.style.direction),
+                line.width,
+                line.available.min(box_.content_width),
+            );
             // An inline box's own background and border, under everything the
             // line draws. Outermost first, which is the order the fragments
             // come in, so a nested span's background covers its parent's.
@@ -876,7 +941,7 @@ pub fn rasterise_band(
     ));
 
     // The canvas tile goes over the canvas colour and under everything else.
-    if let Some((node, repeat, position)) = list.canvas_image
+    if let Some((node, repeat, position, area)) = list.canvas_image
         && let Some(image) = images.get(&ImageKey::background(node))
     {
         // The canvas is the whole document, so the anchor is measured against
@@ -889,7 +954,7 @@ pub fn rasterise_band(
             width: pixmap.width() as f32,
             height: top + pixmap.height() as f32,
         };
-        let anchor = anchor_of(&full, position, image);
+        let anchor = anchor_of(&area, position, image);
         if let Some(slice) = banded(&full, top, pixmap.height() as f32) {
             let slice = shifted(&slice, top);
             if drawable(&slice) {
@@ -1427,7 +1492,14 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
         let sizes = layout::IntrinsicSizes::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
+        let layout = layout::layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &sizes,
+            width as f32,
+            width as f32,
+        );
         let list = build_display_list(&layout);
         let height = layout.height.ceil().max(1.0) as u32;
         let images = ImageStore::new();
@@ -1650,7 +1722,14 @@ mod tests {
         let styles = css::cascade::cascade(&doc, &sheets);
         let mut fonts = FontStore::new();
         let sizes = layout::IntrinsicSizes::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, width as f32);
+        let layout = layout::layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &sizes,
+            width as f32,
+            width as f32,
+        );
         let height = layout.height.ceil().max(1.0) as u32;
         (build_display_list(&layout), fonts, height)
     }
@@ -1994,6 +2073,47 @@ mod tests {
             "a box broken over lines drew {broken} pixels of side, which is more than the two \
              it has"
         );
+    }
+
+    #[test]
+    fn an_outline_is_drawn_outside_the_border_and_moves_nothing() {
+        // §18.4: outside the border box and taking up no room, which is the
+        // whole point — an outline that moved the page could not be used to
+        // mark focus.
+        let red = |pixmap: &Pixmap| {
+            pixmap
+                .pixels()
+                .iter()
+                .filter(|p| (p.red(), p.green(), p.blue()) == (255, 0, 0))
+                .count()
+        };
+        const CSS: &str = "body { margin: 20px } p { margin: 0; width: 100px; height: 20px; \
+                           border: 2px solid #000000 }";
+        let bare = render("<body><p>x</p></body>", CSS, 200);
+        let outlined = render(
+            "<body><p>x</p></body>",
+            "body { margin: 20px } p { margin: 0; width: 100px; height: 20px; \
+             border: 2px solid #000000; outline: 3px solid #ff0000 }",
+            200,
+        );
+        assert_eq!(red(&bare), 0);
+        assert!(red(&outlined) > 100, "no outline drawn");
+        assert_eq!(
+            bare.height(),
+            outlined.height(),
+            "the outline changed the page's height"
+        );
+
+        // It is *outside* the border: the pixel three rows above the box's top
+        // edge is outline, and the border is still black underneath.
+        let (r, g, b) = at(&outlined, 40, 19);
+        assert_eq!(
+            (r, g, b),
+            (255, 0, 0),
+            "the row above the border is not red"
+        );
+        let (r, g, b) = at(&outlined, 40, 21);
+        assert_eq!((r, g, b), (0, 0, 0), "the border itself was overwritten");
     }
 
     #[test]
@@ -2542,7 +2662,7 @@ mod canvas_background_tests {
         let styles = css::cascade::cascade(&doc, &[Stylesheet::default()]);
         let mut fonts = FontStore::new();
         let sizes = layout::IntrinsicSizes::new();
-        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, 200.0);
+        let layout = layout::layout(&doc, &styles, &mut fonts, &sizes, 200.0, 200.0);
         (build_display_list(&layout), doc)
     }
 
@@ -2582,6 +2702,38 @@ mod canvas_background_tests {
         assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(html));
         // The body's own tile is not propagated, so it still paints normally.
         assert_eq!(tiles(&list), 1);
+    }
+
+    #[test]
+    fn a_root_colour_keeps_the_body_tile_on_the_body() {
+        // §14.2 propagates the body's background only when the root has *none*
+        // — no image and no colour. A root with a colour alone used to leave
+        // the body's tile going to the canvas anyway, which is a different
+        // rectangle and so a different part of the tile.
+        let (list, _) = list_for(
+            "<html style=\"background-color: navy\">\
+             <body background=\"body.gif\"><p>x</p></body></html>",
+        );
+        assert_eq!(
+            list.canvas_image, None,
+            "the root has a background of its own"
+        );
+        assert_eq!(tiles(&list), 1, "so the body paints its own tile");
+    }
+
+    #[test]
+    fn the_canvas_tile_is_positioned_against_the_root_and_not_the_window() {
+        // §14.2 paints it over the whole canvas but places it "as if it was
+        // painted for the root element alone", so the positioning area is that
+        // element's padding box. Measured from the window instead, a root with
+        // a margin puts the tile in the wrong place — and a negative offset
+        // puts it off the canvas entirely.
+        let (list, _) = list_for(
+            "<html style=\"margin: 20px; border: 5px solid red; \
+             background-image: url(root.gif)\"><body><p>x</p></body></html>",
+        );
+        let (.., area) = list.canvas_image.expect("a canvas tile");
+        assert_eq!((area.x, area.y), (25.0, 25.0), "margin then border");
     }
 
     #[test]

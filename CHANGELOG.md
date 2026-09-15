@@ -14,7 +14,697 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
-## Unreleased
+## 0.4.0
+
+A release about boxes this engine never generated. CSS 2.1 says several exist
+that nothing here was building: §17.2.1's anonymous tables, the root element's
+own box, the strut that gives a line its height, and the anonymous block an
+inline element leaves behind when a block is put inside it. An absent box does
+not read as a bug. It reads as a page that rendered — a little short, a little
+flat, nothing a reader would think to report — which is why most of these had
+been wrong since before there was a changelog to record them in.
+
+Right-to-left text is the other half, and the opposite kind of absence: not a
+box that was missing but an algorithm, and the one PLAN.md had been listing as
+unimplemented since M2 opened.
+
+**The CSS 2.1 conformance suite went from 66.9% to 76.0%** — 3226 of 4821
+reference tests to 3665, with no panics across roughly ten thousand renders.
+0.2.0 moved further and this file said plainly that the harness was why; this
+time fifteen of the 439 are the harness, learning to read an XHTML file's own
+encoding declaration, and the rest are the engine.
+
+Six tests were lost, across five of the changes below — right-to-left text
+cost two and four others cost one apiece. Every one of the six was passing
+because *both* sides of the pair were equally wrong: a reference that spells
+its expected result with three non-breaking spaces matches a test that loses
+them, for exactly as long as the engine loses them too. Each is recorded with
+the issue that carries it rather than quietly absorbed, and PLAN.md lists them
+beside the deviations that were already there.
+
+**An anonymous table sits beside a float** rather than on top of it. §9.5 says
+a table may not overlap one, and a table §17.2.1 generated is a table like any
+other — the child walk asks this of every box with a formatting context of its
+own, and the branch that places an inferred table places its own box, so it had
+to be told to ask too. No conformance test moves either way; the case is a run
+of orphan `display: table-cell` boxes after a float, which the suite does not
+cover and Chromium draws beside it.
+
+**A box with a formatting context of its own does not overlap a float**
+(§9.5). Its border box narrows and moves beside the float; where it cannot fit
+beside it, it goes below. **Worth 15 conformance tests against nothing lost.**
+
+This is the whole visible difference between a plain `<div>` beside a float and
+one with `overflow: hidden`. The first has its *lines* shortened and keeps a
+full-width box, so its background runs underneath the float. The second has the
+box itself shortened, so the background stops where the float begins — which is
+how a two-column layout was built out of a float and an `overflow: hidden`
+before anybody had flexbox, and this engine drew the second exactly like the
+first.
+
+Two halves, and the second is the one that is easy to leave out. Such a box
+cannot see the floats *inside* it either, so it gets a formatting context of its
+own rather than the one it sits in — without which its inline content is shifted
+by the float's width a second time, on top of the shift its own box already
+took.
+
+Whether it fits is decided by its min-content width plus its horizontal margins,
+which can be negative: a box pulled left by `margin-left: -50px` occupies fifty
+pixels less than it declares, and a test of exactly that is what caught the
+margins being left out. The band is measured at the box's top rather than over
+its whole height, which is not known until it has been laid out — and laying it
+out is what the answer is for.
+
+**An absolutely positioned root element takes its offsets** (§10.1). Its
+containing block is the initial one — the viewport — and `layout_block` applies
+a *relative* shift itself, but absolute placement is a parent's business and
+the root element has no parent to do it. So `html { position: absolute;
+left: 100px }` moved nothing at all. Two conformance tests, nothing lost.
+
+**A table's `height` is a minimum** (§17.5.3), not its height. Where the rows do
+not fill it the excess is shared out among them. **Worth 27 conformance tests
+against nothing lost.**
+
+It was ignored outright, so a `<table height="200">` was as tall as its text.
+That shape is what a great many of the suite's own *reference* files are built
+out of — a cell with `vertical-align: bottom` holding an image at the foot of
+a two-hundred-pixel box is how a reference draws "a green rectangle above a
+blue stripe" without using the property under test — which is why a rule about
+tables was worth twenty-two tests in the backgrounds chapter.
+
+How the excess is distributed is left undefined by §17.5.3. It goes in
+proportion to the heights the rows already have, which is what browsers do, or
+evenly when they have none to be in proportion to. A percentage height is left
+alone: it resolves against the table's containing block height, which is
+usually `auto`, and §10.5 then makes the percentage behave as `auto` — which is
+what leaving it alone produces.
+
+**A stylesheet decides its own encoding** (§4.4), which is a different
+question from a document's and was being answered with a document's rules.
+**Worth 18 conformance tests against nothing lost.**
+
+A stylesheet has no `<meta>` and no locale to fall back on, so the
+declarations it does carry are the whole of what a browser has. §4.4 puts them
+in this order: the transport's `charset` parameter, then a byte-order mark or
+the `@charset` rule at the very start, then whatever the link said — a
+`<link charset>` or the charset on an `@import` — then the encoding of the
+document that referred to it, and only then an assumption of UTF-8.
+
+None of the middle three existed here. An external stylesheet went through the
+document decoder, which looks for a `<meta>` a stylesheet cannot have and then
+assumes windows-1252. A sheet declaring `@charset "shift-jis"` was read as
+windows-1252, so a selector spelled in Japanese matched nothing and the rule
+was silently dropped.
+
+`@charset` is read only at byte zero and only in the one spelling §4.4 allows
+— `@charset "…";`, a single space, no comment before it. Anywhere else it is
+an ordinary at-rule, which is what keeps a stylesheet from redecoding itself
+out of the inside of a string.
+
+The referring document's encoding is read from the `<meta>` the document
+carries, because by the time the shell sees a page the bytes are gone. That
+loses the two steps above a `<meta>` — a byte-order mark and the transport's
+header — so a page that declared its encoding only there hands its stylesheets
+the era's default instead. Which is exactly what they were handed before any of
+this existed, so it is a gap rather than a regression, and it only matters for
+a stylesheet that declares nothing itself.
+
+**The root element is a box of its own.** The walk started at `<body>`, so
+everything `<html>` declared about its own box was dropped:
+`html { border: solid blue }` drew nothing at all and `html { margin: 1in }`
+moved nothing. **Worth 11 conformance tests against 1 lost.**
+
+It is laid out now, with the body inside it, and the extra level costs the
+reference baselines exactly nothing — a page that says nothing about its root
+element gets a box with no margin, no border and no padding, which is a
+pass-through.
+
+Two halves of §14.2 came out of it, both about the background the root sends to
+the canvas.
+
+**Propagation is all or nothing.** The condition is "if the computed value of
+`background-image` on the root element is `none` *and* its `background-color`
+is `transparent`", and this engine asked the two questions separately and sent
+each answer to the canvas on its own. So a root with a colour and a body with a
+tile put the tile on the canvas, where §14.2 leaves it on the body's own box —
+a different rectangle, showing a different part of the tile.
+
+**And the tile is positioned against the root, not the window.** §14.2 paints
+it over the whole canvas but places it "as if it was painted for the root
+element alone", so the offsets are measured from that element's padding box.
+Measured from the window, `background-position: -2em -2em` on a root with a
+one-em margin and a one-em border puts the tile off the canvas instead of at
+its corner.
+
+The one test lost is `floats/float-root`, recorded as #128, and it was passing
+because neither side floated. Its reference floats the body, which works now;
+the test floats `:root`, which does not — the root is laid out directly rather
+than as a child, and a float is applied by a parent's walk over its children.
+Chromium honours a float there. No real page writes one.
+
+**A non-breaking space no longer collapses.** §16.6.1 collapses spaces, tabs
+and newlines; `&nbsp;` is none of them. It is a character with a width, and the
+whole point of writing one is that it survives. **Worth 17 conformance tests
+against 1 lost.**
+
+The cause was `char::is_whitespace`, which answers Unicode's White_Space
+question and so says yes to U+00A0. Four places asked it: the collapsing pass,
+the block's leading and trailing trim, the state carried across run boundaries,
+and the intrinsic-width split that decides a column's minimum. So
+`x&nbsp;&nbsp;&nbsp;y` came out with one space, `&nbsp;Heading` lost its
+indent, and `a&nbsp;b` was measured as two words a column could take apart.
+
+This matters more for the pages this engine is for than for anything modern.
+`&nbsp;` is how the era indented a paragraph, spaced a row of navigation links
+and held an empty table cell open — the repository's own `era-page` fixture
+opens with one, and its heading has been four pixels out of place for as long
+as there has been a baseline. Checked against Chromium, which puts it where the
+new baseline does.
+
+The one test lost is `generated-content/content-175`, recorded as #126. It was
+passing because both sides were equally wrong: its reference ends in three
+non-breaking spaces that used to collapse away. They are kept now, and the test
+side is still short, because a `white-space: pre` run's trailing spaces are
+taken by the same block-level trim. Keeping *those* was tried and measured — it
+fixes nothing and breaks two, since the line break beside them then draws a
+second empty inline box, which needs §9.4.2's rule that a line box holding
+nothing generates none.
+
+**A pseudo-element carries its own counters** (§12.4), and every one of CSS
+2.1's counter styles is spelled. **Worth 30 conformance tests against 1 lost.**
+
+§12.4's own example is a heading numbered from a `::before` that increments
+the counter itself:
+
+```css
+h1::before { content: "Chapter " counter(chapter) ". "; counter-increment: chapter }
+```
+
+The number it prints is the one *after* that increment, which one pass over the
+style cannot produce: `content` is resolved against the counters as they stand,
+and the increment is a property of the style being resolved. So a
+pseudo-element that declares a counter operation is computed twice — the first
+pass read only for the operation, the second kept — and nearly none of them do,
+so nearly none of them pay for it.
+
+Two rules came with it. `::after` is computed after the element's children
+rather than beside `::before`, because its box comes after the element's
+content and so does anything it does to a counter. And an operation on a box
+nobody generates has no effect: a `::before` with no `content`, or one told
+`display: none`, counts nothing — without which four tests that check exactly
+that went the other way.
+
+The missing counter styles are `decimal-leading-zero`, `lower-greek`,
+`armenian` and `georgian`. Greek is twenty-four letters and not twenty-five:
+final sigma is a positional form of the same letter, and counting it would
+number two items sigma. The other two are additive like Roman but without the
+subtractive pairs — 1996 is one letter per non-zero digit, largest first — and
+past the top of each system there is no notation at all, so the number is
+written in digits rather than as a wall of letters. All four spell list markers
+and `counter()` alike, since §12.4.3 takes the values `list-style-type` does.
+
+The bundled Liberation faces carry neither Armenian nor Georgian (ADR-0008), so
+those two number correctly and draw nothing. That is the font's coverage and
+not the numbering, which is why the reference fixture leaves them out and their
+tests name the letters by codepoint instead.
+
+The one test lost is `generated-content/counters-root-000`, recorded as #124. A
+pseudo-element's `counter-reset` is scoped here the way §12.4.1 describes an
+element's — the element, its following siblings, their descendants — and
+browsers do something narrower that four probes against Chromium could not
+reduce to a rule. Twenty-two tests need the reading here; one needs the other.
+
+**A short page is no longer mistaken for an empty one.** ADR-0009's third
+state — "this page has no content without JavaScript" — fired on any document
+with a script and fewer than two hundred characters of text. That is a measure
+of *length*, and the ADR asks for near-zero *content*: a table of twenty-six
+one-letter rows is a hundred and fifty characters and a complete rendering, and
+replacing it with "this page requires JavaScript" is a lie about a page already
+on the screen.
+
+There are two measures now and both must agree: how much text there is, and how
+many elements carry any. The shell the state exists for has none of the second
+— an empty `<div id="root">`, or the one `<noscript>` line a framework's
+template ships with. Each measure alone gets a page wrong, which is why neither
+replaced the other: the count would call a long article in three paragraphs
+near-empty, and the character total called a short complete page a shell.
+
+**The conformance harness reads the XML declaration's encoding.** Not an engine
+change and it does not claim to be one — the same bridge as the CDATA
+unwrapping beside it, and for the same reason. The suite is XHTML, an XHTML
+document declares its encoding in its prologue, and this engine parses
+everything as HTML, where `<?xml … ?>` is a bogus comment that HTML5's prescan
+deliberately does not read. Chromium does not read it either when the same
+bytes arrive as `text/html`.
+
+A hundred and two files in the suite carry non-ASCII bytes under such a
+declaration. Every one was being decoded as windows-1252, so `À` reached the
+engine as `Ã€` — and a test that uppercases it cannot match a reference that
+spells it out. That is the harness losing the document, not the engine
+mis-rendering it.
+
+The two together are worth **21 conformance tests against nothing lost** —
+fifteen for the encoding, two for the classification, and four that needed
+both, which is the whole `text-transform-bicameral` family bar the three that
+want locale-aware casing.
+
+**Anonymous tables** (§17.2.1): a run of table-internal boxes with no table
+above them gets one generated around it, and is laid out as the table it was
+describing. Together with the width rule below, **worth 25 conformance tests
+against nothing lost.**
+
+What a page writes is `display: table-cell` on three spans, or a
+`display: table-row` and its cells, with no `display: table` anywhere. The
+engine used to lay each one out as an ordinary block, so three cells that
+belong side by side came out stacked. They are collected into a run now — the
+run ends at the first thing that is not table-internal, which is why a
+paragraph between two pairs of cells produces two tables rather than one — and
+the run is handed to the table code as the children of a box that has no
+element behind it. That is the whole shape of the change: `build_grid` and
+`layout_table` take a child list instead of reading one from a node, and
+everything downstream is unchanged.
+
+One of §17.2.1's rules is still missing: the anonymous *cell* that goes around
+a row's child that is not a cell. A run that yields no cells is therefore left
+alone rather than wrapped, because a table built from it would swallow its
+content — `<span style="display: table-row"><span>aaa</span></span>` still
+renders as the word `aaa`, which is what it looked like before any of this.
+Without that guard it rendered as nothing at all.
+
+**`left` and `right` together size an absolutely positioned box** (§10.3.7).
+With both offsets given and `width: auto` the two edges are pinned and the
+width falls out of the equation; this engine shrank the box to fit its content
+and then placed its left edge, so the right offset did nothing.
+
+It surfaced as a table one pixel too wide. A reference file that stretches a
+table with `left: 1px; right: 1px` had it two pixels wider than the test it
+was the reference for, which put every column a fraction of a pixel out and
+failed the comparison on antialiasing alone.
+
+A replaced element is the exception (§10.3.8): its `auto` width comes from the
+intrinsic size, and narrowing the basis resolved `<img width="50%">` against
+the gap between the offsets instead of against the containing block.
+
+**An inline element holding a block is broken around it** (§9.2.1.1), instead
+of being laid out as a block. **Worth 31 conformance tests against 1 lost.**
+
+The old shape put the element's background and border around the block child,
+made it fill its container where two fragments are each as wide as their own
+text, and applied vertical margins an inline box does not have.
+
+What makes it tractable is that the split is a matter of *style*, not of new
+machinery. A fragment gets the element's style with the sides it does not own
+zeroed — the start side on the first, the end side on the last, nothing at
+either break — and the room reserved on the line and the border painted later
+both read that same style, so neither has to be told a split happened.
+
+Three things had to agree about it, and each announced itself by losing a box:
+
+- **The float pass.** A split element no longer has a layout pass of its own,
+  so a float inside it was reached by nothing and vanished. It descends now.
+- **Document order.** The walk hands the container a *grandchild* — the block
+  that broke the element open — and `precedes` looked for it among the
+  container's children, found nothing, and read that as "does not precede". A
+  float declared beside such a block was never placed before it and fell
+  through to the end of the container.
+- **Inheritance.** The text inside a split element is gathered as a child of
+  the *container*, so a `<span style="color: black">` broken around a block
+  drew its halves in whatever colour the container had.
+
+A fourth was not a bug but a judgement. The anonymous block a stretch lands in
+takes the split element's style rather than the container's, because the line's
+strut comes from it: `<font size="2">` broken around an `<hr>` — the era's own
+markup, and what turned this up — otherwise spaces a sidebar's links out by the
+difference between the two fonts. Arguably not what §9.2.1.1's anonymous boxes
+inherit. It is what every browser draws.
+
+The one test lost, `box-display/block-in-inline-001`, is one **Chromium fails
+too** — checked directly, same rectangle. It was passing here by the usual
+accident: the old block-shaped rendering happened to match a reference the
+correct shape does not.
+
+**A box is measured one inline stretch at a time.** The words before a block
+child and the words after it can never share a line, and the intrinsic width
+was gathering the whole box's inline content in one sequence and measuring it
+as though they could — reporting a box wide enough for both.
+
+§9.2.1.1's shape is where it showed. An inline element holding a block is laid
+out as a block here, so `Line 1<div>Line 2</div>Line 3` in a table cell asked
+for the width of `Line 1Line 3`: very nearly double what a browser gives it,
+and the cell came out twice the size beside an identical one built out of
+divs. That is `box-display/block-in-inline-001`, which now matches Chromium to
+the pixel.
+
+One conformance test, nothing lost, and the fix is not really about
+block-in-inline at all — it is about any block container with mixed children,
+which is most of the era's markup.
+
+The rest of §9.2.1.1 is still outstanding and PLAN.md now says which part: the
+geometry is right, the box is not. An inline element's background and border
+wrap the block child instead of stopping either side of it.
+
+**Right-to-left text**, which PLAN.md has been listing as unimplemented since
+M2 opened: `direction`, `unicode-bidi`, and the reordering itself. Worth **21
+conformance tests** against 2 lost.
+
+The algorithm is `unicode-bidi`'s — the crate `cosmic-text` already depends on,
+so the tree gains no new code — and what had been missing was everything around
+it. Shaping happened per word, so each Hebrew word came out right and the words
+came out in the wrong order; the fix is to run the analysis over the whole
+inline formatting context and reorder each line's segments by the levels it
+returns. Segments are split at level boundaries as well as at line-break
+opportunities, because `AAA<RLO>BBB` is one unbreakable word and two
+directions.
+
+An inline box's own borders are not characters and do not reorder like them.
+They attach to the ends of the box in the box's own direction, so a `<span>`
+that reordering cuts in two draws two fragments with a border on the outside of
+each end and nothing at the join — and a nested box's side stays inside its
+parent's, which is a plain left-to-right case that broke first and caught the
+tie-break the wrong way round.
+
+Whitespace turned out to need a level of its own. The space between two Hebrew
+words travels with them; the space between the last Hebrew word and the English
+after it is a neutral at the paragraph's direction and belongs past the whole
+Hebrew run. Same character, same place in the source, two different answers.
+
+One piece of UAX #9 is written here rather than taken: Latin under an explicit
+override. The shaper does not act on the formatting codes — handed
+`<RLO>abcdef<PDF>` it draws two blank boxes and six letters forwards, measured
+before believed — so such a run is shaped forwards and then mirrored, with rule
+L4's brackets swapped by shaping the mirrored characters and letting the shaper
+find the glyphs.
+
+`text-align` gains a `Start` value, because §16.2's initial value is "left if
+`direction` is `ltr`, right if it is `rtl`" — not a value a stylesheet can name
+and so one the enum has to hold, resolved where it is used rather than in the
+cascade, since `text-align` and `direction` inherit separately.
+
+And a pre-existing bug this uncovered: `text-align: right` measured from the
+edge of the *box* rather than the edge of the room the line actually had, so a
+right-aligned line beside a float was pushed past it. Lines carry their own
+available width now.
+
+Two tests lost, both right-to-left and both needing block-level work that is
+not here: a box split across lines by a `<br>`, and §10.3.3's over-constrained
+margin, whose one-line version moved every absolutely positioned and replaced
+box as well (8 recovered against 37 lost) and was backed out.
+
+**Line boxes have a strut now** (§10.8.1), and quirks mode takes it away again
+on a line with no text — which is the quirk the era's sliced-image tables were
+built on.
+
+The strut was half there: a line started at the block's own line height with an
+ascent of `font_size * 0.8`. That is near enough for deciding how *tall* a line
+is and nowhere near enough for deciding how far below the baseline it reaches,
+which is the same number subtracted from the line height. So an image sitting
+alone in a table cell had no descender space under it at all, in either mode.
+With the face's own metrics and half-leading — the extra a `line-height` asks
+for split above and below the content rather than hung underneath it — the
+image lands on the same pixel row Chromium puts it on.
+
+Doing only that would have made things worse, not better, for the pages this
+engine is for. Quirks mode is where the era lives, and there a line box holding
+no text has no strut: the cell is exactly as tall as the picture. A sliced
+image with a hairline gap under every tile is not a near miss, it is the page
+visibly coming apart. Both modes are now pixel-exact against Chromium, and both
+have a reference fixture.
+
+**Net one conformance test, the wrong way** — two recovered, three lost — and
+worth saying why rather than burying. All three losses are a test and a
+reference that used to be *equally* wrong and now differ, with our side of each
+having moved toward Chromium: `floats-124` puts its green band on row 8 where
+Chromium puts it on 7 and the reference is still on 9;
+`line-breaking-font-size-zero-001` is 98 rows against Chromium's 100, up from
+92. Holding the line boxes wrong to keep three pairs agreeing with each other
+would be the wrong trade.
+
+Nine reference baselines grow by between one and forty-two pixels, all of them
+in standards mode and all of them around images and form controls, which is
+where descender space belongs.
+
+**`font-variant: small-caps`**, another of the properties PLAN.md has been
+listing as parsed and then ignored since M2 opened — and the `font` shorthand
+now keeps the `small-caps` it had been accepting and throwing away.
+
+Synthesised, because there is nothing to ask for: the bundled Liberation faces
+carry no small-caps variant. Lowercase letters are uppercased and shaped at 0.7
+of the size, which is the number Chromium synthesises at — measured off a
+rendering (a 100px `x` in small caps beside a 100px `X` gives cap heights of 46
+and 65) rather than argued about from first principles. Our glyphs now land on
+the same pixel rows as Chromium's.
+
+Two things it deliberately does not do. It does not shrink the line: a word of
+nothing but lowercase keeps the full-size ascent and line height, or a
+paragraph of small caps would read as one set in a smaller font. And it does
+not change the text — the glyph offsets still point at what the author wrote,
+so a search for "word" finds a word drawn as WORD.
+
+No conformance change, and none was available: CSS 2.1's suite has no
+`font-variant` test at all. This one is for the pages, not for the number.
+
+**Two things absolutely positioned boxes were measured against, neither of
+them what CSS 2.1 says.** Worth **43 conformance tests** between them, with
+nothing lost the other way, and both showed up as a box in the wrong place
+rather than as anything recognisably about containing blocks.
+
+§10.1 says the containing block a positioned ancestor establishes is its
+*padding* box. This used its border box, so `left: 0` landed on top of the
+border rather than inside it and a percentage was measured against a box two
+paddings too narrow. That is the larger half: 38 tests, most of them the
+`absolute-*-height` and `absolute-*-width` families, which put a border on the
+container precisely because it is the thing that tells the three boxes apart.
+
+The other half is the box with no positioned ancestor at all, whose containing
+block is the initial one — the page. Two corrections were missing there. A
+box's own margins move it inside its parent and were never counted, so
+`position: absolute; top: 0; left: 0` came out at the body's 8px margin instead
+of the page corner. And a top margin is not final until it has finished
+collapsing: a `<p>` with `margin-top: 1in` pushes the body down an inch *after*
+the box has been placed against it, and took the box along.
+
+New `containing-blocks` reference fixture holds all three: the page corner, the
+inside of a border, and a percentage of a padding box.
+
+**`list-style-position`**, which PLAN.md has been listing as parsed and ignored
+since M2 opened. An `inside` marker is not a box in the list's padding but the
+first inline box of the item's *own* content, which is why it could not be a
+tweak to the existing marker: only something on the line pushes the first
+line's text along and leaves the rest where they were, so the second line of a
+wrapped item comes back under the marker instead of beside it. That is the
+whole visible difference between the two values, and it is what the new
+`list-style-position` reference fixture holds.
+
+The marker run carries the item's font and colour and none of its box. Cloning
+the item's style whole gave it the margin too, and §8.4 then charged that to
+the line — a list item with `margin-left: 1in` bought a second inch of inline
+edge and came out an inch too wide. Eleven `list-style-position-applies-to`
+tests failed on exactly that and said nothing about markers.
+
+**`counter(c, square)` prints a square.** §12.4.3 supports every
+`list-style-type`, the glyph ones included; this printed nothing for `disc`,
+`circle` and `square`, with a doc comment confidently citing the section it was
+contradicting. The suite could not catch it, because the test's reference is
+built out of `list-style-position: inside` markers that this engine also drew
+nowhere — a blank matched a blank, and the pair passed. Fixing the marker is
+what made the blank on one side go away.
+
+Five conformance tests together, nothing lost in the other direction.
+
+**`inherit` is a value now**, which it was not before — the cascade read it as
+a length, a colour or a font family name, failed to parse it, and dropped the
+declaration. §6.2.1 makes it universal: every property takes it, including the
+forty-odd that do not inherit on their own, and it means the parent's
+*computed* value rather than a re-parse of what the parent declared. So a child
+of an element sized `font-size: 50%` that says `font-size: inherit` gets the
+parent's resolved pixels, not half of its own.
+
+It is handled once, ahead of the per-property parsing, because there is nothing
+for a property's own parser to say about a value that is a copy. A shorthand
+spreads across every longhand it covers, so `border: inherit` takes the width,
+the style and the colour, and `border-left-width: inherit` takes exactly the one
+field its name points at. Worth **50 conformance tests** with nothing lost in
+the other direction — the `-inherit-` tests exist across nearly every property
+group, which is why one small change in the cascade moves that many rows at
+once.
+
+**`word-spacing`, `outline` and `text-align: justify`**, three of the properties
+PLAN.md has been listing as parsed and then ignored since M2 opened. And `ex`,
+a CSS 2.1 length unit that parsed as nothing at all — `outline-width: 0ex` left
+a medium outline standing where the suite asked for none.
+
+`word-spacing` adds its length at every space, which for preformatted text means
+at *each* of a row of them. `outline` (§18.4) is a ring drawn outside the border
+box that takes up no room: not a fifth border, since it is the same on all four
+sides and does not influence layout — an outline that moved the page could not
+be used to mark focus. `invert`, its initial colour, is taken as the element's
+own; inverting what is underneath needs pixels that are not rasterised until
+after the display list is built. `text-align: justify` (§16.2) stretches the
+spaces until a line fills its box, on every line but the last — the last line of
+a paragraph keeps its natural width, which is the difference between justified
+text and a page of stretched fragments.
+
+**And the measurement goes down: 3356 of 4821 to 3352.** Four newly failing and
+none newly passing, which wants explaining rather than burying.
+
+There are 174 `outline` tests in the suite and **every one of them was passing**
+before this. They pass by drawing nothing on both sides — the same "identically
+blank" trap as the CDATA pairs and the inline boxes before them — and 171 still
+pass now that something is drawn, which is the real result. Of the four that
+broke, two want an outline on a `display: table-column-group`, which generates no
+box here; one wants `outline-width: inherit`, which is #87; and one is a
+`word-spacing` subtlety about where the extra space falls relative to a span's
+background. None of them is the property this entry is about.
+
+Shipping a negative number is the honest option here. Holding the work back
+would leave three M2 gaps open to keep a figure tidy, and the figure is supposed
+to be evidence rather than a score.
+
+**Three table gaps the plan had been carrying since M2 opened** — fixed layout,
+`empty-cells`, and a `border-spacing` per axis. Together they are worth **85
+newly passing tests and none newly failing**, 3271 of 4821 to 3356, which is the
+largest single move since the suite started being measured in both directions.
+
+**`table-layout: fixed`** (§17.5.2.1). The columns and the *first row* decide
+the widths and nothing below them is measured, which is the point of the
+property: a table whose widths are declared should not cost a pass over every
+cell to find out what they already are.
+
+Two things in it are easy to get wrong and both were caught by measuring rather
+than by reading. A column takes the cell's **border box** — a `width: 80px` cell
+with 24px of padding and a 36px border either side makes a 200px column, not an
+80px one — and in the collapsing model the borders it adds are the *used* ones,
+half of each grid line rather than what the cell declared. The first was worth 35
+tests and the second 8.
+
+And a fixed table that declared no width of its own does not stretch its columns
+to the window: it is as wide as they asked to be, and a column that asked for
+nothing falls back to what its content wants, exactly as it would under
+automatic layout. Without that, `<col width="50">` twice over made a table the
+width of the window.
+
+**`empty-cells: hide`** (§17.6.1.1): a cell with nothing in it draws neither its
+background nor its border, so the table's own shows through. It keeps its room —
+the property decides what is painted, not what is laid out — which is why it is
+applied to the finished box rather than to the style it was laid out with. The
+collapsing model has no cell border to hide and CSS 2.1 says the property does
+not apply there, so it does not.
+
+**And `border-spacing` takes a length per axis.** Only the first was read, so
+`border-spacing: 0 8px` — the rows spaced and the columns not — came out with
+the axes the wrong way round on one of them. A band's background has to stop at
+a gap on either axis now, which the row-group work of the previous entry had
+only had to think about horizontally.
+
+`cargo run -p gaps` is what caught the documentation drifting behind the code
+here: three rows recorded as ignored started being honoured, and it refuses to
+pass until README.md and PLAN.md say so too.
+
+**`line-height: normal` comes from the font** (#89). It was a flat 1.2 times the
+font size, applied in the cascade, where there are no fonts to ask. §10.8.1
+leaves the value to the user agent and says it should be "based on the font",
+and every browser answers with the face's own ascent, descent and line gap —
+1.15 for Liberation Serif against the 1.2 used here, and further off for the
+other two bundled families.
+
+Three things had to change together, which is why this was filed rather than
+done at the time.
+
+**`normal` had to survive the cascade.** `line-height` is a `LineHeight` now
+rather than a number of pixels: `Normal`, a unitless `Number`, or `Px`. The
+first is resolved in `text`, where a face can be measured; `cosmic-text` will
+not name the face it matched, so it is found by shaping one `x` and reading the
+id off the glyph.
+
+**A unitless number had to inherit as a number.** §10.8.1 says so, and the old
+code resolved `1.2` to pixels immediately — so an `<h1>` at 32px inherited the
+body's 19.2px line and its text would have overlapped. What stopped it was a
+heuristic in `font-size` that recomputed the line height whenever it still
+matched the parent's, as a way of asking "was that `normal`, inherited?". That
+question has an answer now, and the heuristic is gone.
+
+**And the UA sheet had to stop pinning it.** `body { line-height: 1.2 }` was
+overriding `normal` on every element of every page, since it inherits. No
+browser's UA sheet sets one. Removing it is what makes the rest of this visible.
+
+The metrics are rounded to whole pixels, which is not cosmetic and is what took
+the change from a net loss to a net gain. Every browser built on FreeType does
+it: an ascent decides where a baseline sits, and a baseline on a half pixel is a
+line of text rendered through a filter. It also stops a fraction of a pixel per
+line accumulating down a page — forty lines of a third of a pixel is a line's
+worth of drift by the bottom, and it lands differently depending on how many
+lines came before it. Unrounded, seven `background-position-applies-to-*` tests
+failed by exactly one pixel.
+
+An inline box's content area (§10.6.1) is measured from the same face, which
+retires two constants that were the bundled faces' metrics written down by hand
+because nothing could reach the real ones.
+
+**3264 of 4821 reference tests to 3271**, nothing newly failing — and a page of
+five paragraphs now has its baselines on exactly the same rows as Chromium's,
+which is the check worth more than the seven tests. Every reference baseline
+moves, because every line on every page does.
+
+**The reader gutter is made of padding** (#91). A page that asks for
+`body { margin: 0 }` gets eight pixels anyway, because those pages were written
+for a window with browser chrome around it and taken literally they put the
+first letter of every line against the glass. That floor was applied to the
+*margin*, which is outside the background — so a `body { margin: 0; background:
+navy }` page came out navy with a pale frame around it, which is the same "looks
+like a bug" the gutter exists to avoid, one step further out.
+
+The compensation for that was the box holding the page carrying the body's
+background out to the window on its behalf. Right when that background is the
+canvas's, and wrong when the root has one of its own: `html { background: purple
+}` with a navy body came out navy to the window edge instead of navy in a purple
+field. Padding is inside the background, so with the floor on the padding the
+background reaches the glass by itself and §14.2 needs no exception — the
+holding box paints no background at all now, which is what #76 wanted and could
+not have.
+
+The floor is on the distance from the glass rather than on the margin alone, so
+a page that spent it on padding has already met it and one that spent half needs
+only the other half.
+
+3261 of 4821 reference tests to 3264, with nothing newly failing. The blast
+radius is smaller than it looks: every reference fixture is unchanged, and all
+three pages in README.md's screenshots render byte-identically, because a page
+has to ask for *less* than the gutter before any of this is reachable.
+
+**A table has six background layers, and now paints five of them** (#86).
+§17.5.1 makes a table the table, its column groups, its columns, its row
+groups, its rows and its cells, superimposed in that order, with a background in
+a lower layer showing through wherever the ones above it are transparent. Only
+two of the six were painted: the table and the cells, plus rows, which had a box
+of their own because `<tr bgcolor>` striping is how the era made a table
+readable. A `<tbody>`, a `<col>` or a `<colgroup>` with a background painted
+nothing at all.
+
+**35 newly passing tests and none newly failing**, which is a great deal more
+than the four the issue was filed on. Twenty-one of them are in `backgrounds`,
+where the suite works through every background property against every element it
+applies to, and a table part is a lot of those elements.
+
+§17.6.1 decides the *shape*, and this is where a browser and a naive
+implementation part company: in the separated model the gaps between cells show
+the table's own background and nothing else, so a band covers the cell areas it
+spans and stops at every gap. Rows had been filling the gaps too — the UA sheet
+gives every table 2px of `border-spacing`, so this was visible on any striped
+table that had not set `cellspacing="0"`.
+
+Splitting a band into one box per cell is right for a colour and wrong for an
+image, which is the interesting part. A background image is positioned against
+the band as a *whole* — §17.5.1 makes a band one box that the gaps cut holes in,
+not a box per cell — so cutting the image up draws it once per cell, and
+`tbody { background: url(x) top right no-repeat }` drew four squares where the
+suite asks for exactly one. Four tests said so. The colour is painted on the
+cell areas and the image on the band, which is right for both except that the
+image still bleeds into the gaps: clipping one box to several rectangles is a
+shape the display list cannot express. Reachable only on a table that asked for
+spacing *and* put an image on a band, and less wrong than drawing it four times.
+
+A `table-layers` reference fixture covers all of it, and was compared against
+headless Chromium before it was blessed.
 
 ## 0.3.0
 

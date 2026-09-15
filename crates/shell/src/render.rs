@@ -378,6 +378,28 @@ impl Loaded {
         let (text, ..) = net::encoding::decode_document(&self.bytes, self.content_type.as_deref());
         text
     }
+
+    /// The bytes decoded as a *stylesheet*, which §4.4 decides differently: it
+    /// has no `<meta>`, so its own `@charset` rule and whatever the link said
+    /// are most of what a browser has to go on, and an unlabelled one is UTF-8
+    /// rather than the era's windows-1252.
+    ///
+    /// `linked` is the `charset` attribute of the `<link>` that asked for it,
+    /// or the charset on an `@import` — the step §4.4 puts between the
+    /// stylesheet's own declaration and the referring document's encoding.
+    fn stylesheet_text(
+        &self,
+        linked: Option<&str>,
+        referrer: Option<&'static net::encoding::Encoding>,
+    ) -> String {
+        let (text, _) = net::encoding::decode_stylesheet(
+            &self.bytes,
+            self.content_type.as_deref(),
+            linked,
+            referrer,
+        );
+        text
+    }
 }
 
 /// Loads subresources in this process, subject to the network policy.
@@ -410,6 +432,20 @@ impl Loader for DirectLoader {
 /// So the page keeps a gutter whatever it asks for. Eight pixels, matching the
 /// UA sheet's own body margin: enough to read against, not enough to be a
 /// second opinion about the page's design.
+///
+/// Made of **padding**, not margin, and the difference is the whole reason this
+/// comment is longer than the constant. Padding is inside the background where
+/// margin is outside it: a `body { margin: 0; background: navy }` page topped up
+/// with margin is navy with a pale frame around it — which is exactly the
+/// "looks like a bug" this exists to avoid, one step further out. Topped up with
+/// padding it is navy to the glass with its text held off.
+///
+/// It also keeps §14.2 honest. The compensation for the frame used to be that
+/// the box holding the page carried the body's background out to the window,
+/// which is right when that background is the canvas's and wrong when the root
+/// has one of its own — `html { background: purple }` with a navy body came out
+/// navy to the window edge instead of navy in a purple field. With the gutter
+/// inside the background there is nothing to compensate for.
 const PAGE_GUTTER: f32 = 8.0;
 
 /// Renders HTML at a given viewport width.
@@ -765,7 +801,18 @@ pub(crate) fn render_sized(
     // had its turn, and the rest of the pipeline reads.
     let styles = styles;
 
-    let laid_out = layout::layout(&doc, &styles, fonts, &intrinsic, width as f32);
+    // The band is the window's page area, which is what `position: fixed`
+    // measures against. For a plain `render` it is the cap on the canvas
+    // instead — the nearest thing to a viewport a caller with no window has,
+    // and the same number a test harness means by one.
+    let laid_out = layout::layout(
+        &doc,
+        &styles,
+        fonts,
+        &intrinsic,
+        width as f32,
+        band_height.max(1) as f32,
+    );
     let list = build_display_list(&laid_out);
     // The band asked for, clipped to what the document actually has below it.
     // A page shorter than the band gets a canvas its own height, which is what
@@ -1283,6 +1330,9 @@ fn push_with_imports(
     base: Option<(&Origin, &str)>,
     depth: usize,
     viewport_width: f32,
+    // §4.4's fourth step for an imported sheet, which is the sheet that
+    // imported it — and so, up the chain, the document.
+    referrer: Option<&'static net::encoding::Encoding>,
 ) {
     if depth < MAX_IMPORT_DEPTH
         && let Some((origin, path)) = base
@@ -1300,11 +1350,12 @@ fn push_with_imports(
             };
             push_with_imports(
                 sheets,
-                Stylesheet::parse_at(&resource.text(), viewport_width),
+                Stylesheet::parse_at(&resource.stylesheet_text(None, referrer), viewport_width),
                 loader,
                 Some((&sheet_origin, &sheet_path)),
                 depth + 1,
                 viewport_width,
+                referrer,
             );
         }
     }
@@ -1329,6 +1380,40 @@ fn is_applied_stylesheet(rel: Option<&str>) -> bool {
     stylesheet
 }
 
+/// The encoding the document says it is in, for §4.4's fourth step.
+///
+/// Read from the `<meta>` the document carries rather than from the bytes,
+/// because by this point the bytes are gone: the shell is handed decoded text.
+/// That loses the two steps above a `<meta>` — a byte-order mark and the
+/// transport's header — so a page that declared its encoding only there hands
+/// its stylesheets the era's default instead. That is exactly what they were
+/// handed before any of this existed, so it is a gap rather than a regression,
+/// and it only matters for a stylesheet that declares nothing itself.
+fn declared_encoding(doc: &dom::Document) -> Option<&'static net::encoding::Encoding> {
+    for node in doc.descendants(doc.root()) {
+        let Some(element) = doc.element(node) else {
+            continue;
+        };
+        if element.local_name() != "meta" {
+            continue;
+        }
+        if let Some(label) = element.attr("charset")
+            && let Some(encoding) = net::encoding::for_label(label)
+        {
+            return Some(encoding);
+        }
+        if element
+            .attr("http-equiv")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("content-type"))
+            && let Some(content) = element.attr("content")
+            && let Some(encoding) = net::encoding::charset_from_content_type(content)
+        {
+            return Some(encoding);
+        }
+    }
+    None
+}
+
 fn collect_stylesheets(
     doc: &dom::Document,
     loader: &mut dyn Loader,
@@ -1338,6 +1423,11 @@ fn collect_stylesheets(
     viewport_width: f32,
 ) -> Vec<Stylesheet> {
     let mut sheets = Vec::new();
+    // §4.4's fourth step, below the stylesheet's own declaration and above the
+    // assumption of UTF-8: a legacy page's unlabelled stylesheet decodes the
+    // way the page does. Falling back to the era's default keeps that true for
+    // the pages that declare nothing at all, which is most of them.
+    let referrer = declared_encoding(doc).or(Some(net::encoding::ERA_DEFAULT));
 
     for node in doc.descendants(doc.root()) {
         let Some(element) = doc.element(node) else {
@@ -1347,7 +1437,15 @@ fn collect_stylesheets(
             "style" => {
                 let sheet = Stylesheet::parse_at(&doc.text_content(node), viewport_width);
                 // A `<style>` block's imports resolve against the document.
-                push_with_imports(&mut sheets, sheet, loader, base, 0, viewport_width);
+                push_with_imports(
+                    &mut sheets,
+                    sheet,
+                    loader,
+                    base,
+                    0,
+                    viewport_width,
+                    referrer,
+                );
             }
             // An external stylesheet is how a site of this era shared one look
             // across every page; skipping them leaves those pages unstyled.
@@ -1365,7 +1463,10 @@ fn collect_stylesheets(
                 if let Some(resource) = loader.load(&url, Some(origin), RequestKind::Subresource)
                     && let Ok((sheet_origin, sheet_path)) = net::parse_url(&url)
                 {
-                    let sheet = Stylesheet::parse_at(&resource.text(), viewport_width);
+                    let sheet = Stylesheet::parse_at(
+                        &resource.stylesheet_text(element.attr("charset"), referrer),
+                        viewport_width,
+                    );
                     // An imported sheet's URLs resolve against the sheet that
                     // imported it, not against the document.
                     push_with_imports(
@@ -1375,6 +1476,7 @@ fn collect_stylesheets(
                         Some((&sheet_origin, &sheet_path)),
                         0,
                         viewport_width,
+                        referrer,
                     );
                 }
             }
@@ -1940,12 +2042,12 @@ mod tests {
     fn the_pages_background_still_reaches_the_window_edge() {
         // The gutter holds the page's *content* back; it is not a frame drawn
         // around the page. A body background that stopped 8px short would put a
-        // pale border around every coloured page.
+        // pale border around every coloured page, which is why the gutter is
+        // made of padding rather than margin: padding is inside the background.
         //
         // The root is given a background of its own so that §14.2 propagation
-        // cannot answer this by accident: the canvas is white here, and the
-        // blue at the window edge can only have come from the body's own box
-        // still spanning the window.
+        // cannot answer this by accident: the canvas is white here, and blue at
+        // the window edge can only have come from the body's own box.
         let mut fonts = FontStore::new();
         let page = render(
             "<style>html { background: #ffffff } \
@@ -1954,17 +2056,26 @@ mod tests {
             2000,
             &mut fonts,
         );
-        let row = &page.pixmap.data()[..page.pixmap.width() as usize * 4];
-        let colour = |pixel: &[u8]| (pixel[0], pixel[1], pixel[2]);
+        let width = page.pixmap.width() as usize;
+        let colour = |x: usize, y: usize| {
+            let at = (y * width + x) * 4;
+            let pixel = &page.pixmap.data()[at..at + 4];
+            (pixel[0], pixel[1], pixel[2])
+        };
+        const BLUE: (u8, u8, u8) = (0x33, 0x66, 0xcc);
+
+        // Whichever row the body's box lands on — which is not row zero, and
+        // deliberately not asserted: the `<p>`'s top margin collapses out
+        // through a body with no border or padding of its own, so the box
+        // starts below it. That is §8.3.1 and is what a browser does too; it is
+        // the *horizontal* reach this test is about.
+        let row = (0..page.pixmap.height() as usize)
+            .find(|&y| colour(0, y) == BLUE)
+            .expect("no row carries the page's background to the left edge");
         assert_eq!(
-            colour(&row[..4]),
-            (0x33, 0x66, 0xcc),
-            "the top-left pixel is not the page's background"
-        );
-        assert_eq!(
-            colour(&row[row.len() - 4..]),
-            (0x33, 0x66, 0xcc),
-            "the top-right pixel is not the page's background"
+            colour(width - 1, row),
+            BLUE,
+            "the background reached the left edge of row {row} and not the right"
         );
     }
 

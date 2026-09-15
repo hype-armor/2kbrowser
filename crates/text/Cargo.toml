@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 cosmic-text = "0.14"
 css = { path = "../css" }
+unicode-bidi = "0.3"
 unicode-linebreak = "0.1.5"
 
 [lints]

@@ -390,6 +390,11 @@ fn hex_string(text: &str) -> Option<Color> {
     }
 }
 
+/// The x-height every face is treated as having, as a fraction of the font
+/// size — the same approximation `text::X_HEIGHT` makes and for the same
+/// reason.
+const X_HEIGHT: f32 = 0.5;
+
 /// Parses a length from a single component value.
 pub fn parse_length(raw: &Raw) -> Option<Length> {
     match raw {
@@ -400,6 +405,13 @@ pub fn parse_length(raw: &Raw) -> Option<Length> {
         Raw::Dimension { value, unit } => match unit.as_str() {
             "px" => Some(Length::Px(*value)),
             "em" => Some(Length::Em(*value)),
+            // `ex` is the font's x-height, and is carried as a fraction of an
+            // `em` so that everything downstream resolves it the way it already
+            // resolves those. Half an em is the figure the rest of the engine
+            // uses — see `text::X_HEIGHT`, where the four bundled faces are
+            // measured at between 0.52 and 0.53 — and measuring each face here
+            // would need the shaper, which the cascade has no access to.
+            "ex" => Some(Length::Em(value * X_HEIGHT)),
             // Absolute units, converted at the CSS-standard 96dpi.
             "pt" => Some(Length::Px(value * 96.0 / 72.0)),
             "pc" => Some(Length::Px(value * 16.0)),

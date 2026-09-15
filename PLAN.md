@@ -336,10 +336,20 @@ now closed: see M2 item 2 below.
 The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 
 1. Real cascade and selector matching; full box model; backgrounds and
-   **borders** — *done.*
+   **borders** — *done.* `inherit` is a value every property takes (§6.2.1),
+   which is a copy of the parent's *computed* value rather than a re-parse of
+   what the parent declared, and which a shorthand spreads across every
+   longhand it covers
 2. **Inline layout with correct line breaking** — *done.* Differently-styled
    spans share line boxes, break as one paragraph, carry their own colour and
-   size, and collapse whitespace across run boundaries.
+   size, and collapse whitespace across run boundaries. **Block-in-inline
+   splitting** (§9.2.1.1): an inline element holding a block is broken around
+   it into two boxes, so the block is a sibling of the halves rather than
+   inside the element's border — which is what `<font>…<hr>…</font>`, ordinary
+   in the era's markup, has always needed. **Right-to-left text**
+   — `direction`, `unicode-bidi`, UAX #9's reordering per line, mirrored
+   brackets, and an inline box that draws one fragment per contiguous run when
+   reordering cuts it in two
 3. **Tables** — *done.* Automatic column sizing from cell content, `colspan`
    and `rowspan`, row groups, declared widths, shrink-to-fit boxes, row
    backgrounds, `border-spacing` including the `cellspacing` attribute, and
@@ -347,23 +357,43 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    conflict resolution in full, resolved per grid line *segment* so that one
    edge of a spanning cell can carry a different border against each neighbour
    it faces. Captions, above or below per `caption-side`, outside the table's
-   border box. Missing: fixed layout
+   border box. `table-layout: fixed`, where the columns and the first row decide
+   the widths and nothing below them is measured (§17.5.2.1); `empty-cells`;
+   a `border-spacing` per axis; and §17.5.3's *minimum* height, where a
+   declared height the rows do not fill is shared out among them. A table is
+   never narrower than its own
+   caption — §17.4's wrapper box, folded into the table's width rather than
+   built as a box of its own. **Anonymous tables** (§17.2.1): a run of
+   table-internal boxes with no table above them gets one generated around it,
+   so `display: table-cell` on three spans lays them out side by side rather
+   than stacked
 4. **Floats** — *done.* Placement on both sides, stacking, line boxes that
-   narrow beside them, `clear`, and containers that enclose their floats
+   narrow beside them, `clear`, containers that enclose their floats, and
+   §9.5's rule for a box with a formatting context of its own: its *box*
+   narrows and moves beside the float rather than its lines, and where it
+   cannot fit beside it goes below
 5. **Images** — *done.* Fetched, decoded, sized from intrinsic or declared
    dimensions, floatable, and sitting *on* a line rather than interrupting it.
    Links, scrolling, and hit testing remain
 6. **Positioned layout** — *done.* Relative shifts, absolute placement against
-   the nearest positioned ancestor, `top`/`right`/`bottom`/`left`, shrink-to-fit
-   widths. **Quirks mode** — *started;* unitless lengths and hash-less hex
-   colours parse, other quirks outstanding. **Framesets** — *done*
+   the nearest positioned ancestor's **padding box** (§10.1),
+   `top`/`right`/`bottom`/`left`, shrink-to-fit widths. `position: fixed` takes
+   the viewport as its containing block whatever is positioned above it —
+   though it still scrolls with the page, which needs the display list to be
+   re-placed per scroll position rather than blitted. **Quirks mode** —
+   *started;* unitless lengths and hash-less hex colours parse, and a line box
+   holding no text has no strut — the quirk the era's sliced-image tables were
+   built on, without which every tile of a sliced image gets a hairline gap
+   under it. Other quirks outstanding. **Framesets** — *done*
 7. **Presentational attributes** — *done.* `bgcolor`, `text`, `link`, `align`,
    `valign`, `hspace`/`vspace`, `<font>`, `background`, and the table
    attributes, at their own cascade origin between the UA sheet and author
    CSS. The era's markup keeps most of its styling here rather than in CSS, so
    without this these pages render as unstyled text
 8. **Lists, decorations, rules, and forced breaks** — *done.* Markers with
-   `<ol start>` and `<li value>`, `text-decoration` propagated per §16.3,
+   `<ol start>` and `<li value>`, `list-style-position` — an `inside` marker
+   joins the item's first line, so the text wraps back *under* it rather than
+   beside it — `text-decoration` propagated per §16.3,
    underlined links via attribute selectors, `<hr>`, and `<br>`
 9. **Tiled backgrounds** — *done.* `background-image`, `background-repeat`, the
    `background` shorthand and its reset, `<body background>`, and canvas
@@ -373,7 +403,10 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    Feature queries are CSS 3 and do not apply
 11. **Legacy character encodings** — *done.* Byte-order mark, `Content-Type`,
    a `<meta>` prescan, then windows-1252 — which most of the surviving old web
-   needs and which the plan called required rather than optional
+   needs and which the plan called required rather than optional. A *stylesheet*
+   is decided by §4.4's different order: the header, then a byte-order mark or
+   the sheet's own `@charset` rule, then what the link said, then the referring
+   document's encoding, and only then UTF-8
 
 12. **Intrinsic sizing over whole subtrees** — *done.* A cell holding a nested
    table, an image, or a block is measured by what is inside it rather than by
@@ -381,22 +414,49 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
    margins centre a block; and an inline element wrapping a block one still
    lays that block out
 
-Known-wrong and recorded rather than hidden: fixed table
-layout, forms that draw but do not work — no control can be typed into, clicked
-or submitted — the properties that parse and are then ignored
-(`word-spacing`, `font-variant`, `outline`, `max-height`,
-`text-align: justify`, `list-style-position`, `list-style-image`, `clip`,
-`position: fixed`, `border-spacing`'s second value, `direction`, and generated
-content), a caption wider than its table — which overhangs rather than widening
-the wrapper box CSS 2.1 puts around a table and its caption, since there is no
-such box here, so the table sits further left than a browser draws it —
-`empty-cells` — ignored in the separated model, where it applies, and
-correctly ignored in the collapsing one, where it does not — the corner where
-two collapsed borders cross, which CSS 2.1 leaves undefined and which is
-settled here by width rather than by a diagonal mitre, and proper
-block-in-inline splitting — an inline element containing a block is
-laid out as a block instead, which matches for the shapes that occur but is
-not what CSS 2.1 §9.2.1.1 describes.
+Known-wrong and recorded rather than hidden, each with the issue that carries
+it:
+
+- **Forms draw but do not work** — no control can be typed into, clicked or
+  submitted. The stopping point this milestone chose, not an oversight: a
+  control that draws correctly makes the page read correctly, and interaction
+  is separate work with a separate risk.
+- **`list-style-image`** parses and is ignored, the last property still on that
+  list. It needs an image fetched for a box that is not an element, which is
+  the same blocker `url()` in `content` has and the same scope decision.
+- **The corner where two collapsed borders cross** is settled by width rather
+  than by a diagonal mitre. CSS 2.1 leaves it undefined.
+- **`position: fixed` scrolls with the page** (#108). Its containing block is
+  the viewport, which is the layout half; staying put needs the display list to
+  know which items are anchored to the window, which is a change to how
+  painting works.
+- **Stacking contexts are not modelled** (#107) — each parent's children are
+  sorted by `(z-index, positioned)`, so every positioned box behaves as a
+  context and a negative `z-index` never escapes one that should not be.
+- **Two right-to-left residues**: §10.3.3's over-constrained margin (#112) and
+  an inline box split across lines (#113).
+- **A pseudo-element's `counter-reset` is scoped like its element's** (#124),
+  which is what §12.4.1 says and not what browsers do: they keep such a counter
+  out of the sight of the element's *following siblings*, and out of its
+  descendants' sight as well when the element resets the same name itself. One
+  test turns on it, against twenty-two that need the reading here.
+- **A `white-space: pre` run loses its trailing spaces** to the trim that
+  removes a block's own leading and trailing whitespace (#126). Keeping them
+  needs §9.4.2's rule that a line box holding nothing generates no box, without
+  which the line break beside them draws a second, empty inline box.
+- **`float` on the *root element* does nothing** (#128). The root is laid out
+  directly rather than as a child, and a float is applied by a parent's walk
+  over its children, which the root has none of. Its `position` works now;
+  Chromium honours a float there too, and no real page writes one.
+- **An absolutely positioned child of a `table` element is dropped** (#132) —
+  not misplaced, gone. The table branch of `layout_block` returns before the
+  walk that places out-of-flow children, which is the same shape of bug as the
+  caption one above.
+- **§17.2.1's anonymous *cell* is not generated** (#121) — the box that goes
+  around a row's child that is not a cell. A run of table-internal boxes that
+  would yield no cells is left alone rather than wrapped in a table, because a
+  table built from it would swallow its content. The anonymous table and the
+  anonymous row are both generated.
 
 *Done when:* a Wikipedia article, a typical blog, Hacker News, and a handful of
 Internet Archive captures from ~2000 are pleasant to read. This milestone takes
@@ -437,6 +497,16 @@ is not a second rendering path that can drift — and so it is tested headlessly
 which is where nearly all of its coverage comes from. What is *not* tested is
 the event loop itself: CI has no display server, so key and pointer handling are
 exercised by hand and a regression in them would not be caught by `cargo test`.
+
+One thing this milestone was assigned and did not build: **the per-site override
+for ADR-0006's third-party rule** (#118). The ADR does not offer that as an
+extra — it names the override as the reason the rule is allowed to be absolute
+in the first place, and puts it here. Without it the policy has no escape hatch,
+and a refused image leaves nothing on the page and nothing in the chrome to say
+why, so the browser is indistinguishable from one that is simply broken. Said
+here rather than quietly left out of the list, because "done" that omits a
+milestone's own commitment is the kind of claim §10 spends a paragraph warning
+about.
 
 Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
 Discarding the author's layout without also discarding the author's furniture
@@ -1087,6 +1157,14 @@ implements, so it had been passing because both sides were wrong in the same
 way — the reftest weakness this section opens with, met in person. Changing the
 margins broke the coincidence. Left failing, because the honest fix is to
 implement `direction` and fixed positioning, not to restore the accident.
+
+It is passing again, and not because either half was implemented: it was
+already passing before `position: fixed` got its own containing block, and
+`direction: rtl` still is not implemented at all. So it is back to the
+coincidence this note was written to warn about, by some other change to the
+margins, and it should be read as telling us nothing. Recorded here because a
+number that goes up for no reason is worth as much suspicion as one that goes
+down.
 
 Still missing: an empty block collapsing through itself. That one needs the
 running collapsed margin kept *uncommitted* as the walk proceeds rather than

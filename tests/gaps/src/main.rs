@@ -210,7 +210,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { word-spacing: 20px }",
         body: "<p id=t>spaced words here</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "text-transform",
@@ -224,14 +224,14 @@ const PROPERTIES: &[Property] = &[
         scaffold: "",
         declaration: "#t { font-variant: small-caps }",
         body: "<p id=t>small caps text</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "outline",
         scaffold: "#t { width: 120px }",
         declaration: "#t { outline: 4px solid red }",
         body: "<p id=t>outlined</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "font (shorthand)",
@@ -249,7 +249,7 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { background: #ccc; font-size: 20px }",
         declaration: "#t { font-variant: small-caps }",
         body: "<div id=t>small caps</div>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "content on ::before",
@@ -287,14 +287,14 @@ const PROPERTIES: &[Property] = &[
         declaration: "#t { text-align: justify }",
         body: "<p id=t>a paragraph long enough that justification has some slack \
                to distribute across several lines of text</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "list-style-position",
         scaffold: "#t { width: 200px }",
         declaration: "#t { list-style-position: inside }",
         body: "<ul id=t><li>an item long enough to wrap onto a second line</li></ul>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "z-index",
@@ -323,28 +323,56 @@ const PROPERTIES: &[Property] = &[
         scaffold: "#t { width: 300px } #t td { border: 1px solid }",
         declaration: "#t { table-layout: fixed }",
         body: "<table id=t><tr><td>a very long first cell indeed</td><td>b</td></tr></table>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "empty-cells",
         scaffold: "#t { border-collapse: separate } #t td { border: 2px solid black }",
         declaration: "#t { empty-cells: hide }",
         body: "<table id=t><tr><td>a</td><td></td></tr></table>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
     },
     Property {
         name: "border-spacing, second value",
         scaffold: "#t td { border: 1px solid } #t { border-spacing: 2px }",
         declaration: "#t { border-spacing: 2px 30px }",
         body: "<table id=t><tr><td>a</td></tr><tr><td>b</td></tr></table>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
+    },
+    Property {
+        // `border` does not inherit, and its initial value draws nothing, so a
+        // child that grows a blue border can only have got it from `inherit`.
+        // A width would not do: a block child's auto width already matches its
+        // parent, so the declaration could be dropped with no visible effect.
+        name: "inherit as a value",
+        scaffold: "#p { border: 10px solid blue }",
+        declaration: "#t { border: inherit }",
+        body: "<div id=p><div id=t>a</div></div>",
+        expected: Verdict::Honoured,
+    },
+    Property {
+        // The scaffold is narrow enough that the phrase must wrap without it.
+        name: "white-space: nowrap",
+        scaffold: "#t { width: 80px; background: #ccc }",
+        declaration: "#t { white-space: nowrap }",
+        body: "<div id=t>several words that would otherwise wrap</div>",
+        expected: Verdict::Honoured,
     },
     Property {
         name: "direction: rtl",
         scaffold: "",
         declaration: "#t { direction: rtl }",
         body: "<p id=t>abc def ghi</p>",
-        expected: Verdict::Ignored,
+        expected: Verdict::Honoured,
+    },
+    Property {
+        // The characters reorder, which `direction` alone would not show: a
+        // line of Latin only moves to the other edge.
+        name: "unicode-bidi: bidi-override",
+        scaffold: "#t { direction: rtl }",
+        declaration: "#t { unicode-bidi: bidi-override }",
+        body: "<p id=t>abcdef</p>",
+        expected: Verdict::Honoured,
     },
     Property {
         name: "generated content",

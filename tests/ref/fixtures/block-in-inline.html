@@ -1,0 +1,23 @@
+<!doctype html>
+<title>block in inline</title>
+<style>
+  body { margin: 12px; width: 420px; font: 16px serif }
+  .box {
+    background: #cde; border: 3px solid #036; padding: 0 8px; margin: 0 20px;
+    color: #036;
+  }
+  .block { display: block; background: #fc9; color: #630 }
+  /* The era's own shape: a <font> broken around an <hr>. */
+  .era { font-size: 13px }
+  hr { border: 0; border-top: 1px solid #999; margin: 6px 0 }
+</style>
+<!-- The span is broken around the block: two fragments, the start side on the
+     first and the end side on the last, and nothing at either break. The block
+     sits between them and is not inside the span's border. -->
+<p>before <span class="box">one <span class="block">a block</span> two</span> after</p>
+<!-- Nested: the inner span is broken too, and its sides stay inside the
+     outer one's. -->
+<p><span class="box">outer <span class="box">inner <span class="block">deep</span> back</span> out</span></p>
+<!-- The stretches keep the broken element's own font, which is what keeps a
+     sidebar's links from spreading out when an <hr> lands among them. -->
+<div><span class="era">Home<br>Archive<br>Links<hr>Elsewhere<br>A friend's page</span></div>

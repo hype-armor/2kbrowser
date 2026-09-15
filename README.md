@@ -50,20 +50,43 @@ compare pixels and a person cannot compare descriptions.
 disk, parsed into an arena DOM, cascaded through a CSS 2.1 subset, laid out,
 shaped against bundled Liberation faces, and rasterised on the CPU.
 
-Working: the cascade with selectors, specificity, and inheritance; the box
+Working: the cascade with selectors, specificity, and inheritance —
+including `inherit` as an explicit value, which takes the parent's computed
+value for properties that do not inherit on their own, so `width: inherit` on
+a child of a 300px box is 300px and `border: inherit` takes the width, the
+style and the colour together; the box
 model with borders and backgrounds, on inline boxes as well as block ones — a
 `<span>` with a background and padding draws them, one fragment per line it
 crosses (§8.4), and its horizontal padding and border take room on the line so
 the text after it wraps where a browser wraps it; inline layout with per-span
-styles and Unicode line breaking; floats; tables with automatic column sizing, `colspan` and `rowspan`,
+styles and Unicode line breaking; floats, including §9.5's rule that a box with
+a formatting context of its own may not overlap one — `overflow: hidden` beside
+a float narrows the *box* where a plain block only narrows its lines, and a box
+that cannot fit beside the float goes below it; tables with automatic column sizing, `colspan` and `rowspan`,
 `cellspacing`, and **both border models** — including
 `border-collapse: collapse`, where adjoining borders resolve into one line
 centred on the grid line between them, which is what a Wikipedia infobox or
-wikitable is built out of; table captions, which sit outside the table's
-border box on whichever side `caption-side` names; `visibility`, where a
+wikitable is built out of; §17.5.1's six background layers, so that a
+`<tbody>`, a `<col>` or a `<colgroup>` paints behind the rows and cells the way
+a `<tr>` already did — and stops at each `border-spacing` gap, where §17.6.1
+shows the table's own background instead; `table-layout: fixed`, where the
+columns and the first row decide the widths and nothing below them is measured
+(§17.5.2.1); `empty-cells`, so a cell with nothing in it can be told not to draw
+its border; a `border-spacing` per axis, since `border-spacing: 0 8px` means the
+rows spaced and the columns not; a table's `height` as the *minimum* §17.5.3
+makes it, with whatever the rows do not fill shared out among them — which is
+what lets a cell's `valign="bottom"` sit at the foot of the box the author
+asked for rather than at the foot of its own text; table captions, which sit outside the
+table's border box on whichever side `caption-side` names; §17.2.1's anonymous
+tables, so a run of `display: table-cell` spans with no table above them is
+collected into one and laid out side by side rather than stacked;
+`visibility`, where a
 hidden box draws nothing and keeps every pixel of its room — and a span inside
 it can still ask to be visible and come back out; `text-transform`,
-`letter-spacing`, `text-indent` on a block's first line, `min-height` and
+`letter-spacing`, `text-indent` on a block's first line, whitespace collapsing
+that leaves a **non-breaking space** alone — §16.6.1 collapses spaces, tabs and
+newlines and a `&nbsp;` is none of them, which is what the era's markup relied
+on to indent a paragraph, space a nav bar and hold an empty cell open — `min-height` and
 `max-height` — applied in the order §10.7 gives them, so a box asked for both
 at once takes the minimum — `clip`, where every side of the `rect()` is an
 offset from the box's top-left corner rather than an inset from the far edges,
@@ -73,7 +96,10 @@ author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
-framesets; quirks-mode value parsing; the presentational attributes the era's
+the **root element's own box** — its margin, border and padding hold the body
+away from the window, while §14.2 sends its background to the whole canvas and
+anchors a tile there to the root's padding box rather than to the corner of the
+window; framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`, and `width` on an
 image — including `width="100%"`, which is how a page drew a rule across a
 column or held a layout open with a spacer GIF); list markers;
@@ -92,7 +118,12 @@ external stylesheets, including
 desktop rules apply at a desktop width instead of being dropped; and legacy
 character encodings, which most of the surviving old web needs — a page in
 windows-1252 read as UTF-8 is replacement characters where every accented
-letter and curly quote should be.
+letter and curly quote should be. A stylesheet's encoding is decided by
+§4.4's own order rather than a document's: the header, then a byte-order mark
+or the sheet's `@charset` rule, then the `charset` on the `<link>` that asked
+for it, then the referring document's encoding, and only then UTF-8 — which is
+what lets a rule whose selector is spelled in Shift_JIS match the element it
+was written for.
 
 Rendering is deterministic across Linux, macOS, and Windows, checked by
 reference tests against one shared baseline set — verified, not assumed: all
@@ -104,8 +135,8 @@ The window opens on a virtual display in CI and is checked to survive
 "does it look right". Everything with a testable shape lives outside the event
 loop, and the rendering it drives is covered by the reference tests.
 
-The CSS 2.1 suite has been run against it: **3226 of 4821 reference tests pass,
-66.9%**, with no panics across roughly ten thousand renders. That is an upper
+The CSS 2.1 suite has been run against it: **3665 of 4821 reference tests pass,
+76.0%**, with no panics across roughly ten thousand renders. That is an upper
 bound rather than a score — a reftest passes when both sides look the same, and
 an engine that ignores a property draws both sides the same way.
 `cargo run --profile conformance -p conformance` does it; the suite is not
@@ -153,12 +184,10 @@ widening a wrapper box this engine does not have, so the table sits a little
 left of where a browser puts it; a float, which grows the block
 that contains it instead of hanging out below its bottom edge as §10.6.3 says
 (issue #41), so a container wraps its float where a browser lets it overhang;
-`empty-cells`, which is parsed by nobody here and so is ignored in the
-separated model where it applies — it is correctly ignored in the collapsing
-one, where CSS 2.1 says it does not; where two collapsed borders *cross*, which
+where two collapsed borders *cross*, which
 CSS 2.1 leaves undefined and which this engine settles by giving the corner to
-the wider of them rather than mitring it diagonally as browsers do; fixed
-table layout; raising or lowering *text* off the baseline, so a `<sub>` or a
+the wider of them rather than mitring it diagonally as browsers do; raising or
+lowering *text* off the baseline, so a `<sub>` or a
 `<sup>` sits level with the words around it; and `::first-letter` taking the
 pseudo-element's style whole, so with `<p><b>Bold</b>…` the first letter loses
 the `<b>` — the box should inherit from the innermost inline element around the
@@ -198,22 +227,94 @@ these" against "any of these" — and a `<legend>` sits *in* its group's rule, w
 the rule stopping either side of it, as HTML's rendering section has it.
 
 And a list of properties that parse and are then ignored, which is longer than
-this file used to admit: `word-spacing`, `font-variant`, `outline`,
-`text-align: justify`, `list-style-position`, `list-style-image`,
-`clip`, `position: fixed`, which behaves as `absolute` and so scrolls with the
-page, the system font keywords (`font: menu` and its siblings), which name a
+this file used to admit: `list-style-image`,
+`clip`, the system font keywords (`font: menu` and its siblings), which name a
 font of the host platform's that this engine has no way to ask for and so
-leave the page's own styling standing, the second value of `border-spacing`, `direction` and everything else
-about right-to-left text, and the parts of generated content still out of
+leave the page's own styling standing, and the parts of generated content still out of
 scope: `open-quote` and its family, which needs the nesting depth of quotation
 marks, and `url()` in `content`, which needs an image fetched for a box that is
 not an element. Each of those drops the whole declaration rather than showing
 part of what the author asked for, which would look deliberate.
 
+`list-style-position` came off it too. An `inside` marker is the first inline
+box of the item's own content rather than a box in the list's padding, so the
+text after it starts further along and the *second* line wraps back under the
+marker instead of beside it — which is the whole visible difference between the
+two values.
+
+`font-variant: small-caps` came off it as well, synthesised rather than asked
+for: the bundled Liberation faces carry no small-caps variant, so lowercase
+letters are set as capitals at 0.7 of the size — which is the ratio Chromium
+synthesises at, measured off a rendering rather than argued about. A word of
+nothing but lowercase still sits on a full-size line, or a paragraph of small
+caps would read as one somebody set in a smaller font.
+
+`position: fixed` is half off it. Its containing block is the viewport now,
+past however many positioned ancestors sit in between — which is the whole of
+what separates it from `absolute` at layout time, and which the
+`position-fixed` fixture shows with two identically written squares landing in
+different places. The half still missing is the one a reader would name first:
+a fixed box does not stay put while the page scrolls. It cannot yet, because
+this engine paints a whole document once and scrolls by blitting a band of it,
+so nothing is re-placed per scroll position. That is a change to how painting
+works rather than to what `fixed` means, and it is recorded rather than
+pretended away.
+
+§10.8.1's strut is on the line now, and with the face's own metrics rather
+than a fraction of the font size. It decides how far a line reaches *below* its
+baseline, which is what puts the few pixels of descender space under an image
+sitting alone in a table cell — and it is exactly what quirks mode takes away
+again, because a line box with no text on it has no strut there. Pages of the
+era were authored against that: a sliced image with a gap under every tile is
+not a near miss, it is the page coming apart. Both modes now land on the same
+pixel row as Chromium.
+
+`direction` and `unicode-bidi` came off it, which is most of what
+right-to-left text needed. The algorithm itself is `unicode-bidi`'s — the same
+crate `cosmic-text` already uses, so nothing new entered the tree — and the
+work here is what a shaper cannot do for you: running it over the whole inline
+formatting context rather than per word, reordering each line's segments by the
+levels it returns, and putting an inline box's own borders back at the ends of
+its box rather than letting them reorder like characters. Two Hebrew words now
+come out in the right order, a `<span>` cut in two by reordering draws two
+fragments, and the space between a Hebrew run and the English after it lands
+between them instead of at the end of the line.
+
+One piece of UAX #9 is written here rather than taken, and it is worth naming:
+Latin text under an explicit override. The shaper does not act on the
+formatting codes at all — handed `<RLO>abcdef<PDF>` it draws two blank boxes
+and six letters forwards, which was measured before it was believed — so the
+run is shaped forwards and then mirrored, brackets included. The levels still
+come from the crate; only their application to glyphs is ours, and no shaper
+will reverse letters it has been given no reason to reverse.
+
+An inline element holding a block is broken around it now (§9.2.1.1) rather
+than being laid out as a block: two boxes, one on each side, with the block a
+sibling between them and outside the element's border. `<font>…<hr>…</font>` is
+ordinary in the era's markup, and the difference is visible the moment the
+element has a background — the old shape painted it straight through the rule.
+The sides go on the outside ends and nothing at either break, which is §8.4's
+rule for a box split across lines applied to a box split around a block.
+
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by
 `counter-reset` covers the element, its **following siblings**, and all of
-their descendants, which is the part of that sentence easiest to read past.
+their descendants, which is the part of that sentence easiest to read past. A
+`::before` or `::after` carries its own `counter-reset` and `counter-increment`,
+and prints the value *after* them, which is what §12.4's own example — a
+heading numbered by a pseudo-element that increments the counter itself — needs
+and what one pass over the style cannot give. An operation on a box nobody
+generates has no effect, so a `::before` with no `content`, or one told
+`display: none`, counts nothing.
+
+Every one of CSS 2.1's counter styles is spelled now:
+`decimal-leading-zero`, `lower-greek` — twenty-four letters, with no final
+sigma, since a positional form is the same letter twice — and the two additive
+systems, `armenian` and `georgian`. They spell list markers and `counter()`
+alike, because §12.4.3 takes the same values `list-style-type` does. The
+bundled Liberation faces carry neither Armenian nor Georgian (ADR-0008), so
+those two number correctly and draw nothing, which is the font's coverage
+rather than the numbering.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have

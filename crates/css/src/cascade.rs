@@ -7,11 +7,12 @@ use dom::{Document, ElementData, NodeId};
 use crate::selector::PseudoElement;
 use crate::style::{
     BackgroundPosition, BackgroundRepeat, BorderSide, BorderStyle, Borders, ComputedStyle,
-    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, GenericFamily, ListStyleType,
-    MEDIUM_BORDER, NORMAL_LINE_HEIGHT, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
+    DEFAULT_FONT_SIZE, Display, Edges, Float, FontStack, FontStyle, FontVariant, GenericFamily,
+    LineHeight, ListStyleType, MEDIUM_BORDER, THICK_BORDER, THIN_BORDER, TextAlign, WhiteSpace,
     parse_background_position, parse_background_repeat, parse_border_collapse, parse_border_style,
-    parse_caption_side, parse_clear, parse_clip, parse_display, parse_float, parse_list_style_type,
-    parse_overflow, parse_position, parse_text_decoration, parse_text_transform,
+    parse_caption_side, parse_clear, parse_clip, parse_direction, parse_display, parse_float,
+    parse_font_variant, parse_list_style_position, parse_list_style_type, parse_overflow,
+    parse_position, parse_text_decoration, parse_text_transform, parse_unicode_bidi,
     parse_vertical_align, parse_visibility,
 };
 use crate::value::{
@@ -76,8 +77,8 @@ impl StyleMap {
         }
     }
 
-    /// Raises a node's left and right margins to at least `least` pixels,
-    /// leaving a wider margin alone.
+    /// Holds a node's content at least `least` pixels from each side, leaving a
+    /// node that already asks for more alone.
     ///
     /// For the page gutter. The UA sheet's `body { margin: 8px }` is a default
     /// and an author's `margin: 0` beats it, which leaves text against the
@@ -87,24 +88,40 @@ impl StyleMap {
     /// applied after the cascade, like [`Self::hide`], instead of pretending to
     /// be a stylesheet.
     ///
-    /// `available_width` resolves a percentage margin, which has to be measured
+    /// The shortfall goes on the **padding**, and the margin the page asked for
+    /// counts towards the floor rather than being replaced by it. Padding is
+    /// inside the background where margin is outside it, and that is the whole
+    /// difference: a `body { margin: 0; background: navy }` page topped up with
+    /// margin is navy with a pale frame around it, which is precisely what the
+    /// gutter is not for. Topped up with padding it is navy to the glass with
+    /// its text held off — which is also what lets §14.2 hold without an
+    /// exception, since nothing then has to carry the body's background out to
+    /// the window on its behalf.
+    ///
+    /// `available_width` resolves a percentage, which has to be measured
     /// against something before it can be compared with a length in pixels.
     pub fn keep_off_the_edges(&mut self, node: NodeId, least: f32, available_width: f32) {
         let Some(style) = self.styles.get_mut(&node) else {
             return;
         };
         let font_size = style.font_size;
-        for margin in [&mut style.margin.left, &mut style.margin.right] {
-            // An `auto` horizontal margin on a block of automatic width
-            // resolves to zero, so it has asked for nothing and the floor
-            // applies.
-            let asked = match *margin {
-                Length::Auto => 0.0,
-                length => length.to_px(font_size, available_width),
-            };
-            if asked < least {
-                *margin = Length::Px(least);
-            }
+        // An `auto` horizontal margin on a block of automatic width resolves to
+        // zero, so it has asked for nothing and the whole floor applies.
+        let px = |length: Length| match length {
+            Length::Auto => 0.0,
+            length => length.to_px(font_size, available_width),
+        };
+        // Unrolled rather than looped: two sides, and a loop over them needs
+        // either an enum or two mutable borrows of the same style.
+        let topped = |margin: Length, padding: Length| {
+            let short = least - px(margin) - px(padding);
+            (short > 0.0).then(|| Length::Px(px(padding) + short))
+        };
+        if let Some(left) = topped(style.margin.left, style.padding.left) {
+            style.padding.left = left;
+        }
+        if let Some(right) = topped(style.margin.right, style.padding.right) {
+            style.padding.right = right;
         }
     }
 }
@@ -334,11 +351,16 @@ fn style_subtree(
         // one. Computing the style and then throwing it away when there is no
         // content keeps that decision in one place, and lets every later stage
         // read "a style exists here" as "this box exists".
-        for which in [PseudoElement::Before, PseudoElement::After] {
-            let generated = compute(doc, node, &computed, rules, counters, Some(which));
-            if generated.content.is_some() {
-                out.pseudos.insert((node, which), generated);
-            }
+        if let Some(before) = generated_box(
+            doc,
+            node,
+            &computed,
+            rules,
+            counters,
+            PseudoElement::Before,
+            depth,
+        ) {
+            out.pseudos.insert((node, PseudoElement::Before), before);
         }
         // §5.12.2's box is gated differently, because it invents nothing:
         // `::first-letter` restyles text that is already on the page, so
@@ -366,6 +388,24 @@ fn style_subtree(
 
     for &child in doc.children(node) {
         style_subtree(doc, child, &style, rules, counters, depth + 1, out);
+    }
+    // `::after` is computed here rather than beside `::before`, because its box
+    // comes after the element's content and so does anything it does to a
+    // counter. A list whose items each carry `li::after { counter-increment }`
+    // otherwise numbers every nested item from a value the outer item had not
+    // reached yet.
+    if doc.element(node).is_some()
+        && let Some(after) = generated_box(
+            doc,
+            node,
+            &style,
+            rules,
+            counters,
+            PseudoElement::After,
+            depth,
+        )
+    {
+        out.pseudos.insert((node, PseudoElement::After), after);
     }
     // Every counter this element's children created goes out of scope here:
     // §12.4.1 ends a reset's scope with the element it was written on, and
@@ -617,6 +657,19 @@ fn apply(
     let parse_size = |raw: &Raw| parse_length(raw).filter(|length| !length.is_negative());
     let parse_color = |raw: &Raw| parse_color_quirky(raw, quirks);
 
+    // §6.2.1: every property takes `inherit`, and it means the parent's
+    // computed value whether or not the property inherits by default. Handled
+    // here rather than in each of the fifty arms below, which is also the only
+    // way to get it right: the value is a *copy*, with no parsing to do and
+    // nothing for a property's own parser to say about it.
+    if values.len() == 1
+        && let Raw::Ident(name) = first
+        && name.eq_ignore_ascii_case("inherit")
+    {
+        inherit_property(style, &declaration.name, parent);
+        return;
+    }
+
     match declaration.name.as_str() {
         "display" => {
             if let Raw::Ident(name) = first
@@ -708,19 +761,43 @@ fn apply(
         "font" => {
             if let Some(font) = parse_font_shorthand(values, parent, zoom) {
                 style.font_style = font.style;
+                style.font_variant = font.variant;
                 style.font_weight = font.weight;
                 style.font_size = font.size;
-                style.line_height = font.line_height.unwrap_or(font.size * NORMAL_LINE_HEIGHT);
+                style.line_height = font.line_height.unwrap_or(LineHeight::Normal);
                 style.font_family = font.family;
             }
         }
         // font-size resolves em and % against the *parent's* size, not its own.
+        //
+        // Nothing to do to the line height any more. It used to be recomputed
+        // here whenever it still matched the parent's, as a way of asking "was
+        // that `normal`, inherited?" — `normal` is now carried as itself and
+        // resolves against whatever font size it finds at the far end.
         "font-size" => {
             if let Some(size) = parse_font_size(first, parent.font_size, zoom) {
                 style.font_size = size;
-                if style.line_height == parent.line_height {
-                    style.line_height = size * NORMAL_LINE_HEIGHT;
-                }
+            }
+        }
+        "direction" => {
+            if let Raw::Ident(name) = first
+                && let Some(direction) = parse_direction(name)
+            {
+                style.direction = direction;
+            }
+        }
+        "unicode-bidi" => {
+            if let Raw::Ident(name) = first
+                && let Some(bidi) = parse_unicode_bidi(name)
+            {
+                style.unicode_bidi = bidi;
+            }
+        }
+        "font-variant" => {
+            if let Raw::Ident(name) = first
+                && let Some(variant) = parse_font_variant(name)
+            {
+                style.font_variant = variant;
             }
         }
         "font-weight" => {
@@ -744,12 +821,10 @@ fn apply(
         "font-family" => style.font_family = parse_font_family(values),
         "line-height" => {
             style.line_height = match first {
-                // A unitless number is a multiplier, and inherits as a
-                // multiplier rather than as a resolved length.
-                Raw::Number(n) => style.font_size * n,
-                Raw::Ident(name) if name == "normal" => style.font_size * NORMAL_LINE_HEIGHT,
+                Raw::Number(n) => LineHeight::Number(*n),
+                Raw::Ident(name) if name == "normal" => LineHeight::Normal,
                 other => match parse_length(other) {
-                    Some(length) => length.to_px(style.font_size, style.font_size),
+                    Some(length) => LineHeight::Px(length.to_px(style.font_size, style.font_size)),
                     None => style.line_height,
                 },
             };
@@ -784,12 +859,32 @@ fn apply(
         }
         // `list-style` is a shorthand; only the type is modelled, so scan the
         // whole value for a keyword we recognise rather than reading the first.
+        // The shorthand takes type, position and image in any order, so each
+        // is looked for across all the values rather than by position. An
+        // absent one is left alone rather than reset: `list-style-image` is
+        // not implemented, and resetting a component this engine cannot honour
+        // would only mean forgetting the type the author did set.
         "list-style-type" | "list-style" => {
             if let Some(kind) = values.iter().find_map(|raw| match raw {
                 Raw::Ident(name) => parse_list_style_type(name),
                 _ => None,
             }) {
                 style.list_style_type = kind;
+            }
+            if declaration.name == "list-style"
+                && let Some(position) = values.iter().find_map(|raw| match raw {
+                    Raw::Ident(name) => parse_list_style_position(name),
+                    _ => None,
+                })
+            {
+                style.list_style_position = position;
+            }
+        }
+        "list-style-position" => {
+            if let Raw::Ident(name) = first
+                && let Some(position) = parse_list_style_position(name)
+            {
+                style.list_style_position = position;
             }
         }
         // Two values are allowed — horizontal then vertical — but a table
@@ -802,9 +897,17 @@ fn apply(
                 style.vertical_align = align;
             }
         }
+        // One length applies to both axes, two give horizontal then vertical
+        // (§17.6.1). A second value that does not parse takes the declaration
+        // with it rather than leaving half of it applied.
         "border-spacing" => {
-            if let Some(length) = parse_size(first) {
-                style.border_spacing = length;
+            let horizontal = parse_size(first);
+            let vertical = match values.get(1) {
+                Some(second) => parse_size(second),
+                None => horizontal,
+            };
+            if let (Some(horizontal), Some(vertical)) = (horizontal, vertical) {
+                style.border_spacing = (horizontal, vertical);
             }
         }
         "text-transform" => {
@@ -829,6 +932,16 @@ fn apply(
                 // Resolved here because it is a used length by the time text is
                 // shaped, and shaping is where it has to arrive.
                 style.letter_spacing = length.to_px(style.font_size, 0.0);
+            }
+        }
+        // The same shape as `letter-spacing`, and added at every space rather
+        // than at every glyph. Resolved here for the same reason: it is a used
+        // length by the time text is shaped.
+        "word-spacing" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("normal")) {
+                style.word_spacing = 0.0;
+            } else if let Some(length) = parse_length(first) {
+                style.word_spacing = length.to_px(style.font_size, 0.0);
             }
         }
         "text-indent" => {
@@ -913,11 +1026,57 @@ fn apply(
         // Ahead of the `border-*` longhand fallback at the bottom of this
         // match, which would otherwise hand `collapse` to the code that parses
         // edge names and get nothing for it.
+        // §18.4. A ring outside the border box that takes up no room, so it
+        // needs no layout at all — only parsing and paint. The shorthand
+        // resets what it does not mention, like `border`.
+        "outline" => {
+            let parsed = parse_border_shorthand(values, zoom);
+            style.outline = crate::style::Outline {
+                width: parsed.width.unwrap_or(Length::Px(MEDIUM_BORDER * zoom)),
+                style: parsed.style.unwrap_or_default(),
+                color: parsed.color,
+            };
+        }
+        "outline-width" => {
+            if let Some(width) = parse_border_width(first, zoom) {
+                style.outline.width = width;
+            }
+        }
+        "outline-style" => {
+            if let Raw::Ident(name) = first
+                && let Some(parsed) = parse_border_style(name)
+            {
+                style.outline.style = parsed;
+            }
+        }
+        // `invert` is the initial value and is taken as the element's own
+        // colour; see `Outline::color`.
+        "outline-color" => {
+            if matches!(first, Raw::Ident(name) if name.eq_ignore_ascii_case("invert")) {
+                style.outline.color = None;
+            } else if let Some(color) = parse_color(first) {
+                style.outline.color = Some(color);
+            }
+        }
         "border-collapse" => {
             if let Raw::Ident(name) = first
                 && let Some(collapse) = parse_border_collapse(name)
             {
                 style.border_collapse = collapse;
+            }
+        }
+        "empty-cells" => {
+            if let Raw::Ident(name) = first
+                && let Some(empty) = crate::style::parse_empty_cells(name)
+            {
+                style.empty_cells = empty;
+            }
+        }
+        "table-layout" => {
+            if let Raw::Ident(name) = first
+                && let Some(layout) = crate::style::parse_table_layout(name)
+            {
+                style.table_layout = layout;
             }
         }
         "white-space" => {
@@ -1037,6 +1196,167 @@ fn apply(
     }
 }
 
+/// Copies one property's computed value from the parent (§6.2.1's `inherit`).
+///
+/// Written out rather than derived, because there is nothing to derive it from:
+/// a computed style is a struct of forty fields and the mapping from a CSS
+/// property name to the fields it covers is exactly the knowledge `apply` above
+/// encodes in the other direction. A shorthand copies every field it covers,
+/// which is what makes `border: inherit` take the width, the style *and* the
+/// colour.
+///
+/// A property missing here is a property whose `inherit` is dropped, which is
+/// the same thing that happens to any value this engine cannot parse.
+fn inherit_property(style: &mut ComputedStyle, name: &str, parent: &ComputedStyle) {
+    match name {
+        "display" => style.display = parent.display,
+        "color" => style.color = parent.color,
+        "background-color" => style.background_color = parent.background_color,
+        "background-image" => style.background_image = parent.background_image.clone(),
+        "background-repeat" => style.background_repeat = parent.background_repeat,
+        "background-position" => style.background_position = parent.background_position,
+        "background" => {
+            style.background_color = parent.background_color;
+            style.background_image = parent.background_image.clone();
+            style.background_repeat = parent.background_repeat;
+            style.background_position = parent.background_position;
+        }
+        "font-family" => style.font_family = parent.font_family.clone(),
+        "font-size" => style.font_size = parent.font_size,
+        "font-weight" => style.font_weight = parent.font_weight,
+        "font-style" => style.font_style = parent.font_style,
+        "font-variant" => style.font_variant = parent.font_variant,
+        "direction" => style.direction = parent.direction,
+        "unicode-bidi" => style.unicode_bidi = parent.unicode_bidi,
+        "line-height" => style.line_height = parent.line_height,
+        "font" => {
+            style.font_variant = parent.font_variant;
+            style.font_family = parent.font_family.clone();
+            style.font_size = parent.font_size;
+            style.font_weight = parent.font_weight;
+            style.font_style = parent.font_style;
+            style.line_height = parent.line_height;
+        }
+        "letter-spacing" => style.letter_spacing = parent.letter_spacing,
+        "word-spacing" => style.word_spacing = parent.word_spacing,
+        "text-align" => style.text_align = parent.text_align,
+        "text-decoration" => style.text_decoration = parent.text_decoration,
+        "text-indent" => style.text_indent = parent.text_indent,
+        "text-transform" => style.text_transform = parent.text_transform,
+        "white-space" => style.white_space = parent.white_space,
+        "visibility" => style.visibility = parent.visibility,
+        "vertical-align" => style.vertical_align = parent.vertical_align,
+        "list-style-type" => style.list_style_type = parent.list_style_type,
+        "float" => style.float = parent.float,
+        "clear" => style.clear = parent.clear,
+        "position" => style.position = parent.position,
+        "overflow" => style.overflow = parent.overflow,
+        "clip" => style.clip = parent.clip,
+        "z-index" => style.z_index = parent.z_index,
+        "width" => style.width = parent.width,
+        "min-width" => style.min_width = parent.min_width,
+        "max-width" => style.max_width = parent.max_width,
+        "height" => style.height = parent.height,
+        "min-height" => style.min_height = parent.min_height,
+        "max-height" => style.max_height = parent.max_height,
+        "top" => style.offsets.top = parent.offsets.top,
+        "right" => style.offsets.right = parent.offsets.right,
+        "bottom" => style.offsets.bottom = parent.offsets.bottom,
+        "left" => style.offsets.left = parent.offsets.left,
+        "margin" => style.margin = parent.margin,
+        "padding" => style.padding = parent.padding,
+        "border" => style.border = parent.border,
+        "border-width" => {
+            for (side, from) in border_sides(&mut style.border)
+                .into_iter()
+                .zip(border_sides_of(parent))
+            {
+                side.width = from.width;
+            }
+        }
+        "border-style" => {
+            for (side, from) in border_sides(&mut style.border)
+                .into_iter()
+                .zip(border_sides_of(parent))
+            {
+                side.style = from.style;
+            }
+        }
+        "border-color" => {
+            for (side, from) in border_sides(&mut style.border)
+                .into_iter()
+                .zip(border_sides_of(parent))
+            {
+                side.color = from.color;
+            }
+        }
+        "border-collapse" => style.border_collapse = parent.border_collapse,
+        "border-spacing" => style.border_spacing = parent.border_spacing,
+        "caption-side" => style.caption_side = parent.caption_side,
+        "counter-reset" => style.counter_reset = parent.counter_reset.clone(),
+        "counter-increment" => style.counter_increment = parent.counter_increment.clone(),
+        "content" => style.content = parent.content.clone(),
+        "outline" => style.outline = parent.outline,
+        "outline-width" => style.outline.width = parent.outline.width,
+        "outline-style" => style.outline.style = parent.outline.style,
+        "outline-color" => style.outline.color = parent.outline.color,
+        "empty-cells" => style.empty_cells = parent.empty_cells,
+        "table-layout" => style.table_layout = parent.table_layout,
+        name => {
+            if let Some(side) = name.strip_prefix("margin-") {
+                copy_edge(&mut style.margin, &parent.margin, side);
+            } else if let Some(side) = name.strip_prefix("padding-") {
+                copy_edge(&mut style.padding, &parent.padding, side);
+            } else if let Some(rest) = name.strip_prefix("border-") {
+                inherit_border_longhand(&mut style.border, rest, &parent.border);
+            }
+        }
+    }
+}
+
+/// The parent's four border sides, in the order [`border_sides`] gives them.
+fn border_sides_of(style: &ComputedStyle) -> [BorderSide; 4] {
+    [
+        style.border.top,
+        style.border.right,
+        style.border.bottom,
+        style.border.left,
+    ]
+}
+
+/// Copies one side of an [`Edges`].
+fn copy_edge(into: &mut Edges, from: &Edges, side: &str) {
+    match side {
+        "top" => into.top = from.top,
+        "right" => into.right = from.right,
+        "bottom" => into.bottom = from.bottom,
+        "left" => into.left = from.left,
+        _ => {}
+    }
+}
+
+/// `border-left-width: inherit` and friends, plus `border-left: inherit`.
+fn inherit_border_longhand(borders: &mut Borders, rest: &str, from: &Borders) {
+    let (side_name, property) = match rest.split_once('-') {
+        Some((side, property)) => (side, Some(property)),
+        None => (rest, None),
+    };
+    let (into, source) = match side_name {
+        "top" => (&mut borders.top, from.top),
+        "right" => (&mut borders.right, from.right),
+        "bottom" => (&mut borders.bottom, from.bottom),
+        "left" => (&mut borders.left, from.left),
+        _ => return,
+    };
+    match property {
+        None => *into = source,
+        Some("width") => into.width = source.width,
+        Some("style") => into.style = source.style,
+        Some("color") => into.color = source.color,
+        _ => {}
+    }
+}
+
 fn parse_font_size(raw: &Raw, parent_size: f32, zoom: f32) -> Option<f32> {
     if let Raw::Ident(name) = raw {
         // The CSS 2.1 absolute-size keywords, as scale factors from medium.
@@ -1063,11 +1383,12 @@ fn parse_font_size(raw: &Raw, parent_size: f32, zoom: f32) -> Option<f32> {
 /// Everything a `font` shorthand sets.
 struct FontShorthand {
     style: FontStyle,
+    variant: FontVariant,
     weight: u16,
     size: f32,
     /// `None` where the shorthand wrote no `/ line-height`, which means
     /// `normal` rather than "leave the old one".
-    line_height: Option<f32>,
+    line_height: Option<LineHeight>,
     family: FontStack,
 }
 
@@ -1078,10 +1399,6 @@ struct FontShorthand {
 /// change nothing at all, which is why this returns an `Option` rather than
 /// filling in defaults.
 ///
-/// `small-caps` is accepted and then discarded. `font-variant` is not
-/// implemented here, and rejecting the whole declaration over it would throw
-/// away the size and family too — the page would lose styling it should have,
-/// to no one's benefit.
 ///
 /// The system font keywords — `font: menu`, `caption`, `status-bar` — need no
 /// case of their own, though it is tempting to write one. CSS 2.1 §15.8 says
@@ -1096,6 +1413,7 @@ fn parse_font_shorthand(
     zoom: f32,
 ) -> Option<FontShorthand> {
     let mut style = FontStyle::Normal;
+    let mut variant = FontVariant::Normal;
     let mut weight = 400;
     let mut index = 0;
 
@@ -1105,7 +1423,8 @@ fn parse_font_shorthand(
     while let Some(value) = values.get(index) {
         match value {
             Raw::Ident(name) => match name.as_str() {
-                "normal" | "small-caps" => {}
+                "normal" => variant = FontVariant::Normal,
+                "small-caps" => variant = FontVariant::SmallCaps,
                 "italic" | "oblique" => style = FontStyle::Italic,
                 "bold" => weight = 700,
                 "bolder" => weight = (parent.font_weight + 300).min(900),
@@ -1129,9 +1448,12 @@ fn parse_font_shorthand(
         line_height = Some(match values.get(index)? {
             // Resolved against this shorthand's own size, not the parent's:
             // `font: 20px/1.5 serif` is a 30px line whatever the parent is.
-            Raw::Number(number) => size * number,
-            Raw::Ident(name) if name == "normal" => size * NORMAL_LINE_HEIGHT,
-            other => parse_length(other)?.scaled(zoom).to_px(size, size),
+            // Resolved against this shorthand's own size rather than kept as
+            // a number: `font: 20px/1.5 serif` is a 30px line, and a child of
+            // it that sets a larger size does not get a larger line from it.
+            Raw::Number(number) => LineHeight::Px(size * number),
+            Raw::Ident(name) if name == "normal" => LineHeight::Normal,
+            other => LineHeight::Px(parse_length(other)?.scaled(zoom).to_px(size, size)),
         });
         index += 1;
     }
@@ -1142,6 +1464,7 @@ fn parse_font_shorthand(
     }
     Some(FontShorthand {
         style,
+        variant,
         weight,
         size,
         line_height,
@@ -1255,6 +1578,57 @@ impl Counters {
             .map(|instance| instance.value)
             .collect()
     }
+}
+
+/// The style of a `::before` or `::after` box, where the rules generate one.
+///
+/// §12.1: a pseudo-element generates a box only when `content` gives it one.
+/// Computing the style and then throwing it away when there is no content
+/// keeps that decision in one place, and lets every later stage read "a style
+/// exists here" as "this box exists".
+///
+/// The two passes are what §12.4's own example needs. It numbers a heading
+/// from a `::before` that increments the counter itself —
+///
+/// ```text
+/// h1::before { content: "Chapter " counter(chapter) ". "; counter-increment: chapter }
+/// ```
+///
+/// — and the number it prints is the one *after* that increment, which a
+/// single pass cannot produce: `content` is resolved against the counters as
+/// they stand, and the increment is a property of the style being computed.
+/// So the first pass is read only for the counter operations, and the second
+/// is the style that is kept. Only a pseudo-element that declares one pays for
+/// it, which is nearly none of them.
+///
+/// The operations are applied at the *element's* depth rather than a deeper
+/// one, because §12.4.1 scopes a reset to the box and its following siblings —
+/// and the following siblings of a `::before` box are the element's own
+/// content. A `div::before { counter-reset: n }` has to still be in scope for
+/// a `div div::before` inside it, which is what `counters()` prints as `0.0`.
+fn generated_box(
+    doc: &Document,
+    node: NodeId,
+    parent_style: &ComputedStyle,
+    rules: &Rules,
+    counters: &mut Counters,
+    which: PseudoElement,
+    depth: usize,
+) -> Option<ComputedStyle> {
+    let generated = compute(doc, node, parent_style, rules, counters, Some(which));
+    // §12.4: a counter operation on a box that is not generated has no effect,
+    // and a pseudo-element with no `content` or with `display: none` generates
+    // none. Neither condition depends on a counter's *value*, so the first pass
+    // can be trusted to answer both.
+    let generates_a_box = generated.content.is_some() && generated.display != Display::None;
+    if !generates_a_box
+        || (generated.counter_reset.is_empty() && generated.counter_increment.is_empty())
+    {
+        return generated.content.is_some().then_some(generated);
+    }
+    step_counters(&generated, counters, depth);
+    let generated = compute(doc, node, parent_style, rules, counters, Some(which));
+    generated.content.is_some().then_some(generated)
 }
 
 /// Applies an element's own `counter-reset` and `counter-increment`.
@@ -1955,6 +2329,7 @@ fn set_edge(edges: &mut Edges, side: &str, raw: &Raw, quirks: bool, zoom: f32, n
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::Direction;
     use crate::style::{
         BackgroundPosition, BackgroundRepeat, BorderCollapse, CaptionSide, Display, ListStyleType,
         VerticalAlign, Visibility,
@@ -1982,6 +2357,86 @@ mod tests {
         let map = cascade_as(&doc, &sheets, zoom, colours);
         let node = doc.find_element(tag).expect("element present");
         map.get(node).expect("element styled").clone()
+    }
+
+    #[test]
+    fn inherit_takes_a_property_that_does_not_inherit_by_default() {
+        let css = "div { width: 300px; border: 2px solid red } \
+                   p { width: inherit; border: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.width, Length::Px(300.0));
+        assert_eq!(style.border.top.width, Length::Px(2.0));
+        assert_eq!(style.border.left.style, BorderStyle::Solid);
+        assert_eq!(style.border.bottom.color, Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn inherit_beats_a_later_rule_it_precedes_no_more_than_any_other_value() {
+        // `inherit` is a value, not a directive: the cascade orders it like
+        // anything else, so the second declaration wins.
+        let css = "div { color: red } p { color: inherit; color: blue }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn inherit_copies_the_parents_computed_value_not_the_declared_one() {
+        // The parent's font-size is 50% of the *grandparent*, so a child that
+        // inherits gets 12px, not the string "50%" re-resolved against itself.
+        let css = "body { font-size: 24px } div { font-size: 50% } \
+                   p { font-size: inherit }";
+        let style = style_of("<body><div><p>x</p></div></body>", css, "p");
+
+        assert_eq!(style.font_size, 12.0);
+    }
+
+    #[test]
+    fn inherit_on_a_longhand_leaves_the_other_sides_alone() {
+        let css = "div { margin: 10px } \
+                   p { margin: 1px; margin-left: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.margin.left, Length::Px(10.0));
+        assert_eq!(style.margin.top, Length::Px(1.0));
+    }
+
+    #[test]
+    fn inherit_on_a_border_longhand_takes_only_that_side_and_facet() {
+        let css = "div { border-left: 5px dashed lime } \
+                   p { border: 1px solid red; border-left-width: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.border.left.width, Length::Px(5.0));
+        assert_eq!(style.border.left.style, BorderStyle::Solid);
+        assert_eq!(style.border.right.width, Length::Px(1.0));
+    }
+
+    #[test]
+    fn inherit_at_the_root_gets_the_initial_value() {
+        // The root element's parent is the initial style, so `inherit` there is
+        // the same as `initial` — and must not be mistaken for a colour name.
+        let style = style_of("<p>x</p>", "html { color: inherit }", "html");
+
+        assert_eq!(style.color, ComputedStyle::default().color);
+    }
+
+    #[test]
+    fn inherit_is_not_read_as_a_font_family_or_a_counter_name() {
+        let css = "div { font-family: Verdana; counter-reset: page 3 } \
+                   p { font-family: inherit; counter-reset: inherit }";
+        let style = style_of("<div><p>x</p></div>", css, "p");
+
+        assert_eq!(style.font_family.families, vec!["verdana".to_string()]);
+        assert_eq!(style.counter_reset, vec![("page".to_string(), 3)]);
+    }
+
+    #[test]
+    fn direction_is_read_and_inherited() {
+        let style = style_of("<div><p>x</p></div>", "div { direction: rtl }", "p");
+        assert_eq!(style.direction, Direction::Rtl);
+        assert_eq!(style.text_align.against(style.direction), TextAlign::Right);
     }
 
     #[test]
@@ -2024,10 +2479,10 @@ mod tests {
         let doubled = zoomed_style_of("<body><p>x</p></body>", "", "p", 2.0);
 
         assert_eq!(doubled.font_size, DEFAULT_FONT_SIZE * 2.0);
-        assert_eq!(
-            doubled.line_height,
-            DEFAULT_FONT_SIZE * 2.0 * NORMAL_LINE_HEIGHT
-        );
+        // Still `normal`, which is the point: it is not a length for zoom to
+        // scale, it is a question asked of whatever font the text lands in at
+        // whatever size it ends up being.
+        assert_eq!(doubled.line_height, LineHeight::Normal);
     }
 
     #[test]
@@ -2154,7 +2609,7 @@ mod tests {
     fn the_font_shorthand_sets_size_line_height_and_family() {
         let style = style_of("<p>x</p>", "p { font: 20px/1.5 Georgia, serif }", "p");
         assert_eq!(style.font_size, 20.0);
-        assert_eq!(style.line_height, 30.0);
+        assert_eq!(style.line_height, LineHeight::Px(30.0));
         assert_eq!(style.font_family.families, vec!["georgia".to_owned()]);
         assert_eq!(style.font_family.generic, GenericFamily::Serif);
     }
@@ -2187,7 +2642,7 @@ mod tests {
         assert_eq!(style.font_style, FontStyle::Normal, "style survived it");
         assert_eq!(
             style.line_height,
-            20.0 * NORMAL_LINE_HEIGHT,
+            LineHeight::Normal,
             "line-height survived it"
         );
     }
@@ -2241,7 +2696,7 @@ mod tests {
             "p",
         );
         assert_eq!(style.font_size, 20.0);
-        assert_eq!(style.line_height, 30.0);
+        assert_eq!(style.line_height, LineHeight::Px(30.0));
     }
 
     #[test]
@@ -2249,7 +2704,7 @@ mod tests {
         // Before `Raw::Slash` existed the separator arrived as an unmodelled
         // token, which is how the whole declaration came to be dropped.
         let style = style_of("<p>x</p>", "p { font: 20px/10px serif }", "p");
-        assert_eq!(style.line_height, 10.0);
+        assert_eq!(style.line_height, LineHeight::Px(10.0));
     }
 
     fn content_of(html: &str, css: &str, tag: &str, which: PseudoElement) -> Option<String> {
@@ -2462,6 +2917,33 @@ mod tests {
     }
 
     #[test]
+    fn a_counter_in_a_glyph_style_prints_the_glyph() {
+        // §12.4.3 supports every list-style-type, so `counter(c, square)` is a
+        // square — the count is thrown away, but the glyph is not.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 7 } p::before { content: counter(c, square) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("\u{25aa}")
+        );
+        // `none` is the one style that prints nothing.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p { counter-reset: c 7 } p::before { content: counter(c, none) }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
     fn a_counter_can_be_spelled_in_another_list_style() {
         assert_eq!(
             content_of(
@@ -2485,6 +2967,61 @@ mod tests {
             .as_deref(),
             Some("3. ")
         );
+    }
+
+    #[test]
+    fn a_pseudo_element_sees_its_own_counter_increment() {
+        // §12.4's own example: a heading numbered from a `::before` that
+        // increments the counter itself prints the value *after* the
+        // increment. Resolving `content` in one pass cannot produce that, so
+        // the pseudo-element's operations are applied and the style recomputed.
+        assert_eq!(
+            content_of(
+                "<h1>x</h1>",
+                "h1::before { content: \"Chapter \" counter(chapter) \". \"; \
+                 counter-increment: chapter }",
+                "h1",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("Chapter 1. ")
+        );
+        // Reset before increment here too, as on an element.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p::before { content: counter(c); counter-reset: c 10; \
+                 counter-increment: c 5 }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn a_pseudo_element_that_generates_no_box_counts_nothing() {
+        // §12.4: an operation on a box nobody generates has no effect. A
+        // `::before` with no `content` generates none, and neither does one
+        // told `display: none` — and in both cases the counter must read as
+        // though the rule were not there.
+        for suppressed in [
+            "span::before { counter-increment: c 10 }",
+            "span::before { content: \"x\"; display: none; counter-increment: c 10 }",
+        ] {
+            assert_eq!(
+                content_of(
+                    "<div><span></span></div>",
+                    &format!("div {{ counter-reset: c }} div::after {{ content: counter(c) }} {suppressed}"),
+                    "div",
+                    PseudoElement::After,
+                )
+                .as_deref(),
+                Some("0"),
+                "{suppressed}"
+            );
+        }
     }
 
     #[test]
@@ -3304,7 +3841,10 @@ mod tests {
         );
         assert_eq!(style.margin.left, Length::Auto);
         assert_eq!(style.margin.right, Length::Auto);
-        assert_eq!(style.text_align, TextAlign::Left);
+        // Untouched: the initial value, which settles to `left` in a
+        // left-to-right document and is not what `align="center"` set.
+        assert_eq!(style.text_align, TextAlign::Start);
+        assert_eq!(style.text_align.against(Direction::Ltr), TextAlign::Left);
     }
 
     #[test]
@@ -3409,10 +3949,11 @@ mod tests {
             "",
             "table",
         );
-        assert_eq!(style.border_spacing, Length::Px(0.0));
+        // Both axes: the attribute is one number and means the gap on each.
+        assert_eq!(style.border_spacing, (Length::Px(0.0), Length::Px(0.0)));
 
         let default = standards_style_of("<table><tr><td>x</td></tr></table>", "", "table");
-        assert_eq!(default.border_spacing, Length::Px(2.0));
+        assert_eq!(default.border_spacing, (Length::Px(2.0), Length::Px(2.0)));
     }
 
     #[test]
@@ -3683,49 +4224,106 @@ mod tests {
         assert!(block.display.is_supported_layout());
     }
 
-    /// The body's horizontal margins after the floor has been applied.
-    fn margins_after_floor(css: &str, least: f32, available_width: f32) -> (Length, Length) {
+    /// The body's style after the floor has been applied.
+    fn after_floor(css: &str, least: f32, available_width: f32) -> ComputedStyle {
         let doc = dom::parse(&format!("<style>{css}</style><body>x</body>"));
         let sheets = [Stylesheet::parse(css)];
         let mut map = cascade(&doc, &sheets);
         let body = doc.find_element("body").expect("a body");
         map.keep_off_the_edges(body, least, available_width);
-        let style = map.get(body).expect("a styled body");
-        (style.margin.left, style.margin.right)
+        map.get(body).expect("a styled body").clone()
+    }
+
+    /// How far its content sits from each side of the window: the two edges
+    /// added together, which is the thing the floor is a floor on.
+    fn insets_after_floor(css: &str, least: f32, available_width: f32) -> (f32, f32) {
+        let style = after_floor(css, least, available_width);
+        let px = |length: Length| match length {
+            Length::Auto => 0.0,
+            length => length.to_px(style.font_size, available_width),
+        };
+        (
+            px(style.margin.left) + px(style.padding.left),
+            px(style.margin.right) + px(style.padding.right),
+        )
     }
 
     #[test]
-    fn the_edge_floor_raises_a_margin_that_is_under_it() {
-        let (left, right) = margins_after_floor("body { margin: 0 }", 8.0, 400.0);
-        assert_eq!(left, Length::Px(8.0));
-        assert_eq!(right, Length::Px(8.0));
+    fn the_edge_floor_holds_content_off_a_page_that_asked_for_nothing() {
+        assert_eq!(
+            insets_after_floor("body { margin: 0 }", 8.0, 400.0),
+            (8.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn the_edge_floor_is_made_of_padding_so_a_background_still_reaches_the_glass() {
+        // The whole reason it is not margin. Margin is outside the background,
+        // so topping it up puts a pale frame around every `body { margin: 0 }`
+        // page that set a colour — which is the opposite of what a gutter is
+        // for, and left §14.2 needing an exception to paper over.
+        let style = after_floor("body { margin: 0 }", 8.0, 400.0);
+        assert_eq!(style.margin.left, Length::Px(0.0), "the margin was raised");
+        assert_eq!(style.padding.left, Length::Px(8.0));
     }
 
     #[test]
     fn the_edge_floor_leaves_a_wider_margin_alone() {
         // A floor that overwrote whatever it found would be a fixed margin, and
         // would flatten every page's own spacing to the same eight pixels.
-        let (left, _) = margins_after_floor("body { margin: 40px }", 8.0, 400.0);
-        assert_eq!(left, Length::Px(40.0));
+        let style = after_floor("body { margin: 40px }", 8.0, 400.0);
+        assert_eq!(style.margin.left, Length::Px(40.0));
+        assert_eq!(
+            style.padding.left,
+            Length::Px(0.0),
+            "and adds nothing to it"
+        );
+    }
+
+    #[test]
+    fn the_edge_floor_counts_the_padding_a_page_already_asked_for() {
+        // The floor is on the distance from the glass, so a page that spent it
+        // on padding has already met it and a page that spent half of it needs
+        // only the other half.
+        let style = after_floor("body { margin: 0; padding: 0 20px }", 8.0, 400.0);
+        assert_eq!(style.padding.left, Length::Px(20.0), "padding was raised");
+
+        let topped = after_floor("body { margin: 0; padding: 0 3px }", 8.0, 400.0);
+        assert_eq!(
+            topped.padding.left,
+            Length::Px(8.0),
+            "3px plus the missing 5"
+        );
     }
 
     #[test]
     fn the_edge_floor_measures_a_percentage_margin_before_judging_it() {
         // 5% of 400px is 20px, which already clears the floor; 1% is 4px, which
         // does not. Comparing the numbers unresolved would get both wrong.
-        let (wide, _) = margins_after_floor("body { margin: 0 5% }", 8.0, 400.0);
-        assert_eq!(wide, Length::Percent(5.0), "a wide percentage was replaced");
+        let wide = after_floor("body { margin: 0 5% }", 8.0, 400.0);
+        assert_eq!(wide.margin.right, Length::Percent(5.0));
+        assert_eq!(
+            wide.padding.right,
+            Length::Px(0.0),
+            "a wide percentage was topped up anyway"
+        );
 
-        let (narrow, _) = margins_after_floor("body { margin: 0 1% }", 8.0, 400.0);
-        assert_eq!(narrow, Length::Px(8.0), "a narrow percentage was kept");
+        let narrow = after_floor("body { margin: 0 1% }", 8.0, 400.0);
+        assert_eq!(
+            narrow.padding.right,
+            Length::Px(4.0),
+            "1% of 400 is 4px, so 4 more are owed"
+        );
     }
 
     #[test]
     fn the_edge_floor_treats_an_auto_margin_as_asking_for_nothing() {
         // `margin: 0 auto` on a block of automatic width — which the body is —
         // resolves to zero, so the page has asked for no room at all.
-        let (left, right) = margins_after_floor("body { margin: 0 auto }", 8.0, 400.0);
-        assert_eq!((left, right), (Length::Px(8.0), Length::Px(8.0)));
+        assert_eq!(
+            insets_after_floor("body { margin: 0 auto }", 8.0, 400.0),
+            (8.0, 8.0)
+        );
     }
 
     #[test]
@@ -3740,5 +4338,66 @@ mod tests {
         let style = map.get(body).expect("a styled body");
         assert_eq!(style.margin.top, Length::Px(0.0));
         assert_eq!(style.margin.bottom, Length::Px(0.0));
+    }
+    #[test]
+    fn word_spacing_parses_like_letter_spacing() {
+        let style = style_of("<p>x</p>", "p { word-spacing: 20px }", "p");
+        assert_eq!(style.word_spacing, 20.0);
+        let normal = style_of("<p>x</p>", "p { word-spacing: normal }", "p");
+        assert_eq!(normal.word_spacing, 0.0);
+        // Resolved against the element's own font size, like `letter-spacing`.
+        let em = style_of(
+            "<p>x</p>",
+            "p { font-size: 20px; word-spacing: 0.5em }",
+            "p",
+        );
+        assert_eq!(em.word_spacing, 10.0);
+    }
+
+    #[test]
+    fn an_outline_is_parsed_whole_and_in_parts() {
+        let shorthand = style_of("<p>x</p>", "p { outline: 4px solid red }", "p");
+        assert_eq!(shorthand.outline.width, Length::Px(4.0));
+        assert_eq!(shorthand.outline.style, BorderStyle::Solid);
+        assert_eq!(shorthand.outline.color, Some(Color::rgb(255, 0, 0)));
+
+        // The shorthand resets what it does not mention, like `border`.
+        let reset = style_of(
+            "<p>x</p>",
+            "p { outline-width: 9px; outline: solid green }",
+            "p",
+        );
+        assert_eq!(reset.outline.width, Length::Px(MEDIUM_BORDER));
+
+        // And `invert`, which this engine takes as the element's own colour,
+        // is a colour the parser must not simply drop.
+        let inverted = style_of(
+            "<p>x</p>",
+            "p { outline: solid red; outline-color: invert }",
+            "p",
+        );
+        assert_eq!(inverted.outline.color, None);
+    }
+
+    #[test]
+    fn an_outline_width_alone_draws_nothing() {
+        // The same trap as `border-width`: without a style there is no line.
+        let style = style_of("<p>x</p>", "p { outline-width: 9px }", "p");
+        assert_eq!(style.outline.used_width(16.0), 0.0);
+    }
+
+    #[test]
+    fn an_ex_is_half_an_em() {
+        // CSS 2.1 has `ex` and this engine parsed it as nothing, which meant
+        // `outline-width: 0ex` left a medium outline standing where the suite
+        // asked for none.
+        let style = style_of("<p>x</p>", "p { font-size: 20px; margin-left: 2ex }", "p");
+        assert_eq!(style.margin.left.to_px(20.0, 0.0), 20.0);
+        let zero = style_of(
+            "<p>x</p>",
+            "p { outline: solid red; outline-width: 0ex }",
+            "p",
+        );
+        assert_eq!(zero.outline.used_width(16.0), 0.0);
     }
 }

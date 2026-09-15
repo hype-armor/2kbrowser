@@ -17,8 +17,10 @@ use cosmic_text::{
     Weight,
 };
 use css::style::{
-    ComputedStyle, FontStyle, GenericFamily, TextDecoration, VerticalAlign, Visibility, WhiteSpace,
+    ComputedStyle, Direction, FontStyle, FontVariant, GenericFamily, TextDecoration, UnicodeBidi,
+    VerticalAlign, Visibility, WhiteSpace,
 };
+use unicode_bidi::{BidiClass, BidiInfo, Level};
 
 /// Liberation Sans — metric-compatible with Arial and Helvetica (ADR-0008).
 const SANS: &[(&str, &[u8])] = &[
@@ -88,6 +90,24 @@ const MONO: &[(&str, &[u8])] = &[
 /// call, the existence of one is not.
 const MAX_GLYPH_SIZE: f32 = 2048.0;
 
+/// Whether a character is whitespace §16.6.1 collapses.
+///
+/// Deliberately not `char::is_whitespace`, which answers Unicode's White_Space
+/// question and so says yes to U+00A0. CSS collapses spaces, tabs and the line
+/// terminators, and a non-breaking space is none of those: it is a character
+/// with a width, and the whole point of writing one is that it survives. The
+/// era's markup leans on that harder than anything modern does — `&nbsp;` is
+/// how a page indented a paragraph, spaced a nav bar and held an empty table
+/// cell open — so treating it as collapsible quietly shortened a great many
+/// pages by exactly the spacing their authors had put in.
+///
+/// Carriage return and form feed are here because CSS lists them among the
+/// characters that collapse, even though HTML parsing has already turned a
+/// `\r\n` into a `\n` by the time any of this runs.
+pub fn is_collapsible_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+}
+
 /// One shaped, positioned glyph.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionedGlyph {
@@ -142,24 +162,273 @@ fn span_color(style: &ComputedStyle) -> Option<(u8, u8, u8, u8)> {
 /// between 0.52 and 0.53, and the value is halved before it is used.
 const X_HEIGHT: f32 = 0.5;
 
-/// The ascent and descent of an inline box's content area, as fractions of the
-/// font size.
+/// How much smaller a synthesised small capital is than a full one.
 ///
-/// §10.6.1 leaves the content area's height up to the user agent, and every
-/// browser answers with the font's own ascent and descent. These are those, for
-/// the faces bundled here: Liberation Serif is 0.891 over 0.216, Sans 0.905
-/// over 0.212, and Mono 0.833 over 0.300 — three fonts whose *sums* agree to
-/// within 0.026 even where the split does not.
+/// The bundled Liberation faces carry no small-caps variant, so `small-caps`
+/// has to be drawn rather than asked for: lowercase letters are set as capitals
+/// at this fraction of the size.
 ///
-/// Constants rather than a lookup because `cosmic-text` does not hand back the
-/// face's metrics with a shaped run: it reports a baseline that already has the
-/// line box's half-leading folded in, and the CSS `line-height` as the height.
-/// Deriving the content area from that would make a double-spaced paragraph
-/// highlight its phrases in bands that touch each other rather than at the size
-/// of the words, which is exactly what §10.6.1 says not to do.
-const ASCENT: f32 = 0.89;
-/// See [`ASCENT`].
-const DESCENT: f32 = 0.22;
+/// Measured rather than chosen: a 100px `x` in `small-caps` beside a 100px `X`
+/// in Chromium gives cap heights of 46 and 65, which is this number to within
+/// a rounded pixel. Reading it off a rendering was quicker than arguing about
+/// what a face with real small capitals would have done, and it puts this
+/// engine where the rest of the web already is.
+const SMALL_CAPS: f32 = 0.7;
+
+/// Maximal stretches of lowercase and of everything else, with their byte
+/// offsets into `text`.
+///
+/// Split at the case boundary rather than per character so a word keeps its
+/// shaping: `Word` is two pieces and not five, and the four letters after the
+/// capital are kerned against each other as they would be anywhere else.
+fn case_runs(text: &str) -> Vec<(usize, &str)> {
+    let mut out: Vec<(usize, &str)> = Vec::new();
+    let mut start = 0;
+    let mut lower: Option<bool> = None;
+    for (at, ch) in text.char_indices() {
+        let is_lower = ch.is_lowercase();
+        if lower.is_some_and(|was| was != is_lower) {
+            out.push((start, &text[start..at]));
+            start = at;
+        }
+        lower = Some(is_lower);
+    }
+    if start < text.len() {
+        out.push((start, &text[start..]));
+    }
+    out
+}
+
+/// Whether a line box gets §10.8.1's strut.
+///
+/// It always does in standards mode. The quirk is the one the era's layouts
+/// were built on: in quirks mode a line box holding no text at all — an image
+/// alone in a table cell, a spacer GIF, a sliced-image row — has no strut, so
+/// the cell is exactly as tall as the image and the famous few pixels of
+/// descender space below it do not appear. Pages of the period were authored
+/// against that, and a sliced image with a gap under every tile is not a near
+/// miss: it is the page visibly coming apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strut {
+    /// Standards mode: every line box has one.
+    Always,
+    /// Quirks mode: only a line with text on it.
+    WhereThereIsText,
+}
+
+/// A paragraph's bidi embedding levels, one per byte of the text analysed.
+///
+/// Owned rather than a borrowed `BidiInfo`, because the text it was computed
+/// over is built here and thrown away: the levels are the only part anything
+/// downstream needs, and keeping them by value spares every caller a lifetime.
+struct Bidi {
+    levels: Vec<Level>,
+    base: Level,
+}
+
+impl Bidi {
+    /// The level at a byte offset, or the paragraph's own past the end.
+    fn at(&self, offset: usize) -> Level {
+        self.levels.get(offset).copied().unwrap_or(self.base)
+    }
+}
+
+/// Runs the bidi algorithm over a whole inline formatting context, and says
+/// where each run's text landed in the string it was run over.
+///
+/// That string is not the text that will be drawn. §8.6 defines `unicode-bidi`
+/// by saying which control characters an element is equivalent to, so `embed`
+/// and `bidi-override` are implemented by writing those characters: they steer
+/// the algorithm and are never shaped. An atomic inline box becomes U+FFFC,
+/// the object replacement character UAX #9 asks for, so an image between two
+/// Hebrew words is ordered along with them instead of cutting the run in two.
+///
+/// One analysis for the whole context rather than one per run, because
+/// reordering is a property of the paragraph: a run measured on its own has no
+/// way to know that the word before it was Hebrew.
+fn analyse_bidi(runs: &[InlineRun], base: Direction) -> (Bidi, Vec<usize>) {
+    let base = match base {
+        Direction::Ltr => Level::ltr(),
+        Direction::Rtl => Level::rtl(),
+    };
+    let mut text = String::new();
+    let mut starts = Vec::with_capacity(runs.len());
+    for run in runs {
+        let (open, close) = match (run.style.unicode_bidi, run.style.direction) {
+            (UnicodeBidi::Normal, _) => ("", ""),
+            (UnicodeBidi::Embed, Direction::Ltr) => ("\u{202a}", "\u{202c}"),
+            (UnicodeBidi::Embed, Direction::Rtl) => ("\u{202b}", "\u{202c}"),
+            (UnicodeBidi::BidiOverride, Direction::Ltr) => ("\u{202d}", "\u{202c}"),
+            (UnicodeBidi::BidiOverride, Direction::Rtl) => ("\u{202e}", "\u{202c}"),
+        };
+        text.push_str(open);
+        starts.push(text.len());
+        if run.replaced.is_some() {
+            text.push('\u{fffc}');
+        } else {
+            text.push_str(&run.text);
+        }
+        text.push_str(close);
+    }
+    let info = BidiInfo::new(&text, Some(base));
+    (
+        Bidi {
+            levels: info.levels,
+            base,
+        },
+        starts,
+    )
+}
+
+/// Splits a piece of text into maximal stretches of one embedding level, with
+/// the level each carries.
+///
+/// `at` is where the text begins in the string [`analyse_bidi`] ran over.
+/// Always at least one stretch, so a caller can treat the last one as the end
+/// of the word without checking.
+fn level_runs<'a>(bidi: &Bidi, at: usize, text: &'a str) -> Vec<(Level, &'a str)> {
+    let mut out: Vec<(Level, &str)> = Vec::new();
+    let mut start = 0;
+    let mut level = bidi.at(at);
+    for (offset, _) in text.char_indices() {
+        let here = bidi.at(at + offset);
+        if here != level && offset > start {
+            out.push((level, &text[start..offset]));
+            start = offset;
+            level = here;
+        }
+    }
+    out.push((level, &text[start..]));
+    out
+}
+
+/// The text without the bidi formatting characters.
+///
+/// They steer the algorithm and are never drawn: UAX #9 removes them, and a
+/// shaper handed one either draws a box for it or — worse here — acts on it.
+/// Kept out of the shaped text as well as out of the glyphs, so a search of
+/// the page matches what a reader sees.
+fn without_bidi_controls(text: &str) -> String {
+    text.chars().filter(|&c| !is_bidi_control(c)).collect()
+}
+
+/// Whether a character is one of UAX #9's explicit formatting codes.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether a character is strongly right-to-left in its own right, rather than
+/// having been put that way by an override.
+fn is_strongly_rtl(c: char) -> bool {
+    matches!(
+        unicode_bidi::bidi_class(c),
+        BidiClass::R | BidiClass::AL | BidiClass::AN
+    )
+}
+
+/// The text with UAX #9's mirrored characters swapped for their pairs.
+///
+/// Only the pairs that turn up in running text: brackets, braces, angle
+/// brackets and the two sets of quotation guillemets. The full
+/// `Bidi_Mirroring_Glyph` property is a few hundred entries of mathematics
+/// that no page of this era contains, and the table below is data rather than
+/// an algorithm — which is the line this project draws around what it writes
+/// itself.
+///
+/// Every mapping is its own inverse, so this is safe to apply once and no more.
+fn mirrored(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '(' => ')',
+            ')' => '(',
+            '[' => ']',
+            ']' => '[',
+            '{' => '}',
+            '}' => '{',
+            '<' => '>',
+            '>' => '<',
+            '\u{00ab}' => '\u{00bb}',
+            '\u{00bb}' => '\u{00ab}',
+            '\u{2039}' => '\u{203a}',
+            '\u{203a}' => '\u{2039}',
+            other => other,
+        })
+        .collect()
+}
+
+/// Where a line sits and how much of the width it had.
+///
+/// Two numbers that always travel together and that a float pulls apart from
+/// the block's own content box: the line starts at `offset` and is `available`
+/// wide, which is what alignment measures against.
+#[derive(Debug, Clone, Copy)]
+struct Room {
+    offset: f32,
+    available: f32,
+}
+
+/// Turns a forwards-shaped run back to front, in place.
+///
+/// Each glyph keeps its own advance and takes the place its mirror image had:
+/// the last glyph starts at zero and the first ends at the run's width. The
+/// advances are read back out of the positions, which is what the shaper leaves
+/// behind — the final one is whatever is left between the last glyph and the
+/// end of the run.
+fn mirror(shaped: &mut Shaped) {
+    let width = shaped.width;
+    let mut advances: Vec<f32> = Vec::with_capacity(shaped.glyphs.len());
+    for at in 0..shaped.glyphs.len() {
+        let next = shaped.glyphs.get(at + 1).map_or(width, |glyph| glyph.x);
+        advances.push((next - shaped.glyphs[at].x).max(0.0));
+    }
+    for (glyph, advance) in shaped.glyphs.iter_mut().zip(&advances) {
+        glyph.x = width - glyph.x - advance;
+    }
+    // Left to right again, so anything downstream that walks the glyphs in
+    // order walks them across the page.
+    shaped.glyphs.reverse();
+}
+
+/// The order to draw a line's segments in, left to right (UAX #9's rule L2).
+///
+/// Indices into `levels`. An all-even line comes back in its own order, which
+/// is why this can run on every line rather than behind a test for
+/// right-to-left content — one code path that every page exercises beats a
+/// rare one that nothing does.
+fn visual_order(levels: &[Level]) -> Vec<usize> {
+    BidiInfo::reorder_visual(levels)
+}
+
+/// A face's vertical metrics, as fractions of the font size.
+///
+/// Two questions are answered from these and they are not the same question.
+/// §10.8.1's `line-height: normal` is the whole of it — ascent, descent and the
+/// gap the face asks for between one line and the next. §10.6.1's content area,
+/// which is what an inline box's background covers, is the ascent and descent
+/// *without* the gap: the gap is space between two lines rather than part of
+/// either, and a background drawn over it would run into the line above.
+#[derive(Debug, Clone, Copy)]
+struct FaceMetrics {
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+}
+
+impl FaceMetrics {
+    /// For text with no face to measure — an empty span, a line of spaces, a
+    /// script no bundled face covers.
+    ///
+    /// The numbers are the bundled faces' own, near enough: Liberation Serif is
+    /// 0.891 over 0.216, Sans 0.905 over 0.212, and Mono 0.833 over 0.300, and
+    /// all three ask for no line gap at all. Their *sums* agree to within 0.026
+    /// even where the split does not, which is why a single fallback is
+    /// defensible and why it comes to about the same 1.11 a real face reports.
+    const FALLBACK: Self = Self {
+        ascent: 0.89,
+        descent: 0.22,
+        leading: 0.0,
+    };
+}
 
 /// An atomic inline box that takes up room on a line without contributing
 /// glyphs — an image, in practice.
@@ -232,6 +501,13 @@ pub struct InlineEdge {
     pub width: f32,
     /// Whether this is the box's opening side rather than its closing one.
     pub opening: bool,
+    /// Whether the box's own `direction` is right-to-left.
+    ///
+    /// Which side "opening" means, and not answerable from the bidi level the
+    /// side happens to sit at: an override inside a left-to-right `<span>`
+    /// puts the span's own closing side at a right-to-left level, and the
+    /// border still belongs on the right.
+    pub rtl: bool,
 }
 
 /// A run of text with its own style, within a block's inline content.
@@ -389,6 +665,14 @@ pub struct Line {
     pub text: String,
     /// Width of the line's inked content.
     pub width: f32,
+    /// Room this line actually had, which is not always the block's content
+    /// width: a float narrows it, and `text-align: right` beside one must
+    /// measure from the edge of the room rather than from the edge of the box.
+    ///
+    /// Never wider than the content box in practice, but not guaranteed to be:
+    /// a form control's label is shaped at an unwrapped width on purpose, so
+    /// callers take the smaller of this and the box they are aligning within.
+    pub available: f32,
     /// Top of the line box, relative to the text origin.
     pub y: f32,
     /// Distance from the line box top to the baseline.
@@ -443,6 +727,22 @@ struct Segment {
     align: VerticalAlign,
     /// Horizontal position within the line, filled in during placement.
     x: f32,
+    /// The embedding level of the whitespace that follows this segment, which
+    /// is not always the segment's own.
+    ///
+    /// A space between two Hebrew words is right-to-left and travels with
+    /// them; the space between the last Hebrew word and the English after it
+    /// is a neutral that takes the paragraph's direction, and belongs at the
+    /// far end of the Hebrew rather than inside it. Same character, same
+    /// place in the source, two different answers — which is why it needs a
+    /// level of its own rather than borrowing the segment's.
+    space_level: Level,
+    /// This segment's bidi embedding level (§8.6 / UAX #9).
+    ///
+    /// Even is left-to-right, odd is right-to-left. Carried per segment because
+    /// reordering happens per *line*, and which segments share a line is not
+    /// known until the line has been filled.
+    level: Level,
     /// Decoration the segment's style asks for.
     decoration: TextDecoration,
     /// The segment's font size, which sets where its rules sit and how thick
@@ -456,6 +756,11 @@ struct Segment {
     edge: Option<InlineEdge>,
     /// The drawn inline boxes this segment sits inside, outermost first.
     boxes: Vec<usize>,
+    /// The content area of the face this segment is set in: its ascent above
+    /// the baseline and its descent below it, in pixels (§10.6.1). What an
+    /// inline box's background covers, and not the line box, which
+    /// `line-height` moves around independently.
+    content: (f32, f32),
 }
 
 impl Segment {
@@ -503,6 +808,12 @@ pub struct FontStore {
     /// pages against baselines byte for byte, so a cache that returned the
     /// wrong glyphs would fail them rather than pass quietly.
     shaped: std::collections::HashMap<(AttrsOwned, String), Shaped>,
+    /// What `line-height: normal` comes to for a set of attributes, per em.
+    ///
+    /// Asked once per line of every page and answered from a face's metrics,
+    /// which means finding the face — so it is cached by the attributes rather
+    /// than by the size, and multiplied by the size on the way out.
+    face_metrics: std::collections::HashMap<AttrsOwned, FaceMetrics>,
 }
 
 impl Default for FontStore {
@@ -540,6 +851,7 @@ impl FontStore {
             system,
             cache: SwashCache::new(),
             shaped: std::collections::HashMap::new(),
+            face_metrics: std::collections::HashMap::new(),
         }
     }
 
@@ -603,16 +915,97 @@ impl FontStore {
 
     /// The line height to lay out with.
     ///
-    /// A line height reaches here from the cascade, and the cascade computes it
-    /// from the font size — so `font-size: 1e40px`, which parses to infinity in
-    /// an `f32`, arrives as an infinite line height and poisons every
-    /// coordinate downstream. Geometry that leaves this crate is finite.
-    fn line_height_for(style: &ComputedStyle) -> f32 {
-        if style.line_height.is_finite() && style.line_height >= 0.0 {
-            style.line_height
+    /// `normal` arrives unresolved from the cascade, which has no fonts, and is
+    /// answered here from the face's own metrics (§10.8.1). Everything else is
+    /// already a number of pixels — and is checked, because the cascade computes
+    /// it from the font size and `font-size: 1e40px` parses to infinity in an
+    /// `f32`. Geometry that leaves this crate is finite.
+    pub fn used_line_height(&mut self, style: &ComputedStyle) -> f32 {
+        // Measured only where it is needed: `normal` is the one form that costs
+        // a font lookup, and the other two are arithmetic.
+        let normal = if style.line_height.is_normal() {
+            self.normal_line_height(style)
         } else {
             0.0
+        };
+        style.line_height.resolve(style.font_size, normal)
+    }
+
+    /// What `normal` comes to for the face this style resolves to: its ascent,
+    /// its descent and the line gap between one line and the next, which is
+    /// what §10.8.1's "based on the font" means and what every browser uses.
+    fn normal_line_height(&mut self, style: &ComputedStyle) -> f32 {
+        let (ascent, descent) = self.content_box(style);
+        let face = self.face_metrics_for(style);
+        // Rounded, like the halves it is built from. A line box a fraction of a
+        // pixel tall accumulates down a page: forty lines of a third of a pixel
+        // is a line's worth of drift by the bottom, and it lands differently
+        // depending on how many lines came first.
+        (ascent + descent + face.leading * style.font_size.max(0.0)).round()
+    }
+
+    /// The content area an inline box covers: the face's ascent above the
+    /// baseline and its descent below it, in pixels (§10.6.1).
+    ///
+    /// The line *gap* is deliberately absent. It is space between one line and
+    /// the next, not part of either — so a background drawn over it would run
+    /// into the line above.
+    /// Rounded to whole pixels, which is what every browser built on FreeType
+    /// does and is not cosmetic: the ascent decides where a baseline sits, and
+    /// a baseline on a half pixel is a line of text rendered through a filter.
+    /// It is also what makes a line height stable — the same font at the same
+    /// size gives the same integer however many lines precede it.
+    pub fn content_box(&mut self, style: &ComputedStyle) -> (f32, f32) {
+        let face = self.face_metrics_for(style);
+        let size = style.font_size.max(0.0);
+        ((face.ascent * size).round(), (face.descent * size).round())
+    }
+
+    /// The face's vertical metrics, per em.
+    ///
+    /// The face is found by shaping one character rather than by asking the
+    /// font database, because `cosmic-text` keeps its matching to itself: the
+    /// id inside a `FontMatchKey` is private and a glyph's is not. `x` is the
+    /// probe — present in every face bundled here, and cheap because the
+    /// shaping cache answers the second request for it.
+    ///
+    /// Cached, because it is asked once per line of every page. A run with no
+    /// glyphs — an empty span, a line of spaces, a script no bundled face
+    /// covers — has no face to ask and gets [`FaceMetrics::FALLBACK`].
+    fn face_metrics_for(&mut self, style: &ComputedStyle) -> FaceMetrics {
+        if !(style.font_size.is_finite() && style.font_size > 0.0) {
+            return FaceMetrics::FALLBACK;
         }
+        let key = AttrsOwned::new(&Self::attrs_for(style, style.font_size));
+        if let Some(found) = self.face_metrics.get(&key) {
+            return *found;
+        }
+        let measured = self.measure_face(style).unwrap_or(FaceMetrics::FALLBACK);
+        self.face_metrics.insert(key, measured);
+        measured
+    }
+
+    /// Reads the face's metrics, or `None` when no face could be found.
+    fn measure_face(&mut self, style: &ComputedStyle) -> Option<FaceMetrics> {
+        // A line height that cannot come back round to `normal`: this is what
+        // answers that question, so it must not ask it.
+        let probe = self.shape_with("x", style, style.font_size);
+        let font = self.system.get_font(probe.glyphs.first()?.font_id)?;
+        let metrics = font.as_swash().metrics(&[]);
+        let units = f32::from(metrics.units_per_em);
+        if units <= 0.0 {
+            return None;
+        }
+        let face = FaceMetrics {
+            ascent: metrics.ascent / units,
+            descent: metrics.descent / units,
+            leading: metrics.leading.max(0.0) / units,
+        };
+        let sane = face.ascent.is_finite()
+            && face.descent.is_finite()
+            && face.leading.is_finite()
+            && face.ascent + face.descent > 0.0;
+        sane.then_some(face)
     }
 
     /// Metrics cosmic-text will accept.
@@ -631,7 +1024,7 @@ impl FontStore {
     ///
     /// Non-finite values are floored for the same reason: a `NaN` size would
     /// propagate silently into every coordinate downstream of it.
-    fn metrics_for(style: &ComputedStyle) -> Metrics {
+    fn metrics_for(style: &ComputedStyle, line_height: f32) -> Metrics {
         /// Small enough to be invisible, large enough that no arithmetic
         /// downstream divides by something near zero.
         const FLOOR: f32 = 0.01;
@@ -640,8 +1033,8 @@ impl FontStore {
         } else {
             FLOOR
         };
-        let line = if style.line_height.is_finite() && style.line_height > FLOOR {
-            style.line_height
+        let line = if line_height.is_finite() && line_height > FLOOR {
+            line_height
         } else {
             FLOOR
         };
@@ -649,7 +1042,7 @@ impl FontStore {
     }
 
     /// Attributes for one inline span.
-    fn attrs_for(style: &ComputedStyle) -> Attrs<'static> {
+    fn attrs_for(style: &ComputedStyle, line_height: f32) -> Attrs<'static> {
         Attrs::new()
             // Part of the shaping key, which is what makes this safe to cache:
             // the same words at two spacings are two different shapings and
@@ -675,7 +1068,7 @@ impl FontStore {
                 FontStyle::Italic => Style::Italic,
                 FontStyle::Normal => Style::Normal,
             })
-            .metrics(Self::metrics_for(style))
+            .metrics(Self::metrics_for(style, line_height))
             .color(cosmic_text::Color::rgba(
                 style.color.r,
                 style.color.g,
@@ -695,7 +1088,125 @@ impl FontStore {
     /// Shaping happens per segment rather than per character, so joining
     /// scripts and ligatures within a segment stay correct; segments are cut
     /// only at Unicode break opportunities, where shaping does not carry over.
+    /// Shapes a segment that the bidi algorithm has put at `level`.
+    ///
+    /// Right-to-left *script* needs nothing: `cosmic-text` shapes Hebrew and
+    /// Arabic in their own direction from the characters themselves, which is
+    /// why they came out right long before any of this existed.
+    ///
+    /// What needs handling is left-to-right text that an override has put at a
+    /// right-to-left level — `unicode-bidi: bidi-override`, or a U+202E in the
+    /// source. The shaper does not act on the explicit formatting codes at all:
+    /// handed `<RLO>abcdef<PDF>` it shapes two blank glyphs and six letters
+    /// forwards, which was worth measuring before believing. So the run is
+    /// shaped forwards and then mirrored here.
+    ///
+    /// That is rule L2 applied to glyphs rather than to segments, and it is the
+    /// one piece of UAX #9 this engine does itself. It is not the part the
+    /// plan says to leave alone — the levels still come from `unicode-bidi` —
+    /// and there is nowhere else to put it: no shaper will reverse letters it
+    /// has been given no reason to reverse.
+    fn shape_directed(&mut self, text: &str, style: &ComputedStyle, level: Level) -> Shaped {
+        // The controls have done their work in `analyse_bidi` and are not
+        // content. Left in, they shape as blank boxes that take real width.
+        let bare = without_bidi_controls(text);
+        if bare.is_empty() {
+            return Shaped::default();
+        }
+        if level.is_ltr() || bare.chars().any(is_strongly_rtl) {
+            return self.shape_segment(&bare, style);
+        }
+        // Rule L4 as well as L2: a bracket in right-to-left text is drawn as
+        // the bracket that faces the other way, so that `(x)` reads as `(x)`
+        // once the run has been turned round rather than as `)x(`. Done by
+        // shaping the mirrored characters rather than by substituting glyphs,
+        // which leaves the shaper to find them — it is the one that knows what
+        // is in the face.
+        let mut shaped = self.shape_segment(&mirrored(&bare), style);
+        mirror(&mut shaped);
+        // The offsets index the text the author wrote, and mirroring is
+        // character for character, so they still line up.
+        shaped.text = bare;
+        shaped
+    }
+
     fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Shaped {
+        let line_height = self.used_line_height(style);
+        if style.font_variant == FontVariant::SmallCaps {
+            return self.shape_small_caps(text, style, line_height);
+        }
+        self.shape_with(text, style, line_height)
+    }
+
+    /// Draws lowercase letters as smaller capitals (§15.8's `small-caps`).
+    ///
+    /// Synthesised, because the bundled faces have no small-caps variant to ask
+    /// for and there is nowhere else to get one. The synthesis is the standard
+    /// one: uppercase the lowercase letters and shape them at [`SMALL_CAPS`] of
+    /// the size, leaving every other character alone.
+    ///
+    /// The line's metrics come from the full-size shaping rather than from the
+    /// pieces. A word that happens to be all lowercase would otherwise sit on a
+    /// shorter line than the word beside it, and a paragraph of small caps
+    /// would read as a paragraph somebody set in a smaller font.
+    fn shape_small_caps(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Shaped {
+        let mut plain = style.clone();
+        plain.font_variant = FontVariant::Normal;
+        let mut small = plain.clone();
+        small.font_size = style.font_size * SMALL_CAPS;
+
+        // Full size, for the ascent and the line height — and for the whole
+        // answer when the segment has no lowercase in it to shrink, which on a
+        // page that sets this is most of them.
+        let full = self.shape_with(text, &plain, line_height);
+        if !text.chars().any(char::is_lowercase) {
+            return full;
+        }
+
+        let mut out = Shaped {
+            text: text.to_owned(),
+            ascent: full.ascent,
+            height: full.height,
+            ..Shaped::default()
+        };
+        for (at, piece) in case_runs(text) {
+            let raised = piece.to_uppercase();
+            let lower = piece.starts_with(char::is_lowercase);
+            let shaped = if lower {
+                self.shape_with(&raised, &small, line_height)
+            } else {
+                self.shape_with(piece, &plain, line_height)
+            };
+            // `to_uppercase` can change a piece's length — ß becomes SS — while
+            // the glyph offsets index the *original* text, which is what a
+            // search and a selection are made of. So they are shifted where the
+            // two lengths agree, which is every ASCII word, and collapsed to the
+            // whole piece where they do not: a selection that snaps to one word
+            // beats an offset pointing into the middle of a character.
+            let exact = !lower || raised.len() == piece.len();
+            for glyph in &shaped.glyphs {
+                let (start, end) = if exact {
+                    (at + glyph.start, at + glyph.end)
+                } else {
+                    (at, at + piece.len())
+                };
+                out.glyphs.push(PositionedGlyph {
+                    x: glyph.x + out.width,
+                    start,
+                    end,
+                    ..*glyph
+                });
+            }
+            out.width += shaped.width;
+        }
+        out
+    }
+
+    /// The same, at a line height already resolved.
+    ///
+    /// Split out so that measuring what `normal` means can shape its probe
+    /// without asking what `normal` means.
+    fn shape_with(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Shaped {
         if text.is_empty() {
             return Shaped::default();
         }
@@ -709,7 +1220,7 @@ impl FontStore {
                 ..Shaped::default()
             };
         }
-        let attrs = Self::attrs_for(style);
+        let attrs = Self::attrs_for(style, line_height);
         // Keyed on the attributes themselves rather than on a list of the style
         // properties that matter. `AttrsOwned` carries exactly what `Attrs`
         // carries — the family, the weight, the slant, the colour, and the
@@ -728,7 +1239,7 @@ impl FontStore {
             return shaped.clone();
         }
 
-        let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style));
+        let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style, line_height));
         let mut buffer = buffer.borrow_with(&mut self.system);
         // No width limit: a segment is by definition not broken further.
         buffer.set_size(None, None);
@@ -780,7 +1291,18 @@ impl FontStore {
         default_style: &ComputedStyle,
         max_width: f32,
     ) -> TextLayout {
-        self.layout_runs_constrained(runs, default_style, |_, _| (0.0, max_width))
+        self.layout_runs_in(runs, default_style, Strut::Always, |_, _| (0.0, max_width))
+    }
+
+    /// The same, told whether the document's mode puts a strut on every line.
+    pub fn layout_runs_with(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        strut: Strut,
+        max_width: f32,
+    ) -> TextLayout {
+        self.layout_runs_in(runs, default_style, strut, |_, _| (0.0, max_width))
     }
 
     /// Shapes and wraps runs where the available width varies down the page.
@@ -803,7 +1325,22 @@ impl FontStore {
     where
         F: Fn(f32, f32) -> (f32, f32),
     {
-        let segments = self.segment(runs);
+        self.layout_runs_in(runs, default_style, Strut::Always, constraints)
+    }
+
+    /// The whole of it: runs, a strut rule, and a width that varies down the
+    /// page.
+    pub fn layout_runs_in<F>(
+        &mut self,
+        runs: &[InlineRun],
+        default_style: &ComputedStyle,
+        strut: Strut,
+        constraints: F,
+    ) -> TextLayout
+    where
+        F: Fn(f32, f32) -> (f32, f32),
+    {
+        let segments = self.segment(runs, default_style.direction);
         if segments.is_empty() {
             return TextLayout::default();
         }
@@ -822,9 +1359,30 @@ impl FontStore {
         let mut y = 0.0f32;
         let mut current: Vec<Segment> = Vec::new();
         let mut x = 0.0f32;
-        let mut line_height = Self::line_height_for(default_style);
+        let held_height = self.used_line_height(default_style);
+        let line_height = held_height;
+        // §10.8.1's strut: an invisible box of the block's own font and line
+        // height, on every line box whether or not there is text on it.
+        //
+        // Its ascent was `font_size * 0.8` — near enough for deciding how tall
+        // a line is, and nowhere near enough for deciding how far *below* the
+        // baseline the line reaches, which is the same number subtracted from
+        // the line height. The face's own metrics put an image alone in a table
+        // cell on the pixel row a browser puts it on; the approximation put it
+        // more than a pixel out, and that difference is the whole of the era's
+        // sliced-image layouts.
+        let (strut_ascent, strut_descent) =
+            Self::strut(self.content_box(default_style), line_height);
+        let (strut_ascent, strut_descent, strut_height) = match strut {
+            Strut::Always => (strut_ascent, strut_descent, line_height),
+            // Held back until a line turns out to have text on it, and applied
+            // then rather than here: what it contributes is the same either
+            // way, and this is the only place that knows the difference.
+            Strut::WhereThereIsText => (0.0, 0.0, 0.0),
+        };
+        let mut line_height = strut_height;
         let mut ascent = if default_style.font_size.is_finite() {
-            default_style.font_size * 0.8
+            strut_ascent
         } else {
             0.0
         };
@@ -841,7 +1399,16 @@ impl FontStore {
         // `line-height` — and mixing them here is the half-leading model, which
         // is a larger change than this: it moves every line on every page,
         // including ones with nothing atomic on them at all.
-        let mut descent = 0.0f32;
+        //
+        // The strut's own descent is the exception, and it is not an exception
+        // to the paragraph above: it is the same number for every line in the
+        // block, so it can be taken once here without asking what landed on
+        // any particular line. §10.8.1 puts the strut on every line box whether
+        // or not there is text on it, which is what gives an image alone in a
+        // table cell the few pixels of room below it that the era's sliced-image
+        // layouts are famous for tripping over. Without it a line held nothing
+        // but its tallest box and the descender space vanished.
+        let mut descent = strut_descent;
 
         // The available width depends on the line's height, and the height
         // depends on what lands on the line. Query with the height so far and
@@ -868,15 +1435,30 @@ impl FontStore {
         for segment in segments {
             let fits = current.is_empty() || x + segment.shaped.width <= available;
             if !fits {
-                let (offset, _) = constraints(y, line_height);
+                // Ended because the next word would not fit, so this is not the
+                // last line of its paragraph and §16.2 justifies it.
+                let justify = (default_style.text_align == css::style::TextAlign::Justify)
+                    .then_some(available);
+                let (offset, room) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
-                Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
+                Self::push_line(
+                    &mut layout,
+                    &mut current,
+                    Room {
+                        offset,
+                        available: room,
+                    },
+                    y,
+                    ascent,
+                    line_height,
+                    justify,
+                );
                 y += line_height;
                 x = 0.0;
-                line_height = Self::line_height_for(default_style);
-                ascent = default_style.font_size * 0.8;
-                descent = 0.0;
+                line_height = strut_height;
+                ascent = strut_ascent;
+                descent = strut_descent;
                 available = constraints(y, line_height).1;
             }
 
@@ -903,6 +1485,16 @@ impl FontStore {
                     ascent = ascent.max(segment.shaped.ascent);
                     if replaced.is_some() {
                         descent = descent.max(segment.shaped.height - segment.shaped.ascent);
+                    } else if strut == Strut::WhereThereIsText {
+                        // Text on the line, so the quirk does not apply to it
+                        // after all and the strut joins in — from here on, and
+                        // not retroactively, which is the same thing: every
+                        // contribution is a maximum.
+                        let (held_ascent, held_descent) =
+                            Self::strut(self.content_box(default_style), held_height);
+                        ascent = ascent.max(held_ascent);
+                        descent = descent.max(held_descent);
+                        line_height = line_height.max(held_height);
                     }
                     line_height = line_height.max(segment.shaped.height);
                 }
@@ -920,13 +1512,24 @@ impl FontStore {
             // A newline in `pre`, or any other mandatory opportunity, ends the
             // line regardless of how much room is left.
             if forced {
-                let (offset, _) = constraints(y, line_height);
+                let (offset, room) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
-                Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
+                Self::push_line(
+                    &mut layout,
+                    &mut current,
+                    Room {
+                        offset,
+                        available: room,
+                    },
+                    y,
+                    ascent,
+                    line_height,
+                    None,
+                );
                 y += line_height;
                 x = 0.0;
-                line_height = Self::line_height_for(default_style);
+                line_height = self.used_line_height(default_style);
                 ascent = default_style.font_size * 0.8;
                 descent = 0.0;
                 available = constraints(y, line_height).1;
@@ -934,9 +1537,20 @@ impl FontStore {
         }
 
         if !current.is_empty() {
-            let (offset, _) = constraints(y, line_height);
+            let (offset, room) = constraints(y, line_height);
             let offset = offset + if first_line { indent } else { 0.0 };
-            Self::push_line(&mut layout, &mut current, offset, y, ascent, line_height);
+            Self::push_line(
+                &mut layout,
+                &mut current,
+                Room {
+                    offset,
+                    available: room,
+                },
+                y,
+                ascent,
+                line_height,
+                None,
+            );
             y += line_height;
         }
 
@@ -952,11 +1566,83 @@ impl FontStore {
     fn push_line(
         layout: &mut TextLayout,
         current: &mut Vec<Segment>,
-        offset: f32,
+        room: Room,
         line_y: f32,
         ascent: f32,
         line_height: f32,
+        justify_to: Option<f32>,
     ) {
+        // UAX #9's rule L2, and the whole of what bidi costs this engine: the
+        // segments were filled in *logical* order, and a line is drawn in
+        // visual order. `reorder_visual` returns its input's own order for an
+        // all-left-to-right line, so this runs unconditionally rather than
+        // behind a test for right-to-left content — one code path that is
+        // exercised by every page rather than a rare one that is not.
+        //
+        // The x positions are recomputed here rather than trusted from the
+        // fill loop, which assigned them left to right as each word arrived
+        // and could not have known what would land beside them.
+        let order = Self::visual_line(current);
+        let mut pen = 0.0;
+        // Whitespace owed to the far end of a right-to-left run: it follows the
+        // run in logical order and so follows it visually too, which is past
+        // every segment of the run rather than beside the one that carries it.
+        let mut owed = 0.0;
+        for &at in &order {
+            let segment = &mut current[at];
+            if segment.level.is_rtl() {
+                // A space *inside* a right-to-left run is drawn before the word
+                // it follows, "after" being the logical side and this the
+                // visual one. Keeping it on the right in both cases sends the
+                // space between two Hebrew words to the end of the line, where
+                // it is invisible and the two words end up touching.
+                if segment.space_level.is_rtl() {
+                    pen += segment.trailing_space;
+                    segment.x = pen;
+                    pen += segment.shaped.width;
+                } else {
+                    segment.x = pen;
+                    pen += segment.shaped.width;
+                    owed += segment.trailing_space;
+                }
+            } else {
+                pen += std::mem::take(&mut owed);
+                segment.x = pen;
+                pen += segment.shaped.width + segment.trailing_space;
+            }
+        }
+
+        // §16.2: `justify` stretches the spaces until the line fills its box.
+        // Only the spaces — letters stay where the shaper put them — and only
+        // on a line that was ended because the next word would not fit. The
+        // last line of a paragraph, and the line before a forced break, keep
+        // their natural width, which is why the caller decides rather than this.
+        if let Some(target) = justify_to {
+            let inked = order
+                .last()
+                .map_or(0.0, |&at| current[at].x + current[at].shaped.width);
+            let gaps = order
+                .iter()
+                .take(order.len().saturating_sub(1))
+                .filter(|&&at| current[at].trailing_space > 0.0)
+                .count();
+            let slack = target - inked;
+            if gaps > 0 && slack > 0.0 {
+                let each = slack / gaps as f32;
+                let mut shift = 0.0;
+                // In visual order, because that is the order the gaps appear
+                // in: walking the logical one would widen the space after a
+                // Hebrew word by however much the words drawn to its *right*
+                // had claimed.
+                for &at in &order {
+                    current[at].x += shift;
+                    if current[at].trailing_space > 0.0 {
+                        shift += each;
+                    }
+                }
+            }
+        }
+        let Room { offset, available } = room;
         let mut glyphs = Vec::new();
         let mut text = String::new();
         let mut width = 0.0f32;
@@ -991,14 +1677,105 @@ impl FontStore {
             glyphs,
             replaced: Self::replaced_for(current, offset, line_y, ascent, line_height),
             spans: Self::spans_for(current, offset, line_y, line_height),
-            boxes: Self::boxes_for(current, offset, line_y + ascent),
+            boxes: Self::boxes_for(current, &order, offset, line_y + ascent),
             decorations: Self::decorations_for(current, offset, line_y + ascent),
             text,
             width,
+            available,
             y: line_y,
             baseline: ascent,
         });
         current.clear();
+    }
+
+    /// The strut's half of a line box: how far it reaches above and below the
+    /// baseline (§10.8.1).
+    ///
+    /// `line-height` is distributed evenly above and below the content area —
+    /// half-leading — rather than being added underneath. A paragraph set at
+    /// `line-height: 2` has its extra room split between the lines, not hung
+    /// off the bottom of each one, and putting it all below is what tips text
+    /// out of the middle of a table cell.
+    fn strut(content: (f32, f32), line_height: f32) -> (f32, f32) {
+        let (ascent, descent) = content;
+        let leading = (line_height - ascent - descent) / 2.0;
+        ((ascent + leading).max(0.0), (descent + leading).max(0.0))
+    }
+
+    /// The order to draw this line's segments in, left to right.
+    ///
+    /// UAX #9's rule L2 over the *text*, and then the inline boxes' own sides
+    /// put back where they belong. An `<a>`'s left border is not a character
+    /// and does not reorder like one: §8.4 puts it at the start edge of the
+    /// box, which is the left of its leftmost fragment for a left-to-right
+    /// box and the right of its rightmost for a right-to-left one, however the
+    /// text inside it was rearranged.
+    ///
+    /// Reordering the sides along with the text is what put a span's left
+    /// padding on the wrong side of the word it belonged to, and it only
+    /// showed up once `direction` was honoured at all — before that, no line
+    /// was ever reordered and every side happened to be in the right place.
+    fn visual_line(current: &[Segment]) -> Vec<usize> {
+        let content: Vec<usize> = (0..current.len())
+            .filter(|&at| current[at].edge.is_none())
+            .collect();
+        let levels: Vec<Level> = content.iter().map(|&at| current[at].level).collect();
+        // Visual position of each content segment, by its index in `current`.
+        let mut visual = vec![0usize; current.len()];
+        for (position, &at) in visual_order(&levels).iter().enumerate() {
+            visual[content[at]] = position;
+        }
+
+        // Where a box's content sits on this line, visually.
+        let span_of = |box_: usize| {
+            content
+                .iter()
+                .filter(|&&at| current[at].boxes.contains(&box_))
+                .fold(None, |found: Option<(usize, usize)>, &at| {
+                    let here = visual[at];
+                    Some(match found {
+                        Some((first, last)) => (first.min(here), last.max(here)),
+                        None => (here, here),
+                    })
+                })
+        };
+
+        let mut keys: Vec<(f32, usize)> = Vec::with_capacity(current.len());
+        for (at, segment) in current.iter().enumerate() {
+            let key = match segment.edge {
+                None => visual[at] as f32,
+                Some(edge) => {
+                    let Some(&box_) = segment.boxes.last() else {
+                        continue;
+                    };
+                    // How deeply nested this box is, so that when two boxes
+                    // share an edge the outer one's side stays outside the
+                    // inner one's. A *larger* depth sits nearer the content,
+                    // which is why it moves the key inwards on both sides —
+                    // getting that backwards nests `<div><div>` the wrong way
+                    // round and is not a bidi bug at all: it shows up on a
+                    // plain left-to-right page with two borders in a row.
+                    let depth = (segment.boxes.len() as f32 / 1000.0).min(0.4);
+                    match span_of(box_) {
+                        // An empty box has no content to hang from and keeps
+                        // the place the source gave it.
+                        None => visual.get(at).copied().unwrap_or(at) as f32,
+                        Some((first, last)) => {
+                            if edge.opening != edge.rtl {
+                                first as f32 - 0.5 + depth
+                            } else {
+                                last as f32 + 0.5 - depth
+                            }
+                        }
+                    }
+                }
+            };
+            keys.push((key, at));
+        }
+        // Stable, so segments that tie keep source order — which is what
+        // settles two empty boxes side by side.
+        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+        keys.into_iter().map(|(_, at)| at).collect()
     }
 
     /// One fragment per inline box crossing this line.
@@ -1012,28 +1789,46 @@ impl FontStore {
     /// line box. §10.6.1: `line-height` does not grow an inline box's
     /// background, so a paragraph set double-spaced highlights its phrases at
     /// the size of the words rather than in bands that touch.
-    fn boxes_for(segments: &[Segment], offset: f32, baseline: f32) -> Vec<InlineBoxFragment> {
+    fn boxes_for(
+        segments: &[Segment],
+        order: &[usize],
+        offset: f32,
+        baseline: f32,
+    ) -> Vec<InlineBoxFragment> {
         let mut out: Vec<InlineBoxFragment> = Vec::new();
-        for segment in segments {
+        // In *visual* order, and merging only into a fragment the previous
+        // segment was also part of. Reordering can cut a box in two on one
+        // line — a `<span>` around text an override sends to the far side of
+        // its neighbours is drawn as two boxes with the neighbours between
+        // them — and merging by element alone would draw one box spanning the
+        // gap, with a border straight through the text that is not inside it.
+        let mut previous: Vec<usize> = Vec::new();
+        for &at in order {
+            let segment = &segments[at];
             let left = segment.x + offset;
             let right = left + segment.shaped.width;
             let (top, height) = match segment.replaced {
                 // An atomic box hangs from the baseline by its own; the inline
                 // box around it has to cover all of it.
                 Some(box_) => (baseline - box_.baseline, box_.height),
-                // §10.6.1: the content area, which `line-height` moves the
-                // lines around but does not grow. Taken as the em box — the
-                // same 0.8 ascent the line breaker already assumes — rather
-                // than from the shaped metrics, which carry the CSS line
-                // height and would put a double-spaced paragraph's highlights
-                // in bands that touch.
+                // §10.6.1: the content area, from the face's own ascent and
+                // descent. Not from the shaped metrics, which carry the CSS
+                // line height — that would put a double-spaced paragraph's
+                // highlights in bands that touch each other rather than at the
+                // size of the words.
                 None => (
-                    baseline - segment.font_size * ASCENT,
-                    segment.font_size * (ASCENT + DESCENT),
+                    baseline - segment.content.0,
+                    segment.content.0 + segment.content.1,
                 ),
             };
             for &source in &segment.boxes {
-                match out.iter_mut().find(|box_| box_.source == source) {
+                let joins = previous.contains(&source);
+                match out
+                    .iter_mut()
+                    .rev()
+                    .find(|box_| box_.source == source)
+                    .filter(|_| joins)
+                {
                     Some(found) => {
                         found.width = right - found.x;
                         let bottom = (found.y + found.height).max(top + height);
@@ -1053,6 +1848,7 @@ impl FontStore {
                     }),
                 }
             }
+            previous.clone_from(&segment.boxes);
         }
         out
     }
@@ -1219,9 +2015,17 @@ impl FontStore {
     /// spaces. Scripts without spaces — CJK above all — break between
     /// characters, and a space-splitting breaker would hand them one
     /// unbreakable segment per paragraph that could never wrap.
-    fn segment(&mut self, runs: &[InlineRun]) -> Vec<Segment> {
+    fn segment(&mut self, runs: &[InlineRun], base: Direction) -> Vec<Segment> {
+        let (bidi, starts) = analyse_bidi(runs, base);
         let mut out: Vec<Segment> = Vec::new();
-        for run in runs {
+        for (index, run) in runs.iter().enumerate() {
+            // Where this run's text begins in the string the algorithm saw,
+            // which is not where it begins in the text that will be drawn: the
+            // control characters `unicode-bidi` stands for sit in between.
+            let run_start = starts[index];
+            // Measured once per run rather than once per segment: a paragraph
+            // is one run and dozens of segments, all in the same face.
+            let content = self.content_box(&run.style);
             // An atomic inline box is one unbreakable segment of its own size,
             // aligned on the baseline it declares. For an image that is its
             // bottom edge, which is what `vertical-align: baseline` means for a
@@ -1240,6 +2044,8 @@ impl FontStore {
                     mandatory_break: false,
                     align: run.style.vertical_align,
                     x: 0.0,
+                    level: bidi.at(run_start),
+                    space_level: bidi.at(run_start),
                     replaced: Some(box_),
                     source: run.source,
                     decoration: run.style.text_decoration,
@@ -1248,6 +2054,7 @@ impl FontStore {
                     hidden: run.style.visibility == Visibility::Hidden,
                     edge: None,
                     boxes: run.boxes.clone(),
+                    content,
                 });
                 continue;
             }
@@ -1278,6 +2085,11 @@ impl FontStore {
                     mandatory_break: false,
                     align: run.style.vertical_align,
                     x: 0.0,
+                    // An inline box's own side is not text and has no level of
+                    // its own; it takes the one where it stands so that it
+                    // travels with the words it brackets.
+                    level: bidi.at(run_start),
+                    space_level: bidi.at(run_start),
                     replaced: None,
                     source: run.source,
                     decoration: TextDecoration::default(),
@@ -1286,6 +2098,7 @@ impl FontStore {
                     hidden: run.style.visibility == Visibility::Hidden,
                     edge: Some(edge),
                     boxes: run.boxes.clone(),
+                    content,
                 });
                 continue;
             }
@@ -1293,10 +2106,22 @@ impl FontStore {
                 continue;
             }
             let preserve = run.style.white_space == WhiteSpace::Pre;
+            // §16.6: `nowrap` collapses whitespace like `normal` and wraps
+            // like `pre` — which is to say not at all. So the opportunities
+            // are filtered rather than the segmentation rewritten: a run that
+            // may not break is one long segment, and everything downstream
+            // already knows what to do with a segment too wide for its line.
+            let opportunities: Vec<_> = unicode_linebreak::linebreaks(&run.text)
+                .filter(|(_, opportunity)| {
+                    run.style.white_space != WhiteSpace::NoWrap
+                        || *opportunity == unicode_linebreak::BreakOpportunity::Mandatory
+                })
+                .collect();
             let mut start = 0usize;
-            for (index, opportunity) in unicode_linebreak::linebreaks(&run.text) {
-                let piece = &run.text[start..index];
-                start = index;
+            for (at, opportunity) in opportunities {
+                let piece = &run.text[start..at];
+                let piece_start = start;
+                start = at;
                 // The algorithm reports Mandatory at end of text as well as at
                 // hard line breaks. Requiring an actual break character tells
                 // them apart — otherwise every run boundary would end a line,
@@ -1315,10 +2140,13 @@ impl FontStore {
                 let space_width = if spacing.is_empty() {
                     0.0
                 } else if preserve {
+                    // §16.4: `word-spacing` is added to *each* space, and a
+                    // preformatted run can hold a row of them.
                     self.shape_segment(&spacing, &run.style).width
+                        + run.style.word_spacing * spacing.chars().count() as f32
                 } else {
                     // Collapsed runs already hold at most one space.
-                    self.shape_segment(" ", &run.style).width
+                    self.shape_segment(" ", &run.style).width + run.style.word_spacing
                 };
 
                 if trimmed.is_empty() {
@@ -1337,11 +2165,13 @@ impl FontStore {
                         && !already_breaking
                     {
                         last.trailing_space += space_width;
+                        last.space_level = bidi.at(run_start + piece_start);
                         last.mandatory_break |= mandatory;
                     } else if mandatory {
+                        let height = self.used_line_height(&run.style);
                         out.push(Segment {
                             shaped: Shaped {
-                                height: Self::line_height_for(&run.style),
+                                height,
                                 ascent: run.style.font_size * 0.8,
                                 ..Shaped::default()
                             },
@@ -1349,6 +2179,8 @@ impl FontStore {
                             mandatory_break: true,
                             align: run.style.vertical_align,
                             x: 0.0,
+                            level: bidi.at(run_start + piece_start),
+                            space_level: bidi.at(run_start + piece_start),
                             replaced: None,
                             source: run.source,
                             decoration: run.style.text_decoration,
@@ -1357,27 +2189,44 @@ impl FontStore {
                             hidden: run.style.visibility == Visibility::Hidden,
                             edge: None,
                             boxes: run.boxes.clone(),
+                            content,
                         });
                     }
                     continue;
                 }
 
-                let shaped = self.shape_segment(trimmed, &run.style);
-                out.push(Segment {
-                    shaped,
-                    trailing_space: space_width,
-                    mandatory_break: mandatory,
-                    align: run.style.vertical_align,
-                    x: 0.0,
-                    replaced: None,
-                    source: run.source,
-                    decoration: run.style.text_decoration,
-                    font_size: run.style.font_size,
-                    color: span_color(&run.style),
-                    hidden: run.style.visibility == Visibility::Hidden,
-                    edge: None,
-                    boxes: run.boxes.clone(),
-                });
+                // Split again, at every change of embedding level. A piece
+                // is the text between two line-break opportunities, and there
+                // is no rule that the algorithm holds one level across it:
+                // `AAA<RLO>BBB` is one unbreakable word and two directions.
+                // Without this the whole word takes the level it started at
+                // and the override does nothing at all.
+                let pieces = level_runs(&bidi, run_start + piece_start, trimmed);
+                let last_piece = pieces.len() - 1;
+                for (at, (level, part)) in pieces.into_iter().enumerate() {
+                    let tail = at == last_piece;
+                    let shaped = self.shape_directed(part, &run.style, level);
+                    out.push(Segment {
+                        shaped,
+                        // Only the last piece of a word carries what follows
+                        // the word.
+                        trailing_space: if tail { space_width } else { 0.0 },
+                        mandatory_break: mandatory && tail,
+                        align: run.style.vertical_align,
+                        x: 0.0,
+                        level,
+                        space_level: bidi.at(run_start + piece_start + trimmed.len()),
+                        replaced: None,
+                        source: run.source,
+                        decoration: run.style.text_decoration,
+                        font_size: run.style.font_size,
+                        color: span_color(&run.style),
+                        hidden: run.style.visibility == Visibility::Hidden,
+                        edge: None,
+                        boxes: run.boxes.clone(),
+                        content,
+                    });
+                }
             }
         }
         // The algorithm reports a mandatory break at end of text; that is the
@@ -1406,8 +2255,22 @@ impl FontStore {
         // under-report a bold or larger span and let its column collapse.
         let mut min: f32 = 0.0;
         for run in runs {
-            for word in run.text.split_whitespace() {
-                let single = [InlineRun::text(word, run.style.clone())];
+            // What counts as one unbreakable piece depends on where the run is
+            // allowed to break at all. Neither `pre` nor `nowrap` breaks at a
+            // space, so their narrowest piece is a whole line rather than a
+            // word — which is what makes a `white-space: nowrap` caption widen
+            // the table under it instead of being measured by its longest word
+            // and then overflowing.
+            let pieces: Vec<&str> = match run.style.white_space {
+                WhiteSpace::Normal => run
+                    .text
+                    .split(is_collapsible_space)
+                    .filter(|piece| !piece.is_empty())
+                    .collect(),
+                WhiteSpace::Pre | WhiteSpace::NoWrap => run.text.split('\n').collect(),
+            };
+            for piece in pieces {
+                let single = [InlineRun::text(piece, run.style.clone())];
                 min = min.max(self.layout_runs(&single, default_style, f32::MAX).width);
             }
         }
@@ -1465,12 +2328,12 @@ impl FontStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use css::style::{FontStack, GenericFamily};
+    use css::style::{FontStack, GenericFamily, LineHeight};
 
     fn style(size: f32) -> ComputedStyle {
         ComputedStyle {
             font_size: size,
-            line_height: size * 1.2,
+            line_height: LineHeight::Px(size * 1.2),
             ..Default::default()
         }
     }
@@ -1503,6 +2366,255 @@ mod tests {
     }
 
     #[test]
+    fn two_hebrew_words_are_drawn_in_the_other_order() {
+        // The case that showed the gap: each word was already shaped
+        // right-to-left, and the two words were placed left to right.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let runs = [InlineRun::text(
+            "\u{5d0}\u{5d1} \u{5d2}\u{5d3}",
+            style.clone(),
+        )];
+        let laid = fonts.layout_runs(&runs, &style, 400.0);
+        let line = laid.lines.first().expect("a line");
+
+        let first = line
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.start == 0)
+            .expect("the first word's glyphs");
+        let second = line
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.start > 4)
+            .expect("the second word's glyphs");
+        assert!(
+            first.x > second.x,
+            "the word written first is at {} and the next at {}; the first belongs further right",
+            first.x,
+            second.x
+        );
+    }
+
+    #[test]
+    fn an_override_turns_latin_round() {
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let plain = fonts.shape_directed("abc", &style, Level::ltr());
+        let forced = fonts.shape_directed("abc", &style, Level::rtl());
+
+        assert_eq!(plain.width, forced.width, "reversing must not resize");
+        let ids = |shaped: &Shaped| {
+            shaped
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.glyph_id)
+                .collect::<Vec<_>>()
+        };
+        let mut backwards = ids(&plain);
+        backwards.reverse();
+        assert_eq!(ids(&forced), backwards);
+    }
+
+    #[test]
+    fn right_to_left_script_is_left_to_the_shaper() {
+        // Hebrew is already shaped right-to-left from its own characters, and
+        // reversing it a second time here would put it back the way it came.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let natural = fonts.shape_segment("\u{5d0}\u{5d1}\u{5d2}", &style);
+        let directed = fonts.shape_directed("\u{5d0}\u{5d1}\u{5d2}", &style, Level::rtl());
+
+        let xs = |shaped: &Shaped| shaped.glyphs.iter().map(|g| g.x).collect::<Vec<_>>();
+        assert_eq!(xs(&natural), xs(&directed));
+    }
+
+    #[test]
+    fn a_bracket_in_right_to_left_text_faces_the_other_way() {
+        // Rule L4. Without it `(x)` reads as `)x(` once the run has been
+        // turned round, which is the sort of wrongness a reader sees at once.
+        assert_eq!(mirrored("(x)"), ")x(");
+        assert_eq!(mirrored("[a]{b}"), "]a[}b{");
+        // Every mapping is its own inverse, so applying it twice changes
+        // nothing.
+        assert_eq!(
+            mirrored(&mirrored("\u{00ab}q\u{00bb}")),
+            "\u{00ab}q\u{00bb}"
+        );
+        assert_eq!(mirrored("abc123"), "abc123");
+    }
+
+    #[test]
+    fn bidi_controls_are_steering_and_not_content() {
+        assert_eq!(without_bidi_controls("a\u{202e}b\u{202c}c"), "abc");
+        assert_eq!(without_bidi_controls("plain"), "plain");
+    }
+
+    #[test]
+    fn small_caps_draws_lowercase_as_smaller_capitals() {
+        let mut fonts = FontStore::new();
+        let mut style = ComputedStyle {
+            font_size: 100.0,
+            ..ComputedStyle::default()
+        };
+
+        let plain = fonts.shape_segment("x", &style);
+        let caps = fonts.shape_segment("X", &style);
+        style.font_variant = FontVariant::SmallCaps;
+        let small = fonts.shape_segment("x", &style);
+
+        // It is a capital, not a lowercase letter: it is nothing like as wide
+        // as the `x` it was written as.
+        assert!(
+            small.width > plain.width,
+            "small cap {} is no wider than the lowercase {}",
+            small.width,
+            plain.width
+        );
+        // And it is a *small* one.
+        assert!(
+            small.width < caps.width,
+            "small cap {} is not smaller than the full capital {}",
+            small.width,
+            caps.width
+        );
+        let ratio = small.width / caps.width;
+        assert!(
+            (ratio - SMALL_CAPS).abs() < 0.02,
+            "expected about {SMALL_CAPS} of a capital, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn a_line_reaches_below_its_baseline_by_the_struts_descent() {
+        // An image alone on a line: the line is taller than the picture,
+        // because §10.8.1's strut is on it whether or not there is text.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let runs = [InlineRun::replaced(
+            ReplacedInline {
+                id: 1,
+                width: 40.0,
+                height: 40.0,
+                baseline: 40.0,
+            },
+            style.clone(),
+        )];
+
+        let laid = fonts.layout_runs_with(&runs, &style, Strut::Always, 400.0);
+        assert!(
+            laid.height > 40.0,
+            "no room below the image: line is {} for a 40px picture",
+            laid.height
+        );
+    }
+
+    #[test]
+    fn small_caps_leaves_capitals_and_the_line_alone() {
+        let mut fonts = FontStore::new();
+        let mut style = ComputedStyle {
+            font_size: 40.0,
+            ..ComputedStyle::default()
+        };
+        let plain = fonts.shape_segment("ABC", &style);
+        style.font_variant = FontVariant::SmallCaps;
+        let small = fonts.shape_segment("ABC", &style);
+
+        assert_eq!(small.width, plain.width, "capitals must not shrink");
+
+        // A word of nothing but lowercase still sits on a full-size line, or a
+        // paragraph of small caps would read as one set in a smaller font.
+        let lower = fonts.shape_segment("abc", &style);
+        assert_eq!(lower.height, plain.height);
+        assert_eq!(lower.ascent, plain.ascent);
+    }
+
+    #[test]
+    fn small_caps_keeps_the_text_it_was_written_as() {
+        // What a search and a selection match against is the source text, not
+        // the capitals drawn in its place.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle {
+            font_variant: FontVariant::SmallCaps,
+            ..ComputedStyle::default()
+        };
+        let shaped = fonts.shape_segment("Word", &style);
+
+        assert_eq!(shaped.text, "Word");
+        for glyph in &shaped.glyphs {
+            assert!(
+                glyph.end <= shaped.text.len(),
+                "glyph range {}..{} escapes {:?}",
+                glyph.start,
+                glyph.end,
+                shaped.text
+            );
+        }
+    }
+
+    #[test]
+    fn case_runs_split_on_the_boundary_and_nowhere_else() {
+        assert_eq!(case_runs("Word"), vec![(0, "W"), (1, "ord")]);
+        assert_eq!(case_runs("abc"), vec![(0, "abc")]);
+        assert_eq!(case_runs(""), Vec::new());
+        // Digits and spaces are not lowercase, so they join the capitals.
+        assert_eq!(case_runs("A1 b"), vec![(0, "A1 "), (3, "b")]);
+    }
+
+    #[test]
+    fn quirks_mode_takes_the_strut_off_a_line_with_no_text() {
+        // The quirk the era's sliced-image tables were built on: the cell is
+        // exactly as tall as the picture, with no descender space under it.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let image = ReplacedInline {
+            id: 1,
+            width: 40.0,
+            height: 40.0,
+            baseline: 40.0,
+        };
+        let runs = [InlineRun::replaced(image, style.clone())];
+
+        let laid = fonts.layout_runs_with(&runs, &style, Strut::WhereThereIsText, 400.0);
+        assert_eq!(laid.height, 40.0);
+    }
+
+    #[test]
+    fn quirks_mode_keeps_the_strut_where_there_is_text() {
+        // Only a line with *nothing* on it but boxes loses the strut. One word
+        // beside the picture brings it back, in either mode.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let image = ReplacedInline {
+            id: 1,
+            width: 40.0,
+            height: 40.0,
+            baseline: 40.0,
+        };
+        let runs = [
+            InlineRun::text("x", style.clone()),
+            InlineRun::replaced(image, style.clone()),
+        ];
+
+        let quirks = fonts.layout_runs_with(&runs, &style, Strut::WhereThereIsText, 400.0);
+        let standards = fonts.layout_runs_with(&runs, &style, Strut::Always, 400.0);
+        assert_eq!(quirks.height, standards.height);
+        assert!(quirks.height > 40.0, "line is only {}", quirks.height);
+    }
+
+    #[test]
+    fn line_height_is_split_above_and_below_the_text() {
+        // Half-leading: a paragraph set double-spaced puts the extra room
+        // evenly around each line rather than hanging it underneath, which is
+        // what keeps text in the middle of a table cell.
+        let (ascent, descent) = FontStore::strut((14.0, 4.0), 40.0);
+
+        assert_eq!(ascent, 25.0);
+        assert_eq!(descent, 15.0);
+        assert_eq!(ascent + descent, 40.0);
+    }
+
+    #[test]
     fn a_remembered_segment_is_never_handed_to_a_style_it_was_not_shaped_for() {
         // The cache is keyed on the attributes a segment was shaped under, and
         // `AttrsOwned` *is* those attributes rather than a hand-listed subset
@@ -1519,7 +2631,7 @@ mod tests {
         // Line height alone, with the size held still: it rides in the metrics
         // `attrs_for` folds in, and nothing about the glyphs shows it.
         let mut taller = style(16.0);
-        taller.line_height = 40.0;
+        taller.line_height = LineHeight::Px(40.0);
         styles.push(taller);
         for weight in [300u16, 400, 700] {
             let mut bold = style(16.0);
@@ -1732,7 +2844,7 @@ mod tests {
         let mut fonts = FontStore::new();
         let flat = ComputedStyle {
             font_size: 16.0,
-            line_height: 0.0,
+            line_height: LineHeight::Px(0.0),
             ..Default::default()
         };
         let laid = fonts.layout("visible", &flat, 400.0);
@@ -1895,6 +3007,7 @@ mod tests {
                 InlineEdge {
                     width: edge,
                     opening,
+                    rtl: false,
                 },
                 style.clone(),
             )
@@ -1976,6 +3089,7 @@ mod tests {
                 InlineEdge {
                     width: 0.0,
                     opening: true,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -1988,6 +3102,7 @@ mod tests {
                 InlineEdge {
                     width: 0.0,
                     opening: false,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -2025,7 +3140,7 @@ mod tests {
         let mut store = FontStore::new();
         let tight = style(16.0);
         let airy = ComputedStyle {
-            line_height: 40.0,
+            line_height: LineHeight::Px(40.0),
             ..style(16.0)
         };
         let mut of = |style: &ComputedStyle| {
@@ -2056,6 +3171,7 @@ mod tests {
                 InlineEdge {
                     width: 10.0,
                     opening: true,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -2065,6 +3181,7 @@ mod tests {
                 InlineEdge {
                     width: 10.0,
                     opening: false,
+                    rtl: false,
                 },
                 plain.clone(),
             )
@@ -2092,7 +3209,7 @@ mod tests {
         let small = style(12.0);
         let large = ComputedStyle {
             font_size: 30.0,
-            line_height: 36.0,
+            line_height: LineHeight::Px(36.0),
             ..style(30.0)
         };
         let uniform = store.layout("small text", &small, 1000.0);
@@ -2184,7 +3301,7 @@ mod tests {
         let small = style(12.0);
         let large = ComputedStyle {
             font_size: 28.0,
-            line_height: 34.0,
+            line_height: LineHeight::Px(34.0),
             ..style(28.0)
         };
         let runs = [
@@ -2206,19 +3323,73 @@ mod tests {
         assert!(layout.lines.is_empty());
         assert_eq!(layout.height, 0.0);
     }
+    #[test]
+    fn word_spacing_widens_every_gap_and_nothing_else() {
+        let mut store = FontStore::new();
+        let plain = style(16.0);
+        let spaced = ComputedStyle {
+            word_spacing: 20.0,
+            ..style(16.0)
+        };
+        let bare = store.layout("one two three", &plain, 1000.0);
+        let wide = store.layout("one two three", &spaced, 1000.0);
+        let grew = wide.lines[0].width - bare.lines[0].width;
+        assert!(
+            (grew - 40.0).abs() < 0.01,
+            "two gaps at 20px grew the line by {grew}"
+        );
+    }
+
+    #[test]
+    fn justify_fills_every_line_but_the_last() {
+        // §16.2. The last line of a paragraph keeps its natural width, which is
+        // the difference between justified text and a page of stretched
+        // fragments.
+        let mut store = FontStore::new();
+        let justified = ComputedStyle {
+            text_align: css::style::TextAlign::Justify,
+            ..style(16.0)
+        };
+        let text = "The quick brown fox jumps over the lazy dog and keeps on running";
+        let layout = store.layout(text, &justified, 200.0);
+        assert!(layout.lines.len() > 2, "the text did not wrap enough");
+
+        for (index, line) in layout.lines.iter().enumerate() {
+            if index + 1 == layout.lines.len() {
+                assert!(
+                    line.width < 200.0 - 1.0,
+                    "the last line was stretched to {}",
+                    line.width
+                );
+            } else {
+                assert!(
+                    (line.width - 200.0).abs() < 0.01,
+                    "line {index} came to {} rather than filling 200",
+                    line.width
+                );
+            }
+        }
+
+        // And left alignment leaves them all ragged.
+        let ragged = store.layout(text, &style(16.0), 200.0);
+        assert!(
+            ragged.lines.iter().any(|line| line.width < 199.0),
+            "unjustified text filled every line exactly"
+        );
+    }
 }
 
 #[cfg(test)]
 mod decoration_tests {
     use super::*;
-    use css::style::TextDecoration;
+    use css::style::{LineHeight, TextDecoration};
 
     fn run(text: &str, decoration: TextDecoration) -> InlineRun {
         InlineRun::text(
             text,
             ComputedStyle {
                 font_size: 16.0,
-                line_height: 19.2,
+                line_height: LineHeight::Px(19.2),
                 text_decoration: decoration,
                 ..Default::default()
             },
