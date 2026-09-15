@@ -100,10 +100,16 @@ pub struct DisplayList {
     /// page — and the background has to reach the bottom of it either way.
     pub canvas: Color,
     /// Image tiled across the whole canvas, for the same reason.
+    ///
+    /// The fourth field is the *positioning* area, which is not the canvas:
+    /// §14.2 places the tile "as if it was painted for the root element
+    /// alone", so an offset is measured from that element's padding box while
+    /// the tiling covers the window.
     pub canvas_image: Option<(
         dom::NodeId,
         css::style::BackgroundRepeat,
         css::style::BackgroundPosition,
+        Rect,
     )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
@@ -935,7 +941,7 @@ pub fn rasterise_band(
     ));
 
     // The canvas tile goes over the canvas colour and under everything else.
-    if let Some((node, repeat, position)) = list.canvas_image
+    if let Some((node, repeat, position, area)) = list.canvas_image
         && let Some(image) = images.get(&ImageKey::background(node))
     {
         // The canvas is the whole document, so the anchor is measured against
@@ -948,7 +954,7 @@ pub fn rasterise_band(
             width: pixmap.width() as f32,
             height: top + pixmap.height() as f32,
         };
-        let anchor = anchor_of(&full, position, image);
+        let anchor = anchor_of(&area, position, image);
         if let Some(slice) = banded(&full, top, pixmap.height() as f32) {
             let slice = shifted(&slice, top);
             if drawable(&slice) {
@@ -2696,6 +2702,38 @@ mod canvas_background_tests {
         assert_eq!(list.canvas_image.map(|(node, ..)| node), Some(html));
         // The body's own tile is not propagated, so it still paints normally.
         assert_eq!(tiles(&list), 1);
+    }
+
+    #[test]
+    fn a_root_colour_keeps_the_body_tile_on_the_body() {
+        // §14.2 propagates the body's background only when the root has *none*
+        // — no image and no colour. A root with a colour alone used to leave
+        // the body's tile going to the canvas anyway, which is a different
+        // rectangle and so a different part of the tile.
+        let (list, _) = list_for(
+            "<html style=\"background-color: navy\">\
+             <body background=\"body.gif\"><p>x</p></body></html>",
+        );
+        assert_eq!(
+            list.canvas_image, None,
+            "the root has a background of its own"
+        );
+        assert_eq!(tiles(&list), 1, "so the body paints its own tile");
+    }
+
+    #[test]
+    fn the_canvas_tile_is_positioned_against_the_root_and_not_the_window() {
+        // §14.2 paints it over the whole canvas but places it "as if it was
+        // painted for the root element alone", so the positioning area is that
+        // element's padding box. Measured from the window instead, a root with
+        // a margin puts the tile in the wrong place — and a negative offset
+        // puts it off the canvas entirely.
+        let (list, _) = list_for(
+            "<html style=\"margin: 20px; border: 5px solid red; \
+             background-image: url(root.gif)\"><body><p>x</p></body></html>",
+        );
+        let (.., area) = list.canvas_image.expect("a canvas tile");
+        assert_eq!((area.x, area.y), (25.0, 25.0), "margin then border");
     }
 
     #[test]

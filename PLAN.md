@@ -436,6 +436,10 @@ it:
   removes a block's own leading and trailing whitespace (#126). Keeping them
   needs §9.4.2's rule that a line box holding nothing generates no box, without
   which the line break beside them draws a second, empty inline box.
+- **`float` and `position` on the *root element* do nothing** (#128). The root
+  is laid out directly rather than as a child, and both are applied by a
+  parent's walk over its children, which the root has none of. Chromium
+  honours a float there; no real page writes one.
 - **§17.2.1's anonymous *cell* is not generated** (#121) — the box that goes
   around a row's child that is not a cell. A run of table-internal boxes that
   would yield no cells is left alone rather than wrapped in a table, because a

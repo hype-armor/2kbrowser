@@ -16,6 +16,39 @@ record for everything earlier.
 
 ## Unreleased
 
+**The root element is a box of its own.** The walk started at `<body>`, so
+everything `<html>` declared about its own box was dropped:
+`html { border: solid blue }` drew nothing at all and `html { margin: 1in }`
+moved nothing. **Worth 11 conformance tests against 1 lost.**
+
+It is laid out now, with the body inside it, and the extra level costs the
+reference baselines exactly nothing — a page that says nothing about its root
+element gets a box with no margin, no border and no padding, which is a
+pass-through.
+
+Two halves of §14.2 came out of it, both about the background the root sends to
+the canvas.
+
+**Propagation is all or nothing.** The condition is "if the computed value of
+`background-image` on the root element is `none` *and* its `background-color`
+is `transparent`", and this engine asked the two questions separately and sent
+each answer to the canvas on its own. So a root with a colour and a body with a
+tile put the tile on the canvas, where §14.2 leaves it on the body's own box —
+a different rectangle, showing a different part of the tile.
+
+**And the tile is positioned against the root, not the window.** §14.2 paints
+it over the whole canvas but places it "as if it was painted for the root
+element alone", so the offsets are measured from that element's padding box.
+Measured from the window, `background-position: -2em -2em` on a root with a
+one-em margin and a one-em border puts the tile off the canvas instead of at
+its corner.
+
+The one test lost is `floats/float-root`, recorded as #128, and it was passing
+because neither side floated. Its reference floats the body, which works now;
+the test floats `:root`, which does not — the root is laid out directly rather
+than as a child, and a float is applied by a parent's walk over its children.
+Chromium honours a float there. No real page writes one.
+
 **A non-breaking space no longer collapses.** §16.6.1 collapses spaces, tabs
 and newlines; `&nbsp;` is none of them. It is a character with a width, and the
 whole point of writing one is that it survives. **Worth 17 conformance tests

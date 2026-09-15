@@ -536,10 +536,15 @@ pub struct Layout {
     /// and how it repeats. Propagated from the root or the body by the same
     /// §14.2 rule as the colour, and for the same reason: a tile that stopped
     /// at the content height would leave a band of blank canvas below it.
+    /// The fourth field is the *positioning* area: §14.2 paints the canvas
+    /// background over the whole canvas but places it "as if it was painted
+    /// for the root element alone", so a `-2em` offset is measured from that
+    /// element's padding box and not from the corner of the window.
     pub canvas_image: Option<(
         NodeId,
         css::style::BackgroundRepeat,
         css::style::BackgroundPosition,
+        Rect,
     )>,
     /// Colour the whole canvas takes, per CSS 2.1 §14.2.
     ///
@@ -922,6 +927,45 @@ fn collect_rects(
     }
 }
 
+/// An element's padding box, in canvas coordinates.
+///
+/// Returns `None` where the element generated no box, which for the root and
+/// the body means the document had neither.
+fn padding_box_of(box_: &LayoutBox, node: NodeId, x: f32, y: f32) -> Option<Rect> {
+    let (x, y) = (x + box_.rect.x, y + box_.rect.y);
+    if box_.node == Some(node) {
+        let font_size = box_.style.font_size;
+        let border = &box_.style.border;
+        let (left, top) = (
+            border.left.used_width(font_size),
+            border.top.used_width(font_size),
+        );
+        return Some(Rect {
+            x: x + left,
+            y: y + top,
+            width: (box_.rect.width - left - border.right.used_width(font_size)).max(0.0),
+            height: (box_.rect.height - top - border.bottom.used_width(font_size)).max(0.0),
+        });
+    }
+    box_.children
+        .iter()
+        .find_map(|child| padding_box_of(child, node, x, y))
+}
+
+/// The box laid out for an element, searched depth-first.
+///
+/// Only ever asked for the body, whose box is the root's first child on every
+/// ordinary page — but not on one whose `<html>` carries a `::before`, and a
+/// search costs nothing next to the layout that just ran.
+fn find_box(box_: &mut LayoutBox, node: NodeId) -> Option<&mut LayoutBox> {
+    if box_.node == Some(node) {
+        return Some(box_);
+    }
+    box_.children
+        .iter_mut()
+        .find_map(|child| find_box(child, node))
+}
+
 /// Lays out a styled document at a given viewport width.
 pub fn layout(
     doc: &Document,
@@ -944,11 +988,33 @@ pub fn layout(
         .unwrap_or(css::Color::TRANSPARENT);
     // Whether it is the *body's* background that reached the canvas, which is
     // what decides whether the body may still paint one of its own.
-    let propagated = html_background.is_transparent();
+    //
+    // All or nothing, and that is the whole of §14.2's condition: the body's
+    // background is used "if the computed value of `background-image` on the
+    // root element is `none` and its `background-color` is `transparent`". A
+    // root with a colour and no image keeps the body's tile on the *body's*
+    // box, which is a different rectangle from the canvas and shows a
+    // different part of the tile. This used to ask the two questions
+    // separately and send each answer to the canvas on its own.
+    let propagated = html_background.is_transparent()
+        && html_style.is_none_or(|style| style.background_image.is_none());
     let canvas_background = if propagated {
         body_style.background_color
     } else {
         html_background
+    };
+
+    // The root element is a box like any other. Its background goes to the
+    // canvas (above), but its margin, border and padding are its own and hold
+    // the body away from the window — which this engine used to drop entirely
+    // by starting the walk at `<body>`. `html { border: solid blue }` drew
+    // nothing at all, and `html { margin: 1in }` moved nothing.
+    //
+    // Where there is no `<html>` element the walk starts at the body, as it
+    // always did: a fragment rendered on its own has no root to lay out.
+    let (start, start_style) = match (html, html_style) {
+        (Some(node), Some(style)) => (node, style.clone()),
+        _ => (body, body_style.clone()),
     };
 
     let mut root = LayoutBox {
@@ -975,7 +1041,12 @@ pub fn layout(
         style: ComputedStyle {
             background_color: css::Color::TRANSPARENT,
             background_image: None,
-            ..body_style.clone()
+            // Nothing this box paints or reserves is its own: the element it
+            // stands for is laid out inside it and draws its own border.
+            border: css::style::Borders::default(),
+            padding: css::style::Edges::all(Length::Px(0.0)),
+            margin: css::style::Edges::all(Length::Px(0.0)),
+            ..start_style.clone()
         },
         text: None,
         content_origin: (0.0, 0.0),
@@ -991,8 +1062,8 @@ pub fn layout(
         doc,
         styles,
         fonts,
-        body,
-        &body_style,
+        start,
+        &start_style,
         intrinsic,
         0.0,
         0.0,
@@ -1017,26 +1088,37 @@ pub fn layout(
     // not painted a second time. The image half of that is settled in paint,
     // which has to know the source node anyway; the colour is settled here,
     // where which element was the source has just been decided.
-    if propagated
-        && let Some(box_) = root.children.first_mut()
-        && box_.node == Some(body)
-    {
+    if propagated && let Some(box_) = find_box(&mut root, body) {
         box_.style.background_color = css::Color::TRANSPARENT;
     }
 
-    // The image propagates independently of the colour: a root with a colour
-    // and a body with a tile is ordinary markup, and both belong on the canvas.
+    // The image goes with the colour, for the reason given where `propagated`
+    // is worked out.
     let canvas_image = match (html, html_style) {
         (Some(node), Some(style)) if style.background_image.is_some() => {
             Some((node, style.background_repeat, style.background_position))
         }
-        _ if body_style.background_image.is_some() => Some((
+        _ if propagated && body_style.background_image.is_some() => Some((
             body,
             body_style.background_repeat,
             body_style.background_position,
         )),
         _ => None,
     };
+    // §14.2 paints that image over the whole canvas and positions it "as if it
+    // was painted for the root element alone", so the offsets are measured
+    // from the propagating element's own padding box. `-2em -2em` on a root
+    // with a one-em margin and a one-em border puts the tile at the corner of
+    // the window; measured from the window instead it lands off it entirely.
+    let canvas_image = canvas_image.map(|(node, repeat, position)| {
+        let area = padding_box_of(&root, node, 0.0, 0.0).unwrap_or(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: viewport_width,
+            height: viewport_height,
+        });
+        (node, repeat, position, area)
+    });
 
     // Not `height.outer()` alone. That is the root box's own height, and
     // content is allowed to be taller than the box holding it — `overflow`
@@ -5361,6 +5443,36 @@ mod tests {
     }
 
     #[test]
+    fn the_root_element_is_a_box_of_its_own() {
+        // The walk used to start at `<body>`, so everything the root element
+        // declared about its own box — margin, border, padding — was dropped:
+        // `html { border: solid blue }` drew nothing at all.
+        let rendered = run(
+            "<html><body><p>x</p></body></html>",
+            "html { margin: 10px; border: 5px solid blue; padding: 20px }              body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let body = siblings(&rendered);
+        let paragraph = body.first().expect("the paragraph");
+        // 10 margin + 5 border + 20 padding, from each side.
+        assert_eq!(paragraph.rect.width, 600.0 - 2.0 * 35.0);
+        let all = boxes(&rendered.layout.root);
+        let root = all.first().expect("the root element's box");
+        assert_eq!(root.style.border.left.width, Length::Px(5.0));
+    }
+
+    #[test]
+    fn a_document_with_no_root_element_still_lays_out() {
+        // A fragment parsed on its own: the walk starts at the body, as it
+        // always did, and nothing above it is invented.
+        let rendered = run("<p>x</p>", "", 600.0);
+        assert!(
+            content_boxes(&rendered).iter().any(|b| b.text.is_some()),
+            "the fragment's text vanished"
+        );
+    }
+
+    #[test]
     fn a_page_with_no_text_has_nothing_to_select() {
         let (_, _, out) = page_for("<body><hr></body>", 800.0);
 
@@ -5371,6 +5483,10 @@ mod tests {
 
     struct Rendered {
         layout: Layout,
+        /// The `<body>` element, so `content_boxes` can find its box rather
+        /// than guess at a depth. The root element is laid out now, so the
+        /// body is a grandchild of the layout root and not a child.
+        body: Option<NodeId>,
     }
 
     fn run(html: &str, css_text: &str, width: f32) -> Rendered {
@@ -5393,6 +5509,7 @@ mod tests {
                 width,
                 height,
             ),
+            body: doc.find_element("body"),
         }
     }
 
@@ -5409,11 +5526,20 @@ mod tests {
 
     /// Boxes inside `<body>`, which is what the tests actually care about.
     ///
-    /// The layout root is the canvas and its sole child is the body box, so
-    /// indexing the root directly returns the body and silently shifts every
-    /// expectation by one level.
+    /// The layout root is the canvas and the root element's box is inside it,
+    /// so walking from either directly returns boxes these tests do not mean
+    /// and silently shifts every expectation by a level.
     fn content_boxes(rendered: &Rendered) -> Vec<&LayoutBox> {
-        let body = rendered.layout.root.children.first().expect("body box");
+        fn box_for(box_: &LayoutBox, node: NodeId) -> Option<&LayoutBox> {
+            if box_.node == Some(node) {
+                return Some(box_);
+            }
+            box_.children.iter().find_map(|child| box_for(child, node))
+        }
+        let body = rendered
+            .body
+            .and_then(|body| box_for(&rendered.layout.root, body))
+            .expect("body box");
         boxes(body)
     }
 
@@ -5773,11 +5899,15 @@ mod tests {
     /// table and its caption can be compared: every other box in the tree is
     /// positioned relative to its parent.
     fn siblings(rendered: &Rendered) -> &[LayoutBox] {
+        fn box_for(box_: &LayoutBox, node: NodeId) -> Option<&LayoutBox> {
+            if box_.node == Some(node) {
+                return Some(box_);
+            }
+            box_.children.iter().find_map(|child| box_for(child, node))
+        }
         &rendered
-            .layout
-            .root
-            .children
-            .first()
+            .body
+            .and_then(|body| box_for(&rendered.layout.root, body))
             .expect("body box")
             .children
     }
@@ -6545,6 +6675,7 @@ mod tests {
         let mut fonts = FontStore::new();
         let rendered = Rendered {
             layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
+            body: doc.find_element("body"),
         };
 
         let all = content_boxes(&rendered);
@@ -6581,6 +6712,7 @@ mod tests {
                 let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css)]);
                 let rendered = Rendered {
                     layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
+                    body: doc.find_element("body"),
                 };
                 content_boxes(&rendered)
                     .into_iter()
@@ -6699,6 +6831,7 @@ mod tests {
         let mut fonts = FontStore::new();
         let rendered = Rendered {
             layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
+            body: doc.find_element("body"),
         };
         assert_eq!(first_line(&rendered).text, " word");
     }
@@ -6949,6 +7082,7 @@ mod tests {
         let mut fonts = FontStore::new();
         let rendered = Rendered {
             layout: layout(&doc, &styles, &mut fonts, &sizes, 600.0, 600.0),
+            body: doc.find_element("body"),
         };
         let boxes = replaced_boxes(&rendered);
         assert_eq!(boxes.len(), 1);
@@ -9337,13 +9471,10 @@ mod tests {
         let mut fonts = FontStore::new();
         let sizes = IntrinsicSizes::new();
         let laid_out = layout(&doc, &styles, &mut fonts, &sizes, 500.0, 500.0);
-        let image = laid_out
-            .root
-            .children
-            .first()
-            .and_then(|body| body.children.first())
+        let image = boxes(&laid_out.root)
+            .into_iter()
+            .find(|box_| box_.replaced.is_some())
             .expect("image box");
-        assert!(image.replaced.is_some(), "img must be marked replaced");
         assert_eq!(image.rect.width, 90.0);
         assert_eq!(image.rect.height, 45.0);
     }
@@ -9435,7 +9566,10 @@ mod tests {
             400.0,
         );
 
-        let rendered = Rendered { layout: laid };
+        let rendered = Rendered {
+            layout: laid,
+            body: doc.find_element("body"),
+        };
         let boxes = content_boxes(&rendered);
         let image = boxes
             .iter()
