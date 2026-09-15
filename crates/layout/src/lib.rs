@@ -3851,6 +3851,39 @@ fn layout_table(
         }
     }
 
+    // §17.5.3: a table's `height` is a *minimum*, not the height. Where the
+    // rows do not fill it the excess is distributed among them, and how is
+    // left undefined — in proportion to the heights the rows already have,
+    // which is what browsers do, or evenly when they have none to be in
+    // proportion to. Without this a `<table height="200">` was as tall as its
+    // text, which is the shape the suite's own reference files are built out
+    // of: a cell with `vertical-align: bottom` holding an image at the foot of
+    // a two-hundred-pixel box.
+    //
+    // A percentage is left alone. It resolves against the table's containing
+    // block height, which this function is not told and which is usually
+    // `auto` anyway — §10.5 then makes the percentage behave as `auto`, which
+    // is what leaving it alone produces.
+    let declared = match style.height {
+        Length::Px(px) if px.is_finite() && px > 0.0 => px,
+        _ => 0.0,
+    };
+    let filled = heights.iter().sum::<f32>() + spacing_y * (heights.len() + 1) as f32;
+    if declared > filled && !heights.is_empty() {
+        let extra = declared - filled;
+        let total: f32 = heights.iter().sum();
+        if total > 0.0 {
+            for height in heights.iter_mut() {
+                *height += extra * (*height / total);
+            }
+        } else {
+            let share = extra / heights.len() as f32;
+            for height in heights.iter_mut() {
+                *height += share;
+            }
+        }
+    }
+
     let mut tops = Vec::with_capacity(heights.len());
     let mut cursor_y = y + spacing_y;
     for height in &heights {
@@ -8730,6 +8763,58 @@ mod tests {
             content_boxes(&rendered).iter().any(|b| b.text.is_some()),
             "the cell still renders"
         );
+    }
+
+    #[test]
+    fn a_tables_declared_height_is_a_minimum_and_stretches_its_rows() {
+        // §17.5.3. The height is not the table's height: where the rows do not
+        // fill it the excess goes to them, which is what puts a cell's
+        // `vertical-align: bottom` content at the foot of the declared box
+        // rather than at the foot of its own text.
+        let rendered = run(
+            "<body><table><tr><td>a</td></tr><tr><td>b</td></tr></table></body>",
+            "body { margin: 0 } table { height: 200px; border-spacing: 0 }              td { padding: 0 }",
+            600.0,
+        );
+        let table = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("the table");
+        assert_eq!(table.rect.height, 200.0);
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 2);
+        // Two rows of equal content share the excess equally.
+        assert_eq!(cells[0].rect.height, 100.0);
+        assert_eq!(cells[1].rect.height, 100.0);
+        assert_eq!(cells[1].rect.y - cells[0].rect.y, 100.0);
+    }
+
+    #[test]
+    fn a_declared_height_shorter_than_the_content_does_not_squeeze_a_table() {
+        // The other half of "a minimum": a table asked for less room than its
+        // rows need keeps the rows.
+        let tall = run(
+            "<body><table><tr><td>one<br>two<br>three<br>four</td></tr></table></body>",
+            "body { margin: 0 } table { border-spacing: 0 } td { padding: 0 }",
+            600.0,
+        );
+        let squeezed = run(
+            "<body><table><tr><td>one<br>two<br>three<br>four</td></tr></table></body>",
+            "body { margin: 0 } table { height: 10px; border-spacing: 0 } td { padding: 0 }",
+            600.0,
+        );
+        let height = |r: &Rendered| {
+            content_boxes(r)
+                .into_iter()
+                .find(|b| b.style.display == Display::Table)
+                .expect("the table")
+                .rect
+                .height
+        };
+        assert_eq!(height(&tall), height(&squeezed));
     }
 
     #[test]
