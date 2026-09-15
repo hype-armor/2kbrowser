@@ -282,7 +282,22 @@ rule for a box split across lines applied to a box split around a block.
 `counter()` and `counters()` came off that list. Counters are kept now, with
 the self-nesting scope §12.4.1 describes — an instance created by
 `counter-reset` covers the element, its **following siblings**, and all of
-their descendants, which is the part of that sentence easiest to read past.
+their descendants, which is the part of that sentence easiest to read past. A
+`::before` or `::after` carries its own `counter-reset` and `counter-increment`,
+and prints the value *after* them, which is what §12.4's own example — a
+heading numbered by a pseudo-element that increments the counter itself — needs
+and what one pass over the style cannot give. An operation on a box nobody
+generates has no effect, so a `::before` with no `content`, or one told
+`display: none`, counts nothing.
+
+Every one of CSS 2.1's counter styles is spelled now:
+`decimal-leading-zero`, `lower-greek` — twenty-four letters, with no final
+sigma, since a positional form is the same letter twice — and the two additive
+systems, `armenian` and `georgian`. They spell list markers and `counter()`
+alike, because §12.4.3 takes the same values `list-style-type` does. The
+bundled Liberation faces carry neither Armenian nor Georgian (ADR-0008), so
+those two number correctly and draw nothing, which is the font's coverage
+rather than the numbering.
 
 Most of those were found by rendering era-typical markup beside a real browser
 and comparing, which is worth recording because nothing already here could have

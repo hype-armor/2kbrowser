@@ -38,6 +38,15 @@
   ol.nested li::before { content: counters(section, ".") " "; color: #0066aa; }
   .roman::before { content: counter(page, upper-roman) " — "; color: #0066aa; }
   .roman { counter-reset: page 7; }
+  /* CSS 2.1 12.4's own example: the pseudo-element increments the counter and
+     prints the value *after* its own increment. */
+  ol.self { counter-reset: n; list-style: none; padding-left: 0; }
+  ol.self > li::before { counter-increment: n; content: counter(n) ") "; color: #0066aa; }
+  /* An operation on a box nobody generates has no effect: this increment is
+     on a pseudo-element with no content, so the count below stays at zero. */
+  .silent::before { counter-increment: n 100; }
+  .counted { counter-reset: n; }
+  .counted::after { content: " (n is " counter(n) ")"; color: #0066aa; }
 
   /* A column box renders no content. */
   .column::before { content: "FAIL"; display: table-column; color: #cc0000; }
@@ -75,6 +84,8 @@
 <ol class="chapters"><li>first</li><li>second</li><li>third</li></ol>
 <ol class="nested"><li>one<ol><li>one one</li><li>one two</li></ol></li><li>two</li></ol>
 <p class="roman">a counter reset to seven, in roman</p>
+<ol class="self"><li>numbered by the pseudo-element itself</li><li>which sees its own increment</li></ol>
+<p class="counted">a pseudo-element with no content counts nothing<span class="silent"></span></p>
 
 <h3>Mixed content: the brackets go outside, once</h3>
 <div class="mixed">first<p>a block in the middle</p>last</div>

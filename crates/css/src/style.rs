@@ -568,6 +568,8 @@ pub enum ListStyleType {
     Square,
     /// 1, 2, 3.
     Decimal,
+    /// 01, 02, 03 — padded to two digits, and no wider than the number needs.
+    DecimalLeadingZero,
     /// a, b, c.
     LowerAlpha,
     /// A, B, C.
@@ -576,6 +578,12 @@ pub enum ListStyleType {
     LowerRoman,
     /// I, II, III.
     UpperRoman,
+    /// Lowercase classical Greek: alpha, beta, gamma.
+    LowerGreek,
+    /// Traditional Armenian numbering, which is additive like Roman.
+    Armenian,
+    /// Traditional Georgian numbering, likewise additive.
+    Georgian,
     /// No marker at all.
     None,
 }
@@ -626,10 +634,14 @@ impl ListStyleType {
             }
             ListStyleType::None => String::new(),
             ListStyleType::Decimal => format!("{ordinal}"),
+            ListStyleType::DecimalLeadingZero => format!("{ordinal:02}"),
             ListStyleType::LowerAlpha => alphabetic(ordinal, 'a'),
             ListStyleType::UpperAlpha => alphabetic(ordinal, 'A'),
             ListStyleType::LowerRoman => roman(ordinal).to_lowercase(),
             ListStyleType::UpperRoman => roman(ordinal),
+            ListStyleType::LowerGreek => greek(ordinal),
+            ListStyleType::Armenian => additive(ordinal, &ARMENIAN, 9999),
+            ListStyleType::Georgian => additive(ordinal, &GEORGIAN, 19999),
         }
     }
 }
@@ -716,10 +728,14 @@ pub fn parse_list_style_type(name: &str) -> Option<ListStyleType> {
         "circle" => ListStyleType::Circle,
         "square" => ListStyleType::Square,
         "decimal" => ListStyleType::Decimal,
+        "decimal-leading-zero" => ListStyleType::DecimalLeadingZero,
         "lower-alpha" | "lower-latin" => ListStyleType::LowerAlpha,
         "upper-alpha" | "upper-latin" => ListStyleType::UpperAlpha,
         "lower-roman" => ListStyleType::LowerRoman,
         "upper-roman" => ListStyleType::UpperRoman,
+        "lower-greek" => ListStyleType::LowerGreek,
+        "armenian" => ListStyleType::Armenian,
+        "georgian" => ListStyleType::Georgian,
         "none" => ListStyleType::None,
         _ => return None,
     };
@@ -743,6 +759,142 @@ fn alphabetic(ordinal: usize, first: char) -> String {
 }
 
 /// Roman numerals, in the subtractive form.
+/// The classical Greek alphabet, which is 24 letters and not 25.
+///
+/// Final sigma is absent: it is a positional form of the same letter, so a
+/// list numbered with it would count sigma twice. CSS 2.1 says "lowercase
+/// classical Greek" and means exactly this sequence.
+const GREEK: [char; 24] = [
+    '\u{3b1}', '\u{3b2}', '\u{3b3}', '\u{3b4}', '\u{3b5}', '\u{3b6}', '\u{3b7}', '\u{3b8}',
+    '\u{3b9}', '\u{3ba}', '\u{3bb}', '\u{3bc}', '\u{3bd}', '\u{3be}', '\u{3bf}', '\u{3c0}',
+    '\u{3c1}', '\u{3c3}', '\u{3c4}', '\u{3c5}', '\u{3c6}', '\u{3c7}', '\u{3c8}', '\u{3c9}',
+];
+
+/// Traditional Armenian numbering: nine ones, nine tens, nine hundreds, nine
+/// thousands, each its own letter, written largest first and added up.
+///
+/// Additive rather than positional, so there is no zero and nothing to carry:
+/// 1996 is 1000 + 900 + 90 + 6, four letters, one per non-zero digit.
+const ARMENIAN: [(usize, char); 36] = [
+    (9000, '\u{554}'),
+    (8000, '\u{553}'),
+    (7000, '\u{552}'),
+    (6000, '\u{551}'),
+    (5000, '\u{550}'),
+    (4000, '\u{54f}'),
+    (3000, '\u{54e}'),
+    (2000, '\u{54d}'),
+    (1000, '\u{54c}'),
+    (900, '\u{54b}'),
+    (800, '\u{54a}'),
+    (700, '\u{549}'),
+    (600, '\u{548}'),
+    (500, '\u{547}'),
+    (400, '\u{546}'),
+    (300, '\u{545}'),
+    (200, '\u{544}'),
+    (100, '\u{543}'),
+    (90, '\u{542}'),
+    (80, '\u{541}'),
+    (70, '\u{540}'),
+    (60, '\u{53f}'),
+    (50, '\u{53e}'),
+    (40, '\u{53d}'),
+    (30, '\u{53c}'),
+    (20, '\u{53b}'),
+    (10, '\u{53a}'),
+    (9, '\u{539}'),
+    (8, '\u{538}'),
+    (7, '\u{537}'),
+    (6, '\u{536}'),
+    (5, '\u{535}'),
+    (4, '\u{534}'),
+    (3, '\u{533}'),
+    (2, '\u{532}'),
+    (1, '\u{531}'),
+];
+
+/// Traditional Georgian numbering, built the same way and reaching ten
+/// thousand, which Armenian does not.
+const GEORGIAN: [(usize, char); 37] = [
+    (10000, '\u{10f5}'),
+    (9000, '\u{10f0}'),
+    (8000, '\u{10ef}'),
+    (7000, '\u{10f4}'),
+    (6000, '\u{10ee}'),
+    (5000, '\u{10ed}'),
+    (4000, '\u{10ec}'),
+    (3000, '\u{10eb}'),
+    (2000, '\u{10ea}'),
+    (1000, '\u{10e9}'),
+    (900, '\u{10e8}'),
+    (800, '\u{10e7}'),
+    (700, '\u{10e6}'),
+    (600, '\u{10e5}'),
+    (500, '\u{10e4}'),
+    (400, '\u{10f3}'),
+    (300, '\u{10e2}'),
+    (200, '\u{10e1}'),
+    (100, '\u{10e0}'),
+    (90, '\u{10df}'),
+    (80, '\u{10de}'),
+    (70, '\u{10dd}'),
+    (60, '\u{10f2}'),
+    (50, '\u{10dc}'),
+    (40, '\u{10db}'),
+    (30, '\u{10da}'),
+    (20, '\u{10d9}'),
+    (10, '\u{10d8}'),
+    (9, '\u{10d7}'),
+    (8, '\u{10f1}'),
+    (7, '\u{10d6}'),
+    (6, '\u{10d5}'),
+    (5, '\u{10d4}'),
+    (4, '\u{10d3}'),
+    (3, '\u{10d2}'),
+    (2, '\u{10d1}'),
+    (1, '\u{10d0}'),
+];
+
+/// Lowercase classical Greek, wrapping past omega the way the alphabetic
+/// systems do: alpha, … omega, then alpha alpha.
+///
+/// CSS 2.1 does not say what happens past the twenty-fourth item, and every
+/// browser repeats the letter. Doing something else would number a long list
+/// with digits halfway down it.
+fn greek(ordinal: usize) -> String {
+    if ordinal == 0 {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut n = ordinal;
+    while n > 0 {
+        out.push(GREEK[(n - 1) % GREEK.len()]);
+        n = (n - 1) / GREEK.len();
+    }
+    out.iter().rev().collect()
+}
+
+/// An additive numeral system: the largest letter that fits, repeatedly.
+///
+/// Outside `limit` the system has no notation at all — unlike Roman, where
+/// the convention merely runs out — so the number is written in digits, which
+/// is what a reader can still use.
+fn additive(ordinal: usize, table: &[(usize, char)], limit: usize) -> String {
+    if ordinal == 0 || ordinal > limit {
+        return ordinal.to_string();
+    }
+    let mut out = String::new();
+    let mut n = ordinal;
+    for &(value, letter) in table {
+        while n >= value {
+            out.push(letter);
+            n -= value;
+        }
+    }
+    out
+}
+
 fn roman(ordinal: usize) -> String {
     // Above this the numeral system has no agreed notation, and a list that
     // long is not going to be read by its numbers anyway.
@@ -1725,6 +1877,49 @@ mod marker_tests {
         // Past the point where the notation is agreed, fall back to digits
         // rather than emitting a wall of Ms.
         assert_eq!(ListStyleType::UpperRoman.marker(4000), "4000.");
+    }
+
+    #[test]
+    fn decimal_leading_zero_pads_to_two_and_no_further() {
+        for (ordinal, expected) in [(1, "01"), (9, "09"), (10, "10"), (99, "99"), (100, "100")] {
+            assert_eq!(ListStyleType::DecimalLeadingZero.counter(ordinal), expected);
+        }
+    }
+
+    #[test]
+    fn lower_greek_skips_final_sigma() {
+        // Twenty-four letters, not twenty-five: final sigma is a positional
+        // form of the same letter and counting it would number two items
+        // sigma.
+        assert_eq!(ListStyleType::LowerGreek.counter(1), "\u{3b1}");
+        assert_eq!(ListStyleType::LowerGreek.counter(17), "\u{3c1}");
+        assert_eq!(ListStyleType::LowerGreek.counter(18), "\u{3c3}");
+        assert_eq!(ListStyleType::LowerGreek.counter(24), "\u{3c9}");
+        assert_eq!(
+            ListStyleType::LowerGreek.counter(25),
+            "\u{3b1}\u{3b1}",
+            "past omega it repeats, as the alphabetic systems do"
+        );
+    }
+
+    #[test]
+    fn armenian_and_georgian_are_additive() {
+        // 1996 is 1000 + 900 + 90 + 6: one letter per non-zero digit, largest
+        // first, and no subtractive pairs of the Roman kind.
+        assert_eq!(ListStyleType::Armenian.counter(1), "\u{531}");
+        assert_eq!(
+            ListStyleType::Armenian.counter(1996),
+            "\u{54c}\u{54b}\u{542}\u{536}"
+        );
+        assert_eq!(ListStyleType::Georgian.counter(1), "\u{10d0}");
+        assert_eq!(
+            ListStyleType::Georgian.counter(1996),
+            "\u{10e9}\u{10e8}\u{10df}\u{10d5}"
+        );
+        // Past the top of each system there is no notation at all, so the
+        // number is written in digits rather than in a wall of letters.
+        assert_eq!(ListStyleType::Armenian.counter(10000), "10000");
+        assert_eq!(ListStyleType::Georgian.counter(20000), "20000");
     }
 
     #[test]
