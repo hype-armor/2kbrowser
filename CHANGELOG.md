@@ -16,6 +16,50 @@ record for everything earlier.
 
 ## Unreleased
 
+**A pseudo-element carries its own counters** (§12.4), and every one of CSS
+2.1's counter styles is spelled. **Worth 30 conformance tests against 1 lost.**
+
+§12.4's own example is a heading numbered from a `::before` that increments
+the counter itself:
+
+```css
+h1::before { content: "Chapter " counter(chapter) ". "; counter-increment: chapter }
+```
+
+The number it prints is the one *after* that increment, which one pass over the
+style cannot produce: `content` is resolved against the counters as they stand,
+and the increment is a property of the style being resolved. So a
+pseudo-element that declares a counter operation is computed twice — the first
+pass read only for the operation, the second kept — and nearly none of them do,
+so nearly none of them pay for it.
+
+Two rules came with it. `::after` is computed after the element's children
+rather than beside `::before`, because its box comes after the element's
+content and so does anything it does to a counter. And an operation on a box
+nobody generates has no effect: a `::before` with no `content`, or one told
+`display: none`, counts nothing — without which four tests that check exactly
+that went the other way.
+
+The missing counter styles are `decimal-leading-zero`, `lower-greek`,
+`armenian` and `georgian`. Greek is twenty-four letters and not twenty-five:
+final sigma is a positional form of the same letter, and counting it would
+number two items sigma. The other two are additive like Roman but without the
+subtractive pairs — 1996 is one letter per non-zero digit, largest first — and
+past the top of each system there is no notation at all, so the number is
+written in digits rather than as a wall of letters. All four spell list markers
+and `counter()` alike, since §12.4.3 takes the values `list-style-type` does.
+
+The bundled Liberation faces carry neither Armenian nor Georgian (ADR-0008), so
+those two number correctly and draw nothing. That is the font's coverage and
+not the numbering, which is why the reference fixture leaves them out and their
+tests name the letters by codepoint instead.
+
+The one test lost is `generated-content/counters-root-000`, recorded as #124. A
+pseudo-element's `counter-reset` is scoped here the way §12.4.1 describes an
+element's — the element, its following siblings, their descendants — and
+browsers do something narrower that four probes against Chromium could not
+reduce to a rule. Twenty-two tests need the reading here; one needs the other.
+
 **A short page is no longer mistaken for an empty one.** ADR-0009's third
 state — "this page has no content without JavaScript" — fired on any document
 with a script and fewer than two hundred characters of text. That is a measure
@@ -86,7 +130,6 @@ failed the comparison on antialiasing alone.
 A replaced element is the exception (§10.3.8): its `auto` width comes from the
 intrinsic size, and narrowing the basis resolved `<img width="50%">` against
 the gap between the offsets instead of against the containing block.
->>>>>>> b4d974c (layout: stop mistaking a short page for an empty one)
 
 **An inline element holding a block is broken around it** (§9.2.1.1), instead
 of being laid out as a block. **Worth 31 conformance tests against 1 lost.**

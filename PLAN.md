@@ -427,6 +427,11 @@ it:
   context and a negative `z-index` never escapes one that should not be.
 - **Two right-to-left residues**: §10.3.3's over-constrained margin (#112) and
   an inline box split across lines (#113).
+- **A pseudo-element's `counter-reset` is scoped like its element's** (#124),
+  which is what §12.4.1 says and not what browsers do: they keep such a counter
+  out of the sight of the element's *following siblings*, and out of its
+  descendants' sight as well when the element resets the same name itself. One
+  test turns on it, against twenty-two that need the reading here.
 - **§17.2.1's anonymous *cell* is not generated** (#121) — the box that goes
   around a row's child that is not a cell. A run of table-internal boxes that
   would yield no cells is left alone rather than wrapped in a table, because a

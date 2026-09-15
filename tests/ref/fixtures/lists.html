@@ -7,6 +7,8 @@
     .plain a { text-decoration: none }
     ol.roman { list-style-type: upper-roman }
     ul.none { list-style-type: none }
+    ol.zero { list-style-type: decimal-leading-zero }
+    ol.greek { list-style-type: lower-greek }
   </style>
 </head>
 <body>
@@ -42,6 +44,26 @@
     <li>A list with no markers at all</li>
     <li>still indented, still a list</li>
   </ul>
+
+  <h2>The rest of CSS 2.1's counter styles</h2>
+
+  <ol class="zero" start="8">
+    <li>Padded to two digits</li>
+    <li>and no wider than the number needs</li>
+    <li>so the tenth item is not "010"</li>
+  </ol>
+
+  <ol class="greek" start="16">
+    <li>Classical Greek is twenty-four letters</li>
+    <li>with no final sigma: rho, then sigma</li>
+    <li>because a positional form is the same letter twice</li>
+  </ol>
+
+  <!-- Armenian and Georgian are implemented and deliberately absent here:
+       the bundled Liberation faces carry neither script (ADR-0008), so a row
+       for them would be a blank line in the baseline and would record the
+       font's coverage rather than the numbering. Their tests live in
+       `crates/css/src/style.rs`, where the letters can be named by codepoint. -->
 
   <hr>
 

@@ -351,11 +351,16 @@ fn style_subtree(
         // one. Computing the style and then throwing it away when there is no
         // content keeps that decision in one place, and lets every later stage
         // read "a style exists here" as "this box exists".
-        for which in [PseudoElement::Before, PseudoElement::After] {
-            let generated = compute(doc, node, &computed, rules, counters, Some(which));
-            if generated.content.is_some() {
-                out.pseudos.insert((node, which), generated);
-            }
+        if let Some(before) = generated_box(
+            doc,
+            node,
+            &computed,
+            rules,
+            counters,
+            PseudoElement::Before,
+            depth,
+        ) {
+            out.pseudos.insert((node, PseudoElement::Before), before);
         }
         // §5.12.2's box is gated differently, because it invents nothing:
         // `::first-letter` restyles text that is already on the page, so
@@ -383,6 +388,24 @@ fn style_subtree(
 
     for &child in doc.children(node) {
         style_subtree(doc, child, &style, rules, counters, depth + 1, out);
+    }
+    // `::after` is computed here rather than beside `::before`, because its box
+    // comes after the element's content and so does anything it does to a
+    // counter. A list whose items each carry `li::after { counter-increment }`
+    // otherwise numbers every nested item from a value the outer item had not
+    // reached yet.
+    if doc.element(node).is_some()
+        && let Some(after) = generated_box(
+            doc,
+            node,
+            &style,
+            rules,
+            counters,
+            PseudoElement::After,
+            depth,
+        )
+    {
+        out.pseudos.insert((node, PseudoElement::After), after);
     }
     // Every counter this element's children created goes out of scope here:
     // §12.4.1 ends a reset's scope with the element it was written on, and
@@ -1555,6 +1578,57 @@ impl Counters {
             .map(|instance| instance.value)
             .collect()
     }
+}
+
+/// The style of a `::before` or `::after` box, where the rules generate one.
+///
+/// §12.1: a pseudo-element generates a box only when `content` gives it one.
+/// Computing the style and then throwing it away when there is no content
+/// keeps that decision in one place, and lets every later stage read "a style
+/// exists here" as "this box exists".
+///
+/// The two passes are what §12.4's own example needs. It numbers a heading
+/// from a `::before` that increments the counter itself —
+///
+/// ```text
+/// h1::before { content: "Chapter " counter(chapter) ". "; counter-increment: chapter }
+/// ```
+///
+/// — and the number it prints is the one *after* that increment, which a
+/// single pass cannot produce: `content` is resolved against the counters as
+/// they stand, and the increment is a property of the style being computed.
+/// So the first pass is read only for the counter operations, and the second
+/// is the style that is kept. Only a pseudo-element that declares one pays for
+/// it, which is nearly none of them.
+///
+/// The operations are applied at the *element's* depth rather than a deeper
+/// one, because §12.4.1 scopes a reset to the box and its following siblings —
+/// and the following siblings of a `::before` box are the element's own
+/// content. A `div::before { counter-reset: n }` has to still be in scope for
+/// a `div div::before` inside it, which is what `counters()` prints as `0.0`.
+fn generated_box(
+    doc: &Document,
+    node: NodeId,
+    parent_style: &ComputedStyle,
+    rules: &Rules,
+    counters: &mut Counters,
+    which: PseudoElement,
+    depth: usize,
+) -> Option<ComputedStyle> {
+    let generated = compute(doc, node, parent_style, rules, counters, Some(which));
+    // §12.4: a counter operation on a box that is not generated has no effect,
+    // and a pseudo-element with no `content` or with `display: none` generates
+    // none. Neither condition depends on a counter's *value*, so the first pass
+    // can be trusted to answer both.
+    let generates_a_box = generated.content.is_some() && generated.display != Display::None;
+    if !generates_a_box
+        || (generated.counter_reset.is_empty() && generated.counter_increment.is_empty())
+    {
+        return generated.content.is_some().then_some(generated);
+    }
+    step_counters(&generated, counters, depth);
+    let generated = compute(doc, node, parent_style, rules, counters, Some(which));
+    generated.content.is_some().then_some(generated)
 }
 
 /// Applies an element's own `counter-reset` and `counter-increment`.
@@ -2893,6 +2967,61 @@ mod tests {
             .as_deref(),
             Some("3. ")
         );
+    }
+
+    #[test]
+    fn a_pseudo_element_sees_its_own_counter_increment() {
+        // §12.4's own example: a heading numbered from a `::before` that
+        // increments the counter itself prints the value *after* the
+        // increment. Resolving `content` in one pass cannot produce that, so
+        // the pseudo-element's operations are applied and the style recomputed.
+        assert_eq!(
+            content_of(
+                "<h1>x</h1>",
+                "h1::before { content: \"Chapter \" counter(chapter) \". \"; \
+                 counter-increment: chapter }",
+                "h1",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("Chapter 1. ")
+        );
+        // Reset before increment here too, as on an element.
+        assert_eq!(
+            content_of(
+                "<p>x</p>",
+                "p::before { content: counter(c); counter-reset: c 10; \
+                 counter-increment: c 5 }",
+                "p",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn a_pseudo_element_that_generates_no_box_counts_nothing() {
+        // §12.4: an operation on a box nobody generates has no effect. A
+        // `::before` with no `content` generates none, and neither does one
+        // told `display: none` — and in both cases the counter must read as
+        // though the rule were not there.
+        for suppressed in [
+            "span::before { counter-increment: c 10 }",
+            "span::before { content: \"x\"; display: none; counter-increment: c 10 }",
+        ] {
+            assert_eq!(
+                content_of(
+                    "<div><span></span></div>",
+                    &format!("div {{ counter-reset: c }} div::after {{ content: counter(c) }} {suppressed}"),
+                    "div",
+                    PseudoElement::After,
+                )
+                .as_deref(),
+                Some("0"),
+                "{suppressed}"
+            );
+        }
     }
 
     #[test]
