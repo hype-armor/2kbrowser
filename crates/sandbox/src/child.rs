@@ -279,6 +279,8 @@ mod tests {
                 title: None,
                 links: Vec::new(),
                 missing: Vec::new(),
+                buttons: Vec::new(),
+                submit: None,
                 can_toggle_layout: false,
                 editing: false,
                 images_loaded: 0,

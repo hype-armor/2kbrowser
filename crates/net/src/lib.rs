@@ -155,6 +155,15 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
+/// Largest form body this browser will send.
+///
+/// Not a limit any form needs: the era's are a few hundred bytes and a long
+/// comment is a few thousand. It is a bound on what a *compromised renderer*
+/// can push out of this machine in one request — the one direction the
+/// boundary could not otherwise measure, since a body, unlike a URL, has no
+/// length anything agrees on.
+pub const MAX_FORM_BYTES: u64 = 1024 * 1024;
+
 /// Largest response we will read into memory.
 ///
 /// A browser must not let a hostile server exhaust its memory, and 32 MiB is
@@ -256,6 +265,49 @@ impl Fetcher {
         })
     }
 
+    /// Sends a form and fetches what comes back (#110).
+    ///
+    /// The one request this browser makes that carries data *up*. Everything
+    /// else here asks a server for something; this hands it something, which is
+    /// a different kind of act and is why it is a separate method rather than a
+    /// flag on `fetch_raw`: a caller has to mean it.
+    ///
+    /// Three rules, all enforced here rather than by whoever calls:
+    ///
+    /// * **Network schemes only.** There is nothing to post to a `file:` URL,
+    ///   and a page that asked to would be asking to write to the disk.
+    /// * **Bounded.** A body is not a URL and has no length anyone has ever
+    ///   agreed on, so [`MAX_FORM_BYTES`] is what leaves this machine at most.
+    ///   The cap is about what a *compromised renderer* can push, not about
+    ///   what a form needs — the era's forms are a few hundred bytes.
+    /// * **Navigation, so the third-party rule does not apply.** Posting to
+    ///   another host is what a form to another host means, and refusing it
+    ///   would break the sign-in on half the surviving web. ADR-0006 is about
+    ///   what a page loads *without being asked*, and this was asked for.
+    pub fn post(&self, url: &str, body: &str) -> Result<Fetched, FetchError> {
+        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
+        if origin.scheme == Scheme::File {
+            return Err(FetchError::Refused(Refusal::UnsupportedScheme {
+                scheme: "file".to_owned(),
+            }));
+        }
+        if body.len() as u64 > MAX_FORM_BYTES {
+            return Err(FetchError::TooLarge);
+        }
+        self.policy
+            .check(None, &origin, RequestKind::Navigation)
+            .map_err(FetchError::Refused)?;
+
+        let (bytes, content_type, trust) = post_http(url, body)?;
+        Ok(Fetched {
+            body: bytes,
+            content_type,
+            origin,
+            path,
+            trust,
+        })
+    }
+
     /// Fetches a URL without decoding it, keeping the `Content-Type`.
     ///
     /// What a navigation uses now that decoding happens in the renderer child
@@ -343,6 +395,46 @@ fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError>
             Ok((bytes, content_type, Trust::LocalRoot))
         }
     }
+}
+
+/// One form, through the same two-agent dance `fetch_http` does.
+fn post_http(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
+    match send(tls::agent(), url, body) {
+        Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
+        Err(error) => {
+            if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
+                return Err(into_fetch_error(error));
+            }
+            let (bytes, content_type) =
+                send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
+            Ok((bytes, content_type, Trust::LocalRoot))
+        }
+    }
+}
+
+/// One form sent through a given agent.
+fn send(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &str,
+) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
+    let response = agent
+        .post(url)
+        .content_type("application/x-www-form-urlencoded")
+        .send(body)?;
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let bytes = response
+        .into_body()
+        .with_config()
+        .limit(MAX_BODY_BYTES)
+        .read_to_vec()?;
+    Ok((bytes, content_type))
 }
 
 /// One request through a given agent.

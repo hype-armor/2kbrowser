@@ -244,6 +244,55 @@ impl Page {
         out
     }
 
+    /// Every control that can be pressed, in document order, with where it is.
+    ///
+    /// Buttons, so a form can be sent (#110). Checkboxes and radios are not
+    /// here: pressing one has to *change* it, and nothing can yet — offering a
+    /// target that does nothing would be worse than offering none.
+    pub fn buttons(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                if layout::forms::control_of(&frame.doc, node)
+                    != Some(layout::forms::Control::Button)
+                {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// The button at a point on the canvas, if there is one.
+    pub fn button_at(&self, x: f32, y: f32) -> Option<dom::NodeId> {
+        self.buttons()
+            .into_iter()
+            .rev()
+            .find(|(_, rect)| {
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|(node, _)| node)
+    }
+
+    /// The form `node` belongs to, collected and ready to send (#110).
+    ///
+    /// `submitter` is the control that asked — a button, or `None` when it was
+    /// Enter in a text field, which presses nothing.
+    pub fn submission_from(&self, node: dom::NodeId) -> Option<layout::forms::Submission> {
+        self.frames.iter().find_map(|frame| {
+            let form = layout::forms::form_of(&frame.doc, node)?;
+            let submitter = (layout::forms::control_of(&frame.doc, node)
+                == Some(layout::forms::Control::Button))
+            .then_some(node);
+            Some(layout::forms::submission(&frame.doc, form, submitter))
+        })
+    }
+
     /// The text control at a point on the canvas, if there is one.
     ///
     /// Last match wins, the way the hit test for links does: a control drawn

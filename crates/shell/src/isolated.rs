@@ -99,6 +99,12 @@ pub struct PageRenderer {
     values: Vec<(dom::NodeId, String)>,
     /// The control being typed in, and its editing state.
     focus: Option<(dom::NodeId, crate::field::Field)>,
+    /// A form the reader asked to send, waiting for the next render to carry
+    /// it out (#110).
+    ///
+    /// Taken rather than held: one press sends one form, and a submission left
+    /// lying here would be re-sent by the next resize.
+    submit: Option<sandbox::message::Submission>,
 }
 
 impl Default for PageRenderer {
@@ -119,6 +125,7 @@ impl PageRenderer {
             last: None,
             values: Vec::new(),
             focus: None,
+            submit: None,
         }
     }
 
@@ -206,11 +213,46 @@ impl PageRenderer {
     /// up the focus, which is what pressing the margin of a page means
     /// everywhere.
     fn focus_at(&mut self, at: (f32, f32)) {
+        // A button first: it is a press rather than a place to type, and a
+        // button that sat inside a field's rectangle would otherwise be
+        // unreachable (#110).
+        if let Some(button) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.button_at(at.0, at.1))
+        {
+            self.set_focus(None);
+            self.ask_to_send(button);
+            return;
+        }
         let found = self
             .page
             .as_ref()
             .and_then(|page| page.control_at(at.0, at.1));
         self.set_focus(found);
+    }
+
+    /// Collects the form `node` is in, for the parent to send.
+    ///
+    /// Nothing happens here beyond the collecting. Where it goes and whether it
+    /// goes at all is the parent's decision, because a stranger's page must not
+    /// be able to make this process talk to a server of its choosing — only to
+    /// ask (ADR-0012).
+    fn ask_to_send(&mut self, node: dom::NodeId) {
+        // What has been typed has to be in the document before the form is
+        // read out of it, and it is only written there by a render.
+        self.flush_focus();
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        let Some(collected) = page.submission_from(node) else {
+            return;
+        };
+        self.submit = Some(sandbox::message::Submission {
+            action: collected.action,
+            post: collected.method == layout::forms::Method::Post,
+            body: collected.body,
+        });
     }
 
     /// Moves the focus to a control, starting its editing state from what the
@@ -283,21 +325,25 @@ impl PageRenderer {
             .as_ref()
             .zip(self.page.as_ref())
             .is_some_and(|((node, _), page)| page.is_multiline(*node));
-        let Some((_, field)) = &mut self.focus else {
+        let mut submitting = false;
+        let Some((node, field)) = &mut self.focus else {
             return;
         };
+        let node = *node;
         match key {
             // A newline belongs in a `<textarea>` and nowhere else. The parent
-            // sends the character and this refuses it, because the parent has
-            // no idea what kind of control it is typing into and should not
-            // have to: Enter in a one-line field means submit, which this
-            // browser does not do yet, and a literal newline in one would be a
-            // field holding something no browser would ever put there.
+            // sends the character and this decides, because the parent has no
+            // idea what kind of control it is typing into and should not have
+            // to. In a one-line field Enter means *send the form*, which is
+            // how every search box on the era's web is used — and a literal
+            // newline in one would be a field holding something no browser
+            // would ever put there.
             Key::Insert(text) if text.contains('\n') && !multiline => {
                 let without: String = text.chars().filter(|c| *c != '\n').collect();
                 if !without.is_empty() {
                     field.insert(&without);
                 }
+                submitting = true;
             }
             Key::Insert(text) => field.insert(text),
             Key::Backspace => field.backspace(),
@@ -312,6 +358,12 @@ impl PageRenderer {
             Key::Tab { .. } | Key::Escape => {}
         }
         self.flush_focus();
+        if submitting {
+            // Nothing was pressed, so no button is a successful control. That
+            // is HTML's own rule and it is the difference between a search box
+            // and a form with two buttons meaning opposite things.
+            self.ask_to_send(node);
+        }
     }
 }
 
@@ -405,6 +457,8 @@ impl Render for PageRenderer {
             title: page.title.clone(),
             links: links_of(&page),
             missing: missing_of(&page),
+            buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            submit: self.submit.take(),
             can_toggle_layout: self.can_toggle_layout(&page),
             editing: self.focus.is_some(),
             images_loaded: page.images_loaded as u32,
@@ -452,6 +506,10 @@ impl Render for PageRenderer {
             title: page.title.clone(),
             links: links_of(page),
             missing: missing_of(page),
+            buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            // A band is a repaint of rows already laid out, and repainting is
+            // not a thing anybody asked a form to be sent by.
+            submit: None,
             can_toggle_layout: self.can_toggle_layout(page),
             editing: self.focus.is_some(),
             images_loaded: page.images_loaded as u32,

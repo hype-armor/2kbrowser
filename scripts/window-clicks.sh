@@ -743,4 +743,86 @@ longer be scrolled with the keyboard"
 echo "ok: a text field took a click, took five characters, and let go on Escape"
 stop
 
+# N. Pressing a submit button sends the form (#110).
+#
+#    The one check in this file that involves a server, because it is the one
+#    behaviour that cannot be seen without one: a form is sent correctly only if
+#    what *arrived* is right, and nothing on this side of the socket can tell
+#    you that. `isolation.rs` proves the encoding against a real socket; this
+#    proves that a press in a real window reaches it at all.
+#
+#    Local, on a port the kernel picks, and killed with the harness.
+form_port=8737
+python3 - "$form_port" >/dev/null 2>&1 <<'SERVER' &
+import http.server, socketserver, sys, pathlib
+
+seen = pathlib.Path("/tmp/2kbrowser-form-seen")
+seen.unlink(missing_ok=True)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def page(self, body):
+        body = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.page(
+            "<title>A form</title><body style='margin:0'>"
+            "<form action='/submit' method='post'>"
+            "<input name='q' value='tables'>"
+            "<input type='submit' name='go' value='Send'>"
+            "</form></body>"
+        )
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        seen.write_text(self.rfile.read(length).decode())
+        self.page("<title>Answered</title><body><p>thanks</p></body>")
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as server:
+    server.serve_forever()
+SERVER
+form_server=$!
+# Waited for rather than slept on: a port that is not listening yet fails the
+# navigation below, and the failure would read as a browser that cannot fetch.
+for _ in $(seq 1 40); do
+    (echo > "/dev/tcp/127.0.0.1/$form_port") >/dev/null 2>&1 && break
+    sleep 0.25
+done
+
+start_on "http://127.0.0.1:$form_port/form" "A form"
+DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null || true
+sleep 0.3
+# Where the button is, asked of the screen: the fixture has the field and the
+# button on one line, so the rightmost ink below the chrome is the button.
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 1)) $((height - 1)))
+[ -n "$box" ] || fail "the form never reached the screen"
+set -- $box
+DISPLAY=$display xdotool mousemove $(($3 - 12)) $((($2 + $4) / 2))
+DISPLAY=$display xdotool click 1
+
+sent=""
+for _ in $(seq 1 30); do
+    sleep 0.3
+    case "$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null)" in
+        Answered*) sent=yes; break ;;
+    esac
+done
+kill "$form_server" 2>/dev/null || true
+[ -n "$sent" ] || fail "pressing the submit button did not navigate, so the \
+form never left the browser"
+arrived=$(cat /tmp/2kbrowser-form-seen 2>/dev/null || true)
+[ "$arrived" = "q=tables&go=Send" ] || fail "the server was sent \
+\"$arrived\" rather than the form's own fields"
+echo "ok: pressing submit sent the form and the server got its fields"
+stop
+
 echo "all window click checks passed"

@@ -385,6 +385,23 @@ impl Viewport {
         }
     }
 
+    /// Where this page's buttons are, in document order (#110).
+    ///
+    /// Asked of the child at render time and carried with the page, for the
+    /// same reason the links are: the parent has no box tree, so a rectangle
+    /// missing from this list is a button that does nothing when pressed.
+    pub fn buttons(&self) -> Vec<Rect> {
+        self.page.buttons.clone()
+    }
+
+    /// A form the page asked to send, if it did (#110).
+    ///
+    /// Taken rather than read: one press sends one form, and a submission left
+    /// here would be sent again by whatever asked next.
+    pub fn take_submission(&mut self) -> Option<sandbox::message::Submission> {
+        self.page.submit.take()
+    }
+
     /// Whether a form control on this page is taking the typing.
     pub fn editing(&self) -> bool {
         self.page.editing

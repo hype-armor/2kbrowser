@@ -85,6 +85,27 @@ pub struct Missing {
     pub url: String,
 }
 
+/// A form the reader asked to send (#110).
+///
+/// Assembled by the child, because the form is part of the document and the
+/// document never leaves that side (ADR-0012). What crosses is only this: a
+/// destination as the markup wrote it, a method, and the encoded pairs.
+///
+/// The parent decides everything that follows — where the destination resolves
+/// to, whether the policy allows it, how big a body may be, and whether to
+/// navigate at all. That split is the point: a compromised renderer can ask for
+/// a request, exactly as it can already ask for a navigation by claiming a link
+/// is under the pointer, and it cannot make one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    /// The form's `action`, as written. Empty means the document's own URL.
+    pub action: String,
+    /// Whether the pairs go in the query string or in a body.
+    pub post: bool,
+    /// The successful controls, `application/x-www-form-urlencoded`.
+    pub body: String,
+}
+
 /// A link's rectangle and where it leads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
@@ -613,6 +634,20 @@ pub struct Rendered {
     pub missing: Vec<Missing>,
     /// Whether there is a fallback decision to overrule.
     pub can_toggle_layout: bool,
+    /// Where this page's buttons are, in document order (#110).
+    ///
+    /// The parent routes a press to the child by coordinates, so it does not
+    /// strictly need these — but a *test* does, and so would a keyboard that
+    /// could reach a button. Rectangles only: which form each belongs to and
+    /// what it would send stays on the side that holds the document.
+    pub buttons: Vec<Rect>,
+    /// A form the reader asked to send, if they did (#110).
+    ///
+    /// Answered with the render rather than as a message of its own, because
+    /// that is what happened: a key was pressed, the page is unchanged, and a
+    /// navigation is being asked for. The parent reads it after the pixels and
+    /// decides.
+    pub submit: Option<Submission>,
     /// Whether a form control on this page currently has the typing (#110).
     ///
     /// One bit, and deliberately no more: the parent needs to know whether a
@@ -677,6 +712,16 @@ impl ToParent {
                 for missing in &page.missing {
                     write_rect(&mut writer, &missing.rect);
                     writer.str(&missing.url);
+                }
+                writer.u32(page.buttons.len() as u32);
+                for rect in &page.buttons {
+                    write_rect(&mut writer, rect);
+                }
+                writer.some(page.submit.is_some());
+                if let Some(submit) = &page.submit {
+                    writer.str(&submit.action);
+                    writer.some(submit.post);
+                    writer.str(&submit.body);
                 }
                 writer.some(page.can_toggle_layout);
                 writer.some(page.editing);
@@ -760,6 +805,20 @@ impl ToParent {
                         url: reader.str()?,
                     });
                 }
+                let count = reader.count()?;
+                let mut buttons = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    buttons.push(read_rect(&mut reader)?);
+                }
+                let submit = if reader.some()? {
+                    Some(Submission {
+                        action: reader.str()?,
+                        post: reader.some()?,
+                        body: reader.str()?,
+                    })
+                } else {
+                    None
+                };
                 let can_toggle_layout = reader.some()?;
                 let editing = reader.some()?;
                 let images_loaded = reader.u32()?;
@@ -788,6 +847,8 @@ impl ToParent {
                     title,
                     links,
                     missing,
+                    buttons,
+                    submit,
                     can_toggle_layout,
                     editing,
                     images_loaded,
@@ -863,6 +924,17 @@ mod tests {
                 },
                 url: "https://cdn.example.net/photo.jpg".to_owned(),
             }],
+            buttons: vec![Rect {
+                x: 9.0,
+                y: 10.0,
+                width: 11.0,
+                height: 12.0,
+            }],
+            submit: Some(Submission {
+                action: "/search".to_owned(),
+                post: false,
+                body: "q=tables".to_owned(),
+            }),
             can_toggle_layout: true,
             editing: false,
             images_loaded: 3,
