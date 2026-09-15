@@ -855,9 +855,15 @@ const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// That scope is deliberately narrow. It makes re-rendering cheap, which is
 /// what a resize is and what most of the cost of one was, and it makes a page
 /// that uses the same spacer image forty times fetch it once. It does nothing
-/// for navigating back to a page you were just on — that wants a cache which
-/// outlives a page, which in turn wants an answer about `Cache-Control` and
-/// about eviction, and neither is a decision to make in passing.
+/// for navigating back to a page you were just on.
+///
+/// That wants a cache which outlives a page, and the terms it would have to
+/// meet are now settled rather than open: ADR-0018 decides them — keyed on the
+/// pair of document site and full URL, consulted only behind the policy check,
+/// carrying `trust` with each entry, honouring `no-store` and `Pragma:
+/// no-cache`, bypassed by reload, and evicting least-recently-used against a
+/// byte cap. It *replaces* this rather than sitting beside it, so that one
+/// store holds the bytes rather than two.
 #[derive(Debug, Default)]
 struct Fetched {
     /// Answers ready to send, by URL.
