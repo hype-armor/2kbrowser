@@ -16,6 +16,12 @@ record for everything earlier.
 
 ## Unreleased
 
+**An absolutely positioned root element takes its offsets** (§10.1). Its
+containing block is the initial one — the viewport — and `layout_block` applies
+a *relative* shift itself, but absolute placement is a parent's business and
+the root element has no parent to do it. So `html { position: absolute;
+left: 100px }` moved nothing at all. Two conformance tests, nothing lost.
+
 **A table's `height` is a minimum** (§17.5.3), not its height. Where the rows do
 not fill it the excess is shared out among them. **Worth 27 conformance tests
 against nothing lost.**

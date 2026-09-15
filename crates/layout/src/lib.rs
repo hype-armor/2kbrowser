@@ -1083,6 +1083,27 @@ pub fn layout(
     );
     root.rect.height = height.outer();
 
+    // §10.1: the root element's containing block is the *initial* containing
+    // block — the viewport. `layout_block` applies a relative shift itself, but
+    // absolute placement is a parent's business, and the root element has no
+    // parent to do it. So `html { position: absolute; left: 100px }` moved
+    // nothing at all.
+    if start_style.position.is_out_of_flow()
+        && let Some(box_) = find_box(&mut root, start)
+    {
+        let size = (box_.rect.width, box_.rect.height);
+        let (x, y) = absolute_offset(
+            &start_style,
+            (viewport_width, viewport_height),
+            size,
+            // With no offsets given the box stays where flow put it, which for
+            // the root element is the corner of the viewport.
+            (0.0, 0.0),
+        );
+        box_.rect.x = x;
+        box_.rect.y = y;
+    }
+
     // §14.2 again: when it was the *body's* background that reached the canvas,
     // the body's own background properties take their initial values — it is
     // not painted a second time. The image half of that is settled in paint,
@@ -5492,6 +5513,42 @@ mod tests {
         let all = boxes(&rendered.layout.root);
         let root = all.first().expect("the root element's box");
         assert_eq!(root.style.border.left.width, Length::Px(5.0));
+    }
+
+    #[test]
+    fn an_absolutely_positioned_root_element_takes_its_offsets() {
+        // §10.1: the root element's containing block is the initial one, the
+        // viewport. `layout_block` applies a relative shift itself, but
+        // absolute placement is a parent's business and the root has none, so
+        // `html { position: absolute; left: 100px }` moved nothing at all.
+        let rendered = run_in(
+            "<html style=\"position: absolute; left: 100px; top: 40px; \
+             width: 100px; height: 100px\"><body></body></html>",
+            "",
+            600.0,
+            500.0,
+        );
+        let root = boxes(&rendered.layout.root)
+            .into_iter()
+            .next()
+            .expect("the root element's box");
+        assert_eq!((root.rect.x, root.rect.y), (100.0, 40.0));
+    }
+
+    #[test]
+    fn a_root_element_offset_from_the_far_edges_measures_from_the_viewport() {
+        let rendered = run_in(
+            "<html style=\"position: absolute; right: 0; bottom: 0; \
+             width: 100px; height: 50px\"><body></body></html>",
+            "",
+            600.0,
+            500.0,
+        );
+        let root = boxes(&rendered.layout.root)
+            .into_iter()
+            .next()
+            .expect("the root element's box");
+        assert_eq!((root.rect.x, root.rect.y), (500.0, 450.0));
     }
 
     #[test]
