@@ -76,8 +76,10 @@ done
 Xvfb "$display" -screen 0 1200x1000x24 >/dev/null 2>&1 &
 xvfb=$!
 app=""
+applog=$(mktemp)
 cleanup() {
     [ -n "$app" ] && kill "$app" 2>/dev/null
+    rm -f "$applog"
     kill "$xvfb" 2>/dev/null
     return 0
 }
@@ -108,8 +110,13 @@ start() {
 # what the page's title actually is.
 start_on() {
     local on=$1 ready=$2
+    # Kept rather than discarded, so a browser that dies on startup can say why.
+    # This timed out twice on CI with no window ever appearing and nothing to
+    # go on, because its output went to /dev/null — an unreproducible failure
+    # whose one witness was being thrown away.
+    : > "$applog"
     DISPLAY=$display "$browser" open "$on" --width "$width" --height "$height" \
-        >/dev/null 2>&1 &
+        >"$applog" 2>&1 &
     app=$!
     local waited=0 title=""
     while [ "$waited" -lt 60 ]; do
@@ -132,6 +139,13 @@ start_on() {
     # browser, and a bare timeout cannot tell them apart — which matters most
     # on CI, where this is the only evidence there will be.
     if [ -z "$window" ]; then
+        # Alive and silent is a different fault from dead and noisy, and the
+        # two want different things looked at next.
+        local alive="no"
+        kill -0 "$app" 2>/dev/null && alive="yes"
+        echo "--- browser output ---" >&2
+        tail -20 "$applog" >&2 || true
+        echo "--- still running: $alive ---" >&2
         fail "no window within 30s waiting for \"$ready\" — the browser never \
 opened one, so no click below would have meant anything"
     fi

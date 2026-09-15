@@ -1429,6 +1429,91 @@ fn fill_rect(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
     );
 }
 
+/// The glyph every font reserves for "no glyph for this character".
+const NOTDEF: u16 = 0;
+
+/// How much of the font size a tofu box stands above the baseline.
+///
+/// Cap height rather than the full ascent: a box drawn to the ascender sits
+/// noticeably higher than the letters beside it, and a line mixing covered and
+/// uncovered script should read as one line.
+const TOFU_HEIGHT: f32 = 0.66;
+
+/// How much of the advance is left clear either side, so a run of them reads as
+/// separate boxes rather than as a bar.
+const TOFU_SIDE: f32 = 0.12;
+
+/// How thick the box's edge is drawn, as a share of the font size, and the
+/// floor it never goes below.
+const TOFU_EDGE: f32 = 0.06;
+const TOFU_EDGE_MIN: f32 = 1.0;
+
+/// Below this many pixels of advance a tofu is not drawn at all.
+///
+/// A box smaller than this is a smudge rather than a character, and a page set
+/// in 4px text would gain nothing from a row of them. The same judgement the
+/// image placeholder makes at its own size.
+const TOFU_MIN: f32 = 4.0;
+
+/// Draws a hollow box where a character has no glyph.
+///
+/// `x` is the pen position and `y` the baseline, which is what the glyph path
+/// around this already holds.
+fn draw_tofu(pixmap: &mut Pixmap, glyph: &text::PositionedGlyph, x: f32, y: f32, color: Color) {
+    let advance = glyph.advance;
+    let height = glyph.font_size * TOFU_HEIGHT;
+    if advance < TOFU_MIN || height < TOFU_MIN {
+        return;
+    }
+    let inset = advance * TOFU_SIDE;
+    // Snapped to whole pixels, unlike a glyph. A glyph is antialiased and reads
+    // correctly at a fractional position; a one-pixel edge drawn at one is
+    // spread across two rows at half intensity, so a box of them comes out as a
+    // grey smudge rather than as a box.
+    //
+    // It also makes the box a function of the rounded baseline rather than the
+    // exact one, which matters more than it sounds: two layouts whose baselines
+    // differ by a fraction of a pixel — an anonymous block beside a `<br>`, say
+    // — would otherwise draw boxes of different heights, and a hard edge turns
+    // a sub-pixel difference into a visible one.
+    let rect = Rect {
+        x: (x + inset).round(),
+        y: (y - height).round(),
+        width: (advance - inset * 2.0).round().max(1.0),
+        height: height.round().max(1.0),
+    };
+    let edge = (glyph.font_size * TOFU_EDGE).max(TOFU_EDGE_MIN).round();
+    // Hollow, so it reads as a container for a character that is missing rather
+    // than as a solid block, which at small sizes is indistinguishable from
+    // censored text.
+    if rect.width <= edge * 2.0 || rect.height <= edge * 2.0 {
+        fill_rect(pixmap, &rect, color);
+        return;
+    }
+    for side in [
+        Rect {
+            height: edge,
+            ..rect
+        },
+        Rect {
+            y: rect.y + rect.height - edge,
+            height: edge,
+            ..rect
+        },
+        Rect {
+            width: edge,
+            ..rect
+        },
+        Rect {
+            x: rect.x + rect.width - edge,
+            width: edge,
+            ..rect
+        },
+    ] {
+        fill_rect(pixmap, &side, color);
+    }
+}
+
 fn draw_glyph(
     pixmap: &mut Pixmap,
     fonts: &mut FontStore,
@@ -1445,6 +1530,22 @@ fn draw_glyph(
     // same family as the `margin: 1e40px` bug, one layer further in.
     let (x, y) = (origin_x + glyph.x, origin_y + glyph.y);
     if !in_range(x) || !in_range(y) {
+        return;
+    }
+
+    // A character the bundled fonts do not cover (#97). The shaper resolves it
+    // to `.notdef` and gives it a real advance, so the line is the right length
+    // and the layout is right — and then nothing is drawn, because `.notdef`
+    // has no outline in these faces. A page in Chinese or Arabic came out
+    // *blank*, which is the worse of the two failures: a reader cannot tell
+    // "this page is empty" from "this browser has no font for it".
+    //
+    // ADR-0008 and PLAN.md both already say pages in uncovered scripts render
+    // as tofu. This is that sentence becoming true. Covering the scripts is the
+    // other half and a separate decision, since it is tens of megabytes against
+    // a font budget currently using four.
+    if glyph.glyph_id == NOTDEF {
+        draw_tofu(pixmap, glyph, x, y, color);
         return;
     }
 
@@ -3019,5 +3120,161 @@ mod missing_image_tests {
             "only {inked} inked pixels across the middle of a 240x160 \
              placeholder, so the label is not there"
         );
+    }
+}
+
+#[cfg(test)]
+mod tofu_tests {
+    use super::*;
+
+    /// One line of `text` at 20px, rasterised onto white.
+    fn draw(text: &str) -> Pixmap {
+        let mut fonts = FontStore::new();
+        let style = css::style::ComputedStyle {
+            font_size: 20.0,
+            ..css::style::ComputedStyle::default()
+        };
+        let runs = [text::InlineRun::text(text, style.clone())];
+        let layout = fonts.layout_runs(&runs, &style, 400.0);
+        let mut pixmap = Pixmap::new(400, 60).expect("a pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
+        for line in &layout.lines {
+            for glyph in &line.glyphs {
+                draw_glyph(
+                    &mut pixmap,
+                    &mut fonts,
+                    glyph,
+                    0.0,
+                    30.0,
+                    Color::rgb(0, 0, 0),
+                );
+            }
+        }
+        pixmap
+    }
+
+    /// How many pixels are not the white the canvas started as.
+    fn inked(pixmap: &Pixmap) -> usize {
+        pixmap
+            .pixels()
+            .iter()
+            .filter(|pixel| pixel.red() != 0xff || pixel.green() != 0xff || pixel.blue() != 0xff)
+            .count()
+    }
+
+    #[test]
+    fn a_script_the_bundled_fonts_do_not_cover_draws_something() {
+        // #97. The shaper resolves these to `.notdef` and gives them real
+        // advances, so the line was always the right length — and then nothing
+        // was drawn, so a page in Chinese came out blank. A reader cannot tell
+        // "this page is empty" from "this browser has no font for it".
+        for (script, text) in [
+            ("CJK", "你好世界"),
+            ("Arabic", "مرحبا"),
+            ("Devanagari", "नमस्ते"),
+            ("Thai", "สวัสดี"),
+        ] {
+            let ink = inked(&draw(text));
+            assert!(ink > 0, "{script} drew nothing at all");
+        }
+    }
+
+    #[test]
+    fn a_script_the_fonts_do_cover_still_draws_its_own_glyphs() {
+        // The tofu must not be reaching text that has glyphs. Hebrew is the
+        // interesting one: Liberation is metric-compatible with Arial and
+        // inherits its coverage, which is why it renders where Arabic does not.
+        for (script, text) in [
+            ("Latin", "Hello"),
+            ("Greek", "Καλημέρα"),
+            ("Hebrew", "שלום"),
+        ] {
+            let pixmap = draw(text);
+            let ink = inked(&pixmap);
+            assert!(ink > 0, "{script} drew nothing");
+            // A tofu is a hollow rectangle: its rows are either empty or have
+            // ink at both ends and none between. Real text is not that regular,
+            // so a row with ink somewhere strictly inside it is proof of a
+            // glyph rather than a box.
+            let inside = (0..pixmap.height()).any(|y| {
+                let row: Vec<bool> = (0..pixmap.width())
+                    .map(|x| {
+                        let p = pixmap.pixels()[(y * pixmap.width() + x) as usize];
+                        p.red() != 0xff || p.green() != 0xff || p.blue() != 0xff
+                    })
+                    .collect();
+                match (
+                    row.iter().position(|on| *on),
+                    row.iter().rposition(|on| *on),
+                ) {
+                    (Some(first), Some(last)) if last > first + 1 => {
+                        row[first + 1..last].iter().any(|on| *on)
+                    }
+                    _ => false,
+                }
+            });
+            assert!(inside, "{script} drew hollow boxes rather than glyphs");
+        }
+    }
+
+    #[test]
+    fn a_space_is_not_drawn_as_a_box() {
+        // A space has a glyph and an advance; only a character with *no* glyph
+        // gets a box. Getting this wrong would put a box between every word.
+        assert_eq!(inked(&draw(" ")), 0);
+        assert_eq!(inked(&draw("   ")), 0);
+    }
+
+    #[test]
+    fn a_tofu_is_no_wider_than_the_advance_it_stands_in() {
+        // Otherwise a run of them overlaps and reads as a bar rather than as
+        // one box per character.
+        let mut fonts = FontStore::new();
+        let style = css::style::ComputedStyle {
+            font_size: 20.0,
+            ..css::style::ComputedStyle::default()
+        };
+        let runs = [text::InlineRun::text("你好", style.clone())];
+        let layout = fonts.layout_runs(&runs, &style, 400.0);
+        let line = layout.lines.first().expect("a line");
+        let glyphs = &line.glyphs;
+        assert_eq!(glyphs.len(), 2, "two characters, two glyphs");
+        assert!(
+            glyphs[0].advance > 0.0,
+            "an uncovered character still reserves its width",
+        );
+        assert!(
+            glyphs[0].x + glyphs[0].advance <= glyphs[1].x + 0.01,
+            "the first box ends before the second begins",
+        );
+    }
+
+    #[test]
+    fn text_too_small_to_read_draws_no_boxes() {
+        // A page of 3px scaffolding text would otherwise become a page of
+        // smudges — the same judgement the image placeholder makes at its own
+        // size.
+        let mut fonts = FontStore::new();
+        let style = css::style::ComputedStyle {
+            font_size: 3.0,
+            ..css::style::ComputedStyle::default()
+        };
+        let runs = [text::InlineRun::text("你好世界", style.clone())];
+        let layout = fonts.layout_runs(&runs, &style, 400.0);
+        let mut pixmap = Pixmap::new(400, 60).expect("a pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
+        for line in &layout.lines {
+            for glyph in &line.glyphs {
+                draw_glyph(
+                    &mut pixmap,
+                    &mut fonts,
+                    glyph,
+                    0.0,
+                    30.0,
+                    Color::rgb(0, 0, 0),
+                );
+            }
+        }
+        assert_eq!(inked(&pixmap), 0);
     }
 }
