@@ -488,4 +488,47 @@ page arrived, so it says nothing about whether anything is loading"
 echo "ok: the loading bar showed during a navigation and went away after it"
 stop
 
+# N. Hovering a link shows its address in the bottom-left corner, and moving off
+#    it takes the strip away again (#139).
+#
+#    Unreachable from `cargo test` for the same reason every check in this file
+#    is: `preview.rs` pins what the strip looks like and where it goes, and
+#    nothing there proves the event loop asks for it, that a redraw happens
+#    without a click to force one, or that it lands over the page rather than
+#    under it. A strip drawn into a buffer nobody presents is a passing test and
+#    an invisible feature.
+start
+# Two pixels in from the corner, which is inside the strip's surface and clear
+# of the hairline along its top edge.
+corner_x=2
+corner_y=$((height - 6))
+empty=$(pixel "$corner_x" "$corner_y")
+DISPLAY=$display xdotool mousemove "$click_x" "$click_y"
+hovered=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$corner_x" "$corner_y")" != "$empty" ]; then
+        hovered=yes
+        break
+    fi
+done
+[ -n "$hovered" ] || fail "hovering the link drew nothing in the corner, so the \
+link preview never reached the screen"
+
+# Straight down from the link, which the earlier checks already established is
+# page and not a link.
+DISPLAY=$display xdotool mousemove "$click_x" $((click_y + link_h * 2))
+gone=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$corner_x" "$corner_y")" = "$empty" ]; then
+        gone=yes
+        break
+    fi
+done
+[ -n "$gone" ] || fail "the link preview stayed up after the pointer left the \
+link, so it is showing an address for nothing"
+echo "ok: hovering a link showed its address and moving off took it away"
+stop
+
 echo "all window click checks passed"

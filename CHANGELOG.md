@@ -16,6 +16,33 @@ record for everything earlier.
 
 ## Unreleased
 
+**The address of the link under the pointer**, in the bottom-left corner
+(#139). Every browser has had this since before it had tabs, and it is not
+decoration: a link's text says whatever its author wanted it to say, and only
+the address says where it goes. Without somewhere to read that, the only way to
+find out where a link leads is to follow it — which is a browser handing the
+question back.
+
+It matters more here than in a browser with JavaScript rather than less. This
+one refuses off-site subresources and says when a page is not encrypted, both
+of which are about *which host you are dealing with*, and the link about to be
+clicked was the one place that question went unanswered.
+
+Over the page rather than in a row of its own, because a strip of chrome that
+is empty almost all the time would cost every page a line of height. Capped at
+three quarters of the window and elided with the same marker the URL bar uses —
+a long address is not worth more than the page it would be lying across, and a
+reader cannot move a strip that follows their own pointer. It comes down when
+the pointer leaves the link, when it leaves the window, and it is recomputed
+rather than blanked when the page relayouts, so a window drag does not make it
+flicker.
+
+Checked by `scripts/window-clicks.sh` rather than by `cargo test`, which is the
+only honest place for it: the unit tests pin where the strip goes and what it
+says, and none of them can prove the event loop asks for one or that a redraw
+happens without a click to force it. A strip drawn into a buffer nobody
+presents is a passing test and an invisible feature.
+
 **The third-party rule says what it did** (#118). ADR-0006 has refused
 off-origin subresources since the first commit and has never once mentioned
 it, which is the half of the feature that was missing rather than a polish

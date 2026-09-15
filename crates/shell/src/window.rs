@@ -404,8 +404,13 @@ struct App {
     rendered_size: (u32, u32),
     /// Last known pointer position, in window coordinates.
     pointer: (f32, f32),
-    /// Whether the pointer is over a link, so the cursor can say so.
-    over_link: bool,
+    /// The address of the link under the pointer (#139).
+    ///
+    /// One field for two jobs — the cursor shape and the preview strip — so
+    /// that the two cannot disagree about what the pointer is on. It was a
+    /// bool for the cursor alone; keeping a second copy of "is there a link
+    /// here" would have been a bug waiting for the day the answers diverged.
+    over_link: Option<String>,
     /// How far through a navigation the browser is, or `None` when it is not
     /// in one.
     ///
@@ -627,6 +632,12 @@ impl App {
         // Same reason: the focused link is still the same link, but it is no
         // longer in the same place.
         self.refresh_focus();
+        // And the preview strip was showing an address from the layout that
+        // has just been replaced (#139). Recomputed rather than cleared: the
+        // pointer has not moved, so it may still be over a link — and a strip
+        // that blanked on every relayout would flicker for the whole of a
+        // window drag.
+        self.over_link = self.link_under_pointer();
 
         if let Some(window) = &self.window {
             // The page's own title, falling back to the URL: a titled page is
@@ -1523,6 +1534,7 @@ impl App {
             menu,
             fonts,
             theme,
+            over_link,
             ..
         } = self;
         let tab = tabs.active();
@@ -1630,31 +1642,32 @@ impl App {
             (width.get(), height.get()),
             bar_height,
         );
+        // The address of the link under the pointer, in the bottom-left corner
+        // (#139). Under the menu, which is opened deliberately and takes the
+        // pointer while it is there, and over everything else, because a strip
+        // half-hidden behind a page is a strip that cannot be read.
+        if let Some(url) = over_link.as_deref() {
+            let rect = crate::preview::rect(fonts, url, (width.get(), height.get()));
+            let pixmap = crate::preview::render(fonts, url, *theme, rect);
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
+        }
         // Over everything else, including the bar: a menu is in front of the
         // window by definition, and one opened near the top would otherwise
         // disappear under the chrome it overlaps.
         if let Some(menu) = menu {
             let pixmap = menu.render(fonts, *theme);
             let rect = menu.rect();
-            for row in 0..pixmap.height() {
-                let y = rect.y as u32 + row;
-                if y >= height.get() {
-                    break;
-                }
-                for column in 0..pixmap.width() {
-                    let x = rect.x as u32 + column;
-                    if x >= width.get() {
-                        break;
-                    }
-                    let Some(pixel) = pixmap
-                        .pixels()
-                        .get((row * pixmap.width() + column) as usize)
-                    else {
-                        continue;
-                    };
-                    buffer[(y * width.get() + x) as usize] = pack(pixel);
-                }
-            }
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
         }
         // Over everything, because it is about the window rather than about
         // the page under it, and a page can be any colour at all.
@@ -1709,6 +1722,35 @@ fn draw_loading(buffer: &mut [u32], progress: Option<f32>, size: (u32, u32), bar
     for row in bar_height..(bar_height + LOADING_HEIGHT).min(height) {
         let start = row as usize * width as usize;
         buffer[start..start + filled].fill(LOADING_COLOUR);
+    }
+}
+
+/// Draws a pixmap over the window buffer at `at`, clipped to `size`.
+///
+/// What the overlays share: a menu and a link preview are both an opaque
+/// rectangle the parent draws on top of whatever is already there, and the only
+/// thing that differs is where. Clipped rather than assumed to fit, because
+/// both are placed relative to a window that can be resized to smaller than
+/// they are.
+fn blit_over(buffer: &mut [u32], pixmap: &paint::Pixmap, at: (u32, u32), size: (u32, u32)) {
+    for row in 0..pixmap.height() {
+        let y = at.1 + row;
+        if y >= size.1 {
+            break;
+        }
+        for column in 0..pixmap.width() {
+            let x = at.0 + column;
+            if x >= size.0 {
+                break;
+            }
+            let Some(pixel) = pixmap
+                .pixels()
+                .get((row * pixmap.width() + column) as usize)
+            else {
+                continue;
+            };
+            buffer[(y * size.0 + x) as usize] = pack(pixel);
+        }
     }
 }
 
@@ -2046,6 +2088,17 @@ impl ApplicationHandler<BandReady> for App {
                     self.scroll_by(pixels);
                 }
             }
+            // The pointer left the window without passing over anything that
+            // is not a link, so nothing else would have taken the strip down.
+            // A preview of a link that is no longer under anything is a
+            // browser answering a question nobody is asking (#139).
+            WindowEvent::CursorLeft { .. } => {
+                if self.over_link.take().is_some()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
                 // A drag in progress owns the pointer. It deliberately does not
@@ -2075,17 +2128,27 @@ impl ApplicationHandler<BandReady> for App {
                     return;
                 }
                 // The cursor says whether there is a link here, which is how a
-                // pointer-driven browser has always answered that question.
-                let over = self.link_under_pointer().is_some();
+                // pointer-driven browser has always answered that question —
+                // and the strip in the corner says *where* it goes, which the
+                // cursor cannot (#139).
+                let over = self.link_under_pointer();
                 if over != self.over_link
                     && let Some(window) = &self.window
                 {
+                    let changed_shape = over.is_some() != self.over_link.is_some();
                     self.over_link = over;
-                    window.set_cursor(if over {
-                        winit::window::CursorIcon::Pointer
-                    } else {
-                        winit::window::CursorIcon::Default
-                    });
+                    if changed_shape {
+                        window.set_cursor(if self.over_link.is_some() {
+                            winit::window::CursorIcon::Pointer
+                        } else {
+                            winit::window::CursorIcon::Default
+                        });
+                    }
+                    // Moving from one link straight to another changes the
+                    // address without changing the cursor, so the redraw is
+                    // asked for on its own terms rather than as part of the
+                    // shape change.
+                    window.request_redraw();
                 }
             }
             WindowEvent::MouseInput {
@@ -2461,7 +2524,7 @@ pub fn open(
         // first resize to arrive is never mistaken for one already shown.
         rendered_size: (0, 0),
         pointer: (0.0, 0.0),
-        over_link: false,
+        over_link: None,
         loading: None,
         dragging: None,
         selecting: None,
