@@ -311,6 +311,22 @@ impl Renderer {
         &mut self.fetcher
     }
 
+    /// The policy itself, for a caller that only wants to read it.
+    pub fn policy(&self) -> &net::Policy {
+        &self.fetcher.policy
+    }
+
+    /// The policy, to change.
+    ///
+    /// Changing it affects the *next* child. A session clones the fetcher when
+    /// it is spawned, so the page already on screen keeps the policy it was
+    /// rendered under — which is the honest behaviour: granting an exception
+    /// does not retroactively fetch what was already refused, and the caller
+    /// has to ask for the page again.
+    pub fn policy_mut(&mut self) -> &mut net::Policy {
+        &mut self.fetcher.policy
+    }
+
     /// Starts a renderer and renders a document in it.
     ///
     /// The child stays alive afterwards, holding the document and the box tree,

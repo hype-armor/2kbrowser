@@ -16,6 +16,66 @@ record for everything earlier.
 
 ## Unreleased
 
+**A site can be allowed to load from a host** (#118). ADR-0006 refuses
+off-origin subresources by default and names the per-site override as the
+reason that default is allowed to be as absolute as it is. Until now there was
+no override, so the escape hatch the ADR leans on did not exist — a page whose
+images were on a CDN simply rendered without them, for ever, with nothing a
+reader could do about it.
+
+The padlock left of the URL opens the list. What this page asked for and did
+not get is at the top, each line one press from `allow`; what this site has
+already been allowed is under it, each line one press from `revoke`. Both
+directions in one place on purpose: an allow-list that only grows is one a
+reader stops being able to reason about, and "I let this through once to see
+the images" becomes permanent by accident.
+
+**An exception is a pair** — this site may load from that host — and not a bare
+host. The bare-host version is the obvious one and it is wrong: a reader who
+allows a font CDN because one site will not lay out without it has said
+something about that site, and putting the host in the browser's good books
+everywhere hands it to every other page on the web. That is a cross-site
+identifier reassembled by consent, which is the precise mechanism the rule
+exists to remove. An override that quietly rebuilds what the default removes is
+not an override. Local files share one key, because they are already one origin
+to this policy.
+
+Kept in `sites.tsv` beside the bookmarks, one pair per line, editable in
+anything. A permission list nobody can read is a permission list nobody audits.
+It is the second piece of state this browser keeps between runs and that cost
+is paid deliberately: a permission that did not survive the window closing
+would be granted again on every visit, and a prompt asked often enough stops
+being a decision and becomes a reflex.
+
+Granting one drops the renderer child rather than re-rendering in it. The child
+holding the page also holds what it fetched, refusals included — it remembers
+them as failures so a broken image is not retried on every resize — so the
+newly allowed host would never actually be asked for. The document itself is
+not fetched again.
+
+**The padlock reverses what ADR-0006 said**, and the ADR now records the change
+of mind rather than being left to contradict the code. The position was that
+the chrome marks only the exception, because decorating the secure case teaches
+people to look for a positive signal whose absence is easy to miss. That is
+still right about *words* and the words have not changed — HTTPS says nothing,
+and nothing anywhere says "secure". What changed is that the bar now has a
+control for what a site may load from, and a control needs somewhere to be: one
+that appeared only on pages with something to decide would be missing on
+exactly the page a reader goes looking for it on, the one whose images did not
+arrive. So the padlock is on every page, shut on HTTPS and open otherwise.
+
+Drawn from rectangles and an ellipse, not set as text: ADR-0008 bundles four
+Liberation families and none has U+1F512, so a padlock asked for as a glyph
+would draw as the hollow box the reload arrow once did. The insecure state is
+an open shackle rather than a struck-through lock, because the display list has
+no primitive that can draw a diagonal. A dot above its shoulder says this page
+has something in the panel worth opening.
+
+The padlock takes 26px from the URL's share of the bar, so on a narrow window
+`11 blocked from 3 sites` now elides to `11 blocked from 3 …`. That is the
+designed degradation — the count is front-loaded so what goes is the least of
+it — and the breakdown it loses is the first thing the padlock beside it opens.
+
 **The address of the link under the pointer**, in the bottom-left corner
 (#139). Every browser has had this since before it had tabs, and it is not
 decoration: a link's text says whatever its author wanted it to say, and only

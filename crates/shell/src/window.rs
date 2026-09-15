@@ -459,6 +459,15 @@ struct App {
     waker: Option<winit::event_loop::EventLoopProxy<BandReady>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
+    /// The open site panel, if the padlock has been pressed (#118).
+    panel: Option<crate::site_panel::Panel>,
+    /// Where the granted exceptions are written back to.
+    ///
+    /// The policy itself lives on the two fetchers — this window's, for
+    /// navigations, and the renderer's, which is cloned into every child that
+    /// asks the parent for subresources. There is no third copy here, so
+    /// nothing can hold a stale one.
+    sites_path: std::path::PathBuf,
 }
 
 impl App {
@@ -770,6 +779,9 @@ impl App {
     /// difference between a field that feels instant and one that stutters on
     /// every character of a long document.
     fn refresh_chrome(&mut self) {
+        // Taken before the destructure below, because it asks the renderer's
+        // policy and the tab at once and the destructure splits them.
+        let allowed = self.allowed_hosts();
         // Destructured for disjoint borrows: the bar is drawn with the font
         // store while reading the tab it describes.
         let App {
@@ -813,6 +825,7 @@ impl App {
                 local_root: tab.local_root,
                 withheld: withheld.subresources(),
                 withheld_hosts: withheld.hosts(),
+                allowed_hosts: &allowed,
             },
             size.0,
             fonts,
@@ -1088,6 +1101,120 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// The key this page's exceptions are stored under (#118).
+    ///
+    /// `None` on a page no exception can be written for — there is nothing to
+    /// scope one to, so the panel has nothing to offer.
+    fn site(&self) -> Option<String> {
+        net::Policy::site_of(&self.tab().loaded.origin).map(str::to_owned)
+    }
+
+    /// What this site has already been allowed to load from.
+    fn allowed_hosts(&self) -> Vec<String> {
+        let Some(site) = self.site() else {
+            return Vec::new();
+        };
+        self.renderer
+            .policy()
+            .allowed_on(&site)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// What this page asked for and did not get.
+    fn withheld_hosts(&self) -> Vec<String> {
+        self.tab()
+            .page
+            .as_ref()
+            .map(|page| page.withheld().hosts().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Opens the site panel under the padlock.
+    ///
+    /// Under the control rather than under the pointer, unlike the context
+    /// menu: this one is opened from a fixed place in the bar, so it has a
+    /// fixed place to hang from, and a panel that appeared wherever the click
+    /// landed would move by a few pixels every time it was opened.
+    fn open_site_panel(&mut self) {
+        let Some(site) = self.site() else { return };
+        let rows =
+            crate::site_panel::rows_for(&site, &self.withheld_hosts(), &self.allowed_hosts());
+        let at = crate::chrome::control_rect(
+            &crate::chrome::Control::Site,
+            self.size.0 as f32,
+            self.chrome_height() as f32,
+        );
+        self.panel = crate::site_panel::Panel::open(at, rows, self.size);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Acts on whatever the pointer is over in the panel, and closes it.
+    fn choose_from_site_panel(&mut self) {
+        let Some(panel) = self.panel.take() else {
+            return;
+        };
+        let chosen = panel.choice_at(self.pointer.0, self.pointer.1).cloned();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let Some(site) = self.site() else { return };
+        match chosen {
+            Some(crate::site_panel::Row::Allow(host)) => self.set_exception(&site, &host, true),
+            Some(crate::site_panel::Row::Revoke(host)) => self.set_exception(&site, &host, false),
+            // A click outside the panel, or on a line that only explains
+            // something, dismisses it and does nothing else.
+            _ => {}
+        }
+    }
+
+    /// Grants or takes back one exception, and shows the page it changed.
+    ///
+    /// Written to disk before the page is redrawn rather than after. If the
+    /// write fails the reader must not be shown a page loading from a host the
+    /// browser will have forgotten about by the next run — a permission that
+    /// appears to have been granted and was not is worse than one that visibly
+    /// failed.
+    fn set_exception(&mut self, site: &str, host: &str, allow: bool) {
+        let policy = self.renderer.policy_mut();
+        if allow {
+            policy.allow(site, host);
+        } else {
+            policy.revoke(site, host);
+        }
+        let policy = self.renderer.policy().clone();
+        self.fetcher.policy = policy.clone();
+        if let Err(error) = crate::sites::save(&policy, &self.sites_path) {
+            // Said rather than swallowed, and the change is left standing for
+            // this session: the reader asked for it, and refusing it because a
+            // config directory is read-only would be answering the wrong
+            // question. It will not survive the window closing.
+            eprintln!("2kbrowser: could not save site exceptions: {error}");
+        }
+        // A fresh child rather than a re-render, because the one holding this
+        // page also holds what it fetched — including the refusals, which it
+        // remembers as failures so a broken image is not retried on every
+        // resize. Dropping it is what makes the newly allowed host actually be
+        // asked for, and the document itself is not fetched again.
+        self.tab_mut().page = None;
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Closes the site panel if one is open. Whether there was one to close.
+    fn close_site_panel(&mut self) -> bool {
+        let had = self.panel.take().is_some();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
     }
 
     /// Drops the selection, which is what pressing anywhere does.
@@ -1409,6 +1536,7 @@ impl App {
             .as_ref()
             .map(crate::viewport::Viewport::withheld)
             .unwrap_or_default();
+        let allowed = self.allowed_hosts();
         crate::chrome::control_at(
             &crate::chrome::State {
                 theme: self.theme,
@@ -1430,6 +1558,7 @@ impl App {
                 local_root: self.tab().local_root,
                 withheld: withheld.subresources(),
                 withheld_hosts: withheld.hosts(),
+                allowed_hosts: &allowed,
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -1535,6 +1664,7 @@ impl App {
             fonts,
             theme,
             over_link,
+            panel,
             ..
         } = self;
         let tab = tabs.active();
@@ -1649,6 +1779,19 @@ impl App {
         if let Some(url) = over_link.as_deref() {
             let rect = crate::preview::rect(fonts, url, (width.get(), height.get()));
             let pixmap = crate::preview::render(fonts, url, *theme, rect);
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
+        }
+        // The site panel hangs off the padlock, so it starts under the bar and
+        // is drawn over the page. Below the menu, which can be opened on top of
+        // anything, and above everything else for the same reason a menu is.
+        if let Some(panel) = panel {
+            let pixmap = panel.render(fonts, *theme);
+            let rect = panel.rect();
             blit_over(
                 &mut buffer,
                 &pixmap,
@@ -2123,6 +2266,17 @@ impl ApplicationHandler<BandReady> for App {
                     }
                     return;
                 }
+                // And the site panel, the same way.
+                if let Some(panel) = &mut self.panel {
+                    let hovered = panel.row_at(self.pointer.0, self.pointer.1);
+                    if hovered != panel.hovered {
+                        panel.hovered = hovered;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 if self.selecting.is_some() {
                     self.extend_selection();
                     return;
@@ -2202,6 +2356,16 @@ impl ApplicationHandler<BandReady> for App {
                         self.choose_from_menu();
                         return;
                     }
+                    // The same for the site panel, with one exception: a click
+                    // on the padlock itself falls through to the control
+                    // routing below, which closes the panel. Otherwise pressing
+                    // it a second time would dismiss and immediately reopen.
+                    if self.panel.is_some()
+                        && self.control_under_pointer() != Some(crate::chrome::Control::Site)
+                    {
+                        self.choose_from_site_panel();
+                        return;
+                    }
                     // Letting go of the thumb is not a click on whatever the
                     // pointer happens to be over by then.
                     if self.dragging.take().is_some() {
@@ -2245,6 +2409,15 @@ impl ApplicationHandler<BandReady> for App {
                             Some(crate::chrome::Control::Forward) => self.go_forward(),
                             Some(crate::chrome::Control::Reload) => self.reload(),
                             Some(crate::chrome::Control::Bookmark) => self.toggle_bookmark(),
+                            // Pressing the padlock again closes what it
+                            // opened, which is what a control that opens a
+                            // panel has to do — otherwise the only way out is
+                            // to click somewhere that does something else.
+                            Some(crate::chrome::Control::Site) => {
+                                if !self.close_site_panel() {
+                                    self.open_site_panel();
+                                }
+                            }
                             Some(crate::chrome::Control::ToggleLayout) => {
                                 self.tab_mut().toggle_layout();
                                 self.rerender();
@@ -2439,8 +2612,13 @@ impl ApplicationHandler<BandReady> for App {
                     // meant to drop a focus ring would be unforgivable.
                     Key::Named(NamedKey::Escape) => {
                         // An open menu is the innermost thing in progress, so
-                        // it is the first thing Escape gives up.
-                        if !self.close_menu() && !self.clear_focused_link() {
+                        // it is the first thing Escape gives up — then the
+                        // site panel, which is opened the same deliberate way
+                        // and must not need a click somewhere else to close.
+                        if !self.close_menu()
+                            && !self.close_site_panel()
+                            && !self.clear_focused_link()
+                        {
                             event_loop.exit();
                         }
                     }
@@ -2476,7 +2654,14 @@ pub fn open(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
-    let renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
+    let mut renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
+    // The exceptions the reader granted on earlier visits (#118). Onto the
+    // renderer's fetcher, which is what every child clones when it is spawned,
+    // and onto the window's own below — navigations are not subject to the
+    // third-party rule, but the two policies being visibly the same object is
+    // what stops them drifting.
+    let allowed = crate::sites::load(&crate::sites::default_path());
+    renderer.fetcher_mut().policy = allowed.clone();
     // Said once, here, rather than by every renderer child on spawn: twenty
     // copies of a warning in one run is how a warning becomes something people
     // scroll past. Someone deciding whether to point this at a strange page
@@ -2513,7 +2698,7 @@ pub fn open(
             },
             url,
         )),
-        fetcher: net::Fetcher::default(),
+        fetcher: net::Fetcher { policy: allowed },
         renderer,
         fonts: FontStore::new(),
         window: None,
@@ -2537,6 +2722,8 @@ pub fn open(
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        panel: None,
+        sites_path: crate::sites::default_path(),
         waker: Some(event_loop.create_proxy()),
     };
     event_loop

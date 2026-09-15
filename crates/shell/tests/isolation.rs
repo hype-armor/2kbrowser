@@ -1709,3 +1709,94 @@ fn the_pages_canvas_colour_crosses_the_boundary_with_it() {
     let brightness = (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0;
     assert!(brightness < 0.2, "the fallback canvas is {r},{g},{b}");
 }
+
+/// Opens a page served from `port` under `host`, with `policy`, in a real
+/// child.
+///
+/// Two names for one loopback address is what makes a third-party request
+/// testable without a network: `localhost` and `127.0.0.1` are different hosts
+/// to the policy — which is all it looks at — and the same server to the
+/// socket.
+fn over_http_as(
+    host: &str,
+    port: u16,
+    html: &str,
+    policy: net::Policy,
+) -> shell::viewport::Viewport {
+    let (origin, at) = net::parse_url(&format!("http://{host}:{port}/p.html")).expect("parses");
+    let mut renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    *renderer.policy_mut() = policy;
+    shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens")
+}
+
+#[test]
+fn a_site_exception_is_what_lets_a_refused_subresource_through() {
+    // #118's third part, end to end through a real renderer child and a real
+    // socket. ADR-0006 names the per-site override as the reason the rule is
+    // allowed to be as absolute as it is, and until now there was nothing that
+    // could grant one — so the escape hatch the ADR leans on did not exist.
+    let (port, served) = serve_each(vec![("/dot.png", solid_png(8, 8, (0, 0xff, 0)))]);
+    let html = format!("<html><body><img src=\"http://127.0.0.1:{port}/dot.png\"></body></html>");
+
+    let refused = over_http_as("localhost", port, &html, net::Policy::default());
+    assert_eq!(
+        refused.images_loaded(),
+        0,
+        "the default let a third-party image through"
+    );
+    assert_eq!(
+        refused.withheld().hosts(),
+        ["127.0.0.1"],
+        "the host an exception would be granted against"
+    );
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused request reached the network, which the policy exists to prevent"
+    );
+
+    let mut policy = net::Policy::default();
+    policy.allow("localhost", "127.0.0.1");
+    let allowed = over_http_as("localhost", port, &html, policy);
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the image request never reached the test server");
+        return;
+    }
+    assert_eq!(
+        allowed.images_loaded(),
+        1,
+        "the exception was granted and the image still did not load"
+    );
+    assert!(
+        allowed.withheld().is_empty(),
+        "an allowed host is not withheld: {:?}",
+        allowed.withheld().hosts()
+    );
+
+    // And it is the *site* that was allowed, not the host. The same page under
+    // a different name gets nothing, which is the whole reason an exception is
+    // a pair.
+    let mut policy = net::Policy::default();
+    policy.allow("elsewhere.example", "127.0.0.1");
+    let elsewhere = over_http_as("localhost", port, &html, policy);
+    assert_eq!(
+        elsewhere.images_loaded(),
+        0,
+        "one site's exception was honoured on another"
+    );
+}

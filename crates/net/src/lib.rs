@@ -9,7 +9,8 @@ pub mod policy;
 pub mod tls;
 
 pub use policy::{
-    Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path, parse_url, resolve,
+    Exception, LOCAL_SITE, Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path,
+    parse_url, resolve,
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering};
