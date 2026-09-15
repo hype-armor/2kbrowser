@@ -1722,72 +1722,18 @@ fn emit_replaced_boxes(
             // width is finally known.
             let control = forms::control_of(doc, node);
             let inner = (placed.width - left - right).max(0.0);
-            let label = control
-                .and_then(|control| Some((control, forms::label_of(doc, node, control)?)))
-                .map(|(control, text)| {
-                    let single_line = forms::is_single_line(doc, node, control);
-                    // A list box and a textarea hold their lines apart with
-                    // newlines, so the label is shaped preformatted or they
-                    // would collapse into one run-on line — which is the bug
-                    // that made a `<select>` read as `United KingdomFrance`
-                    // before any of this existed.
-                    let mut label_style = child_style.clone();
-                    if !single_line {
-                        label_style.white_space = WhiteSpace::Pre;
-                    }
-                    let runs = [InlineRun::text(text, label_style.clone())];
-                    // A field that clips is shaped with nothing to break at,
-                    // so the value stays on one line and is cut at the border
-                    // rather than wrapping out of the box.
-                    let shaping_width = if single_line { UNWRAPPED } else { inner };
-                    let mut label = fonts.layout_runs(&runs, &label_style, shaping_width);
-                    clip_label(&mut label, inner);
-                    label
-                });
-
-            // A checked box needs a mark: a filled inner shape reads as
-            // "checked" and is most of what a control this small comes down
-            // to. Round for a radio and square for a checkbox, because the
-            // shape is the question — "one of these" against "any of these" —
-            // and drawing both square leaves a reader unable to tell which
-            // they are answering.
-            let round = matches!(control, Some(forms::Control::Radio));
-            let checked = matches!(
-                control,
-                Some(forms::Control::Checkbox | forms::Control::Radio)
-            ) && doc
-                .element(node)
-                .is_some_and(|element| element.attr("checked").is_some());
-            let mut children = Vec::new();
-            if checked {
-                // A dot needs more room inside the ring than a square mark
-                // needs inside a box: at this size an inset of a quarter
-                // leaves a circle that reads as a smudge against the border.
-                let share = if round { 0.3 } else { 0.25 };
-                let inset = (placed.width * share).max(1.0);
-                let mark = ComputedStyle {
-                    background_color: child_style.color,
-                    ..ComputedStyle::default()
-                };
-                children.push(LayoutBox {
-                    rect: Rect {
-                        x: inset,
-                        y: inset,
-                        width: (placed.width - inset * 2.0).max(1.0),
-                        height: (placed.height - inset * 2.0).max(1.0),
-                    },
-                    style: mark,
-                    text: None,
-                    content_origin: (0.0, 0.0),
-                    content_width: 0.0,
-                    children: Vec::new(),
-                    replaced: None,
-                    replaced_image: false,
-                    node: None,
-                    round,
-                    top_border_gap: None,
-                });
-            }
+            let (label, children, round) = match control {
+                Some(control) => control_parts(
+                    doc,
+                    fonts,
+                    node,
+                    control,
+                    child_style,
+                    (placed.width, placed.height),
+                    inner,
+                ),
+                None => (None, Vec::new(), false),
+            };
 
             parent.children.push(LayoutBox {
                 rect: Rect {
@@ -1812,6 +1758,118 @@ fn emit_replaced_boxes(
             });
         }
     }
+}
+
+/// A control's used content size: what it asks for, unless the style says.
+///
+/// Both layout paths resolve it the same way, for the same reason `control_parts`
+/// exists — a field's size is a property of the field, not of which path found
+/// it.
+fn control_size(
+    doc: &Document,
+    style: &ComputedStyle,
+    node: NodeId,
+    control: forms::Control,
+    available_width: f32,
+) -> (f32, f32) {
+    let label = forms::label_of(doc, node, control);
+    let (w, h) = forms::intrinsic_size(doc, node, style, control, label.as_deref());
+    // A declared width or height still wins, as it does for an image:
+    // `<input style="width: 300px">` is a wide field.
+    match (style.width, style.height) {
+        (Length::Auto, Length::Auto) => (w, h),
+        (Length::Auto, height) => (w, height.to_px(style.font_size, h)),
+        (width, Length::Auto) => (width.to_px(style.font_size, available_width), h),
+        (width, height) => (
+            width.to_px(style.font_size, available_width),
+            height.to_px(style.font_size, h),
+        ),
+    }
+}
+
+/// The parts of a form control's box that both layout paths have to agree on.
+///
+/// Its label, its tick mark, and whether it is drawn round. Shared, because the
+/// two paths *disagreeing* is precisely what issue #145 was: the inline path
+/// built all of this and the block path built none of it, so a field given
+/// `display: block` drew as an empty full-width hairline with its value
+/// nowhere. An `<input>` carries its value in an attribute rather than as
+/// content, so a block box built the ordinary way has nothing to lay out and
+/// draws an empty field — which looks like a styling bug and is a missing
+/// branch.
+///
+/// `border_box` is the box the mark is inset within; `inner` is the content
+/// width the label is shaped to.
+fn control_parts(
+    doc: &Document,
+    fonts: &mut FontStore,
+    node: NodeId,
+    control: forms::Control,
+    style: &ComputedStyle,
+    border_box: (f32, f32),
+    inner: f32,
+) -> (Option<text::TextLayout>, Vec<LayoutBox>, bool) {
+    let label = forms::label_of(doc, node, control).map(|text| {
+        let single_line = forms::is_single_line(doc, node, control);
+        // A list box and a textarea hold their lines apart with newlines, so
+        // the label is shaped preformatted or they would collapse into one
+        // run-on line — which is the bug that made a `<select>` read as
+        // `United KingdomFrance` before any of this existed.
+        let mut label_style = style.clone();
+        if !single_line {
+            label_style.white_space = WhiteSpace::Pre;
+        }
+        let runs = [InlineRun::text(text, label_style.clone())];
+        // A field that clips is shaped with nothing to break at, so the value
+        // stays on one line and is cut at the border rather than wrapping out
+        // of the box.
+        let shaping_width = if single_line { UNWRAPPED } else { inner };
+        let mut label = fonts.layout_runs(&runs, &label_style, shaping_width);
+        clip_label(&mut label, inner);
+        label
+    });
+
+    // A checked box needs a mark: a filled inner shape reads as "checked" and
+    // is most of what a control this small comes down to. Round for a radio and
+    // square for a checkbox, because the shape is the question — "one of these"
+    // against "any of these" — and drawing both square leaves a reader unable
+    // to tell which they are answering.
+    let round = control == forms::Control::Radio;
+    let checked = matches!(control, forms::Control::Checkbox | forms::Control::Radio)
+        && doc
+            .element(node)
+            .is_some_and(|element| element.attr("checked").is_some());
+    let mut children = Vec::new();
+    if checked {
+        // A dot needs more room inside the ring than a square mark needs inside
+        // a box: at this size an inset of a quarter leaves a circle that reads
+        // as a smudge against the border.
+        let share = if round { 0.3 } else { 0.25 };
+        let inset = (border_box.0 * share).max(1.0);
+        let mark = ComputedStyle {
+            background_color: style.color,
+            ..ComputedStyle::default()
+        };
+        children.push(LayoutBox {
+            rect: Rect {
+                x: inset,
+                y: inset,
+                width: (border_box.0 - inset * 2.0).max(1.0),
+                height: (border_box.1 - inset * 2.0).max(1.0),
+            },
+            style: mark,
+            text: None,
+            content_origin: (0.0, 0.0),
+            content_width: 0.0,
+            children: Vec::new(),
+            replaced: None,
+            replaced_image: false,
+            node: None,
+            round,
+            top_border_gap: None,
+        });
+    }
+    (label, children, round)
 }
 
 /// Whether §9.2.1.1 breaks this inline element around a block inside it.
@@ -2602,6 +2660,52 @@ fn layout_block(
         {
             margin_left = ((available_width - outer_width) / 2.0).max(0.0);
         }
+    }
+
+    // CSS 2.1 §10.3.4: a block-level replaced element's `auto` width is its
+    // intrinsic width rather than the width of the space available. A form
+    // control is replaced in every way that matters here — it has a size of its
+    // own and no content to lay out — so `display: block` on a field has to be
+    // caught before the ordinary block box below, which is #145: the field
+    // stretched the whole column, collapsed to a hairline because there was no
+    // content to give it a height, and an `<input>` lost its value entirely,
+    // because a value lives in an attribute and only this path ever reads it.
+    if let Some(control) = forms::control_of(doc, node) {
+        let (width, height) = control_size(doc, style, node, control, available_width);
+        let border_box = (
+            width + surround,
+            height + padding_top + padding_bottom + border_top + border_bottom,
+        );
+        let (label, children, round) =
+            control_parts(doc, fonts, node, control, style, border_box, width);
+        let box_ = LayoutBox {
+            rect: Rect {
+                x: x + margin_left,
+                y: y + margin_top,
+                width: border_box.0,
+                height: border_box.1,
+            },
+            style: style.clone(),
+            text: label,
+            content_origin: (padding_left + border_left, padding_top + border_top),
+            content_width: width,
+            children,
+            // Painted from its own border and background, so there is nothing
+            // for the image path to go looking for.
+            replaced: None,
+            replaced_image: false,
+            node: Some(node),
+            round,
+            top_border_gap: None,
+        };
+        let consumed = Consumed {
+            height: box_.rect.height,
+            margin_top,
+            margin_bottom: style.margin.bottom.to_px(font_size, available_width),
+            collapses_through: false,
+        };
+        parent.children.push(box_);
+        return consumed;
     }
 
     if is_replaced(doc, node) {
@@ -5265,21 +5369,7 @@ fn gather_one(
     let control = forms::control_of(doc, child);
     if is_replaced(doc, child) || control.is_some() {
         let (width, height) = match control {
-            Some(control) => {
-                let label = forms::label_of(doc, child, control);
-                let (w, h) = forms::intrinsic_size(doc, child, style, control, label.as_deref());
-                // A declared width or height still wins, as it does for an
-                // image: `<input style="width: 300px">` is a wide field.
-                match (style.width, style.height) {
-                    (Length::Auto, Length::Auto) => (w, h),
-                    (Length::Auto, height) => (w, height.to_px(style.font_size, h)),
-                    (width, Length::Auto) => (width.to_px(style.font_size, available_width), h),
-                    (width, height) => (
-                        width.to_px(style.font_size, available_width),
-                        height.to_px(style.font_size, h),
-                    ),
-                }
-            }
+            Some(control) => control_size(doc, style, child, control, available_width),
             None => replaced_size(
                 style,
                 intrinsic.get(&child).copied(),
@@ -11224,5 +11314,142 @@ mod caret_tests {
         let past = layout.caret_in(node, 9_999).expect("a caret");
         let end = layout.caret_in(node, 3).expect("a caret");
         assert_eq!(past.x, end.x, "{past:?} vs {end:?}");
+    }
+}
+
+#[cfg(test)]
+mod block_control_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    fn boxes(html: &str, css_text: &str) -> Vec<LayoutBox> {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            600.0,
+            600.0,
+        );
+        fn walk(box_: &LayoutBox, out: &mut Vec<LayoutBox>) {
+            out.push(box_.clone());
+            for child in &box_.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&rendered.root, &mut out);
+        out
+    }
+
+    /// The box the named control was given, whichever path built it.
+    fn control(html: &str, css_text: &str, local_name: &str) -> LayoutBox {
+        let doc = dom::parse(html);
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|id| {
+                doc.element(*id)
+                    .is_some_and(|element| element.local_name() == local_name)
+            })
+            .expect("the fixture has the control it names");
+        boxes(html, css_text)
+            .into_iter()
+            .find(|box_| box_.node == Some(wanted))
+            .expect("the control was laid out")
+    }
+
+    #[test]
+    fn a_block_field_keeps_its_own_width() {
+        // #145. §10.3.4: a block-level replaced element's auto width is its
+        // intrinsic width. Before this the field took the whole column.
+        let inline = control(
+            "<body><input value=\"x\"></body>",
+            "body { margin: 0 }",
+            "input",
+        );
+        let block = control(
+            "<body><input value=\"x\"></body>",
+            "body { margin: 0 } input { display: block }",
+            "input",
+        );
+        assert_eq!(
+            (block.rect.width, block.rect.height),
+            (inline.rect.width, inline.rect.height),
+            "a field is the same size whichever way it is displayed",
+        );
+        assert!(
+            block.rect.width < 600.0,
+            "the field stretched to {} of a 600px column",
+            block.rect.width,
+        );
+    }
+
+    #[test]
+    fn a_block_field_keeps_its_value() {
+        // The other half of #145, and the visible one: an `<input>` carries its
+        // value in an attribute, so a box built the ordinary way has nothing to
+        // lay out and draws empty.
+        let block = control(
+            "<body><input value=\"hello\"></body>",
+            "body { margin: 0 } input { display: block }",
+            "input",
+        );
+        let text = block.text.as_ref().expect("the field shaped its value");
+        assert!(
+            !text.lines.is_empty() && text.lines.iter().any(|line| !line.glyphs.is_empty()),
+            "the field drew no glyphs, so its value is invisible",
+        );
+    }
+
+    #[test]
+    fn a_block_checkbox_keeps_its_tick() {
+        let block = control(
+            "<body><input type=\"checkbox\" checked></body>",
+            "body { margin: 0 } input { display: block }",
+            "input",
+        );
+        assert_eq!(
+            block.children.len(),
+            1,
+            "a checked box draws a mark inside it whichever path built it",
+        );
+    }
+
+    #[test]
+    fn a_block_field_still_takes_a_declared_width() {
+        let block = control(
+            "<body><input value=\"x\"></body>",
+            "body { margin: 0 } input { display: block; width: 300px }",
+            "input",
+        );
+        // `width` is the content box, so the border box is wider by the
+        // field's own border and padding.
+        assert_eq!(
+            block.content_width, 300.0,
+            "a declared width still wins, got a {}px content box in a {}px \
+             border box",
+            block.content_width, block.rect.width,
+        );
+    }
+
+    #[test]
+    fn a_block_textarea_keeps_its_rows() {
+        let inline = control(
+            "<body><textarea rows=\"4\">one\ntwo</textarea></body>",
+            "body { margin: 0 }",
+            "textarea",
+        );
+        let block = control(
+            "<body><textarea rows=\"4\">one\ntwo</textarea></body>",
+            "body { margin: 0 } textarea { display: block }",
+            "textarea",
+        );
+        assert_eq!(
+            block.rect.height, inline.rect.height,
+            "a four-row textarea is four rows tall either way",
+        );
     }
 }
