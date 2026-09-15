@@ -511,15 +511,28 @@ here rather than quietly left out of the list, because "done" that omits a
 milestone's own commitment is the kind of claim §10 spends a paragraph warning
 about.
 
-Half of that is now built. Refusals are counted — process-wide for the budget
-harness, which could previously only measure that nothing left the origin and
-not that anything had tried, and per page for the chrome, which says how many
-subresources a page asked for and did not get and from how many sites. The
-record lives on the parent's side of the renderer boundary and stays there: a
-refusal and a failure are the same shape on the wire on purpose, so telling the
-child would leak the user's configuration to the untrusted side. What remains
-is the override itself — a per-site exception the reader can grant and revoke,
-persisted the way bookmarks are.
+Built after the fact, and recorded here rather than by editing the paragraph
+above, because a milestone that quietly rewrites what it did not do is a
+milestone whose "done" means nothing. Refusals are counted — process-wide for
+the budget harness, which could previously only measure that nothing left the
+origin and not that anything had tried, and per page for the chrome, which says
+how many subresources a page asked for and did not get and from how many sites.
+The record lives on the parent's side of the renderer boundary and stays there:
+a refusal and a failure are the same shape on the wire on purpose, so telling
+the child would leak the user's configuration to the untrusted side.
+
+The override itself is the padlock left of the URL. It opens what this page was
+refused and what this site has already been allowed, and either list can be
+changed from there — granting and revoking in one place, because an allow-list
+that only grows is one a reader stops being able to reason about. An exception
+is a *pair*, the site and the host it may load from, which is what ADR-0006
+means by per-site and is the amendment the ADR now carries: a bare host allowed
+everywhere would rebuild the cross-site identifier the rule removes. Kept in
+`sites.tsv` beside the bookmarks.
+
+The padlock reverses what ADR-0006 said about marking the secure case, and the
+ADR records the change of mind rather than being left to contradict the code.
+The *words* still mark only the exception.
 
 Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
 Discarding the author's layout without also discarding the author's furniture

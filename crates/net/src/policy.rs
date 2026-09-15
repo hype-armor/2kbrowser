@@ -97,20 +97,88 @@ pub enum RequestKind {
     Subresource,
 }
 
+/// The site key a `file:` document is remembered under.
+///
+/// A local document has no host, so it has no name to scope an exception to.
+/// This stands in for one, and cannot collide with a real host because a host
+/// may not contain a colon.
+pub const LOCAL_SITE: &str = "file:";
+
+/// One third-party host the user has allowed, and the site it is allowed on.
+///
+/// A pair rather than a bare host, which is what ADR-0006 means by a *per-site*
+/// exception. Allowing `fonts.example.net` because one site needs it must not
+/// hand every other site on the web a host that is already in the browser's
+/// good books — that is a cross-site identifier reassembled by consent, and it
+/// is the exact mechanism the third-party rule exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exception {
+    /// The document host it applies on, or [`LOCAL_SITE`] for a local file.
+    pub site: String,
+    /// The third-party host allowed there.
+    pub host: String,
+}
+
 /// The network policy.
 ///
 /// The default is the whole point: no third-party requests at all. Anything
 /// less restrictive has to be asked for explicitly.
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
-    /// Hosts the user has explicitly allowed as third parties.
+    /// The per-site exceptions the reader has granted.
     ///
-    /// Empty by default. ADR-0006 makes the rule a default, not a prohibition;
-    /// the per-site override is M3 chrome work, and this is what it will drive.
-    pub allowed_third_parties: Vec<String>,
+    /// Empty by default. ADR-0006 makes the rule a default rather than a
+    /// prohibition, and names the override as the reason it is allowed to be
+    /// absolute; this is it.
+    pub exceptions: Vec<Exception>,
 }
 
 impl Policy {
+    /// The key a document's exceptions are stored under.
+    ///
+    /// `None` for an origin no exception can be written for — there is nothing
+    /// to scope one to.
+    pub fn site_of(document: &Origin) -> Option<&str> {
+        match document.scheme {
+            Scheme::File => Some(LOCAL_SITE),
+            _ if document.host.is_empty() => None,
+            _ => Some(&document.host),
+        }
+    }
+
+    /// Whether this exact pair has been allowed.
+    pub fn allows(&self, site: &str, host: &str) -> bool {
+        self.exceptions
+            .iter()
+            .any(|exception| exception.site == site && exception.host == host)
+    }
+
+    /// The hosts allowed on one site, in the order they were granted.
+    pub fn allowed_on(&self, site: &str) -> Vec<&str> {
+        self.exceptions
+            .iter()
+            .filter(|exception| exception.site == site)
+            .map(|exception| exception.host.as_str())
+            .collect()
+    }
+
+    /// Grants one. Granting the same pair twice changes nothing.
+    pub fn allow(&mut self, site: &str, host: &str) {
+        if self.allows(site, host) {
+            return;
+        }
+        self.exceptions.push(Exception {
+            site: site.to_owned(),
+            host: host.to_owned(),
+        });
+    }
+
+    /// Takes one back.
+    pub fn revoke(&mut self, site: &str, host: &str) {
+        self.exceptions
+            .retain(|exception| !(exception.site == site && exception.host == host));
+    }
+
     /// Decides whether a request may proceed.
     pub fn check(
         &self,
@@ -135,16 +203,14 @@ impl Policy {
             (Scheme::Http | Scheme::Https, Scheme::File) => return Err(Refusal::LocalFile),
             // A local document reaching out to the network is third-party by
             // the same argument: it has no host, so nothing it asks the
-            // network for can be first-party. Falls through to the allow-list
-            // below, so an explicitly permitted host still works.
+            // network for can be first-party. Falls through to the exceptions
+            // below, so a host allowed for local files still works.
             (Scheme::File, _) => {}
             _ if document.is_same_site(target) => return Ok(()),
             _ => {}
         }
-        if self
-            .allowed_third_parties
-            .iter()
-            .any(|host| host == &target.host)
+        if let Some(site) = Self::site_of(document)
+            && self.allows(site, &target.host)
         {
             return Ok(());
         }
@@ -595,7 +661,10 @@ mod tests {
     #[test]
     fn an_explicit_allowance_admits_one_host_only() {
         let policy = Policy {
-            allowed_third_parties: vec!["cdn.example.net".to_owned()],
+            exceptions: vec![Exception {
+                site: "example.com".to_owned(),
+                host: "cdn.example.net".to_owned(),
+            }],
         };
         let document = origin("https://example.com/");
         assert!(
@@ -667,7 +736,10 @@ mod scheme_boundary_tests {
     fn an_allowed_host_still_works_from_a_local_file() {
         // The rule is a default, not a prohibition (ADR-0006).
         let policy = Policy {
-            allowed_third_parties: vec!["cdn.example.net".to_owned()],
+            exceptions: vec![Exception {
+                site: LOCAL_SITE.to_owned(),
+                host: "cdn.example.net".to_owned(),
+            }],
         };
         assert!(
             policy
@@ -694,7 +766,13 @@ mod scheme_boundary_tests {
     #[test]
     fn an_allow_list_does_not_open_the_disk() {
         let policy = Policy {
-            allowed_third_parties: vec!["etc".to_owned(), String::new(), "localhost".to_owned()],
+            exceptions: ["etc", "", "localhost"]
+                .into_iter()
+                .map(|host| Exception {
+                    site: "example.com".to_owned(),
+                    host: host.to_owned(),
+                })
+                .collect(),
         };
         assert!(
             policy
@@ -705,6 +783,86 @@ mod scheme_boundary_tests {
                 )
                 .is_err(),
             "the allow-list is for third-party hosts, not for local files"
+        );
+    }
+
+    #[test]
+    fn an_exception_granted_on_one_site_does_not_apply_on_another() {
+        // The whole reason an exception is a pair. A reader who allows a font
+        // host because one site needs it has said something about that site,
+        // not about the host — and a browser that read it the other way would
+        // hand every other page on the web a host already in its good books,
+        // which is a cross-site identifier reassembled by consent and exactly
+        // what the third-party rule exists to remove.
+        let mut policy = Policy::default();
+        policy.allow("example.com", "cdn.example.net");
+
+        let cdn = origin("https://cdn.example.net/a.png");
+        assert!(
+            policy
+                .check(
+                    Some(&origin("https://example.com/")),
+                    &cdn,
+                    RequestKind::Subresource
+                )
+                .is_ok(),
+            "the site it was granted on"
+        );
+        assert!(
+            matches!(
+                policy.check(
+                    Some(&origin("https://elsewhere.example/")),
+                    &cdn,
+                    RequestKind::Subresource
+                ),
+                Err(Refusal::ThirdParty { .. })
+            ),
+            "a different site got the benefit of somebody else's decision"
+        );
+    }
+
+    #[test]
+    fn an_exception_can_be_taken_back() {
+        // Revoking has to be as reachable as granting. An allow-list that only
+        // grows is one a reader stops being able to reason about, and "I let
+        // this through once" becomes permanent by accident.
+        let mut policy = Policy::default();
+        policy.allow("example.com", "cdn.example.net");
+        policy.allow("example.com", "cdn.example.net");
+        assert_eq!(
+            policy.allowed_on("example.com"),
+            ["cdn.example.net"],
+            "granting the same pair twice should record it once"
+        );
+
+        policy.revoke("example.com", "cdn.example.net");
+        assert!(policy.allowed_on("example.com").is_empty());
+        assert!(
+            matches!(
+                policy.check(
+                    Some(&origin("https://example.com/")),
+                    &origin("https://cdn.example.net/a.png"),
+                    RequestKind::Subresource
+                ),
+                Err(Refusal::ThirdParty { .. })
+            ),
+            "a revoked host was still allowed"
+        );
+    }
+
+    #[test]
+    fn a_local_document_is_one_site_rather_than_none() {
+        // A `file:` document has no host to key an exception on, so it would
+        // otherwise be the one kind of page where the override does not exist.
+        // Every local file shares the key, which is the honest shape: they are
+        // all the same origin to this policy already.
+        assert_eq!(
+            Policy::site_of(&origin("file:///pages/index.html")),
+            Some(LOCAL_SITE)
+        );
+        assert_eq!(
+            Policy::site_of(&origin("https://example.com/")),
+            Some("example.com")
         );
     }
 

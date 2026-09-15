@@ -363,6 +363,12 @@ pub struct State<'a> {
     pub withheld: usize,
     /// The hosts those subresources were on, in the order first asked for.
     pub withheld_hosts: &'a [String],
+    /// The third-party hosts this site has been allowed to load from (#118).
+    ///
+    /// The other half of what the site control opens. A page with an exception
+    /// already granted has something to show even when nothing was refused —
+    /// which is the common case once one is granted, since the refusals stop.
+    pub allowed_hosts: &'a [String],
     /// Which colour scheme to draw in.
     pub theme: Theme,
 }
@@ -387,6 +393,8 @@ pub enum Control {
     ToggleLayout,
     /// Save this page, or forget it if it is already saved.
     Bookmark,
+    /// Open what this site is allowed to load from (#118).
+    Site,
 }
 
 /// The arrow a navigation control carries, or nothing for one that carries a
@@ -402,7 +410,7 @@ fn arrow_glyph(control: Control) -> Option<&'static str> {
     match control {
         Control::Back => Some("\u{2190}"),
         Control::Forward => Some("\u{2192}"),
-        Control::Reload | Control::ToggleLayout | Control::Bookmark => None,
+        Control::Reload | Control::ToggleLayout | Control::Bookmark | Control::Site => None,
     }
 }
 
@@ -421,6 +429,13 @@ const TOGGLE: f32 = 96.0;
 /// (ADR-0008 bundles four families and nothing else), and a control that draws
 /// as a hollow box is worse than one that says what it does.
 const BOOKMARK: f32 = 56.0;
+/// Width of the site control, which carries a drawn padlock rather than a word.
+///
+/// Drawn from rectangles and ellipses, not a glyph. ADR-0008 bundles four
+/// Liberation families and nothing else, and none of them has U+1F512 — a
+/// padlock asked for as text would draw as the same hollow box the reload arrow
+/// once did, which is how it reached a screenshot before anyone noticed.
+const SITE: f32 = 26.0;
 
 /// Where each control sits, so the window can route a click without knowing
 /// how the bar is drawn.
@@ -448,6 +463,14 @@ pub fn controls(state: &State<'_>) -> Vec<(Control, Rect)> {
         (Control::Back, button(PADDING, BUTTON)),
         (Control::Forward, button(PADDING + BUTTON, BUTTON)),
         (Control::Reload, button(PADDING + BUTTON * 2.0, RELOAD)),
+        // Immediately left of the URL, which is where a padlock has gone in
+        // every browser for twenty years and therefore where a reader's eye
+        // already looks for one. It is also what it is about: the site whose
+        // address is the next thing along the bar.
+        (
+            Control::Site,
+            button(PADDING * 2.0 + BUTTON * 2.0 + RELOAD, SITE),
+        ),
     ];
     // Not while editing: the bar gives its right-hand side over to the field,
     // so these are not drawn — and a control that is not drawn must not still
@@ -475,6 +498,52 @@ fn placed_controls(state: &State<'_>, width: f32) -> Vec<(Control, Rect)> {
             (control, rect)
         })
         .collect()
+}
+
+/// Where one control's bottom-left corner is, in *window* coordinates.
+///
+/// For hanging something off a control — the site panel, which opens under the
+/// padlock rather than under the pointer so that it is in the same place every
+/// time it is opened. `chrome_height` rather than [`HEIGHT`] because the tab
+/// strip sits above the bar and the bar's own y is not the window's.
+///
+/// A state that offers no such control gives the bar's bottom-left corner,
+/// which is where a panel with nothing to hang from should still appear rather
+/// than at the origin of the screen.
+pub fn control_rect(wanted: &Control, width: f32, chrome_height: f32) -> (f32, f32) {
+    let found = placed_controls(&editable_state(), width)
+        .into_iter()
+        .find(|(control, _)| control == wanted)
+        .map(|(_, rect)| rect.x);
+    (found.unwrap_or(PADDING), chrome_height)
+}
+
+/// A state with nothing in it, for asking geometry questions of.
+///
+/// The control positions are fixed — that is the whole point of `controls`
+/// being width-independent — so the only thing this has to get right is which
+/// controls exist, and the editing and finding flags are the only two that
+/// change that.
+fn editable_state() -> State<'static> {
+    static AUTHORED: RenderMode = RenderMode::Authored;
+    State {
+        url: "",
+        mode: &AUTHORED,
+        error: None,
+        can_go_back: false,
+        can_go_forward: false,
+        forcing_authored: false,
+        forcing_document: false,
+        can_toggle_layout: false,
+        editing: None,
+        finding: None,
+        saved: false,
+        local_root: false,
+        withheld: 0,
+        withheld_hosts: &[],
+        allowed_hosts: &[],
+        theme: Theme::LIGHT,
+    }
 }
 
 /// The control at a point in the bar's own coordinates.
@@ -525,11 +594,121 @@ pub fn bookmark_label(state: &State<'_>) -> &'static str {
 /// `https` gets nothing at all. A browser that decorates the secure case
 /// teaches people to look for a positive signal, and the absence of one is
 /// easy to miss; marking only the exception is the way round that works.
+///
+/// Still true of the *words*, which is what this function is. The padlock on
+/// the site control is shut on HTTPS and open otherwise, which is the reverse
+/// and is a deliberate exception recorded in ADR-0006: it is a click target for
+/// what a site may load from rather than a verdict on the connection, and a
+/// control that appeared only on some pages would be one nobody could find.
+/// Nothing here says "secure", and nothing should.
 pub fn scheme_notice(url: &str) -> Option<&'static str> {
     match net::parse_url(url).ok()?.0.scheme {
         Scheme::Http => Some("not encrypted"),
         Scheme::File => Some("local file"),
         Scheme::Https => None,
+    }
+}
+
+/// Draws the padlock on the site control.
+///
+/// Rectangles and one ellipse, because there is no glyph to ask for: ADR-0008
+/// bundles four Liberation families and none of them carries U+1F512, so a
+/// padlock written as text would draw as a hollow box — the exact failure the
+/// reload control's missing arrow already cost this project once.
+///
+/// `closed` is the encrypted case and `open` everything else. That is the half
+/// of this that ADR-0006 originally forbade, and the ADR now records why it
+/// changed its mind: this is not a decoration on the secure case, it is the
+/// click target for what a site is allowed to load, and a control that appears
+/// on some pages and not others is one nobody learns the position of. The
+/// *words* still mark only the exception — `not encrypted` appears beside the
+/// URL exactly as before, and nothing says "secure".
+///
+/// `marked` draws a dot beside it: this page has something to say about what it
+/// was refused or what it has been allowed. Without it the control is the same
+/// shape on every page and there is nothing to suggest opening it.
+fn padlock(list: &mut DisplayList, rect: &Rect, theme: Theme, closed: bool, marked: bool) {
+    // The body, centred in the control.
+    let body = Rect {
+        width: 12.0,
+        height: 9.0,
+        x: rect.x + (rect.width - 12.0) / 2.0,
+        y: rect.y + rect.height / 2.0 - 1.0,
+    };
+    // The shackle's ring. Open, it is lifted clear and swung to the right, so
+    // its left leg no longer reaches the body — which is what an open padlock
+    // looks like, and is drawable from the primitives that exist. A diagonal
+    // line through a closed one is not: `DisplayItem` has axis-aligned
+    // rectangles and ellipses, and nothing that can be drawn at an angle.
+    let (shift, lift) = if closed { (0.0, 0.0) } else { (4.0, 2.0) };
+    let ring = Rect {
+        width: 9.0,
+        height: 10.0,
+        x: body.x + (body.width - 9.0) / 2.0 + shift,
+        y: body.y - 7.0 - lift,
+    };
+    const THICK: f32 = 1.5;
+    list.items.push(DisplayItem::Ellipse {
+        rect: ring,
+        color: theme.ink,
+    });
+    list.items.push(DisplayItem::Ellipse {
+        rect: Rect {
+            x: ring.x + THICK,
+            y: ring.y + THICK,
+            width: ring.width - THICK * 2.0,
+            height: ring.height - THICK * 2.0,
+        },
+        color: theme.bar,
+    });
+    // Cuts the bottom off the ring, leaving an arch with two feet in the air.
+    list.items.push(DisplayItem::Rect {
+        rect: Rect {
+            x: ring.x,
+            y: ring.y + ring.height / 2.0,
+            width: ring.width,
+            height: ring.height / 2.0 + 1.0,
+        },
+        color: theme.bar,
+    });
+    // The legs, from the arch down to where the body starts. Both when the
+    // lock is shut; only the right one when it is open, because the left one is
+    // what has come out.
+    let mut leg = |x: f32| {
+        list.items.push(DisplayItem::Rect {
+            rect: Rect {
+                x,
+                y: ring.y + ring.height / 2.0,
+                width: THICK,
+                height: (body.y - (ring.y + ring.height / 2.0)).max(0.0),
+            },
+            color: theme.ink,
+        });
+    };
+    leg(ring.x + ring.width - THICK);
+    if closed {
+        leg(ring.x);
+    }
+    // Last, so it covers the feet of whichever legs reach it.
+    list.items.push(DisplayItem::Rect {
+        rect: body,
+        color: theme.ink,
+    });
+    if marked {
+        // Above the shoulder rather than beside the body, with the bar showing
+        // between the two. Level with the body it read as a smudge on the lock
+        // — one shape rather than a lock and a mark about it — and being hard
+        // against the URL made it look like punctuation belonging to the
+        // address.
+        list.items.push(DisplayItem::Ellipse {
+            rect: Rect {
+                x: rect.x + rect.width - 6.0,
+                y: ring.y,
+                width: 4.0,
+                height: 4.0,
+            },
+            color: theme.notice,
+        });
     }
 }
 
@@ -696,6 +875,19 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
                     rect.width,
                 );
             }
+            Control::Site => {
+                // No surface. Every browser's padlock is a mark on the bar
+                // rather than a button, and giving it one here would put a
+                // third raised rectangle between the reload control and the
+                // address for something that is mostly an indicator.
+                padlock(
+                    &mut list,
+                    &rect,
+                    theme,
+                    scheme_notice(state.url).is_none(),
+                    state.withheld > 0 || !state.allowed_hosts.is_empty(),
+                );
+            }
             Control::ToggleLayout | Control::Bookmark => {
                 right_edge = right_edge.min(rect.x);
                 // Outlined rather than filled: these are escape hatches, not
@@ -727,7 +919,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         }
     }
 
-    let url_x = PADDING * 2.0 + BUTTON * 2.0 + RELOAD;
+    let url_x = PADDING * 2.0 + BUTTON * 2.0 + RELOAD + SITE;
 
     // Find takes the bar over while it is open, the same way editing does, and
     // for the same reason: what you are doing is more important than where you
@@ -1275,6 +1467,7 @@ mod tests {
             local_root: false,
             withheld: 0,
             withheld_hosts: &[],
+            allowed_hosts: &[],
             theme: Theme::LIGHT,
         }
     }
@@ -1418,8 +1611,9 @@ mod tests {
         let placed = controls(&state);
         assert_eq!(
             placed.len(),
-            5,
-            "back, forward, reload, toggle, save — the toggle is on every page now"
+            6,
+            "back, forward, reload, the padlock, toggle, save — the toggle is on \
+             every page now and so is the padlock"
         );
 
         assert_eq!(
@@ -1433,6 +1627,11 @@ mod tests {
         assert_eq!(
             control_at(&state, 600.0, placed[2].1.x + 1.0, 5.0),
             Some(Control::Reload)
+        );
+        assert_eq!(
+            control_at(&state, 600.0, placed[3].1.x + 1.0, 5.0),
+            Some(Control::Site),
+            "the padlock sits between the reload control and the URL"
         );
         // Past the buttons is the URL, which is not a control.
         assert_eq!(control_at(&state, 600.0, 300.0, 5.0), None);
@@ -2133,10 +2332,14 @@ mod tests {
             let placed = placed_controls(state, 600.0);
             let leftmost = placed
                 .iter()
-                // The right-hand controls only. The nav buttons sit at the left
-                // edge and are not what the status has to stop short of.
+                // The right-hand controls only. The nav buttons and the
+                // padlock sit at the left edge, before the URL, and are not
+                // what the status has to stop short of.
                 .filter(|(control, _)| {
-                    !matches!(control, Control::Back | Control::Forward | Control::Reload)
+                    !matches!(
+                        control,
+                        Control::Back | Control::Forward | Control::Reload | Control::Site
+                    )
                 })
                 .map(|(_, rect)| rect.x)
                 .fold(f32::MAX, f32::min);

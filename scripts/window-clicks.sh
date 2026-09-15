@@ -52,6 +52,12 @@ toggle=96
 # pinned there by its own tests, and repeated here because a pointer has to be
 # told a number.
 scrollbar=8
+# The left-hand controls, from `chrome.rs`: two 40px arrows, the reload word,
+# then the padlock. Same caveat again — pinned there by `controls()`'s own
+# tests, repeated here because a pointer has to be told a number.
+button=40
+reload=58
+site_x=$((padding + button * 2 + reload + 13))
 toggle_x=$((width - padding - bookmark - toggle / 2))
 # Down the middle of the URL bar, which is below the strip rather than at the
 # top of the window.
@@ -529,6 +535,47 @@ done
 [ -n "$gone" ] || fail "the link preview stayed up after the pointer left the \
 link, so it is showing an address for nothing"
 echo "ok: hovering a link showed its address and moving off took it away"
+stop
+
+# N. The padlock opens the site panel, and opens it again closed (#118).
+#
+#    `site_panel.rs` pins what the panel holds and where a click in it lands.
+#    What it cannot pin is that pressing the padlock reaches any of that: the
+#    control routing, the panel being drawn over the page rather than under it,
+#    and the second press closing what the first opened all live in the event
+#    loop. A panel that only ever opens is a browser with no way out of it.
+start
+# Just below the bar and a little in from the left, which the panel covers and
+# an ordinary page does not.
+panel_x=$((site_x + 20))
+panel_y=$((chrome + 30))
+closed=$(pixel "$panel_x" "$panel_y")
+DISPLAY=$display xdotool mousemove "$site_x" "$toggle_y"
+DISPLAY=$display xdotool click 1
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$panel_x" "$panel_y")" != "$closed" ]; then
+        opened=yes
+        break
+    fi
+done
+[ -n "$opened" ] || fail "pressing the padlock drew nothing over the page, so \
+the site panel never reached the screen"
+
+DISPLAY=$display xdotool mousemove "$site_x" "$toggle_y"
+DISPLAY=$display xdotool click 1
+shut=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$panel_x" "$panel_y")" = "$closed" ]; then
+        shut=yes
+        break
+    fi
+done
+[ -n "$shut" ] || fail "pressing the padlock a second time did not close the \
+panel, so there is no way out of it with the pointer"
+echo "ok: the padlock opened the site panel and closed it again"
 stop
 
 echo "all window click checks passed"

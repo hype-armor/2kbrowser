@@ -29,8 +29,12 @@ HTTPS has nothing to say.
 ![The first website in 2kbrowser](docs/images/first-website.png)
 
 The first website, still up, still plain HTTP. The bar marks it *not encrypted*
-— never the reverse, because decorating the secure case teaches people to look
-for a signal whose absence is easy to miss (ADR-0006).
+in words, and never the reverse: decorating the secure case teaches people to
+look for a signal whose absence is easy to miss, so nothing anywhere says
+"secure" (ADR-0006). The padlock beside it is a control rather than a verdict —
+it opens what this site is allowed to load from — and it is on every page for
+the reason every control is: one that came and went would be missing on exactly
+the page you went looking for it on.
 
 ![A modern page re-rendered as a document](docs/images/document-fallback.png)
 
@@ -639,6 +643,16 @@ A page missing a third of its images because a CDN was refused otherwise looks
 identical to a page whose CDN is down, and a browser that quietly changes what
 a page contains has the same problem as one that quietly changes how it is laid
 out.
+
+The padlock left of the URL opens the list: what this page asked for and did
+not get, each line one press from being allowed, and what this site has already
+been allowed to load from, each line one press from being taken back. An
+exception is scoped to the pair — this site may load from that host — so
+allowing a font CDN for one site does not hand it to every other site on the
+web, which would rebuild the cross-site identifier the rule exists to remove.
+They are kept in `sites.tsv` beside the bookmarks, one pair per line, editable
+in anything: a permission list nobody can read is a permission list nobody
+audits.
 
 When a page's layout depends on features this engine does not implement, it is
 re-rendered as a document and told so — never silently (ADR-0009):
