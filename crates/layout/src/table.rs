@@ -138,12 +138,27 @@ impl Grid {
 /// `tbody` whether or not the author wrote one, so rows are almost never direct
 /// children of the table.
 pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId) -> Grid {
+    build_grid_of(doc, styles, table, doc.children(table))
+}
+
+/// The same, for a table that is not an element.
+///
+/// §17.2.1 generates an anonymous table around table-internal boxes that have
+/// none, and an anonymous box has no node to read children from — so the
+/// children are handed in. `owner` is the box the anonymous table stands in
+/// for, which is what an anonymous *row* inside it is attributed to.
+pub fn build_grid_of(
+    doc: &Document,
+    styles: &css::cascade::StyleMap,
+    owner: NodeId,
+    children: &[NodeId],
+) -> Grid {
     let mut grid = Grid::default();
     // How many further rows each column is still occupied by a cell spanning
     // down from above. Without this a `rowspan` cell's column is handed to the
     // next row's first cell, and every row below it shifts left.
     let mut occupied: Vec<usize> = Vec::new();
-    collect_rows(doc, styles, table, None, &mut occupied, &mut grid);
+    collect_rows(doc, styles, owner, children, None, &mut occupied, &mut grid);
     // The rightmost column any cell reaches, not the widest row: with row
     // spanning a row's own cells no longer cover every column.
     grid.columns = grid
@@ -153,7 +168,7 @@ pub fn build_grid(doc: &Document, styles: &css::cascade::StyleMap, table: NodeId
         .map(|cell| cell.column + cell.colspan)
         .max()
         .unwrap_or(0);
-    collect_columns(doc, styles, table, &mut grid);
+    collect_columns(doc, styles, children, &mut grid);
     grid
 }
 
@@ -188,7 +203,7 @@ pub fn captions(
 fn collect_columns(
     doc: &Document,
     styles: &css::cascade::StyleMap,
-    table: NodeId,
+    children: &[NodeId],
     grid: &mut Grid,
 ) {
     let span_of = |element: &dom::ElementData| {
@@ -199,7 +214,7 @@ fn collect_columns(
             .clamp(1, MAX_SPAN)
     };
     let mut column = 0;
-    for &child in doc.children(table) {
+    for &child in children {
         let Some(element) = doc.element(child) else {
             continue;
         };
@@ -361,13 +376,14 @@ fn collect_rows(
     doc: &Document,
     styles: &css::cascade::StyleMap,
     node: NodeId,
+    children: &[NodeId],
     group: Option<usize>,
     occupied: &mut Vec<usize>,
     grid: &mut Grid,
 ) {
     // Cells found where a row was expected, waiting for the run to end.
     let mut stray: Vec<NodeId> = Vec::new();
-    for &child in doc.children(node) {
+    for &child in children {
         let Some(style) = styles.get(child) else {
             continue;
         };
@@ -412,7 +428,15 @@ fn collect_rows(
                     first,
                     end: first,
                 });
-                collect_rows(doc, styles, child, Some(band), occupied, grid);
+                collect_rows(
+                    doc,
+                    styles,
+                    child,
+                    doc.children(child),
+                    Some(band),
+                    occupied,
+                    grid,
+                );
                 // Set once the rows are in. A group that held none keeps an
                 // empty range, which no row points at and nothing reads.
                 grid.row_groups[band].end = grid.rows.len();
@@ -434,7 +458,15 @@ fn collect_rows(
             // the group it is nested in.
             _ => {
                 flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
-                collect_rows(doc, styles, child, group, occupied, grid);
+                collect_rows(
+                    doc,
+                    styles,
+                    child,
+                    doc.children(child),
+                    group,
+                    occupied,
+                    grid,
+                );
             }
         }
     }

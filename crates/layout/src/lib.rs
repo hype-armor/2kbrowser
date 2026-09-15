@@ -2540,6 +2540,7 @@ fn layout_block(
             styles,
             fonts,
             node,
+            doc.children(node),
             style,
             collapsed.as_ref(),
             intrinsic,
@@ -2756,7 +2757,18 @@ fn layout_block(
     // Which split inline elements the walk is currently inside, so a block
     // child can close them and the stretch after it can pick them up again.
     let mut open: Vec<NodeId> = Vec::new();
-    for step in walk_order(doc, styles, node, !all_inline) {
+    let steps = walk_order(doc, styles, node, !all_inline);
+    // §17.2.1's anonymous tables, worked out over the whole walk because a run
+    // is only as long as the next thing that is not part of it.
+    let anonymous = anonymous_tables(doc, styles, node, &steps);
+    let mut inside_anonymous: std::collections::HashSet<NodeId> = anonymous
+        .values()
+        .flat_map(|run| run.iter().copied())
+        .collect();
+    for &first in anonymous.keys() {
+        inside_anonymous.remove(&first);
+    }
+    for step in steps {
         let child = match step {
             Step::Node(child) => child,
             Step::Opens(element) => {
@@ -2802,6 +2814,9 @@ fn layout_block(
             || (child_style.display.is_table_internal() && inside_a_table(doc, styles, child))
             // Floated children were placed above, out of the normal flow.
             || child_style.float != Float::None
+            // Already laid out by the anonymous table the run's first box
+            // stood up.
+            || inside_anonymous.contains(&child)
         {
             continue;
         }
@@ -2809,6 +2824,85 @@ fn layout_block(
             if !all_inline {
                 pending.push(Inlines::Child(child));
             }
+            continue;
+        }
+
+        // §17.2.1: a run of table-internal boxes with no table above them gets
+        // an anonymous one, and it is block-level like any other table. Handled
+        // ahead of the general block path because there is no element to hand
+        // `layout_block` — the box exists only here.
+        if let Some(run) = anonymous.get(&child) {
+            interrupt_boxes(&mut pending, &open);
+            let stretch_style = open
+                .last()
+                .and_then(|&element| styles.get(element))
+                .unwrap_or(style);
+            let flushed = flush_inline(
+                doc,
+                styles,
+                fonts,
+                &mut pending,
+                node,
+                stretch_style,
+                intrinsic,
+                (padding_left + border_left, cursor_y),
+                content_width,
+                &context,
+                padding_top + border_top,
+                &mut box_,
+                (lead.take(), None),
+                &mut first_letter,
+            );
+            resume_boxes(&mut pending, &open);
+            cursor_y += flushed;
+            // An anonymous box inherits the inherited properties from the box
+            // it is generated inside and takes the initial value for the rest,
+            // so it draws nothing of its own — which is what keeps it from
+            // painting a second background over the one already there.
+            let table_style = ComputedStyle {
+                display: Display::Table,
+                ..ComputedStyle::inherit_from(style)
+            };
+            let mut table_box = LayoutBox {
+                rect: Rect {
+                    x: padding_left + border_left,
+                    y: cursor_y,
+                    width: content_width,
+                    height: 0.0,
+                },
+                style: table_style.clone(),
+                text: None,
+                content_origin: (0.0, 0.0),
+                content_width,
+                children: Vec::new(),
+                replaced: None,
+                node: None,
+                round: false,
+                top_border_gap: None,
+            };
+            let (table_width, table_height) = layout_table(
+                doc,
+                styles,
+                fonts,
+                node,
+                run,
+                &table_style,
+                None,
+                intrinsic,
+                0.0,
+                0.0,
+                content_width,
+                &mut table_box,
+            );
+            table_box.rect.width = table_width.min(content_width);
+            table_box.rect.height = table_height;
+            table_box.content_width = table_box.rect.width;
+            box_.children.push(table_box);
+            cursor_y += table_height;
+            // A table is a formatting context of its own: nothing collapses
+            // through it and nothing collapses with it.
+            previous_bottom = Some(0.0);
+            trailing_bottom = None;
             continue;
         }
 
@@ -3220,6 +3314,28 @@ fn layout_block(
         // for, which would need a full intrinsic-width pass over the subtree.
         let available = child_containing.size.0;
         let width_basis = match child_style.width {
+            // §10.3.7: `left` and `right` both given with `width: auto` is the
+            // one case where an absolutely positioned box does *not* shrink to
+            // fit — the two offsets pin both edges and the width falls out of
+            // the equation. `left: 1px; right: 1px` is how a reference file
+            // stretches a table across its containing block, and shrink-to-fit
+            // there leaves every column a fraction of a pixel out of place.
+            // A replaced element is the exception (§10.3.8): its `auto` width
+            // comes from the intrinsic size and the offsets only place it, so
+            // narrowing the basis here would resolve `<img width="50%">`
+            // against the gap between the offsets instead of the containing
+            // block.
+            Length::Auto
+                if child_style.offsets.left != Length::Auto
+                    && child_style.offsets.right != Length::Auto
+                    && !is_replaced(doc, child) =>
+            {
+                let font_size = child_style.font_size;
+                (available
+                    - child_style.offsets.left.to_px(font_size, available)
+                    - child_style.offsets.right.to_px(font_size, available))
+                .max(0.0)
+            }
             Length::Auto => {
                 let runs = collect_inline_runs(
                     doc,
@@ -3343,6 +3459,9 @@ fn layout_table(
     styles: &StyleMap,
     fonts: &mut FontStore,
     node: NodeId,
+    // The table's children. Its own, for a real table; §17.2.1's run of
+    // orphans, for an anonymous one that has no element to ask.
+    children: &[NodeId],
     style: &ComputedStyle,
     collapsed: Option<&table::Collapsed>,
     intrinsic: &IntrinsicSizes,
@@ -3357,7 +3476,7 @@ fn layout_table(
     let grid = match collapsed {
         Some(collapsed) => &collapsed.grid,
         None => {
-            owned_grid = table::build_grid(doc, styles, node);
+            owned_grid = table::build_grid_of(doc, styles, node, children);
             &owned_grid
         }
     };
@@ -4158,6 +4277,75 @@ fn precedes(doc: &Document, parent: NodeId, first: NodeId, second: NodeId) -> bo
         (Some(a), Some(b)) => a < b,
         _ => false,
     }
+}
+
+/// Runs of table-internal boxes that have no table above them, keyed by the
+/// box that starts each run.
+///
+/// §17.2.1 generates anonymous boxes until a table's structure is legal, and
+/// the outermost of them is the table itself: consecutive `table-cell`,
+/// `table-row` or row-group siblings with no table around them are one
+/// anonymous table, and anything else between two of them ends the run and
+/// starts another.
+///
+/// Without this an orphan is laid out as an ordinary block, which stacks two
+/// cells that belong side by side — the shape the suite's
+/// `table-anonymous-objects` family is almost entirely made of.
+fn anonymous_tables(
+    doc: &Document,
+    styles: &StyleMap,
+    holder: NodeId,
+    steps: &[Step],
+) -> std::collections::HashMap<NodeId, Vec<NodeId>> {
+    let mut out = std::collections::HashMap::new();
+    let mut run: Vec<NodeId> = Vec::new();
+    let mut flush = |run: &mut Vec<NodeId>| {
+        if let Some(&first) = run.first() {
+            out.insert(first, std::mem::take(run));
+        } else {
+            run.clear();
+        }
+    };
+    for step in steps {
+        let Step::Node(child) = *step else {
+            flush(&mut run);
+            continue;
+        };
+        let Some(style) = styles.get(child) else {
+            // A text node between two cells is anonymous content that §17.2.1
+            // puts in a cell of its own. Not generated here — it would need an
+            // anonymous cell as well — so it ends the run rather than being
+            // swallowed by it.
+            if doc.text(child).is_some_and(|text| !text.trim().is_empty()) {
+                flush(&mut run);
+            }
+            continue;
+        };
+        // Out of flow or floated is §9.7's business and is already block-level.
+        let orphan = style.display.is_table_internal()
+            && style.display != Display::TableCaption
+            && !inside_a_table(doc, styles, child)
+            && style.float == Float::None
+            && !style.position.is_out_of_flow();
+        if orphan {
+            run.push(child);
+        } else if style.display != Display::None {
+            flush(&mut run);
+        }
+    }
+    flush(&mut run);
+    // A run that yields no cells is not a table anybody can see, and wrapping
+    // it in one loses its content: the rows this engine can build are the ones
+    // whose children are cells, and §17.2.1's anonymous *cell* — the box that
+    // would go round a row's non-cell child — is not generated yet. Leaving the
+    // run alone in that case keeps it rendering as inline content, which is
+    // where it was before the table was inferred.
+    out.retain(|_, run| {
+        !table::build_grid_of(doc, styles, holder, run)
+            .rows
+            .is_empty()
+    });
+    out
 }
 
 /// A block container's children in walk order, with split inline elements
@@ -7316,10 +7504,9 @@ mod tests {
 
     #[test]
     fn a_table_cell_with_no_table_around_it_is_still_drawn() {
-        // §17.2.1 wraps an orphan in anonymous table boxes. This engine does
-        // not generate them, and a box nobody lays out is a box that vanishes
-        // — so an orphan falls back to being an ordinary block, which is close
-        // to what a table wrapped around one on its own looks like.
+        // §17.2.1 wraps an orphan in anonymous table boxes. They are generated
+        // now, so the cell is laid out as a cell — but the point of the test is
+        // the older one: a box nobody lays out is a box that vanishes.
         let rendered = run(
             "<body><div><span class=c>cell</span></div></body>",
             "body { margin: 0 } .c { display: table-cell; background: #ff0000 }",
@@ -7329,6 +7516,75 @@ mod tests {
             .into_iter()
             .find(|b| b.style.background_color == css::Color::rgb(255, 0, 0));
         assert!(cell.is_some(), "the orphan cell vanished");
+    }
+
+    #[test]
+    fn orphan_cells_share_an_anonymous_table_row() {
+        // §17.2.1: consecutive cells with no row above them get one anonymous
+        // row between them, not one each — so they sit side by side. The run
+        // ends at the block, which starts a second table under the first.
+        let rendered = run(
+            "<body><div><span class=c>a</span><span class=c>b</span>\
+             <p>break</p><span class=c>c</span></div></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             .c { display: table-cell; padding: 0 }",
+            600.0,
+        );
+        let tables: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::Table)
+            .collect();
+        assert_eq!(tables.len(), 2, "the paragraph ended the first run");
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].rect.y, cells[1].rect.y, "one row, not two");
+        assert!(
+            cells[0].rect.x < cells[1].rect.x,
+            "side by side: {} then {}",
+            cells[0].rect.x,
+            cells[1].rect.x
+        );
+    }
+
+    #[test]
+    fn a_row_whose_children_are_not_cells_is_left_alone() {
+        // The anonymous *cell* of §17.2.1 is not generated, so inferring a
+        // table around a row that yields none would swallow its content. The
+        // run is left as inline content instead — which is what it looked like
+        // before tables were inferred at all.
+        let rendered = run(
+            "<body><span class=r><span>aaa</span></span></body>",
+            "body { margin: 0 } .r { display: table-row }",
+            600.0,
+        );
+        let text: String = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter())
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(text.trim(), "aaa", "the row's content vanished");
+    }
+
+    #[test]
+    fn left_and_right_together_size_an_absolute_box() {
+        // §10.3.7: with both offsets given and `width: auto` the box stretches
+        // between them rather than shrinking to fit its content.
+        let rendered = run(
+            "<body><div id=outer><div id=inner>x</div></div></body>",
+            "body { margin: 0 } #outer { position: relative; width: 200px } \
+             #inner { position: absolute; left: 20px; right: 30px }",
+            600.0,
+        );
+        let inner = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.position == Position::Absolute)
+            .expect("the absolute box");
+        assert_eq!(inner.rect.x, 20.0);
+        assert_eq!(inner.rect.width, 150.0, "200 less 20 and 30");
     }
 
     #[test]

@@ -39,7 +39,20 @@ fn main() {
             println!("node #{} = <{}>", node.0, element.local_name());
         }
     }
-    let styles = css::cascade::cascade(&doc, &[]);
+    // The document's own `<style>` blocks, because a box tree printed without
+    // them is a box tree for a different document — which has misled more than
+    // one debugging session. External sheets are still skipped: fetching is the
+    // shell's business, and this example deliberately has no loader.
+    let sheets: Vec<css::Stylesheet> = doc
+        .descendants(doc.root())
+        .into_iter()
+        .filter(|&node| {
+            doc.element(node)
+                .is_some_and(|element| element.local_name() == "style")
+        })
+        .map(|node| css::Stylesheet::parse(&doc.text_content(node)))
+        .collect();
+    let styles = css::cascade::cascade(&doc, &sheets);
     let mut fonts = text::FontStore::new();
     let laid_out = layout::layout(
         &doc,

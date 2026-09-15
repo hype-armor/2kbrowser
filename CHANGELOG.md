@@ -16,6 +16,43 @@ record for everything earlier.
 
 ## Unreleased
 
+**Anonymous tables** (§17.2.1): a run of table-internal boxes with no table
+above them gets one generated around it, and is laid out as the table it was
+describing. Together with the width rule below, **worth 25 conformance tests
+against nothing lost.**
+
+What a page writes is `display: table-cell` on three spans, or a
+`display: table-row` and its cells, with no `display: table` anywhere. The
+engine used to lay each one out as an ordinary block, so three cells that
+belong side by side came out stacked. They are collected into a run now — the
+run ends at the first thing that is not table-internal, which is why a
+paragraph between two pairs of cells produces two tables rather than one — and
+the run is handed to the table code as the children of a box that has no
+element behind it. That is the whole shape of the change: `build_grid` and
+`layout_table` take a child list instead of reading one from a node, and
+everything downstream is unchanged.
+
+One of §17.2.1's rules is still missing: the anonymous *cell* that goes around
+a row's child that is not a cell. A run that yields no cells is therefore left
+alone rather than wrapped, because a table built from it would swallow its
+content — `<span style="display: table-row"><span>aaa</span></span>` still
+renders as the word `aaa`, which is what it looked like before any of this.
+Without that guard it rendered as nothing at all.
+
+**`left` and `right` together size an absolutely positioned box** (§10.3.7).
+With both offsets given and `width: auto` the two edges are pinned and the
+width falls out of the equation; this engine shrank the box to fit its content
+and then placed its left edge, so the right offset did nothing.
+
+It surfaced as a table one pixel too wide. A reference file that stretches a
+table with `left: 1px; right: 1px` had it two pixels wider than the test it
+was the reference for, which put every column a fraction of a pixel out and
+failed the comparison on antialiasing alone.
+
+A replaced element is the exception (§10.3.8): its `auto` width comes from the
+intrinsic size, and narrowing the basis resolved `<img width="50%">` against
+the gap between the offsets instead of against the containing block.
+
 **An inline element holding a block is broken around it** (§9.2.1.1), instead
 of being laid out as a block. **Worth 31 conformance tests against 1 lost.**
 
