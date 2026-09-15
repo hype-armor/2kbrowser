@@ -10,7 +10,7 @@
 //! produced without one.
 
 use sandbox::child::{Fetched, Render};
-use sandbox::message::{Link, Mode, Rendered};
+use sandbox::message::{Link, Missing, Mode, Rendered};
 use sandbox::{Error, ToChild};
 use text::FontStore;
 
@@ -156,6 +156,19 @@ fn links_of(page: &crate::render::Page) -> Vec<Link> {
         .collect()
 }
 
+/// Every placeholder on the page, for a parent that has to route a click to
+/// one (#118).
+///
+/// The same shape as [`links_of`] and for the same reason: the parent has no
+/// box tree, so a rectangle missing from this list is a placeholder that does
+/// nothing when pressed.
+fn missing_of(page: &crate::render::Page) -> Vec<Missing> {
+    page.missing_images()
+        .into_iter()
+        .map(|(rect, url)| Missing { rect, url })
+        .collect()
+}
+
 /// A canvas colour packed for the wire, as `0x00RRGGBB`.
 ///
 /// The alpha is dropped rather than carried: the display list's canvas colour
@@ -228,6 +241,7 @@ impl Render for PageRenderer {
             mode: mode_of(&page),
             title: page.title.clone(),
             links: links_of(&page),
+            missing: missing_of(&page),
             can_toggle_layout: self.can_toggle_layout(&page),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
@@ -260,6 +274,7 @@ impl Render for PageRenderer {
             mode: mode_of(page),
             title: page.title.clone(),
             links: links_of(page),
+            missing: missing_of(page),
             can_toggle_layout: self.can_toggle_layout(page),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),

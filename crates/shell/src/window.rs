@@ -411,6 +411,9 @@ struct App {
     /// bool for the cursor alone; keeping a second copy of "is there a link
     /// here" would have been a bug waiting for the day the answers diverged.
     over_link: Option<String>,
+    /// Whether the pointer is over something that answers a press, so the
+    /// cursor can say so. A link, or an image placeholder (#118).
+    over_pressable: bool,
     /// How far through a navigation the browser is, or `None` when it is not
     /// in one.
     ///
@@ -1133,6 +1136,47 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// What pressing a `Load image` placeholder does (#118).
+    ///
+    /// Two different things, because there are two reasons a picture is not
+    /// there and only the parent can tell them apart. The child is told nothing
+    /// — a refusal and a failure are the same shape on the wire on purpose
+    /// (ADR-0012) — so the placeholder says `Load image` and this decides what
+    /// that means:
+    ///
+    /// * **The policy refused it.** Retrying would refuse it again, and a
+    ///   button that visibly does nothing is worse than no button. So this
+    ///   opens the site panel, where the host it wanted is one press from being
+    ///   allowed. The reader asked to see the picture; that is the question
+    ///   actually standing between them and it.
+    /// * **It simply failed** — a server that was down, a connection that
+    ///   dropped, a file that has moved. Then retrying is exactly right, and
+    ///   the child is dropped so the page renders again with an empty cache:
+    ///   the one holding this page remembers the failure, deliberately, so a
+    ///   broken image is not re-fetched on every resize.
+    fn load_image(&mut self, url: &str) {
+        let document = self.tab().loaded.origin.clone();
+        let refused = net::parse_url(url).is_ok_and(|(target, _)| {
+            matches!(
+                self.renderer.policy().check(
+                    Some(&document),
+                    &target,
+                    net::RequestKind::Subresource
+                ),
+                Err(net::Refusal::ThirdParty { .. })
+            )
+        });
+        if refused {
+            self.open_site_panel();
+            return;
+        }
+        self.tab_mut().page = None;
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Opens the site panel under the padlock.
     ///
     /// Under the control rather than under the pointer, unlike the context
@@ -1591,6 +1635,16 @@ impl App {
         let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
         page.target_at(x, y)
             .map(|(url, jump_to)| (url.to_owned(), jump_to))
+    }
+
+    /// The image the placeholder under the pointer was asking for (#118).
+    fn missing_under_pointer(&self) -> Option<String> {
+        if self.scrollbar_grab().is_some() {
+            return None;
+        }
+        let page = self.tab().page.as_ref()?;
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
+        page.missing_at(x, y).map(str::to_owned)
     }
 
     /// Where the pointer falls on the scrollbar, if it falls on one at all.
@@ -2289,20 +2343,28 @@ impl ApplicationHandler<BandReady> for App {
                 if over != self.over_link
                     && let Some(window) = &self.window
                 {
-                    let changed_shape = over.is_some() != self.over_link.is_some();
                     self.over_link = over;
-                    if changed_shape {
-                        window.set_cursor(if self.over_link.is_some() {
-                            winit::window::CursorIcon::Pointer
-                        } else {
-                            winit::window::CursorIcon::Default
-                        });
-                    }
                     // Moving from one link straight to another changes the
                     // address without changing the cursor, so the redraw is
-                    // asked for on its own terms rather than as part of the
+                    // asked for on its own terms rather than as part of any
                     // shape change.
                     window.request_redraw();
+                }
+                // A placeholder is pressable too (#118), and a button that
+                // leaves the cursor an arrow reads as dead. Tracked separately
+                // from the address above because it is a different question
+                // with a different answer: the strip says where a link goes,
+                // and a placeholder is not going anywhere.
+                let pressable = self.over_link.is_some() || self.missing_under_pointer().is_some();
+                if pressable != self.over_pressable
+                    && let Some(window) = &self.window
+                {
+                    self.over_pressable = pressable;
+                    window.set_cursor(if pressable {
+                        winit::window::CursorIcon::Pointer
+                    } else {
+                        winit::window::CursorIcon::Default
+                    });
                 }
             }
             WindowEvent::MouseInput {
@@ -2433,7 +2495,15 @@ impl ApplicationHandler<BandReady> for App {
                         // A click on the page is a click on the page, even if
                         // it is not on a link: the URL bar loses focus.
                         self.cancel_editing();
-                        if let Some((url, jump_to)) = self.target_under_pointer() {
+                        // Before links, not after. An `<img>` inside an `<a>`
+                        // is the era's whole navigation — a thumbnail that is
+                        // also a link — and a placeholder whose click was
+                        // swallowed by the link under it would be a button
+                        // that does nothing. The link is still reachable from
+                        // the caption beside it and from the keyboard (#118).
+                        if let Some(url) = self.missing_under_pointer() {
+                            self.load_image(&url);
+                        } else if let Some((url, jump_to)) = self.target_under_pointer() {
                             self.follow(url, jump_to);
                         }
                     }
@@ -2710,6 +2780,7 @@ pub fn open(
         rendered_size: (0, 0),
         pointer: (0.0, 0.0),
         over_link: None,
+        over_pressable: false,
         loading: None,
         dragging: None,
         selecting: None,

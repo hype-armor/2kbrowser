@@ -272,6 +272,7 @@ mod tests {
                 mode: Mode::Authored,
                 title: None,
                 links: Vec::new(),
+                missing: Vec::new(),
                 can_toggle_layout: false,
                 images_loaded: 0,
                 background: 0x00ff_ffff,

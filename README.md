@@ -644,6 +644,16 @@ identical to a page whose CDN is down, and a browser that quietly changes what
 a page contains has the same problem as one that quietly changes how it is laid
 out.
 
+An image that did not arrive leaves a box saying **Load image** where the
+picture was going to be, rather than a hole. Pressing it loads the picture if
+the server was simply having a bad day; if it was the third-party rule that
+refused it, pressing it opens the panel below, where the host is one press from
+being allowed — because retrying something the policy refuses would refuse it
+again, and a button that visibly does nothing is worse than no button. The box
+does not say "blocked": the renderer is deliberately not told whether a
+resource was refused or merely missing, so that a compromised one cannot use a
+page to probe what you have allowed. The chrome, which does know, says so.
+
 The padlock left of the URL opens the list: what this page asked for and did
 not get, each line one press from being allowed, and what this site has already
 been allowed to load from, each line one press from being taken back. An

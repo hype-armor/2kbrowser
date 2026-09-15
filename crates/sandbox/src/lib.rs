@@ -36,7 +36,7 @@ pub mod wire;
 use std::io::{Read, Write};
 
 pub use confine::Confinement;
-pub use message::{Link, Mode, Rendered, ToChild, ToParent};
+pub use message::{Link, Missing, Mode, Rendered, ToChild, ToParent};
 pub use parent::{MAX_RESOURCES, Renderer, Session, Withheld};
 pub use wire::{MAX_FRAME, WireError};
 

@@ -16,6 +16,53 @@ record for everything earlier.
 
 ## Unreleased
 
+**An image that did not arrive leaves a box, not a hole** (#118). It says
+`Load image`, because that is what pressing it does. Until now a page whose
+pictures were all on a CDN rendered as a screenful of gaps with nothing to
+distinguish a refused image from a dead server — which is exactly the report
+that became #109: a browser working precisely as designed being
+indistinguishable from a broken one.
+
+Pressing it does one of two things, and only the parent can tell which is
+right. If the policy refused the picture, retrying would refuse it again, so
+the site panel opens instead with the host it wanted one press from being
+allowed — that is the question actually standing between the reader and the
+picture. If the image merely failed — a server that was down, a connection that
+dropped — the renderer child is dropped and the page rendered again, which is
+what makes the retry a retry: that child remembers the failure on purpose, so a
+broken image is not re-fetched on every resize.
+
+The box deliberately does not say "blocked". A refusal and a failure are the
+same shape on the wire (ADR-0012) so that a compromised renderer cannot use a
+page to probe what the user has allowed, and the placeholder is drawn on the
+renderer's side. The chrome, which does know, is where the reason lives.
+
+Sized by measurement rather than a threshold. A great deal of the era's markup
+is 1x1 spacers and 10px bullets holding a table layout open, and drawing
+anything in those would turn a page of invisible scaffolding into a page of
+smudges — which is the failure mode of every broken-image icon that ever
+shipped. So a box too small to outline gets nothing, one too small for the
+words gets the outline, and the words appear only where they measurably fit.
+The first version used a fixed minimum, got 80x30 wrong, and clipped the label
+at both ends in the size half the era's thumbnails are.
+
+Checked against a placeholder before the link under it: an `<img>` inside an
+`<a>` is the era's whole navigation, and a button whose press was swallowed by
+the link beneath it would be a button that does nothing. The link is still
+reachable from its caption and from the keyboard.
+
+Only where the page is rendered as authored. A document rendering has already
+thrown the author's layout away *because* it was not serving the reader, and it
+drops the gaps a missing picture leaves along with it (ADR-0009) — a reading
+view of an article is the one place a row of empty boxes is not an improvement
+on nothing.
+
+And only for `<img>`. An `<iframe>` is a replaced element too and has no image
+by nature, so the first version grew a `Load image` button on every empty frame
+on the page. The conformance suite caught it — fourteen tests of §10.4's
+replaced-element sizing, every one of them built out of `<iframe>` elements
+used as plain boxes and none of them about images at all.
+
 **A site can be allowed to load from a host** (#118). ADR-0006 refuses
 off-origin subresources by default and names the per-site override as the
 reason that default is allowed to be as absolute as it is. Until now there was

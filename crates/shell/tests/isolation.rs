@@ -1800,3 +1800,75 @@ fn a_site_exception_is_what_lets_a_refused_subresource_through() {
         "one site's exception was honoured on another"
     );
 }
+
+#[test]
+fn a_refused_image_leaves_a_box_the_reader_can_press() {
+    // #118's placeholder, end to end. A page whose pictures are all on a CDN
+    // used to render a screenful of holes with no way to tell a refused image
+    // from a dead server — which is the report that became #109, a browser
+    // working exactly as designed being indistinguishable from a broken one.
+    let page = viewport(
+        "<body><img src=\"https://cdn.example.net/photo.jpg\" width=\"240\" \
+         height=\"160\"></body>",
+        400,
+    );
+    let missing = page.withheld();
+    assert_eq!(
+        missing.subresources(),
+        1,
+        "nothing was refused to begin with"
+    );
+
+    // The rectangle crosses the boundary, so the window has something to
+    // hit-test against — it has no box tree of its own.
+    let inside = page.missing_at(20.0, 20.0);
+    assert_eq!(
+        inside,
+        Some("https://cdn.example.net/photo.jpg"),
+        "the placeholder does not answer a press at the top-left of the image"
+    );
+    assert_eq!(
+        page.missing_at(1000.0, 1000.0),
+        None,
+        "a point nowhere near it answered anyway"
+    );
+}
+
+#[test]
+fn an_image_that_loaded_leaves_no_placeholder() {
+    // The other half, and the one that would rot silently: a browser that drew
+    // `Load image` over a picture it had successfully loaded would be worse
+    // than one that drew nothing at all.
+    let dir = std::env::temp_dir().join("2kbrowser-placeholder");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("dot.png"), solid_png(40, 40, (0, 0x80, 0))).expect("write");
+    let path = dir.join("page.html");
+    let html = "<body><img src=\"dot.png\"></body>";
+    std::fs::write(&path, html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        400,
+        400,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens");
+
+    assert_eq!(page.images_loaded(), 1, "the image was never fetched");
+    assert_eq!(
+        page.missing_at(20.0, 20.0),
+        None,
+        "an image that loaded was given a placeholder anyway"
+    );
+}

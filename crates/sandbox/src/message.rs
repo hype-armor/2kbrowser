@@ -71,6 +71,20 @@ impl Mode {
     }
 }
 
+/// A box where an image was going to be, and did not arrive (#118).
+///
+/// The reader presses it and the parent decides what that means — retry, or,
+/// if the parent's own policy is what refused it, offer the exception. The
+/// child neither knows nor is told which; it reports what the page asked for
+/// and stops there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Missing {
+    /// Where the placeholder is, in canvas coordinates.
+    pub rect: Rect,
+    /// The absolute URL the page asked for, already resolved by the child.
+    pub url: String,
+}
+
 /// A link's rectangle and where it leads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
@@ -444,6 +458,14 @@ pub struct Rendered {
     pub title: Option<String>,
     /// Every link, with its rectangles already resolved to absolute URLs.
     pub links: Vec<Link>,
+    /// Where an image was going to be and did not arrive (#118).
+    ///
+    /// The child's own knowledge travelling outward, which is the direction
+    /// that is safe: it says what the page asked for, not what the parent did
+    /// about it. A refusal and a failure are still the same thing on this
+    /// side, so the placeholder these describe says `Load image` rather than
+    /// naming a reason it does not have.
+    pub missing: Vec<Missing>,
     /// Whether there is a fallback decision to overrule.
     pub can_toggle_layout: bool,
     /// How many images were fetched and decoded for this page.
@@ -498,6 +520,11 @@ impl ToParent {
                     if let Some(top) = link.jump_to {
                         writer.f32(top);
                     }
+                }
+                writer.u32(page.missing.len() as u32);
+                for missing in &page.missing {
+                    write_rect(&mut writer, &missing.rect);
+                    writer.str(&missing.url);
                 }
                 writer.some(page.can_toggle_layout);
                 writer.u32(page.images_loaded);
@@ -572,6 +599,14 @@ impl ToParent {
                         jump_to: reader.some()?.then(|| reader.f32()).transpose()?,
                     });
                 }
+                let count = reader.count()?;
+                let mut missing = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    missing.push(Missing {
+                        rect: read_rect(&mut reader)?,
+                        url: reader.str()?,
+                    });
+                }
                 let can_toggle_layout = reader.some()?;
                 let images_loaded = reader.u32()?;
                 // Masked rather than rejected: the child is the untrusted side,
@@ -598,6 +633,7 @@ impl ToParent {
                     mode,
                     title,
                     links,
+                    missing,
                     can_toggle_layout,
                     images_loaded,
                     background,
@@ -662,6 +698,15 @@ mod tests {
                 url: "https://example.com/".to_owned(),
                 group: 0,
                 jump_to: Some(920.0),
+            }],
+            missing: vec![Missing {
+                rect: Rect {
+                    x: 5.0,
+                    y: 6.0,
+                    width: 7.0,
+                    height: 8.0,
+                },
+                url: "https://cdn.example.net/photo.jpg".to_owned(),
             }],
             can_toggle_layout: true,
             images_loaded: 3,
