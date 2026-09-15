@@ -1,5 +1,7 @@
 # 2kbrowser
 
+<img src="docs/images/icon.png" alt="" width="96" align="right">
+
 A web browser without the slop.
 
 2kbrowser renders HTML and CSS as the web did around the year 2000, and does not
@@ -47,6 +49,16 @@ and offers you the author's layout anyway (ADR-0009).
 Every state the bar can be in, drawn by `cargo run -p shell --example
 chrome-strip` — which is also how it is reviewed, since a headless test can
 compare pixels and a person cannot compare descriptions.
+
+![The application icon at the sizes it is used at](docs/images/icon-sizes.png)
+
+The application icon, at every size a desktop asks for. It is *drawn* rather
+than shipped as a set of PNGs — a page of geometry that renders at whatever size
+it is handed, through the same rasteriser the pages go through — so there is one
+of it instead of six files to keep in step, and it is reviewed the way the bar
+is: `cargo run -p shell --example app-icon`. Below about thirty pixels it draws
+its outlines heavier, because at the grid weight a sixteen-pixel icon's lines
+come out four tenths of a pixel thick and antialias into a grey smudge.
 
 ## Status
 
