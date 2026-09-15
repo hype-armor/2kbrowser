@@ -16,6 +16,40 @@ record for everything earlier.
 
 ## Unreleased
 
+**A short page is no longer mistaken for an empty one.** ADR-0009's third
+state — "this page has no content without JavaScript" — fired on any document
+with a script and fewer than two hundred characters of text. That is a measure
+of *length*, and the ADR asks for near-zero *content*: a table of twenty-six
+one-letter rows is a hundred and fifty characters and a complete rendering, and
+replacing it with "this page requires JavaScript" is a lie about a page already
+on the screen.
+
+There are two measures now and both must agree: how much text there is, and how
+many elements carry any. The shell the state exists for has none of the second
+— an empty `<div id="root">`, or the one `<noscript>` line a framework's
+template ships with. Each measure alone gets a page wrong, which is why neither
+replaced the other: the count would call a long article in three paragraphs
+near-empty, and the character total called a short complete page a shell.
+
+**The conformance harness reads the XML declaration's encoding.** Not an engine
+change and it does not claim to be one — the same bridge as the CDATA
+unwrapping beside it, and for the same reason. The suite is XHTML, an XHTML
+document declares its encoding in its prologue, and this engine parses
+everything as HTML, where `<?xml … ?>` is a bogus comment that HTML5's prescan
+deliberately does not read. Chromium does not read it either when the same
+bytes arrive as `text/html`.
+
+A hundred and two files in the suite carry non-ASCII bytes under such a
+declaration. Every one was being decoded as windows-1252, so `À` reached the
+engine as `Ã€` — and a test that uppercases it cannot match a reference that
+spells it out. That is the harness losing the document, not the engine
+mis-rendering it.
+
+The two together are worth **21 conformance tests against nothing lost** —
+fifteen for the encoding, two for the classification, and four that needed
+both, which is the whole `text-transform-bicameral` family bar the three that
+want locale-aware casing.
+
 **Anonymous tables** (§17.2.1): a run of table-internal boxes with no table
 above them gets one generated around it, and is laid out as the table it was
 describing. Together with the width rule below, **worth 25 conformance tests
@@ -52,6 +86,7 @@ failed the comparison on antialiasing alone.
 A replaced element is the exception (§10.3.8): its `auto` width comes from the
 intrinsic size, and narrowing the basis resolved `<img width="50%">` against
 the gap between the offsets instead of against the containing block.
+>>>>>>> b4d974c (layout: stop mistaking a short page for an empty one)
 
 **An inline element holding a block is broken around it** (§9.2.1.1), instead
 of being laid out as a block. **Worth 31 conformance tests against 1 lost.**

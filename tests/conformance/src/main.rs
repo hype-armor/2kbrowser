@@ -413,8 +413,45 @@ fn collect(directory: &Path, out: &mut Vec<PathBuf>) {
 
 fn read(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let (text, ..) = net::encoding::decode_document(&bytes, None);
+    // The XML declaration's encoding, offered the way a server would offer it.
+    // Same bridge as `unwrap_cdata` below and for the same reason: the suite is
+    // XHTML, an XHTML document declares its encoding in its prologue, and this
+    // engine parses everything as HTML — where `<?xml … ?>` is a bogus comment
+    // and HTML5's prescan deliberately does not read it. Chromium does not read
+    // it either when the same bytes arrive as `text/html`; it differs here only
+    // because a `.xht` file off disk makes it use its XML parser.
+    //
+    // A hundred and two files in the suite carry non-ASCII bytes under such a
+    // declaration, and without this every one of them is decoded as
+    // windows-1252: `À` reaches the engine as `Ã€`, and a test that uppercases
+    // it no longer matches a reference that spells it out. That is the harness
+    // losing the document, not the engine mis-rendering it.
+    let (text, ..) = net::encoding::decode_document(&bytes, xml_charset(&bytes).as_deref());
     Some(unwrap_cdata(&text))
+}
+
+/// The `encoding` pseudo-attribute of an XML declaration, as a content type.
+///
+/// Only at the very start of the document, which is the only place XML allows
+/// it, and read from the bytes rather than from decoded text because deciding
+/// how to decode is the whole question. The prologue is ASCII by definition, so
+/// reading it as ASCII is safe.
+fn xml_charset(bytes: &[u8]) -> Option<String> {
+    let head = std::str::from_utf8(bytes.get(..bytes.len().min(200))?).ok()?;
+    let rest = head.strip_prefix("<?xml")?;
+    let declaration = &rest[..rest.find("?>")?];
+    let at = declaration.find("encoding")?;
+    let value = declaration[at + "encoding".len()..].trim_start();
+    let value = value.strip_prefix('=')?.trim_start();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &value[1..];
+    Some(format!(
+        "text/html; charset={}",
+        &value[..value.find(quote)?]
+    ))
 }
 
 /// Removes the XML CDATA wrapper the suite writes its stylesheets inside.
@@ -587,6 +624,33 @@ mod tests {
             unwrapped.contains("<style type=\"text/css\">") && unwrapped.contains("</style>"),
             "the element itself was damaged: {unwrapped}"
         );
+    }
+
+    #[test]
+    fn the_xml_declaration_names_the_charset() {
+        assert_eq!(
+            xml_charset(b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<html/>").as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            xml_charset(b"<?xml version='1.0' encoding='iso-8859-15' ?><html/>").as_deref(),
+            Some("text/html; charset=iso-8859-15")
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_xml_declaration_names_nothing() {
+        // Then the engine's own detection decides, which is the point: this
+        // supplies what a server would have said and never overrides it.
+        for document in [
+            &b"<!DOCTYPE html><html/>"[..],
+            b"<?xml version=\"1.0\"?><html/>",
+            b"  <?xml version=\"1.0\" encoding=\"utf-8\"?>",
+            b"<?xml version=\"1.0\" encoding=utf-8?>",
+            b"",
+        ] {
+            assert_eq!(xml_charset(document), None, "{:?}", document);
+        }
     }
 
     #[test]
