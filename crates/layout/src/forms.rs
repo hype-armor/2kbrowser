@@ -22,17 +22,25 @@
 //! label shaped into it. So the box is built here and marked as carrying no
 //! image, and paint draws it like any other bordered box.
 //!
-//! # What is not here
+//! # What is here and what is not
 //!
-//! Nothing can be typed into, clicked, or submitted: this is how a form
-//! *looks*, not a form that works. That is a deliberate stopping point rather
-//! than an oversight — a control that draws correctly makes the page read
-//! correctly, and interaction is a separate piece of work with a separate risk.
+//! Text fields and `<textarea>`s can be typed into (#110). The editing itself
+//! is not here — it lives with the renderer child, which owns the focus and the
+//! cursor — but this is where a control's *value* is read, and that is where
+//! the two meet: what a reader has typed comes from the document's own record
+//! of it, and only then from the markup. The two are different things in HTML
+//! and are kept different here, because `<input value="x">` is the field's
+//! default rather than its contents.
 //!
-//! Nothing can be typed into, clicked, or submitted — see above. What *is* here
-//! besides the controls themselves is [`break_the_rule_for_a_legend`], because
-//! a `<fieldset>`'s rule and the `<legend>` that breaks it are the same piece of
-//! HTML furniture as the controls they surround.
+//! Nothing else works yet. A checkbox cannot be ticked, a button cannot be
+//! pressed, a dropdown cannot be opened, and no form can be submitted — which
+//! is a separate piece of work with a separate risk, since submitting is the
+//! first time this browser would send anything *up* to a server.
+//!
+//! What *is* here besides the controls themselves is
+//! [`break_the_rule_for_a_legend`], because a `<fieldset>`'s rule and the
+//! `<legend>` that breaks it are the same piece of HTML furniture as the
+//! controls they surround.
 
 use css::style::ComputedStyle;
 use dom::{Document, NodeId};
@@ -142,7 +150,12 @@ pub fn label_of(doc: &Document, node: NodeId, control: Control) -> Option<String
             }
             selected_option(doc, node).map(|id| descendant_text(doc, id).trim().to_owned())
         }
-        Control::TextArea | Control::Button if element.local_name() != "input" => {
+        // `<button>Label</button>`, whose label is its content. A `<textarea>`
+        // was in this arm too and is not any more: it reads what has been typed
+        // in it before it reads what the markup said, and this arm reads only
+        // the markup — so it quietly shadowed the one below and nothing typed
+        // into a textarea ever appeared (#110).
+        Control::Button if element.local_name() != "input" => {
             let text = descendant_text(doc, node);
             (!text.trim().is_empty()).then_some(text)
         }
@@ -159,18 +172,45 @@ pub fn label_of(doc: &Document, node: NodeId, control: Control) -> Option<String
             // Bullets, not the value. A password field that renders its own
             // contents over the shoulder of whoever is reading the page is the
             // one way this could be worse than drawing nothing.
-            let len = element.attr("value").map(|v| v.chars().count())?;
+            let len = value_of(doc, node).chars().count();
             (len > 0).then(|| "\u{2022}".repeat(len))
         }
-        Control::Text => element
-            .attr("value")
-            .map(str::to_owned)
-            .filter(|value| !value.is_empty()),
+        Control::Text => {
+            let value = value_of(doc, node);
+            (!value.is_empty()).then_some(value)
+        }
         Control::TextArea => {
-            let text = descendant_text(doc, node);
-            (!text.trim().is_empty()).then_some(text)
+            let text = value_of(doc, node);
+            // Not trimmed, unlike the button labels above. A field somebody has
+            // emptied holds an empty string, and treating that as "say nothing"
+            // would put the markup's original text back on screen the moment
+            // the last character was deleted (#110).
+            match doc.value_of(node) {
+                Some(_) => Some(text),
+                None => (!text.trim().is_empty()).then_some(text),
+            }
         }
     }
+}
+
+/// What a text control holds: what has been typed in it, or what the markup
+/// said (#110).
+///
+/// The two are different things in HTML and this keeps them that way — the
+/// attribute is the field's default, and what a reader has typed is a property
+/// of the control. Which is also why this reads the document's own record
+/// rather than the attribute once anything has been typed.
+pub fn value_of(doc: &Document, node: NodeId) -> String {
+    let Some(element) = doc.element(node) else {
+        return String::new();
+    };
+    if let Some(typed) = doc.value_of(node) {
+        return typed.to_owned();
+    }
+    if element.local_name() == "textarea" {
+        return descendant_text(doc, node);
+    }
+    element.attr("value").unwrap_or_default().to_owned()
 }
 
 /// All the text under a node, joined.
@@ -541,5 +581,63 @@ mod tests {
             "<select><option selected>short</option><option>a much longer one</option></select>",
         );
         assert!(wide > narrow, "{wide} vs {narrow}");
+    }
+
+    /// The one control in a fixture.
+    fn only_control(doc: &Document) -> (NodeId, Control) {
+        doc.descendants(doc.root())
+            .into_iter()
+            .find_map(|node| control_of(doc, node).map(|control| (node, control)))
+            .expect("a control")
+    }
+
+    #[test]
+    fn what_has_been_typed_wins_over_what_the_markup_said() {
+        // The two are different things in HTML — `value` is the field's default
+        // and what a reader has typed is a property of the control — and this
+        // is the seam where the difference shows up (#110).
+        for markup in [
+            "<input type=\"text\" value=\"Ada\">",
+            "<input type=\"password\" value=\"Ada\">",
+            "<textarea>Ada</textarea>",
+        ] {
+            let mut doc = dom::parse(&format!("<body>{markup}</body>"));
+            let (node, control) = only_control(&doc);
+            assert_eq!(
+                label_of(&doc, node, control).as_deref(),
+                Some(if control == Control::Password {
+                    "•••"
+                } else {
+                    "Ada"
+                }),
+                "before anything is typed, in {markup}"
+            );
+
+            doc.set_value(node, "Byron");
+            let shown = label_of(&doc, node, control).expect("a label");
+            if control == Control::Password {
+                // Bullets, not the value. A password field that renders its own
+                // contents over the shoulder of whoever is reading the page is
+                // the one way this could be worse than drawing nothing — and
+                // typing into it must not be the thing that gives that up.
+                assert_eq!(shown, "•••••", "in {markup}");
+            } else {
+                assert_eq!(shown, "Byron", "in {markup}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_textarea_emptied_by_the_reader_stays_empty() {
+        // The arm that reads a `<textarea>`'s content used to sit above the one
+        // that reads what was typed in it, and shadowed it completely: nothing
+        // typed into a textarea ever appeared, and the failure looked exactly
+        // like the keystrokes not arriving. Emptying one is the sharper half —
+        // treating "" as "say nothing" would put the markup's own text back on
+        // screen the moment the last character was deleted.
+        let mut doc = dom::parse("<body><textarea>note</textarea></body>");
+        let (node, control) = only_control(&doc);
+        doc.set_value(node, "");
+        assert_eq!(label_of(&doc, node, control).as_deref(), Some(""));
     }
 }

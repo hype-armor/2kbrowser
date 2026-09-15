@@ -640,4 +640,107 @@ image needs the panel, because retrying it would refuse it again"
 echo "ok: a refused image drew a placeholder and pressing it offered the host"
 stop
 
+# N. A text field can be clicked into and typed in (#110).
+#
+#    Unreachable from `cargo test` and not by a little: the path runs from
+#    winit's key event, through the modifier state and the chrome's own fields,
+#    across the process boundary as a named key, into an editing state the child
+#    owns, back as a fresh render. `isolation.rs` drives the far half of that
+#    directly. Nothing but a real window drives the near half.
+typing="$here/target/window-typing"
+mkdir -p "$typing"
+cat > "$typing/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Typing</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: absolute; left: 40px; top: 40px">
+<input type="text" value="" size="30">
+</div>
+</body>
+FIXTURE
+
+start_on "$typing/p.html" "Typing"
+
+# Where that field actually is, asked of the browser rather than assumed — the
+# same rule the link coordinates above follow. Read off the screen rather than
+# out of a rendered file: measuring a PNG means decoding one, and the only way
+# to do that without writing an inflater is an image library CI does not have.
+# The fixture has nothing on it but the field, so the ink below the chrome is
+# the field.
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 1)) $((height - 1)))
+[ -n "$box" ] || fail "nothing was drawn below the chrome, so the fixture's \
+field never reached the screen"
+set -- $box
+# Back into document coordinates, which is what the rest of this reads in.
+field_left=$1 field_top=$(($2 - chrome)) field_right=$3 field_bottom=$(($4 - chrome))
+# Somewhere across the first few characters, since exactly which pixels the
+# glyphs land on is the shaper's business and not this harness's. Started clear
+# of the caret: a focused empty field has one, a couple of pixels in from the
+# border, and a scan that included it would report "there is text here" the
+# moment the field took the click.
+text_y=$((chrome + (field_top + field_bottom) / 2))
+inked_in_field() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-ink.py" $((field_left + 12)) $((field_left + 70)) "$text_y"
+}
+[ "$(inked_in_field)" = "clear" ] || fail "the field had text in it before \
+anything was typed, so the check below would pass without a single key arriving"
+
+# Two pixels above the field's border box, which is where the focus ring goes
+# and where nothing else ever draws.
+ring_y=$((chrome + field_top - 2))
+ring_x=$(((field_left + field_right) / 2))
+unfocused=$(pixel "$ring_x" "$ring_y")
+
+DISPLAY=$display xdotool mousemove "$ring_x" $((chrome + (field_top + field_bottom) / 2))
+DISPLAY=$display xdotool click 1
+focused=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$ring_x" "$ring_y")" != "$unfocused" ]; then
+        focused=yes
+        break
+    fi
+done
+[ -n "$focused" ] || fail "clicking a text field drew no focus ring, so the \
+click never reached the control"
+
+# The window has to hold the *keyboard* focus, which no check before this one
+# has ever needed: they are all pointer-driven, and XTEST clicks go wherever the
+# pointer is whether or not the window is focused. Keystrokes do not — they go
+# to whatever the window manager last focused, which under a bare Xvfb with no
+# window manager at all is nothing. Without this the keys are delivered to the
+# void and the failure reads exactly like a browser that ignores the keyboard.
+DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null \
+    || DISPLAY=$display xdotool windowfocus --sync "$window" 2>/dev/null \
+    || true
+sleep 0.3
+DISPLAY=$display xdotool type --delay 60 "hello"
+typed=""
+for _ in $(seq 1 25); do
+    sleep 0.2
+    if [ "$(inked_in_field)" = "ink" ]; then
+        typed=yes
+        break
+    fi
+done
+[ -n "$typed" ] || fail "five characters were typed into a focused field and \
+nothing appeared in it"
+
+# Escape gives the field up, which is what puts the keyboard back on the page.
+DISPLAY=$display xdotool key Escape
+released=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$ring_x" "$ring_y")" = "$unfocused" ]; then
+        released=yes
+        break
+    fi
+done
+[ -n "$released" ] || fail "Escape left the field focused, so the page can no \
+longer be scrolled with the keyboard"
+echo "ok: a text field took a click, took five characters, and let go on Escape"
+stop
+
 echo "all window click checks passed"

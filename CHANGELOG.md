@@ -16,6 +16,56 @@ record for everything earlier.
 
 ## Unreleased
 
+**Text fields and `<textarea>`s can be typed into** (#110). Every form control
+has drawn correctly for a while and none of them did anything, which PLAN.md
+recorded as this milestone's chosen stopping point rather than an oversight —
+and which reads, on a page with a search box, as a browser that has hung.
+
+Click into a field or Tab to it and you get a caret and a focus ring, then
+characters, Backspace and Delete, arrows with word motion on Ctrl (or Alt,
+which is where macOS keeps it), Home and End *by line* rather than by field,
+selection with Shift, Ctrl+A, and Escape to let go. Tab walks the page's fields
+in document order and then its links; past the last field the child gives the
+focus up, which is what hands the key back to the window rather than trapping
+it in a form with no way out.
+
+**The editing lives in the renderer child**, with the document it belongs to.
+The window sends *named* keys — "delete a word", not a scancode and a modifier
+mask — so the untrusted side never interprets a keyboard and no platform's idea
+of a key crosses the line. What comes back is a fresh render and one bit saying
+whether the typing now belongs to the page. One bit and no more: the parent
+needs to know where the next keystroke goes and has no business knowing which
+field is focused or what is in it.
+
+What a reader has typed is kept **separately from the `value` attribute**,
+because in HTML they are separate things — the attribute is the field's default
+and the contents are a property of the control. Writing the attribute instead
+would mean a page styling `input[value=""]` changed how it looked the moment
+somebody typed, which is a rule about the markup being answered with a fact
+about the session. A password field still shows bullets and never its value,
+including after you have typed in it.
+
+Two bugs the tests found on the way, both older than this change:
+
+* **Nothing typed into a `<textarea>` ever appeared.** The arm of `label_of`
+  that reads a control's content sat above the arm that reads what was typed in
+  it and shadowed it completely. The failure looked exactly like the keystrokes
+  not arriving, which is how it survived a first round of manual testing.
+* **The caret landed one character short at the end of every field.** The walk
+  that finds which line an offset falls on subtracted a newline that was not
+  there when the offset was past the end, so the last position in a field
+  measured as the second-to-last.
+
+A form still cannot be ticked, pressed or submitted. Submission is deliberately
+last: it is the first thing this browser would send *up* to a server, which is a
+different kind of risk from everything else here.
+
+Checked with real keystrokes in `scripts/window-clicks.sh`, which is the only
+honest place for it. The path runs from winit's key event through the modifier
+state and the chrome's own fields, across the process boundary, into an editing
+state the child owns, and back as pixels; `cargo test` can drive the far half of
+that and nothing but a window can drive the near half.
+
 **The browser has an icon**: a beige-box computer with a lit screen, which is
 what it is for. It appears wherever a program appears outside its own window —
 a dock, a task bar, an alt-tab list — and until now this one appeared there as

@@ -37,6 +37,22 @@ impl Field {
         }
     }
 
+    /// A field containing `text`, with the cursor after it and nothing
+    /// selected.
+    ///
+    /// What clicking into a form control on the page does, rather than the URL
+    /// bar's select-everything: the common next action in a page's field is to
+    /// carry on typing, and a browser that threw away what was already there on
+    /// the first keystroke would be one nobody could fill a form in (#110).
+    pub fn with_cursor_at_end(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            cursor: text.len(),
+            anchor: text.len(),
+            text,
+        }
+    }
+
     /// The current text.
     pub fn text(&self) -> &str {
         &self.text
@@ -141,13 +157,27 @@ impl Field {
     }
 
     /// Moves to the start of the line.
+    ///
+    /// The line, not the text. They are the same thing in the URL bar, which is
+    /// the only thing this edited when it was written, and different in a
+    /// `<textarea>` — where Home jumping to the top of a twenty-line field
+    /// rather than to the front of the row you are on is not what anybody has
+    /// ever meant by the key (#110).
     pub fn home(&mut self, extend: bool) {
-        self.place(0, extend);
+        let at = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|newline| newline + 1)
+            .unwrap_or(0);
+        self.place(at, extend);
     }
 
-    /// Moves to the end of the line.
+    /// Moves to the end of the line, by the same rule.
     pub fn end(&mut self, extend: bool) {
-        self.place(self.text.len(), extend);
+        let at = self.text[self.cursor..]
+            .find('\n')
+            .map(|newline| self.cursor + newline)
+            .unwrap_or(self.text.len());
+        self.place(at, extend);
     }
 
     /// Selects everything.

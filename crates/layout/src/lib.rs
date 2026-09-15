@@ -687,6 +687,118 @@ impl Layout {
         collect_rects(&self.root, node, 0.0, 0.0, &mut out);
         out
     }
+
+    /// Where a caret sits inside a form control's box, and how tall it is
+    /// (#110).
+    ///
+    /// `at` is a byte offset into the control's text. The answer comes from the
+    /// glyphs rather than from re-measuring a prefix: they already carry the
+    /// byte range each one covers, so an offset in the middle of a cluster
+    /// snaps to the front of it instead of landing inside a character that has
+    /// no inside.
+    ///
+    /// `None` when the node generated no box, which is the honest answer for a
+    /// control inside something `display: none`.
+    pub fn caret_in(&self, node: NodeId, at: usize) -> Option<Rect> {
+        let (box_, left, top) = find_box_of(&self.root, node, 0.0, 0.0)?;
+        let content_x = left + box_.content_origin.0;
+        let content_y = top + box_.content_origin.1;
+        // The last line whose text starts at or before `at`, so a `<textarea>`
+        // puts the caret on the row the offset is actually on.
+        let (line, before) = match &box_.text {
+            Some(text) => lines_up_to(text, at),
+            None => (None, 0),
+        };
+        let Some(line) = line else {
+            // An empty control still has a caret, at the front of where its
+            // text would go. A field you cannot see the cursor in is a field
+            // that looks broken until the first character appears.
+            return Some(Rect {
+                x: content_x,
+                y: content_y,
+                width: CARET_WIDTH,
+                height: box_.style.font_size * 1.2,
+            });
+        };
+        let dx = line_offset(
+            box_.style.text_align.against(box_.style.direction),
+            line.width,
+            line.available.min(box_.content_width),
+        );
+        Some(Rect {
+            x: content_x + dx + caret_x(line, at.saturating_sub(before)),
+            y: content_y + line.y,
+            width: CARET_WIDTH,
+            height: line.baseline + box_.style.font_size * 0.25,
+        })
+    }
+}
+
+/// How wide the caret is drawn.
+const CARET_WIDTH: f32 = 1.0;
+
+/// The line a byte offset falls on, and how many bytes came before it.
+///
+/// A control's text is one string and the layout has cut it into lines, which
+/// do not carry where they started — so this counts them out. The newline
+/// between two lines is a byte the control's text holds and no line does, which
+/// is why the running total skips one.
+///
+/// That skip is exact rather than approximate, for the two things a caret is
+/// ever asked about. A one-line field has one line and never reaches it. A
+/// `<textarea>`'s label is shaped `white-space: pre` on purpose — otherwise its
+/// rows collapse into one run-on line — and `pre` does not wrap, so its lines
+/// are precisely its newline-separated ones.
+///
+/// An offset past the end gives the last line and the offset of its start, so a
+/// cursor that is briefly ahead of the layout lands at the end of the text
+/// rather than taking the renderer with it.
+fn lines_up_to(text: &text::TextLayout, at: usize) -> (Option<&text::Line>, usize) {
+    let mut before = 0usize;
+    let mut last = None;
+    for line in &text.lines {
+        let end = before + line.text.len();
+        // `<=` rather than `<`: an offset at the end of a line belongs to that
+        // line's far edge, not to the start of the next one. Typing at the end
+        // of a row must not draw the caret at the beginning of the row below.
+        if at <= end {
+            return (Some(line), before);
+        }
+        last = Some(line);
+        before = end + 1;
+    }
+    (
+        last,
+        before.saturating_sub(last.map_or(0, |line| line.text.len() + 1)),
+    )
+}
+
+/// How far into a line a byte offset sits.
+fn caret_x(line: &text::Line, at: usize) -> f32 {
+    // The first glyph that starts at or after the offset is where the caret
+    // goes; past the last one it goes at the end of what is drawn.
+    line.glyphs
+        .iter()
+        .find(|glyph| glyph.start >= at)
+        .map(|glyph| glyph.x)
+        .unwrap_or(line.width)
+}
+
+/// The box a node generated, with where it sits on the canvas.
+fn find_box_of(
+    box_: &LayoutBox,
+    node: NodeId,
+    offset_x: f32,
+    offset_y: f32,
+) -> Option<(&LayoutBox, f32, f32)> {
+    let left = offset_x + box_.rect.x;
+    let top = offset_y + box_.rect.y;
+    if box_.node == Some(node) {
+        return Some((box_, left, top));
+    }
+    box_.children
+        .iter()
+        .find_map(|child| find_box_of(child, node, left, top))
 }
 
 /// Depth-first, last match wins.
@@ -10988,5 +11100,129 @@ mod find_tests {
             "needle",
         );
         assert_eq!(rects.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod caret_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// Lays out `html` and hands back the document with it, so a test can name
+    /// the node it wants a caret in.
+    fn laid_out(html: &str) -> (dom::Document, Layout) {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("")]);
+        let mut fonts = FontStore::new();
+        let layout = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            600.0,
+            600.0,
+        );
+        (doc, layout)
+    }
+
+    /// The one `<input>` or `<textarea>` in the fixture.
+    fn control(doc: &Document) -> NodeId {
+        doc.descendants(doc.root())
+            .into_iter()
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|it| matches!(it.local_name(), "input" | "textarea"))
+            })
+            .expect("a control")
+    }
+
+    #[test]
+    fn the_caret_moves_along_the_text_as_the_offset_grows() {
+        let (doc, layout) = laid_out("<body><input type=\"text\" value=\"Ada\"></body>");
+        let node = control(&doc);
+
+        let front = layout.caret_in(node, 0).expect("a caret");
+        let middle = layout.caret_in(node, 2).expect("a caret");
+        let back = layout.caret_in(node, 3).expect("a caret");
+        assert!(
+            front.x < middle.x && middle.x < back.x,
+            "the caret does not advance: {front:?} {middle:?} {back:?}"
+        );
+        // And it stays inside the field it belongs to, which is the failure a
+        // caret measured against the wrong origin produces.
+        let box_ = layout.rects_for(node).into_iter().next().expect("a box");
+        assert!(
+            back.x >= box_.x && back.x <= box_.x + box_.width,
+            "the caret left the control: {back:?} against {box_:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_field_still_has_a_caret() {
+        // A field you cannot see the cursor in is a field that looks broken
+        // until the first character appears — and an empty one is exactly where
+        // a reader most needs telling that the typing goes here.
+        let (doc, layout) = laid_out("<body><input type=\"text\" value=\"\"></body>");
+        let node = control(&doc);
+        let caret = layout.caret_in(node, 0).expect("a caret");
+        assert!(caret.height > 0.0, "{caret:?}");
+        let box_ = layout.rects_for(node).into_iter().next().expect("a box");
+        assert!(
+            caret.x >= box_.x && caret.x < box_.x + box_.width,
+            "{caret:?}"
+        );
+    }
+
+    #[test]
+    fn a_caret_on_the_second_line_of_a_textarea_is_on_the_second_line() {
+        // The offset is into the control's whole text and the layout has cut
+        // that into lines, so the line it falls on has to be counted out. A
+        // caret that ignored the newlines would sit on row one however far down
+        // the field the cursor actually was.
+        let (doc, layout) =
+            laid_out("<body><textarea rows=\"3\" cols=\"20\">one\ntwo</textarea></body>");
+        let node = control(&doc);
+
+        let first = layout.caret_in(node, 1).expect("a caret");
+        let second = layout.caret_in(node, 5).expect("a caret");
+        assert!(
+            second.y > first.y,
+            "the caret stayed on line one: {first:?} then {second:?}"
+        );
+        assert!(
+            second.x < first.x + 1.0,
+            "the caret on line two kept line one's column: {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_caret_in_a_control_with_no_box_is_nothing_rather_than_a_panic() {
+        // A control the cascade hid generates no box, and the focus outlives
+        // the box it was on — the reader's focus travels with them, not with
+        // the page.
+        let doc = dom::parse("<body><input type=\"text\" value=\"x\"></body>");
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse("input { display: none }")]);
+        let mut fonts = FontStore::new();
+        let laid = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            600.0,
+            600.0,
+        );
+        assert!(laid.caret_in(control(&doc), 0).is_none());
+    }
+
+    #[test]
+    fn an_offset_past_the_end_lands_at_the_end_rather_than_panicking() {
+        // The offset comes from an editing state the child holds and the layout
+        // is rebuilt from the document each render, so the two can disagree for
+        // one frame — a stale cursor must not take the renderer with it.
+        let (doc, layout) = laid_out("<body><input type=\"text\" value=\"Ada\"></body>");
+        let node = control(&doc);
+        let past = layout.caret_in(node, 9_999).expect("a caret");
+        let end = layout.caret_in(node, 3).expect("a caret");
+        assert_eq!(past.x, end.x, "{past:?} vs {end:?}");
     }
 }

@@ -1872,3 +1872,181 @@ fn an_image_that_loaded_leaves_no_placeholder() {
         "an image that loaded was given a placeholder anyway"
     );
 }
+
+/// A cheap digest of a page's pixels.
+///
+/// Compared instead of the buffers themselves because a failed comparison of
+/// two megabyte slices prints two megabytes, which is not a test report.
+fn look(page: &shell::viewport::Viewport) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in page.pixels() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A page with two text fields and a textarea, at a known place.
+fn form_page(width: u32) -> shell::viewport::Viewport {
+    viewport(
+        "<body style=\"margin: 0\">\
+         <div><input type=\"text\" value=\"Ada\"></div>\
+         <div><input type=\"text\" value=\"\"></div>\
+         <div><textarea rows=\"3\" cols=\"20\">note</textarea></div>\
+         </body>",
+        width,
+    )
+}
+
+#[test]
+fn a_text_field_can_be_focused_and_typed_into() {
+    // #110, end to end through a real renderer child. The whole path is here:
+    // the parent knows where the pointer was and nothing else, the child works
+    // out what is there, and the only thing that comes back is pixels and one
+    // bit saying whether the typing now belongs to the page.
+    let mut page = form_page(400);
+    assert!(
+        !page.editing(),
+        "a page nobody has pressed is not being edited"
+    );
+
+    let before = look(&page);
+    assert!(
+        page.focus_at(20.0, 10.0),
+        "pressing the first field focused nothing"
+    );
+    assert!(page.editing());
+    assert_ne!(
+        look(&page),
+        before,
+        "focusing drew no ring and no caret, so nothing says where the typing goes"
+    );
+
+    // Typing appends rather than replacing: clicking into a field that already
+    // has something in it and losing it on the first keystroke is the one way
+    // this could be worse than not working at all.
+    let focused = look(&page);
+    page.type_key(sandbox::message::Key::Insert("m".to_owned()));
+    assert_ne!(
+        look(&page),
+        focused,
+        "a character was typed and the page did not change"
+    );
+}
+
+#[test]
+fn pressing_away_from_a_control_gives_up_the_typing() {
+    let mut page = form_page(400);
+    assert!(page.focus_at(20.0, 10.0));
+    // Far below the last control, which is page and not a field.
+    assert!(
+        !page.focus_at(380.0, 2.0),
+        "a press to the right of a 200px field focused something"
+    );
+    assert!(!page.editing(), "the focus survived a press on nothing");
+}
+
+#[test]
+fn tab_walks_the_controls_and_then_lets_go() {
+    // The half of #110 the report actually named: "can't add text or tab to
+    // them". Tab from nothing reaches the first control, steps through the
+    // rest, and past the last gives the focus up — which is what hands the key
+    // back to the window, whose own Tab walks the page's links.
+    let mut page = form_page(400);
+    let tab = || sandbox::message::Key::Tab { back: false };
+
+    page.type_key(tab());
+    assert!(page.editing(), "Tab on a fresh page focused nothing");
+
+    let first = look(&page);
+    page.type_key(tab());
+    assert!(page.editing(), "Tab left the second control unfocused");
+    assert_ne!(
+        look(&page),
+        first,
+        "Tab drew the ring in the same place twice"
+    );
+
+    page.type_key(tab());
+    assert!(page.editing(), "Tab left the textarea unfocused");
+    page.type_key(tab());
+    assert!(
+        !page.editing(),
+        "Tab past the last control kept the focus, so the key never reaches \
+         the window and the page's links become unreachable"
+    );
+}
+
+#[test]
+fn escape_gives_up_the_typing() {
+    let mut page = form_page(400);
+    assert!(page.focus_at(20.0, 10.0));
+    page.type_key(sandbox::message::Key::Escape);
+    assert!(!page.editing());
+}
+
+#[test]
+fn a_newline_reaches_a_textarea_and_stops_at_a_one_line_field() {
+    // The parent sends the character and the child decides, because the parent
+    // has no idea what kind of control it is typing into and should not have
+    // to. Enter in a one-line field means submit, which this browser does not
+    // do — and a literal newline in one would be something no browser would
+    // ever put there.
+    let mut page = form_page(400);
+    assert!(page.focus_at(20.0, 10.0), "the one-line field");
+    let before = look(&page);
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    assert_eq!(look(&page), before, "a newline went into a one-line field");
+
+    // The textarea is the third control, so three tabs from nothing. A newline
+    // and then a character, because a newline at the end of the text moves
+    // nothing that is already drawn — the proof it went in is what comes after
+    // it landing on a new row.
+    let mut page = form_page(400);
+    for _ in 0..3 {
+        page.type_key(sandbox::message::Key::Tab { back: false });
+    }
+    page.type_key(sandbox::message::Key::Insert("x".to_owned()));
+    let one_line = look(&page);
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    page.type_key(sandbox::message::Key::Insert("x".to_owned()));
+    assert_ne!(
+        look(&page),
+        one_line,
+        "a newline did not reach the textarea"
+    );
+}
+
+#[test]
+fn typing_repaints_the_rows_the_reader_is_looking_at() {
+    // Typing is a re-render of the whole page, and a render is built from the
+    // request the page came from — which names the band the page *opened* at.
+    // Without carrying the band forward, clicking into a field halfway down a
+    // long page answers by painting the top of it, and the reader's place in
+    // the document is gone (#110).
+    let filler = "<p>a line of text to push the field down the page</p>".repeat(60);
+    let mut page = viewport(
+        &format!(
+            "<body style=\"margin: 0\">{filler}<div><input type=\"text\" value=\"\"></div></body>"
+        ),
+        400,
+    );
+    assert_eq!(page.band_top(), 0);
+
+    // Down the page, the way scrolling does it.
+    page.request_band(800, 400).expect("asks for a band");
+    while !page.accept_band() {
+        std::thread::yield_now();
+    }
+    assert_eq!(page.band_top(), 800, "the band never arrived");
+
+    // Tab into the field, which is a full re-render on the far side.
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    assert!(page.editing(), "Tab focused nothing");
+    assert_eq!(
+        page.band_top(),
+        800,
+        "typing sent the reader back to the top of the page"
+    );
+}

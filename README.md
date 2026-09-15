@@ -230,15 +230,26 @@ containers that would have arranged a row of blocks and now stack them instead.
 Every page in the corpus that should keep its author's layout scores zero of
 those; a Wikipedia article scores sixteen.
 
-**Forms are drawn but do not work.** Every control has a box now — text and
-password fields, buttons, checkboxes, radios, `<textarea>`, `<select>` and the
-rule around a `<fieldset>` — sized in the era's own units, since `size`, `cols`
-and `rows` count characters and lines rather than pixels, and a field follows
-the font it is set in. A password field shows bullets and never its value.
-**Nothing can be typed into, clicked, or submitted**, and that is the stopping
-point rather than an oversight: a control that draws correctly makes the page
-read correctly, and interaction is separate work with a separate risk. A radio
-button is drawn round and a checkbox square — the shape is the question, "one of
+**Forms take typing.** Every control has a box — text and password fields,
+buttons, checkboxes, radios, `<textarea>`, `<select>` and the rule around a
+`<fieldset>` — sized in the era's own units, since `size`, `cols` and `rows`
+count characters and lines rather than pixels, and a field follows the font it
+is set in. A password field shows bullets and never its value, including after
+you have typed in it.
+
+Text fields and `<textarea>`s can be **clicked into, tabbed between and typed
+in**: a caret, a focus ring, arrows and word motion, Home and End by line,
+selection with Shift, Ctrl+A, and Escape to let go. Tab walks the page's fields
+first and then its links, and past the last field it hands the key back rather
+than trapping it. What a reader types lives in the renderer child with the
+document it belongs to; the window sends named keys — "delete a word", not a
+scancode — and gets pixels back, so the untrusted side never has to interpret a
+keyboard and no platform's idea of a key leaves its own side of the line.
+
+**Nothing can be ticked, pressed, or submitted.** A checkbox, a button and a
+dropdown still only draw. Submission is deliberately last: it is the first thing
+this browser would send *up* to a server, which is a different kind of risk from
+everything else here. A radio button is drawn round and a checkbox square — the shape is the question, "one of
 these" against "any of these" — and a `<legend>` sits *in* its group's rule, with
 the rule stopping either side of it, as HTML's rendering section has it.
 

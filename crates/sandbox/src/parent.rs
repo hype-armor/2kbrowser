@@ -411,6 +411,8 @@ enum Job {
     Band { top: u32, height: u32 },
     Find(String),
     Select { from: (f32, f32), to: (f32, f32) },
+    Focus { at: (f32, f32) },
+    Type { key: crate::message::Key },
 }
 
 /// A render request, boxed because it carries the whole document.
@@ -656,6 +658,31 @@ impl Session {
         }
     }
 
+    /// Tells the child the reader pressed a point on the page (#110).
+    ///
+    /// Comes back as a fresh render, because focusing draws a ring and a caret
+    /// that were not there before. The parent never learns *what* was focused —
+    /// only whether anything was, which is all it needs to decide where the
+    /// next keystroke goes.
+    pub fn focus(&mut self, at: (f32, f32)) -> Result<Rendered, Error> {
+        self.submit(Job::Focus { at }, Kind::Page)?;
+        match self.wait_for(Kind::Page)? {
+            Answer::Rendered(page) => Ok(*page),
+            Answer::Failed(error) => Err(error),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
+    /// Sends a keystroke to whatever the child has focused.
+    pub fn type_key(&mut self, key: crate::message::Key) -> Result<Rendered, Error> {
+        self.submit(Job::Type { key }, Kind::Page)?;
+        match self.wait_for(Kind::Page)? {
+            Answer::Rendered(page) => Ok(*page),
+            Answer::Failed(error) => Err(error),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
     /// The renderer's process id.
     ///
     /// Exposed for one reason: so a test can go and look. Dropping a session is
@@ -892,6 +919,15 @@ impl Conversation {
                 .map(|page| Answer::Rendered(Box::new(page))),
             Job::Find(query) => self.ask(&ToChild::Find { query }),
             Job::Select { from, to } => self.ask(&ToChild::Select { from, to }),
+            // Through `converse` rather than `ask`, because these re-render:
+            // a field that grew a line can bring a new row of the page into
+            // the band, and a new row can want an image.
+            Job::Focus { at } => self
+                .converse(ToChild::Focus { at })
+                .map(|page| Answer::Rendered(Box::new(page))),
+            Job::Type { key } => self
+                .converse(ToChild::Type { key })
+                .map(|page| Answer::Rendered(Box::new(page))),
         };
         outcome.unwrap_or_else(Answer::Failed)
     }

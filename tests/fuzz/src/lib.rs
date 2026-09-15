@@ -861,6 +861,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                 url: "https://cdn.example.net/photo.jpg".to_owned(),
             }],
             can_toggle_layout: true,
+            editing: false,
             images_loaded: 2,
             background: 0x0011_2233,
             top: 0,
