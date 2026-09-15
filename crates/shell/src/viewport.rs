@@ -265,6 +265,16 @@ impl Viewport {
         }
     }
 
+    /// What the policy refused this page (ADR-0006, issue #118).
+    ///
+    /// Asked of the session rather than carried on [`sandbox::Rendered`],
+    /// because it is the parent's knowledge and not the child's: a refusal and
+    /// a failure look identical on the wire on purpose, so this never crosses
+    /// the boundary in either direction.
+    pub fn withheld(&self) -> sandbox::Withheld {
+        self.session.withheld()
+    }
+
     /// Every link, with each one's rectangles kept together, in document order.
     pub fn links(&self) -> Vec<Link> {
         let mut out: Vec<Link> = Vec::new();

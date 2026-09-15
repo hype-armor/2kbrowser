@@ -27,6 +27,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// images whether the policy works or not, so success counts prove nothing.
 static THIRD_PARTY_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Count of third-party subresource requests the policy refused.
+///
+/// The other side of the pair. On its own, `THIRD_PARTY_REQUESTS` reads the
+/// same at zero whether the policy is working or the page asked for nothing:
+/// "no third-party request left this process" and "no third-party request was
+/// ever made" are different facts, and only one of them is evidence. Counting
+/// refusals separates them, and it is what lets the chrome say how much of a
+/// page was withheld rather than only that none of it escaped (issue #118).
+///
+/// Only [`Refusal::ThirdParty`] is counted. A malformed URL and an unsupported
+/// scheme are the page being wrong about itself rather than the policy holding
+/// a line, and folding them in here would inflate the number the reader is
+/// being shown with things nobody could allow even if they wanted to.
+static THIRD_PARTY_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
 /// How many third-party subresource requests have been issued this process.
 pub fn third_party_request_count() -> usize {
     THIRD_PARTY_REQUESTS.load(Ordering::Relaxed)
@@ -35,6 +50,30 @@ pub fn third_party_request_count() -> usize {
 /// Resets the count. For tests and the budget harness.
 pub fn reset_third_party_request_count() {
     THIRD_PARTY_REQUESTS.store(0, Ordering::Relaxed);
+}
+
+/// How many third-party subresource requests have been refused this process.
+pub fn third_party_refusal_count() -> usize {
+    THIRD_PARTY_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Resets the count. For tests and the budget harness.
+pub fn reset_third_party_refusal_count() {
+    THIRD_PARTY_REFUSALS.store(0, Ordering::Relaxed);
+}
+
+/// Records a refusal, if it was the third-party rule that did it.
+///
+/// Public because the fetch this crate would have counted does not always
+/// happen here: the sandbox parent checks a whole batch of URLs against the
+/// policy before it fetches any of them, so a refused subresource is dropped
+/// one layer up and never reaches [`Fetcher::fetch_raw`]. That path has to
+/// count for itself, and the two never see the same URL — anything refused in
+/// the batch pre-pass is excluded from what is fetched.
+pub fn count_refusal(refusal: &Refusal) {
+    if matches!(refusal, Refusal::ThirdParty { .. }) {
+        THIRD_PARTY_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Records a request that the policy let through, if it left the origin.
@@ -188,9 +227,10 @@ impl Fetcher {
         kind: RequestKind,
     ) -> Result<Resource, FetchError> {
         let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        self.policy
-            .check(document, &origin, kind)
-            .map_err(FetchError::Refused)?;
+        if let Err(refusal) = self.policy.check(document, &origin, kind) {
+            count_refusal(&refusal);
+            return Err(FetchError::Refused(refusal));
+        }
 
         count_if_third_party(document, &origin, kind);
 
@@ -227,9 +267,10 @@ impl Fetcher {
         kind: RequestKind,
     ) -> Result<Fetched, FetchError> {
         let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        self.policy
-            .check(document, &origin, kind)
-            .map_err(FetchError::Refused)?;
+        if let Err(refusal) = self.policy.check(document, &origin, kind) {
+            count_refusal(&refusal);
+            return Err(FetchError::Refused(refusal));
+        }
         count_if_third_party(document, &origin, kind);
 
         let (body, content_type, trust) = match origin.scheme {
@@ -378,6 +419,12 @@ mod tests {
         // a blocked request should never touch the network at all.
         let fetcher = Fetcher::default();
         let document = parse_url("https://example.com/").expect("parses").0;
+        // A delta rather than a reset: the counter is process-wide and the test
+        // binary is not. This is the only test here that refuses a third party,
+        // so nothing else can move it underneath us — but resetting it would
+        // stamp on whatever else was counting, which is a different bug and a
+        // much harder one to see.
+        let before = third_party_refusal_count();
         let result = fetcher.fetch(
             "https://tracker.invalid/pixel.gif",
             Some(&document),
@@ -389,6 +436,11 @@ mod tests {
             }
             other => panic!("expected a policy refusal, got {other:?}"),
         }
+        assert_eq!(
+            third_party_refusal_count(),
+            before + 1,
+            "the refusal was not counted, so the chrome has nothing to report (#118)"
+        );
     }
 
     #[test]

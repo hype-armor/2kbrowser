@@ -777,6 +777,11 @@ impl App {
             .as_ref()
             .map(crate::viewport::Viewport::mode)
             .unwrap_or(layout::RenderMode::Authored);
+        let withheld = tab
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
         *chrome = crate::chrome::render(
             &crate::chrome::State {
                 theme: *theme,
@@ -795,6 +800,8 @@ impl App {
                     .map(|field| (field, tab.current_match, tab.matches.len())),
                 saved: bookmarks.contains(tab.history.current()),
                 local_root: tab.local_root,
+                withheld: withheld.subresources(),
+                withheld_hosts: withheld.hosts(),
             },
             size.0,
             fonts,
@@ -1385,6 +1392,12 @@ impl App {
             .as_ref()
             .map(crate::viewport::Viewport::mode);
         let mode = mode.unwrap_or(layout::RenderMode::Authored);
+        let withheld = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
         crate::chrome::control_at(
             &crate::chrome::State {
                 theme: self.theme,
@@ -1404,6 +1417,8 @@ impl App {
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
                 saved: self.bookmarks.contains(self.tab().history.current()),
                 local_root: self.tab().local_root,
+                withheld: withheld.subresources(),
+                withheld_hosts: withheld.hosts(),
             },
             self.size.0 as f32,
             self.pointer.0,

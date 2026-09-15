@@ -508,6 +508,16 @@ here rather than quietly left out of the list, because "done" that omits a
 milestone's own commitment is the kind of claim §10 spends a paragraph warning
 about.
 
+Half of that is now built. Refusals are counted — process-wide for the budget
+harness, which could previously only measure that nothing left the origin and
+not that anything had tried, and per page for the chrome, which says how many
+subresources a page asked for and did not get and from how many sites. The
+record lives on the parent's side of the renderer boundary and stays there: a
+refusal and a failure are the same shape on the wire on purpose, so telling the
+child would leak the user's configuration to the untrusted side. What remains
+is the override itself — a per-site exception the reader can grant and revoke,
+persisted the way bookmarks are.
+
 Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
 Discarding the author's layout without also discarding the author's furniture
 turned out not to be reader mode at all: the navigation, the sidebar and the

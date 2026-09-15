@@ -628,6 +628,12 @@ essentially all advertising and tracking with no filter lists (ADR-0006). Plain
 HTTP is allowed, because much of the old web needs it, and is always marked as
 unauthenticated rather than presented as secure.
 
+What the rule refused is marked too — `4 blocked from 2 sites`, beside the URL.
+A page missing a third of its images because a CDN was refused otherwise looks
+identical to a page whose CDN is down, and a browser that quietly changes what
+a page contains has the same problem as one that quietly changes how it is laid
+out.
+
 When a page's layout depends on features this engine does not implement, it is
 re-rendered as a document and told so — never silently (ADR-0009):
 
