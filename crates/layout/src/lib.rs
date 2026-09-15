@@ -4559,7 +4559,7 @@ fn collapse_across_runs(runs: &mut [InlineRun]) {
     let mut previous_ended_in_space = true;
     for run in runs.iter_mut() {
         if run.style.white_space == WhiteSpace::Pre {
-            previous_ended_in_space = run.text.ends_with(char::is_whitespace);
+            previous_ended_in_space = run.text.ends_with(text::is_collapsible_space);
             continue;
         }
         // An edge is not part of the text stream at all, so the state carries
@@ -4593,10 +4593,16 @@ fn collapse_across_runs(runs: &mut [InlineRun]) {
     // skipped — the space after a leading image is real text between two
     // things, not the block's own leading whitespace.
     if let Some(first) = runs.iter_mut().find(|run| run.edge.is_none()) {
-        first.text = first.text.trim_start().to_owned();
+        first.text = first
+            .text
+            .trim_start_matches(text::is_collapsible_space)
+            .to_owned();
     }
     if let Some(last) = runs.iter_mut().rev().find(|run| run.edge.is_none()) {
-        last.text = last.text.trim_end().to_owned();
+        last.text = last
+            .text
+            .trim_end_matches(text::is_collapsible_space)
+            .to_owned();
     }
 }
 
@@ -5188,6 +5194,8 @@ fn draws_a_box(style: &ComputedStyle) -> bool {
 /// this, source indentation and line breaks reach the shaper verbatim and every
 /// wrapped line inherits the author's leading whitespace — visible as a ragged
 /// indent on continuation lines.
+///
+/// A non-breaking space is not one of them; see [`text::is_collapsible_space`].
 pub fn collapse_whitespace(text: &str) -> String {
     collapse_whitespace_from(text, true)
 }
@@ -5202,7 +5210,7 @@ fn collapse_whitespace_from(text: &str, after_space: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_whitespace = after_space;
     for c in text.chars() {
-        if c.is_whitespace() {
+        if text::is_collapsible_space(c) {
             if !in_whitespace {
                 out.push(' ');
             }
@@ -5677,6 +5685,51 @@ mod tests {
     fn source_whitespace_is_collapsed() {
         assert_eq!(collapse_whitespace("a\n    b\tc  d"), "a b c d");
         assert_eq!(collapse_whitespace("\n   leading"), "leading");
+    }
+
+    #[test]
+    fn a_non_breaking_space_does_not_collapse() {
+        // §16.6.1 collapses spaces, tabs and newlines. A non-breaking space is
+        // none of those — it is a character with a width, and the whole point
+        // of writing one is that it survives. `char::is_whitespace` says
+        // otherwise, which is how this got in.
+        assert_eq!(
+            collapse_whitespace("x\u{a0}\u{a0}\u{a0}y"),
+            "x\u{a0}\u{a0}\u{a0}y"
+        );
+        assert_eq!(collapse_whitespace("\u{a0}x"), "\u{a0}x");
+        // And it is not the block's own leading or trailing whitespace either,
+        // so the edges keep it.
+        let rendered = run(
+            "<body><p>\u{a0}\u{a0}indented</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            600.0,
+        );
+        let text: String = content_boxes(&rendered)
+            .into_iter()
+            .filter_map(|b| b.text.as_ref())
+            .flat_map(|t| t.lines.iter())
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(text, "\u{a0}\u{a0}indented");
+    }
+
+    #[test]
+    fn a_non_breaking_space_is_measured_as_part_of_its_word() {
+        // The minimum intrinsic width is the widest unbreakable piece, and
+        // `a\u{a0}b` is one piece. Splitting on it made a column narrower than
+        // the text it has to hold, which is how a table came out too tight.
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle::default();
+        let joined = [InlineRun::text("aaa\u{a0}aaa", style.clone())];
+        let spaced = [InlineRun::text("aaa aaa", style.clone())];
+        let (joined_min, _) = fonts.intrinsic_widths(&joined, &style);
+        let (spaced_min, _) = fonts.intrinsic_widths(&spaced, &style);
+        assert!(
+            joined_min > spaced_min,
+            "the non-breaking space did not hold the words together: \
+             {joined_min} against {spaced_min}"
+        );
     }
 
     #[test]

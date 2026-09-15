@@ -432,6 +432,10 @@ it:
   out of the sight of the element's *following siblings*, and out of its
   descendants' sight as well when the element resets the same name itself. One
   test turns on it, against twenty-two that need the reading here.
+- **A `white-space: pre` run loses its trailing spaces** to the trim that
+  removes a block's own leading and trailing whitespace (#126). Keeping them
+  needs §9.4.2's rule that a line box holding nothing generates no box, without
+  which the line break beside them draws a second, empty inline box.
 - **§17.2.1's anonymous *cell* is not generated** (#121) — the box that goes
   around a row's child that is not a cell. A run of table-internal boxes that
   would yield no cells is left alone rather than wrapped in a table, because a

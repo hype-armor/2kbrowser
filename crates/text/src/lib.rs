@@ -90,6 +90,24 @@ const MONO: &[(&str, &[u8])] = &[
 /// call, the existence of one is not.
 const MAX_GLYPH_SIZE: f32 = 2048.0;
 
+/// Whether a character is whitespace §16.6.1 collapses.
+///
+/// Deliberately not `char::is_whitespace`, which answers Unicode's White_Space
+/// question and so says yes to U+00A0. CSS collapses spaces, tabs and the line
+/// terminators, and a non-breaking space is none of those: it is a character
+/// with a width, and the whole point of writing one is that it survives. The
+/// era's markup leans on that harder than anything modern does — `&nbsp;` is
+/// how a page indented a paragraph, spaced a nav bar and held an empty table
+/// cell open — so treating it as collapsible quietly shortened a great many
+/// pages by exactly the spacing their authors had put in.
+///
+/// Carriage return and form feed are here because CSS lists them among the
+/// characters that collapse, even though HTML parsing has already turned a
+/// `\r\n` into a `\n` by the time any of this runs.
+pub fn is_collapsible_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+}
+
 /// One shaped, positioned glyph.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionedGlyph {
@@ -2244,7 +2262,11 @@ impl FontStore {
             // the table under it instead of being measured by its longest word
             // and then overflowing.
             let pieces: Vec<&str> = match run.style.white_space {
-                WhiteSpace::Normal => run.text.split_whitespace().collect(),
+                WhiteSpace::Normal => run
+                    .text
+                    .split(is_collapsible_space)
+                    .filter(|piece| !piece.is_empty())
+                    .collect(),
                 WhiteSpace::Pre | WhiteSpace::NoWrap => run.text.split('\n').collect(),
             };
             for piece in pieces {
