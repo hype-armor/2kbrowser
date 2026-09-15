@@ -2283,8 +2283,9 @@ fn ticking_a_checkbox_changes_what_the_form_sends() {
     let box_ = page.pressables().first().copied().expect("a checkbox");
     page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
     assert!(
-        !page.editing(),
-        "a checkbox is pressed rather than typed in, so it takes no typing",
+        page.focus_is_pressable(),
+        "a press focuses the box it landed on, and as something pressed rather \
+         than typed in — there is nothing in a checkbox to put a caret in",
     );
 
     let button = page.buttons().first().copied().expect("a submit button");
@@ -2406,4 +2407,212 @@ fn a_row_that_is_not_there_changes_nothing() {
         page.take_submission().expect("sent").body,
         "where=uk&go=Send",
     );
+}
+
+/// A page of one control of each kind, in a known order.
+fn keyboard_form() -> shell::viewport::Viewport {
+    viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"post\">\
+         <input type=\"radio\" name=\"size\" value=\"s\" checked>\
+         <input type=\"radio\" name=\"size\" value=\"m\">\
+         <select name=\"where\">\
+         <option value=\"uk\">United Kingdom</option>\
+         <option value=\"fr\" selected>France</option>\
+         </select>\
+         <input name=\"q\" value=\"\">\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        600,
+    )
+}
+
+/// Tabs forward `count` times from wherever the focus is.
+fn tab(page: &mut shell::viewport::Viewport, count: usize) {
+    for _ in 0..count {
+        page.type_key(sandbox::message::Key::Tab { back: false });
+    }
+}
+
+/// Presses the space bar, which is how the parent spells "press this".
+fn space(page: &mut shell::viewport::Viewport) {
+    page.type_key(sandbox::message::Key::Insert(" ".to_owned()));
+}
+
+/// Sends the form by pressing the button at the end of it, and returns what
+/// would be sent.
+fn sent(page: &mut shell::viewport::Viewport) -> String {
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    page.take_submission()
+        .expect("the press asked to send")
+        .body
+}
+
+#[test]
+fn tab_reaches_every_control_and_not_only_the_ones_with_text_in_them() {
+    // #151. Six controls, six stops, and the seventh Tab falls out of the page
+    // rather than wrapping — which is what hands the key back to the window.
+    let mut page = keyboard_form();
+    for step in 1..=6 {
+        tab(&mut page, 1);
+        assert!(page.editing(), "Tab {step} focused nothing");
+    }
+    tab(&mut page, 1);
+    assert!(
+        !page.editing(),
+        "past the last control the focus is given up, so Tab goes back to \
+         walking the page's links",
+    );
+}
+
+#[test]
+fn a_field_takes_the_typing_and_a_box_does_not() {
+    // The one bit the window reads: it decides whether an arrow scrolls the
+    // page or moves a dropdown, so the two must not look alike.
+    let mut page = keyboard_form();
+    tab(&mut page, 1);
+    assert!(
+        page.focus_is_pressable(),
+        "the checkbox is pressed, not typed in"
+    );
+    tab(&mut page, 4);
+    assert!(
+        !page.focus_is_pressable(),
+        "the text field is typed in, so the arrows stay the window's and the \
+         page still scrolls under a caret",
+    );
+}
+
+#[test]
+fn space_ticks_the_focused_box() {
+    let mut page = keyboard_form();
+    tab(&mut page, 1);
+    space(&mut page);
+    assert_eq!(sent(&mut page), "post=on&size=s&where=fr&q=&go=Send");
+}
+
+#[test]
+fn space_chooses_the_focused_radio_and_clears_its_group() {
+    let mut page = keyboard_form();
+    tab(&mut page, 3);
+    space(&mut page);
+    assert_eq!(
+        sent(&mut page),
+        "size=m&where=fr&q=&go=Send",
+        "the group's other answer has to go, or the form sends two",
+    );
+}
+
+#[test]
+fn the_arrows_walk_a_dropdown_without_opening_it() {
+    // What a dropdown has always done, and the quickest way to answer one.
+    let mut page = keyboard_form();
+    tab(&mut page, 4);
+    page.type_key(sandbox::message::Key::Up);
+    assert!(
+        page.take_dropdown().is_none(),
+        "an arrow moves through the options rather than opening the list",
+    );
+    assert_eq!(sent(&mut page), "size=s&where=uk&q=&go=Send");
+}
+
+#[test]
+fn a_dropdown_does_not_wrap_at_either_end() {
+    // A reader holding Down expects to arrive at the last option and stay
+    // there, rather than to start again at the top.
+    let mut page = keyboard_form();
+    tab(&mut page, 4);
+    for _ in 0..5 {
+        page.type_key(sandbox::message::Key::Down);
+    }
+    assert_eq!(sent(&mut page), "size=s&where=fr&q=&go=Send");
+}
+
+#[test]
+fn space_opens_the_focused_dropdown() {
+    let mut page = keyboard_form();
+    tab(&mut page, 4);
+    space(&mut page);
+    let open = page.take_dropdown().expect("space opened the list");
+    assert_eq!(
+        open.options,
+        vec!["United Kingdom".to_owned(), "France".to_owned()],
+    );
+    assert_eq!(open.on, 1);
+}
+
+#[test]
+fn enter_on_a_control_sends_the_form_and_presses_no_button() {
+    let mut page = keyboard_form();
+    tab(&mut page, 1);
+    space(&mut page);
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    let sent = page.take_submission().expect("Enter asked to send");
+    assert_eq!(
+        sent.body, "post=on&size=s&where=fr&q=",
+        "nothing was pressed, so no button is a successful control",
+    );
+}
+
+#[test]
+fn space_on_a_focused_button_presses_that_button() {
+    let mut page = keyboard_form();
+    tab(&mut page, 6);
+    space(&mut page);
+    let sent = page.take_submission().expect("space pressed the button");
+    assert_eq!(
+        sent.body, "size=s&where=fr&q=&go=Send",
+        "the button that was pressed is a successful control and the others \
+         are not",
+    );
+}
+
+#[test]
+fn tab_steps_back_the_way_it_came() {
+    let mut page = keyboard_form();
+    tab(&mut page, 3);
+    page.type_key(sandbox::message::Key::Tab { back: true });
+    space(&mut page);
+    assert_eq!(
+        sent(&mut page),
+        "size=s&where=fr&q=&go=Send",
+        "Shift+Tab went back to the radio that was already chosen, and \
+         pressing it again changed nothing",
+    );
+}
+
+#[test]
+fn tab_does_not_stop_on_a_control_nobody_can_answer() {
+    // A disabled control answers nothing, so a stop on it is a stop that does
+    // nothing — worse than no stop at all.
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"a\" disabled>\
+         <input type=\"checkbox\" name=\"b\">\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        600,
+    );
+    tab(&mut page, 1);
+    space(&mut page);
+    assert_eq!(
+        sent(&mut page),
+        "b=on&go=Send",
+        "the first Tab went past the disabled box to the one that can answer",
+    );
+}
+
+#[test]
+fn pressing_a_control_focuses_it_so_tab_carries_on_from_there() {
+    let mut page = keyboard_form();
+    let box_ = page.pressables().first().copied().expect("the checkbox");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    // Straight to the second radio, which is two stops on from the box.
+    tab(&mut page, 2);
+    space(&mut page);
+    assert_eq!(sent(&mut page), "post=on&size=m&where=fr&q=&go=Send");
 }

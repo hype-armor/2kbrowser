@@ -1045,7 +1045,65 @@ impl App {
         had
     }
 
-    /// Whether a form control on the page is taking the typing (#110).
+    /// One keystroke while a dropdown's list is open. Whether it was taken.
+    ///
+    /// Up and Down move through the rows, Enter takes the one they are on, and
+    /// Escape gives up — the same four keys the list answers in every browser.
+    /// Everything else is swallowed too, deliberately: while a list is open it
+    /// has the keyboard, and a key that fell through to scroll the page would
+    /// scroll it out from under the list, which is pinned where it opened.
+    ///
+    /// What it does *not* swallow is a chord, for the reason [`App::page_key`]
+    /// gives: Ctrl+T and Ctrl+L belong to the window wherever the keyboard is,
+    /// and a reader who could not open a tab because a dropdown was open would
+    /// think the browser had hung.
+    fn dropdown_key(&mut self, key: &Key, alt: bool, ctrl: bool) -> bool {
+        if alt || ctrl {
+            return false;
+        }
+        let Some(dropdown) = &mut self.dropdown else {
+            return false;
+        };
+        let rows = dropdown.rows();
+        // Starting from the row the control is already on, so the first Down
+        // moves off the current answer rather than to the top of the list.
+        let at = dropdown.hovered.unwrap_or(dropdown.on);
+        match key {
+            Key::Named(NamedKey::ArrowUp) => {
+                dropdown.hovered = Some(at.saturating_sub(1));
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                dropdown.hovered = Some((at + 1).min(rows.saturating_sub(1)));
+            }
+            Key::Named(NamedKey::Home) => dropdown.hovered = Some(0),
+            Key::Named(NamedKey::End) => dropdown.hovered = Some(rows.saturating_sub(1)),
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                let (node, row) = (dropdown.node, at);
+                self.dropdown = None;
+                if let Some(page) = self.tab_mut().page.as_mut() {
+                    page.choose(node, row as u32);
+                }
+            }
+            Key::Named(NamedKey::Escape) => self.dropdown = None,
+            // Swallowed without doing anything, rather than handed on.
+            _ => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
+    }
+
+    /// Whether what has the keyboard on the page is pressed rather than typed
+    /// in (#151).
+    fn page_focus_is_pressable(&self) -> bool {
+        self.tab()
+            .page
+            .as_ref()
+            .is_some_and(crate::viewport::Viewport::focus_is_pressable)
+    }
+
+    /// Whether a form control on the page has the keyboard (#110, #151).
     fn page_is_editing(&self) -> bool {
         self.tab()
             .page
@@ -1822,9 +1880,14 @@ impl App {
                 return false;
             }
             Key::Character(text) => Typed::Insert(text.to_string()),
-            // Arrows up and down, the page keys, the function keys: not the
-            // field's, so the window keeps them and the page still scrolls
-            // under a caret.
+            // Up and Down are a `<select>`'s, and nobody else's. In a field
+            // they stay the window's, so the page still scrolls under a caret
+            // — which is why this asks what kind of control has the keyboard
+            // rather than sending them always and hoping (#151).
+            Key::Named(NamedKey::ArrowUp) if self.page_focus_is_pressable() => Typed::Up,
+            Key::Named(NamedKey::ArrowDown) if self.page_focus_is_pressable() => Typed::Down,
+            // The page keys, the function keys, and the arrows in every other
+            // case: not the control's, so the window keeps them.
             _ => return false,
         };
         self.type_into_page(typed);
@@ -2889,6 +2952,13 @@ impl ApplicationHandler<BandReady> for App {
                 }
                 if self.tab().finding.is_some() {
                     self.find_key(&event.logical_key, alt, ctrl, shift);
+                    return;
+                }
+                // An open dropdown owns the keyboard the way it owns the next
+                // click: it is the innermost thing in progress, and a list you
+                // can open with a key and only close with the pointer is half
+                // a control (#151).
+                if self.dropdown_key(&event.logical_key, alt, ctrl) {
                     return;
                 }
                 // A control on the page, after the chrome's own fields and

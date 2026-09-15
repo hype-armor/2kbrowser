@@ -286,7 +286,7 @@ mod tests {
                 can_toggle_layout: false,
                 open: None,
                 pressables: Vec::new(),
-                editing: false,
+                focused: crate::message::Focused::Nothing,
                 images_loaded: 0,
                 background: 0x00ff_ffff,
                 top: 0,

@@ -215,10 +215,9 @@ impl Page {
 
     /// Every text control on the page, in document order, with where it is.
     ///
-    /// Text controls only: a checkbox and a button have nothing to type into,
-    /// and both are reached with the pointer instead. Tab order is
-    /// document order, which is what HTML says when nothing declares otherwise
-    /// and what this engine can honestly offer — `tabindex` is not read (#110).
+    /// Text controls only, which is not the same list as [`Page::focusable`]:
+    /// this is what a *click* can put a caret in, and that is what Tab stops
+    /// on. A checkbox is in the second and not the first.
     pub fn text_controls(&self) -> Vec<(dom::NodeId, layout::Rect)> {
         let mut out = Vec::new();
         for frame in &self.frames {
@@ -310,6 +309,133 @@ impl Page {
         out
     }
 
+    /// Every control the keyboard can reach, in document order, with where it
+    /// is (#151).
+    ///
+    /// All of them — fields, boxes, radios, dropdowns and buttons — because a
+    /// form that can be filled in with a pointer and by no other means is a
+    /// form half its readers cannot fill in. Document order, which is what HTML
+    /// says when nothing declares otherwise and what this engine can honestly
+    /// offer: `tabindex` is not read.
+    pub fn focusable(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                if layout::forms::control_of(&frame.doc, node).is_none() {
+                    continue;
+                }
+                // A control the author disabled answers nothing, so stopping on
+                // it would be a stop that does nothing — worse than no stop.
+                if frame
+                    .doc
+                    .element(node)
+                    .is_some_and(|element| element.attr("disabled").is_some())
+                {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a control is one there is something to type in.
+    ///
+    /// The line between the two shapes the focus comes in: a field carries a
+    /// caret and a selection, and everything else is somewhere the keyboard is
+    /// pointing.
+    pub fn takes_typing(&self, node: dom::NodeId) -> bool {
+        self.frames.iter().any(|frame| {
+            matches!(
+                layout::forms::control_of(&frame.doc, node),
+                Some(
+                    layout::forms::Control::Text
+                        | layout::forms::Control::Password
+                        | layout::forms::Control::TextArea
+                )
+            )
+        })
+    }
+
+    /// Whether a control is a button, which is pressed to *send* rather than to
+    /// change.
+    pub fn is_button(&self, node: dom::NodeId) -> bool {
+        self.frames.iter().any(|frame| {
+            layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Button)
+        })
+    }
+
+    /// What pressing a named control should change, as entries to record.
+    ///
+    /// The keyboard's way in to the same rule [`Page::choice_at`] reaches with
+    /// a point.
+    pub fn press(&self, node: dom::NodeId) -> Vec<(dom::NodeId, bool)> {
+        self.frames
+            .iter()
+            .find(|frame| frame.doc.element(node).is_some())
+            .map(|frame| layout::forms::press(&frame.doc, node))
+            .unwrap_or_default()
+    }
+
+    /// Moving a closed `<select>` one option up or down, without opening it.
+    ///
+    /// What a dropdown has always done under the arrows, and the quickest way
+    /// to answer one. Nothing for any other control, and nothing at either end:
+    /// a list does not wrap, because a reader holding Down expects to arrive at
+    /// the last option and stay there rather than to start again.
+    pub fn step_option(&self, node: dom::NodeId, up: bool) -> Vec<(dom::NodeId, bool)> {
+        self.frames
+            .iter()
+            .filter(|frame| {
+                layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Select)
+            })
+            .find_map(|frame| {
+                let options = layout::forms::options_of(&frame.doc, node);
+                let at = options.iter().position(|&id| frame.doc.is_on(id))?;
+                let next = if up {
+                    at.checked_sub(1)?
+                } else {
+                    (at + 1 < options.len()).then_some(at + 1)?
+                };
+                Some(layout::forms::press(&frame.doc, options[next]))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The list a named closed `<select>` would open, for a keyboard that has
+    /// no point to hit it with.
+    ///
+    /// The same answer [`Page::dropdown_at`] gives, reached by name instead.
+    pub fn dropdown_of(
+        &self,
+        node: dom::NodeId,
+    ) -> Option<(dom::NodeId, layout::Rect, Vec<String>, usize)> {
+        let frame = self.frames.iter().find(|frame| {
+            layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Select)
+                && !frame
+                    .doc
+                    .element(node)
+                    .is_some_and(layout::forms::is_list_box)
+        })?;
+        let mut rect = frame.layout.rects_for(node).into_iter().next()?;
+        rect.x += frame.rect.x;
+        rect.y += frame.rect.y;
+        let options = layout::forms::options_of(&frame.doc, node);
+        let on = options
+            .iter()
+            .position(|&id| frame.doc.is_on(id))
+            .unwrap_or(0);
+        let labels = options
+            .iter()
+            .map(|&id| layout::forms::option_label(&frame.doc, id))
+            .collect();
+        Some((node, rect, labels, on))
+    }
+
     /// What a press at a point should change, as entries to record.
     ///
     /// Empty when the point is on nothing that can be changed, which includes
@@ -319,7 +445,11 @@ impl Page {
     /// A closed `<select>` is not here either. Pressing one opens a list rather
     /// than changing anything, and the list is drawn by the parent; see
     /// [`Page::dropdown_at`].
-    pub fn choice_at(&self, x: f32, y: f32) -> Vec<(dom::NodeId, bool)> {
+    ///
+    /// The control itself comes back beside the changes, because the press also
+    /// *focuses* it — and for a list box row those are two different nodes: the
+    /// option changes and the `<select>` takes the keyboard.
+    pub fn choice_at(&self, x: f32, y: f32) -> Option<(dom::NodeId, Vec<(dom::NodeId, bool)>)> {
         for frame in &self.frames {
             let (x, y) = (x - frame.rect.x, y - frame.rect.y);
             for node in frame.doc.descendants(frame.doc.root()).into_iter().rev() {
@@ -349,11 +479,11 @@ impl Page {
                     _ => None,
                 };
                 if let Some(hit) = hit {
-                    return layout::forms::press(&frame.doc, hit);
+                    return Some((node, layout::forms::press(&frame.doc, hit)));
                 }
             }
         }
-        Vec::new()
+        None
     }
 
     /// The closed dropdown at a point, and what is in it.
@@ -947,8 +1077,9 @@ pub(crate) struct Settings {
     /// apart from it because they answer different questions about the same
     /// control: one is what a field holds, the other whether a box is on.
     pub(crate) chosen: Vec<(dom::NodeId, bool)>,
-    /// The control the reader is typing in, and where its caret is.
-    pub(crate) focus: Option<(dom::NodeId, usize)>,
+    /// The control the keyboard is on, and where its caret is — `None` for a
+    /// control there is nothing to type in, which gets the ring alone.
+    pub(crate) focus: Option<(dom::NodeId, Option<usize>)>,
     /// How much bigger than its own pixels the page is drawn.
     ///
     /// 1.0 is the page as written. It is applied in the cascade, where every
@@ -1679,7 +1810,7 @@ fn mark_focus(
     list: &mut paint::DisplayList,
     layout: &layout::Layout,
     styles: &css::cascade::StyleMap,
-    focus: Option<(dom::NodeId, usize)>,
+    focus: Option<(dom::NodeId, Option<usize>)>,
 ) {
     let Some((node, at)) = focus else { return };
     // A control the cascade hid is not one anybody is typing in, whatever the
@@ -1699,7 +1830,7 @@ fn mark_focus(
             });
         }
     }
-    if let Some(caret) = layout.caret_in(node, at) {
+    if let Some(caret) = at.and_then(|at| layout.caret_in(node, at)) {
         list.items.push(paint::DisplayItem::Rect {
             rect: caret,
             color: FOCUS,

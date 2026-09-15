@@ -110,7 +110,7 @@ impl Dropdown {
     }
 
     /// How many rows are drawn, which is not always how many options there are.
-    fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.options.len().min(MAX_ROWS)
     }
 
@@ -305,5 +305,14 @@ mod tests {
     fn an_empty_select_opens_nothing() {
         let mut fonts = FontStore::new();
         assert!(Dropdown::open(box_(50.0), Vec::new(), 0, 7, &mut fonts, (800, 600)).is_none());
+    }
+
+    #[test]
+    fn the_row_a_key_moves_from_is_the_one_the_control_is_on() {
+        // Not the top of the list. A reader pressing Down on a dropdown showing
+        // its second option expects the third, not the second again.
+        let list = open(50.0, (800, 600));
+        assert_eq!(list.on, 1);
+        assert_eq!(list.hovered, None, "nothing is hovered until something is");
     }
 }

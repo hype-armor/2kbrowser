@@ -37,10 +37,11 @@
 //! which differs for each and is one function so that no caller has to know
 //! which rule applies to the thing under the pointer.
 //!
-//! What is still missing is the keyboard. Tab reaches the text controls and
-//! stops there, so a checkbox can be ticked with a pointer and by no other
-//! means — which is a gap in reach rather than in what a form can say, and is
-//! filed as #151 rather than fixed here.
+//! The keyboard reaches all of it (#151): Tab stops on every control, Space
+//! presses the one it is on, Enter sends the form, and the arrows walk a
+//! dropdown. `tabindex` is not read — Tab order is document order, which is
+//! what HTML says when nothing declares otherwise and what the era's markup
+//! expects anyway.
 //!
 //! What *is* here besides the controls themselves is
 //! [`break_the_rule_for_a_legend`], because a `<fieldset>`'s rule and the

@@ -884,7 +884,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                 on: 1,
             }),
             can_toggle_layout: true,
-            editing: false,
+            focused: sandbox::message::Focused::Pressable,
             images_loaded: 2,
             background: 0x0011_2233,
             top: 0,
