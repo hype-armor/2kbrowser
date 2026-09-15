@@ -169,6 +169,121 @@ pub struct Supplied {
     pub ok: bool,
 }
 
+/// A keystroke aimed at a form control on the page (#110).
+///
+/// Named rather than raw: the parent turns winit's key events into these, so
+/// the child never sees a keyboard. What crosses the boundary is "the reader
+/// asked to delete a word", not a scancode and a modifier mask — which keeps
+/// the untrusted side from having to interpret anything, and keeps every
+/// platform's idea of a key on the platform's own side of the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    /// Text to put in at the cursor, replacing the selection.
+    Insert(String),
+    /// Delete backwards.
+    Backspace,
+    /// Delete forwards.
+    Delete,
+    /// Move left, by a word if asked, extending the selection if asked.
+    Left {
+        /// Extend the selection rather than collapsing it.
+        extend: bool,
+        /// Move a word rather than a character.
+        word: bool,
+    },
+    /// Move right, by the same rules.
+    Right {
+        /// Extend the selection rather than collapsing it.
+        extend: bool,
+        /// Move a word rather than a character.
+        word: bool,
+    },
+    /// To the front of the line.
+    Home {
+        /// Extend the selection rather than collapsing it.
+        extend: bool,
+    },
+    /// To the end of the line.
+    End {
+        /// Extend the selection rather than collapsing it.
+        extend: bool,
+    },
+    /// Select the whole field.
+    SelectAll,
+    /// Move to the next control, or the previous one.
+    Tab {
+        /// Backwards.
+        back: bool,
+    },
+    /// Give up the focus.
+    Escape,
+}
+
+impl Key {
+    fn write(&self, writer: &mut Writer) {
+        match self {
+            Key::Insert(text) => {
+                writer.tag(0);
+                writer.str(text);
+            }
+            Key::Backspace => writer.tag(1),
+            Key::Delete => writer.tag(2),
+            Key::Left { extend, word } => {
+                writer.tag(3);
+                writer.some(*extend);
+                writer.some(*word);
+            }
+            Key::Right { extend, word } => {
+                writer.tag(4);
+                writer.some(*extend);
+                writer.some(*word);
+            }
+            Key::Home { extend } => {
+                writer.tag(5);
+                writer.some(*extend);
+            }
+            Key::End { extend } => {
+                writer.tag(6);
+                writer.some(*extend);
+            }
+            Key::SelectAll => writer.tag(7),
+            Key::Tab { back } => {
+                writer.tag(8);
+                writer.some(*back);
+            }
+            Key::Escape => writer.tag(9),
+        }
+    }
+
+    fn read(reader: &mut Reader<'_>) -> Result<Self, WireError> {
+        Ok(match reader.tag()? {
+            0 => Key::Insert(reader.str()?),
+            1 => Key::Backspace,
+            2 => Key::Delete,
+            3 => Key::Left {
+                extend: reader.some()?,
+                word: reader.some()?,
+            },
+            4 => Key::Right {
+                extend: reader.some()?,
+                word: reader.some()?,
+            },
+            5 => Key::Home {
+                extend: reader.some()?,
+            },
+            6 => Key::End {
+                extend: reader.some()?,
+            },
+            7 => Key::SelectAll,
+            8 => Key::Tab {
+                back: reader.some()?,
+            },
+            9 => Key::Escape,
+            _ => return Err(WireError::Unknown),
+        })
+    }
+}
+
 /// Parent to child.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToChild {
@@ -251,6 +366,21 @@ pub enum ToChild {
         /// What to look for.
         query: String,
     },
+    /// The reader pressed a point on the page.
+    ///
+    /// The child decides what is there and focuses it, because the box tree is
+    /// the only thing that knows and it never leaves this process. A point on
+    /// nothing gives up whatever focus there was, which is what pressing the
+    /// margin of a page means everywhere (#110).
+    Focus {
+        /// Where, in canvas coordinates.
+        at: (f32, f32),
+    },
+    /// A keystroke for whatever control is focused.
+    Type {
+        /// What was pressed.
+        key: Key,
+    },
 }
 
 impl ToChild {
@@ -291,6 +421,15 @@ impl ToChild {
             ToChild::Find { query } => {
                 writer.tag(2);
                 writer.str(query);
+            }
+            ToChild::Focus { at } => {
+                writer.tag(6);
+                writer.f32(at.0);
+                writer.f32(at.1);
+            }
+            ToChild::Type { key } => {
+                writer.tag(7);
+                key.write(&mut writer);
             }
             ToChild::Select { from, to } => {
                 writer.tag(4);
@@ -380,6 +519,12 @@ impl ToChild {
                 top: reader.u32()?,
                 height: reader.u32()?,
             },
+            6 => ToChild::Focus {
+                at: (reader.f32()?, reader.f32()?),
+            },
+            7 => ToChild::Type {
+                key: Key::read(&mut reader)?,
+            },
             4 => ToChild::Select {
                 from: (reader.f32()?, reader.f32()?),
                 to: (reader.f32()?, reader.f32()?),
@@ -468,6 +613,13 @@ pub struct Rendered {
     pub missing: Vec<Missing>,
     /// Whether there is a fallback decision to overrule.
     pub can_toggle_layout: bool,
+    /// Whether a form control on this page currently has the typing (#110).
+    ///
+    /// One bit, and deliberately no more: the parent needs to know whether a
+    /// keystroke belongs to the page or to the window, and has no business
+    /// knowing which field it is or what is in it. What a reader types into a
+    /// page is the page's business.
+    pub editing: bool,
     /// How many images were fetched and decoded for this page.
     ///
     /// A diagnostic rather than something the window uses: `2kbrowser render`
@@ -527,6 +679,7 @@ impl ToParent {
                     writer.str(&missing.url);
                 }
                 writer.some(page.can_toggle_layout);
+                writer.some(page.editing);
                 writer.u32(page.images_loaded);
                 writer.u32(page.background);
             }
@@ -608,6 +761,7 @@ impl ToParent {
                     });
                 }
                 let can_toggle_layout = reader.some()?;
+                let editing = reader.some()?;
                 let images_loaded = reader.u32()?;
                 // Masked rather than rejected: the child is the untrusted side,
                 // and a stray high byte here is a colour question, not a
@@ -635,6 +789,7 @@ impl ToParent {
                     links,
                     missing,
                     can_toggle_layout,
+                    editing,
                     images_loaded,
                     background,
                 }))
@@ -709,6 +864,7 @@ mod tests {
                 url: "https://cdn.example.net/photo.jpg".to_owned(),
             }],
             can_toggle_layout: true,
+            editing: false,
             images_loaded: 3,
             background: 0x001c_1b22,
         }

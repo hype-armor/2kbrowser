@@ -360,6 +360,36 @@ impl Viewport {
         self.session.find(query).unwrap_or_default()
     }
 
+    /// Tells the child the reader pressed a point on the page (#110).
+    ///
+    /// Returns whether anything ended up focused, which is what the window
+    /// needs in order to decide whether the next keystroke is the page's or
+    /// its own.
+    pub fn focus_at(&mut self, x: f32, y: f32) -> bool {
+        match self.session.focus((x, y)) {
+            Ok(page) => {
+                self.page = page;
+                self.page.editing
+            }
+            // A child that cannot answer is not one to start routing keystrokes
+            // at. The page on screen stays as it was, which is the same answer
+            // every other failed question here gives.
+            Err(_) => false,
+        }
+    }
+
+    /// Sends a keystroke to whatever control the child has focused.
+    pub fn type_key(&mut self, key: sandbox::message::Key) {
+        if let Ok(page) = self.session.type_key(key) {
+            self.page = page;
+        }
+    }
+
+    /// Whether a form control on this page is taking the typing.
+    pub fn editing(&self) -> bool {
+        self.page.editing
+    }
+
     /// Re-renders at a new width, in the same child.
     ///
     /// Cheaper than a fresh page — the document is already parsed — and it is

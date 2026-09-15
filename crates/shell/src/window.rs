@@ -859,6 +859,50 @@ impl App {
         self.refresh_chrome();
     }
 
+    /// Tells the page a point on it was pressed (#110).
+    ///
+    /// The child works out whether there is a form control there — the box tree
+    /// is the only thing that knows, and it stays on that side of the boundary
+    /// (ADR-0012). All that comes back is a fresh render and one bit saying
+    /// whether anything is now taking the typing.
+    fn press_page(&mut self) {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)
+        else {
+            return;
+        };
+        let was = self.page_is_editing();
+        let Some(page) = self.tab_mut().page.as_mut() else {
+            return;
+        };
+        let now = page.focus_at(x, y);
+        // A redraw only when something changed. Pressing the margin of a page
+        // with nothing focused is the commonest click there is, and repainting
+        // the window for it would be work nobody asked for.
+        if (was || now)
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
+    /// Whether a form control on the page is taking the typing (#110).
+    fn page_is_editing(&self) -> bool {
+        self.tab()
+            .page
+            .as_ref()
+            .is_some_and(crate::viewport::Viewport::editing)
+    }
+
+    /// Hands one keystroke to the page's focused control.
+    fn type_into_page(&mut self, key: sandbox::message::Key) {
+        if let Some(page) = self.tab_mut().page.as_mut() {
+            page.type_key(key);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Gives up editing without navigating.
     fn cancel_editing(&mut self) {
         if self.editing.take().is_some() {
@@ -1563,6 +1607,66 @@ impl App {
             _ => return true,
         }
         self.refresh_chrome();
+        true
+    }
+
+    /// One keystroke while a form control on the page has the typing (#110).
+    ///
+    /// Returns whether it was taken. The shape is `edit_key`'s, and so is the
+    /// rule: while a field has the focus, it has the focus — a key meant for it
+    /// must never also scroll the page underneath. What it deliberately does
+    /// *not* swallow is the browser's own shortcuts, which is the difference
+    /// between a field on a page and the URL bar: Ctrl+T, Ctrl+L and the rest
+    /// belong to the window wherever the caret happens to be, and a reader who
+    /// cannot open a tab because they clicked in a search box would think the
+    /// browser had hung.
+    fn page_key(&mut self, key: &Key, alt: bool, ctrl: bool, shift: bool) -> bool {
+        use sandbox::message::Key as Typed;
+        if !self.page_is_editing() {
+            return false;
+        }
+        // Word motion is Ctrl+arrow everywhere except macOS, where it is
+        // Alt+arrow. Both, for the same reason `edit_key` takes both.
+        let by_word = ctrl || alt;
+        let typed = match key {
+            Key::Named(NamedKey::Escape) => Typed::Escape,
+            Key::Named(NamedKey::Tab) => Typed::Tab { back: shift },
+            Key::Named(NamedKey::Backspace) => Typed::Backspace,
+            Key::Named(NamedKey::Delete) => Typed::Delete,
+            Key::Named(NamedKey::ArrowLeft) => Typed::Left {
+                extend: shift,
+                word: by_word,
+            },
+            Key::Named(NamedKey::ArrowRight) => Typed::Right {
+                extend: shift,
+                word: by_word,
+            },
+            Key::Named(NamedKey::Home) => Typed::Home { extend: shift },
+            Key::Named(NamedKey::End) => Typed::End { extend: shift },
+            // A newline in a `<textarea>` and nothing in a one-line field. The
+            // child decides which, because it is the side that knows what the
+            // control is; sending the character and letting it refuse is what
+            // keeps the parent from having to model the page.
+            Key::Named(NamedKey::Enter) => Typed::Insert("\n".to_owned()),
+            Key::Named(NamedKey::Space) => Typed::Insert(" ".to_owned()),
+            Key::Character(text) if ctrl => {
+                if text.as_str() != "a" {
+                    // Every other Ctrl chord is the window's.
+                    return false;
+                }
+                Typed::SelectAll
+            }
+            Key::Character(text) if alt => {
+                let _ = text;
+                return false;
+            }
+            Key::Character(text) => Typed::Insert(text.to_string()),
+            // Arrows up and down, the page keys, the function keys: not the
+            // field's, so the window keeps them and the page still scrolls
+            // under a caret.
+            _ => return false,
+        };
+        self.type_into_page(typed);
         true
     }
 
@@ -2524,6 +2628,12 @@ impl ApplicationHandler<BandReady> for App {
                             self.load_image(&url);
                         } else if let Some((url, jump_to)) = self.target_under_pointer() {
                             self.follow(url, jump_to);
+                        } else {
+                            // Everything else goes to the page, which decides
+                            // whether there is a form control there. Including
+                            // a press on nothing, which is how a field is let
+                            // go of (#110).
+                            self.press_page();
                         }
                     }
                 }
@@ -2561,6 +2671,13 @@ impl ApplicationHandler<BandReady> for App {
                 }
                 if self.tab().finding.is_some() {
                     self.find_key(&event.logical_key, alt, ctrl, shift);
+                    return;
+                }
+                // A control on the page, after the chrome's own fields and
+                // before everything else: the chrome is focused deliberately
+                // and wins, and the page's scrolling is what a keystroke aimed
+                // at a field must not also do (#110).
+                if self.page_key(&event.logical_key, alt, ctrl, shift) {
                     return;
                 }
                 if ctrl && matches!(&event.logical_key, Key::Character(c) if c == "f") {
@@ -2669,10 +2786,23 @@ impl ApplicationHandler<BandReady> for App {
                     self.focus_url();
                     return;
                 }
-                // Tab walks the page's links, Enter follows the one it is on.
-                // A browser that can only be driven with a pointer is not
-                // keyboard-first however many shortcuts its chrome has.
+                // Tab walks the page's form controls and then its links, and
+                // Enter follows the link it is on. A browser that can only be
+                // driven with a pointer is not keyboard-first however many
+                // shortcuts its chrome has.
+                //
+                // The controls come first because the child owns them: it is
+                // the side that knows where they are, so the window offers Tab
+                // to the page and only walks links when the page says it has
+                // nothing to focus. Past the last control the child gives the
+                // focus up, which is what hands the key back here (#110).
                 if matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
+                    if self.tab().focused_link.is_none() {
+                        self.type_into_page(sandbox::message::Key::Tab { back: shift });
+                        if self.page_is_editing() {
+                            return;
+                        }
+                    }
                     self.step_link(!shift);
                     return;
                 }

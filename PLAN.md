@@ -417,10 +417,12 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden, each with the issue that carries
 it:
 
-- **Forms draw but do not work** — no control can be typed into, clicked or
-  submitted. The stopping point this milestone chose, not an oversight: a
-  control that draws correctly makes the page read correctly, and interaction
-  is separate work with a separate risk.
+- **Forms take typing and nothing else** — text fields and `<textarea>`s can
+  be clicked into, tabbed between and typed in (#110). A checkbox still cannot
+  be ticked, a button cannot be pressed, a dropdown cannot be opened, and no
+  form can be submitted. Submission is the sharp one and is deliberately last:
+  it is the first thing this browser would send *up* to a server, which is a
+  different kind of risk from everything else here.
 - **`list-style-image`** parses and is ignored, the last property still on that
   list. It needs an image fetched for a box that is not an element, which is
   the same blocker `url()` in `content` has and the same scope decision.
