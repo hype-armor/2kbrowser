@@ -2980,17 +2980,23 @@ fn layout_block(
                 display: Display::Table,
                 ..ComputedStyle::inherit_from(style)
             };
+            // §9.5 again: a table is one of the boxes that may not overlap a
+            // float, and a table §17.2.1 generated is a table like any other.
+            // The child walk below asks this of every box with a formatting
+            // context of its own; this branch places its box itself, so it has
+            // to ask too.
+            let (beside, room) = context.line_box(cursor_y - padding_top - border_top, 1.0);
             let mut table_box = LayoutBox {
                 rect: Rect {
-                    x: padding_left + border_left,
+                    x: padding_left + border_left + beside,
                     y: cursor_y,
-                    width: content_width,
+                    width: room,
                     height: 0.0,
                 },
                 style: table_style.clone(),
                 text: None,
                 content_origin: (0.0, 0.0),
-                content_width,
+                content_width: room,
                 children: Vec::new(),
                 replaced: None,
                 node: None,
@@ -3008,10 +3014,10 @@ fn layout_block(
                 intrinsic,
                 0.0,
                 0.0,
-                content_width,
+                room,
                 &mut table_box,
             );
-            table_box.rect.width = table_width.min(content_width);
+            table_box.rect.width = table_width.min(room);
             table_box.rect.height = table_height;
             table_box.content_width = table_box.rect.width;
             box_.children.push(table_box);
@@ -7897,6 +7903,25 @@ mod tests {
             cells[0].rect.x,
             cells[1].rect.x
         );
+    }
+
+    #[test]
+    fn an_anonymous_table_sits_beside_a_float() {
+        // §9.5: a table may not overlap a float, and a table §17.2.1 generated
+        // is a table like any other. The child walk asks this of every box with
+        // a formatting context of its own; the branch that places an anonymous
+        // table places its own box, so it has to ask too — and did not, so the
+        // inferred table was drawn on top of the float.
+        let rendered = run(
+            "<body><div class=f>float</div><span class=c>one</span>             <span class=c>two</span></body>",
+            "body { margin: 0 } .f { float: left; width: 120px; height: 80px }              .c { display: table-cell; padding: 0 }",
+            600.0,
+        );
+        let table = content_boxes(&rendered)
+            .into_iter()
+            .find(|b| b.style.display == Display::Table)
+            .expect("the inferred table");
+        assert_eq!(table.rect.x, 120.0, "beside the float, not over it");
     }
 
     #[test]
