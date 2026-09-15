@@ -10,7 +10,20 @@
 //! parser: byte-order mark, then the transport's declaration, then the
 //! document's own `<meta>`, then a default.
 
-use encoding_rs::{Encoding, WINDOWS_1252};
+pub use encoding_rs::Encoding;
+use encoding_rs::WINDOWS_1252;
+
+/// What a document is assumed to be in when nothing says otherwise.
+///
+/// windows-1252, not UTF-8: see `detect`. Exposed because a stylesheet's
+/// encoding falls back to its referring document's, and a caller that has lost
+/// the document's bytes has only this to offer.
+pub const ERA_DEFAULT: &Encoding = WINDOWS_1252;
+
+/// Resolves an encoding label, as a `charset` attribute carries one.
+pub fn for_label(label: &str) -> Option<&'static Encoding> {
+    Encoding::for_label(label.trim().as_bytes())
+}
 
 /// How far into a document a `<meta>` declaration is looked for.
 ///
@@ -66,6 +79,58 @@ pub fn detect(bytes: &[u8], content_type: Option<&str>) -> (&'static Encoding, E
     // the former while using the latter's curly quotes and dashes; the same
     // reasoning makes it the right guess when nothing is declared at all.
     (WINDOWS_1252, EncodingSource::Default)
+}
+
+/// Decodes an external stylesheet, deciding its encoding first.
+///
+/// §4.4 gives a different order from a document's, and the difference is not
+/// cosmetic. A stylesheet has no `<meta>` and no locale to fall back on, so the
+/// declarations it does carry are the whole of what a browser has:
+///
+/// 1. the transport's `charset` parameter;
+/// 2. a byte-order mark, or the `@charset` rule at the very start;
+/// 3. what the *link* said — `<link charset>` or `@import`'s optional charset;
+/// 4. the encoding of the document that referred to it;
+/// 5. UTF-8.
+///
+/// Note the last one: an unlabelled stylesheet is UTF-8 and not windows-1252,
+/// which is the reverse of a document's default and is what §4.4 says. The
+/// referring document's encoding comes first, though, so a legacy page's
+/// stylesheet still decodes as the page does.
+pub fn decode_stylesheet(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    linked: Option<&str>,
+    referrer: Option<&'static Encoding>,
+) -> (String, &'static Encoding) {
+    let encoding = content_type
+        .and_then(charset_from_content_type)
+        .or_else(|| Encoding::for_bom(bytes).map(|(encoding, _)| encoding))
+        .or_else(|| at_charset(bytes))
+        .or_else(|| linked.and_then(|label| Encoding::for_label(label.trim().as_bytes())))
+        .or(referrer)
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, _) = encoding.decode(bytes);
+    (text.into_owned(), encoding)
+}
+
+/// The `@charset` rule at the very start of a stylesheet.
+///
+/// Only at byte zero and only in the one spelling §4.4 allows —
+/// `@charset "…";` with a single space and no comment before it. A rule
+/// anywhere else is not a `@charset` rule at all, which is what keeps a
+/// `content: "@charset \"utf-8\";"` inside a stylesheet from redecoding it.
+///
+/// Read as ASCII, which is safe for every encoding this can select: the ones
+/// where `@charset` would not be spelled in ASCII bytes cannot be reached from
+/// an ASCII rule in the first place.
+fn at_charset(bytes: &[u8]) -> Option<&'static Encoding> {
+    let rest = bytes.strip_prefix(b"@charset \"")?;
+    let end = rest.iter().position(|&b| b == b'"')?;
+    if rest.get(end + 1) != Some(&b';') {
+        return None;
+    }
+    Encoding::for_label(&rest[..end])
 }
 
 /// Reads `charset=` out of a `Content-Type` value.
@@ -166,6 +231,68 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use encoding_rs::UTF_8;
+
+    #[test]
+    fn a_stylesheet_reads_its_own_charset_rule() {
+        // §4.4's second step, and the only declaration most stylesheets carry.
+        let (text, encoding) = decode_stylesheet(
+            b"@charset \"iso-8859-7\";\n.a { content: \"\xe1\" }",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(encoding.name(), "ISO-8859-7");
+        assert!(
+            text.contains('\u{3b1}'),
+            "greek alpha, not a mangled byte: {text}"
+        );
+    }
+
+    #[test]
+    fn a_charset_rule_only_counts_at_the_very_start() {
+        // §4.4 allows one spelling in one place. Anywhere else it is an
+        // ordinary rule, and reading it would let a stylesheet redecode itself
+        // from inside a string.
+        for sheet in [
+            &b"/* a comment first */ @charset \"utf-8\";"[..],
+            b"\n@charset \"utf-8\";",
+            b"@charset 'utf-8';",
+            b"@charset  \"utf-8\";",
+            b"@charset \"utf-8\"",
+            b"a { content: \"@charset \\\"utf-8\\\";\" }",
+        ] {
+            assert_eq!(at_charset(sheet), None, "{:?}", sheet);
+        }
+    }
+
+    #[test]
+    fn a_stylesheet_falls_back_to_the_document_and_then_to_utf8() {
+        // §4.4's fourth and fifth steps. The order matters both ways: a legacy
+        // page's unlabelled stylesheet must not be read as UTF-8, and a
+        // stylesheet with no referrer at all must not be read as the era's
+        // default.
+        let (_, encoding) = decode_stylesheet(b".a { color: red }", None, None, Some(WINDOWS_1252));
+        assert_eq!(encoding, WINDOWS_1252);
+        let (_, encoding) = decode_stylesheet(b".a { color: red }", None, None, None);
+        assert_eq!(encoding, UTF_8);
+    }
+
+    #[test]
+    fn the_transport_outranks_the_charset_rule_and_the_rule_outranks_the_link() {
+        let sheet = b"@charset \"iso-8859-7\"; .a { color: red }";
+        let (_, encoding) =
+            decode_stylesheet(sheet, Some("text/css; charset=utf-8"), Some("koi8-r"), None);
+        assert_eq!(encoding, UTF_8, "the header wins");
+        let (_, encoding) = decode_stylesheet(sheet, None, Some("koi8-r"), None);
+        assert_eq!(encoding.name(), "ISO-8859-7", "the rule beats the link");
+        let (_, encoding) = decode_stylesheet(
+            b".a { color: red }",
+            None,
+            Some("koi8-r"),
+            Some(WINDOWS_1252),
+        );
+        assert_eq!(encoding.name(), "KOI8-R", "the link beats the document");
+    }
 
     #[test]
     fn a_byte_order_mark_outranks_everything() {
