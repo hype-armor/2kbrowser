@@ -1237,6 +1237,44 @@ pub fn layout(
         top_border_gap: None,
     };
 
+    // §9.7: a float shrinks to fit and is placed against an edge of its
+    // containing block. That is done by the *parent's* child walk, and the root
+    // element has no parent to do it — so `:root { float: right }` did nothing
+    // at all (#128). Its containing block is the viewport, so the width to fit
+    // within is the window's.
+    //
+    // A float is out of flow, but only relative to a parent that has none here;
+    // an out-of-flow root is handled below instead, and §9.7 makes `float`
+    // compute to `none` when `position` is absolute or fixed anyway.
+    let root_float = (start_style.float != Float::None && !start_style.position.is_out_of_flow())
+        .then(|| match start_style.width {
+            Length::Auto => {
+                let (_, natural) = subtree_widths(
+                    doc,
+                    styles,
+                    fonts,
+                    start,
+                    &start_style,
+                    intrinsic,
+                    viewport_width,
+                    0,
+                );
+                natural.min(viewport_width)
+            }
+            // Measured the way the ordinary float path measures it, surround
+            // included: `width` is the content box and the float occupies more.
+            length => {
+                let font_size = start_style.font_size;
+                (length.to_px(font_size, viewport_width)
+                    + start_style.padding.left.to_px(font_size, viewport_width)
+                    + start_style.padding.right.to_px(font_size, viewport_width)
+                    + start_style.border.left.used_width(font_size)
+                    + start_style.border.right.used_width(font_size))
+                .min(viewport_width)
+            }
+        });
+    let laid_out_within = root_float.unwrap_or(viewport_width);
+
     let height = layout_block(
         doc,
         styles,
@@ -1246,8 +1284,8 @@ pub fn layout(
         intrinsic,
         0.0,
         0.0,
-        viewport_width,
-        FloatContext::new(viewport_width),
+        laid_out_within,
+        FloatContext::new(laid_out_within),
         // The height passed for `size` is the *width*, deliberately and from
         // before this change: a normal-flow percentage height needs a basis
         // and the document's own height is not known yet. The window's real
@@ -1261,6 +1299,15 @@ pub fn layout(
         &mut root,
     );
     root.rect.height = height.outer();
+
+    // A right float sits against the right edge of the viewport. A left one is
+    // already where flow put it, so only this half needs moving.
+    if root_float.is_some()
+        && start_style.float == Float::Right
+        && let Some(box_) = find_box(&mut root, start)
+    {
+        box_.rect.x = (viewport_width - box_.rect.width).max(0.0);
+    }
 
     // §10.1: the root element's containing block is the *initial* containing
     // block — the viewport. `layout_block` applies a relative shift itself, but
@@ -11640,5 +11687,115 @@ mod list_box_tests {
         let mut found = None;
         walk(&rendered.root, select, &mut found);
         assert_eq!(found, Some(vec![1]));
+    }
+}
+
+#[cfg(test)]
+mod root_float_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// The root element's own box.
+    fn root_box(html: &str, css_text: &str, width: f32) -> LayoutBox {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            width,
+            600.0,
+        );
+        let start = doc.find_element("html").expect("an html element");
+        fn walk(box_: &LayoutBox, node: NodeId, out: &mut Option<LayoutBox>) {
+            if box_.node == Some(node) {
+                *out = Some(box_.clone());
+            }
+            for child in &box_.children {
+                walk(child, node, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, start, &mut found);
+        found.expect("the root element was laid out")
+    }
+
+    #[test]
+    fn a_floated_root_shrinks_to_fit() {
+        // #128. A float is placed by the *parent's* child walk, and the root
+        // element has none — so it filled the window like any block.
+        let floated = root_box(
+            "<html><body><p>foo</p></body></html>",
+            "html { float: right } body, p { margin: 0 }",
+            400.0,
+        );
+        assert!(
+            floated.rect.width < 400.0,
+            "a floated root still filled the window, at {}",
+            floated.rect.width,
+        );
+    }
+
+    #[test]
+    fn a_right_floated_root_sits_against_the_right_edge() {
+        let floated = root_box(
+            "<html><body><p>foo</p></body></html>",
+            "html { float: right } body, p { margin: 0 }",
+            400.0,
+        );
+        assert!(
+            (floated.rect.x + floated.rect.width - 400.0).abs() < 1.0,
+            "its right edge is at {} of a 400px viewport",
+            floated.rect.x + floated.rect.width,
+        );
+    }
+
+    #[test]
+    fn a_left_floated_root_stays_where_flow_put_it() {
+        let floated = root_box(
+            "<html><body><p>foo</p></body></html>",
+            "html { float: left } body, p { margin: 0 }",
+            400.0,
+        );
+        assert_eq!(floated.rect.x, 0.0);
+        assert!(floated.rect.width < 400.0);
+    }
+
+    #[test]
+    fn a_root_that_does_not_float_is_unchanged() {
+        let plain = root_box(
+            "<html><body><p>foo</p></body></html>",
+            "body, p { margin: 0 }",
+            400.0,
+        );
+        assert_eq!((plain.rect.x, plain.rect.width), (0.0, 400.0));
+    }
+
+    #[test]
+    fn a_declared_width_on_a_floated_root_is_honoured() {
+        let floated = root_box(
+            "<html><body><p>foo</p></body></html>",
+            "html { float: right; width: 120px } body, p { margin: 0 }",
+            400.0,
+        );
+        assert_eq!(floated.rect.width, 120.0);
+        assert_eq!(floated.rect.x, 280.0);
+    }
+
+    #[test]
+    fn an_out_of_flow_root_does_not_also_float() {
+        // §9.7: `float` computes to `none` when `position` is absolute or
+        // fixed, and the absolute placement below already handles the box.
+        let positioned = root_box(
+            "<html><body><p>foo</p></body></html>",
+            "html { float: right; position: absolute; left: 10px } body, p { margin: 0 }",
+            400.0,
+        );
+        assert_eq!(
+            positioned.rect.x, 10.0,
+            "placed by `left`, not by the float"
+        );
     }
 }

@@ -105,6 +105,15 @@ pub struct Compound {
     pub classes: Vec<String>,
     /// Every `[attribute]` test in the compound.
     pub attributes: Vec<AttributeTest>,
+    /// Whether the compound carries `:root`.
+    ///
+    /// The one pseudo-class here, and only because it is decidable from the
+    /// tree alone: `:root` is the element with no element parent, which this
+    /// engine already knows at match time. The rest of them are not — `:hover`
+    /// needs a pointer, `:visited` needs history this browser does not keep,
+    /// `:first-child` needs sibling counting that is a separate piece of work
+    /// — so they are still dropped by the arm below rather than half-answered.
+    pub root: bool,
 }
 
 impl Compound {
@@ -113,6 +122,16 @@ impl Compound {
         let Some(element) = doc.element(node) else {
             return false;
         };
+        // The element with no element above it. `<html>` on every ordinary
+        // page, and on a fragment rendered alone it is whatever the parser made
+        // the outermost element — which is the honest answer either way.
+        if self.root
+            && doc
+                .ancestors(node)
+                .any(|ancestor| doc.element(ancestor).is_some())
+        {
+            return false;
+        }
         if let Some(tag) = &self.tag
             && element.local_name() != tag
         {
@@ -140,6 +159,7 @@ impl Compound {
             && self.id.is_none()
             && self.classes.is_empty()
             && self.attributes.is_empty()
+            && !self.root
     }
 }
 
@@ -176,8 +196,11 @@ impl Selector {
         let mut out = Specificity::default();
         for (_, compound) in &self.parts {
             out.ids += u32::from(compound.id.is_some());
-            // An attribute selector counts at the same level as a class.
-            out.classes += (compound.classes.len() + compound.attributes.len()) as u32;
+            // An attribute selector counts at the same level as a class, and
+            // so does a pseudo-class — which is what `:root` is.
+            out.classes += (compound.classes.len()
+                + compound.attributes.len()
+                + usize::from(compound.root)) as u32;
             out.types += u32::from(compound.tag.is_some());
         }
         out
@@ -452,9 +475,13 @@ fn parse_compound(input: &str) -> Option<Compound> {
     let mut chars = input.chars().peekable();
 
     // A leading type selector or `*`, if any.
+    //
+    // `:` ends it as well as `.`, `#` and `[`, or a bare `:root` would be read
+    // as a type selector named `:root` and rejected by the check below — which
+    // is what happened, so the rule was dropped rather than matched.
     let mut tag = String::new();
     while let Some(&c) = chars.peek() {
-        if c == '.' || c == '#' || c == '[' {
+        if c == '.' || c == '#' || c == '[' || c == ':' {
             break;
         }
         chars.next();
@@ -492,7 +519,7 @@ fn parse_compound(input: &str) -> Option<Compound> {
 
         let mut name = String::new();
         while let Some(&c) = chars.peek() {
-            if c == '.' || c == '#' || c == '[' {
+            if c == '.' || c == '#' || c == '[' || c == ':' {
                 break;
             }
             chars.next();
@@ -504,6 +531,7 @@ fn parse_compound(input: &str) -> Option<Compound> {
         match marker {
             '.' => compound.classes.push(name),
             '#' => compound.id = Some(name),
+            ':' if name.eq_ignore_ascii_case("root") => compound.root = true,
             // Pseudo-classes and anything else are out of scope; drop the whole
             // selector rather than match too broadly.
             _ => return None,
@@ -756,5 +784,51 @@ mod tests {
                 "{selector} parsed"
             );
         }
+    }
+
+    #[test]
+    fn root_matches_the_element_with_no_element_above_it() {
+        let doc = dom::parse("<html><body><p>x</p></body></html>");
+        let selector = &parse_selector_list(":root")[0];
+        let html = doc.find_element("html").expect("an html element");
+        let body = doc.find_element("body").expect("a body");
+        assert!(selector.matches(&doc, html));
+        assert!(!selector.matches(&doc, body), ":root is not every element");
+    }
+
+    #[test]
+    fn root_was_being_read_as_a_type_selector_and_dropped() {
+        // The leading type selector ran to the first `.`, `#` or `[`, so a bare
+        // `:root` was read as a tag named ":root", failed the name check, and
+        // took its whole rule with it — which is why `:root { float: right }`
+        // did nothing at all (#128).
+        assert_eq!(parse_selector_list(":root").len(), 1);
+    }
+
+    #[test]
+    fn root_can_be_combined_the_way_any_compound_can() {
+        assert_eq!(parse_selector_list(":root p").len(), 1);
+        assert_eq!(parse_selector_list("html:root").len(), 1);
+    }
+
+    #[test]
+    fn a_pseudo_class_this_engine_cannot_answer_still_drops_its_selector() {
+        // `:root` is here because it is decidable from the tree alone. The
+        // others are not, and half-answering one matches too broadly.
+        for selector in [":hover", "p:first-child", "a:visited"] {
+            assert!(
+                parse_selector_list(selector).is_empty(),
+                "{selector} was accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn root_counts_as_a_class_for_specificity() {
+        let root = parse_selector_list(":root")[0].specificity();
+        let tag = parse_selector_list("html")[0].specificity();
+        let class = parse_selector_list(".x")[0].specificity();
+        assert!(root > tag, "a pseudo-class outranks a type selector");
+        assert_eq!(root, class);
     }
 }
