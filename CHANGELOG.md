@@ -14,6 +14,40 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
+## Unreleased
+
+**The third-party rule says what it did** (#118). ADR-0006 has refused
+off-origin subresources since the first commit and has never once mentioned
+it, which is the half of the feature that was missing rather than a polish
+item: a page missing a third of its images because its CDN was refused looks
+exactly like a page whose CDN is having a bad afternoon. The bar now says how
+many subresources a page asked for and did not get, and from how many sites —
+`4 blocked from 2 sites`, beside the URL, where the *not encrypted* marker
+already lives and alongside it rather than instead of it.
+
+It is counted twice over, in two places that answer different questions. The
+process-wide counter is the other side of the pair the budget harness has
+always measured: "no third-party request left this process" and "no
+third-party request was ever made" read the same at zero, and only one of them
+is evidence, so the budget now asserts three issued-zero *and* three refused
+rather than a zero that a loader which had stopped resolving `src` attributes
+would also produce. The per-page record is what the chrome reads, and it counts
+distinct resources rather than requests — a page naming one tracking pixel in
+forty places is missing one thing, not forty.
+
+The record is assembled on the parent's side of the renderer boundary and never
+sent across it. A refusal and a failure are deliberately the same shape on the
+wire (ADR-0012): the child has no business knowing which it got, because
+telling it would hand a compromised renderer a way to probe what the user has
+allowed. So it is read from the session rather than carried on the rendered
+page, and it is rebuilt on every render rather than accumulated — a resize asks
+for the same subresources again, and a reader watching the number double while
+they widened a window would be right not to believe it.
+
+This is #118's first two parts. The third — a per-site exception, so the rule
+has the escape hatch ADR-0006 names as the reason it is allowed to be absolute
+— is still to come.
+
 ## 0.4.0
 
 A release about boxes this engine never generated. CSS 2.1 says several exist

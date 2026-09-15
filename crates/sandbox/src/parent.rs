@@ -437,6 +437,62 @@ type Wake = Box<dyn Fn() + Send + Sync>;
 
 /// A live renderer holding one page.
 ///
+/// What the policy refused this page, for the chrome to report.
+///
+/// ADR-0006 removes advertising and tracking by refusing third-party
+/// subresources, and until now it did it silently: a page missing half its
+/// images looked exactly like a page whose server was having a bad day. Issue
+/// #118 calls that dishonest rather than incorrect, and this is the record that
+/// fixes it — what was asked for, what it was refused for, and on whose behalf.
+///
+/// Deliberately *not* sent to the child. A refusal and a failure are the same
+/// shape on the wire on purpose (see [`Conversation::fetch_all`]), so this is
+/// assembled on the parent's side of the boundary and read by the window
+/// directly. A compromised renderer cannot use it to probe what the user has
+/// allowed, because it never sees it.
+#[derive(Debug, Default, Clone)]
+pub struct Withheld {
+    /// Refused URLs, deduplicated, in the order the page first asked.
+    urls: Vec<String>,
+    /// The hosts those URLs are on, deduplicated, in the order first seen.
+    hosts: Vec<String>,
+}
+
+impl Withheld {
+    /// How many distinct subresources this page asked for and did not get.
+    ///
+    /// Distinct, because a page that names the same tracking pixel in forty
+    /// places asked for one thing forty times, and "40 blocked" would overstate
+    /// what the reader is missing by thirty-nine.
+    pub fn subresources(&self) -> usize {
+        self.urls.len()
+    }
+
+    /// The hosts involved, in the order the page first asked for them.
+    ///
+    /// What a per-site exception is granted against: the user decides about
+    /// `fonts.example.net`, not about each of its eleven files.
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    /// Whether anything was refused at all.
+    pub fn is_empty(&self) -> bool {
+        self.urls.is_empty()
+    }
+
+    /// Notes one refused URL. Repeats are ignored.
+    fn record(&mut self, url: &str, host: &str) {
+        if self.urls.iter().any(|seen| seen == url) {
+            return;
+        }
+        self.urls.push(url.to_owned());
+        if !self.hosts.iter().any(|seen| seen == host) {
+            self.hosts.push(host.to_owned());
+        }
+    }
+}
+
 /// Dropping it kills the child. That is the mechanism that keeps "one page per
 /// process" true: the caller drops the session when the page is replaced, and
 /// nothing a page accumulated — caches, font state, whatever an exploit left
@@ -460,6 +516,8 @@ pub struct Session {
     child_id: u32,
     wake: std::sync::Arc<std::sync::OnceLock<Wake>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// What the policy refused this page, written by the worker.
+    withheld: std::sync::Arc<std::sync::Mutex<Withheld>>,
 }
 
 impl Session {
@@ -470,6 +528,8 @@ impl Session {
         let (replies, answers) = std::sync::mpsc::channel::<Answer>();
         let wake: std::sync::Arc<std::sync::OnceLock<Wake>> = std::sync::Arc::default();
         let woken = std::sync::Arc::clone(&wake);
+        let withheld: std::sync::Arc<std::sync::Mutex<Withheld>> = std::sync::Arc::default();
+        let recorded = std::sync::Arc::clone(&withheld);
 
         let worker = std::thread::Builder::new()
             .name("renderer-session".to_owned())
@@ -480,6 +540,7 @@ impl Session {
                     fetched: Fetched::default(),
                     timeout,
                     document: None,
+                    withheld: recorded,
                 };
                 // Ends when the handle is dropped and the channel closes, which
                 // is what kills the child: `Conversation` owns it.
@@ -503,7 +564,25 @@ impl Session {
             child_id,
             wake,
             worker: Some(worker),
+            withheld,
         })
+    }
+
+    /// What the policy refused this page.
+    ///
+    /// Rebuilt from scratch on every render rather than accumulated, so a
+    /// resize does not double the number the reader is shown: the child asks
+    /// again for everything it needs, the allowed ones come from the page's
+    /// cache, and the refused ones are refused again.
+    pub fn withheld(&self) -> Withheld {
+        // A panic on the worker thread while this was held would poison the
+        // lock, and a poisoned lock must not take the window with it. What is
+        // inside is a list of hostnames; the worst a half-written one can do is
+        // under-report, and the render that panicked has already failed.
+        self.withheld
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Sets what to call when an answer is ready.
@@ -765,6 +844,8 @@ struct Conversation {
     /// claim any origin it liked, and the policy would then be applied to a
     /// document that does not exist.
     document: Option<Origin>,
+    /// What the policy refused, shared with the [`Session`] handle.
+    withheld: std::sync::Arc<std::sync::Mutex<Withheld>>,
 }
 
 impl Conversation {
@@ -772,6 +853,10 @@ impl Conversation {
         let outcome = match job {
             Job::Render(request) => {
                 self.document = request.origin.clone();
+                // A fresh page, or the same one at a new width. Either way the
+                // child is about to ask for its subresources again, so the
+                // record is rebuilt rather than added to.
+                *self.record() = Withheld::default();
                 self.converse(ToChild::Render {
                     body: request.body,
                     content_type: request.content_type,
@@ -793,6 +878,13 @@ impl Conversation {
             Job::Select { from, to } => self.ask(&ToChild::Select { from, to }),
         };
         outcome.unwrap_or_else(Answer::Failed)
+    }
+
+    /// The refusal record, unpoisoned. See [`Session::withheld`].
+    fn record(&self) -> std::sync::MutexGuard<'_, Withheld> {
+        self.withheld
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn send(&mut self, message: &ToChild) -> Result<(), Error> {
@@ -886,15 +978,31 @@ impl Conversation {
         // asking can change within one live child. `fetch_raw` checks again on
         // a miss, which costs a URL parse and keeps the rule in one place
         // rather than depending on this having got there first.
+        //
+        // The refusal is looked at rather than only counted, because its reason
+        // is what the chrome has to say (issue #118): "three images from two
+        // hosts were not loaded" is a sentence a reader can act on, and "three
+        // resources failed" is not. Counted here as well as in `net`, because a
+        // URL refused in this pre-pass is dropped from `wanted` and never
+        // reaches the fetch that would otherwise have counted it.
         let allowed: Vec<bool> = urls
             .iter()
             .map(|url| {
-                net::parse_url(url).is_ok_and(|(origin, _)| {
-                    self.fetcher
-                        .policy
-                        .check(self.document.as_ref(), &origin, kind)
-                        .is_ok()
-                })
+                let Ok((origin, _)) = net::parse_url(url) else {
+                    return false;
+                };
+                let Err(refusal) = self
+                    .fetcher
+                    .policy
+                    .check(self.document.as_ref(), &origin, kind)
+                else {
+                    return true;
+                };
+                net::count_refusal(&refusal);
+                if let net::Refusal::ThirdParty { host } = &refusal {
+                    self.record().record(url, host);
+                }
+                false
             })
             .collect();
 
@@ -992,6 +1100,27 @@ mod tests {
             content_type: None,
             ok: true,
         }
+    }
+
+    #[test]
+    fn what_was_withheld_counts_resources_once_and_hosts_once() {
+        let mut withheld = Withheld::default();
+        withheld.record("https://cdn.example.net/a.png", "cdn.example.net");
+        withheld.record("https://cdn.example.net/b.png", "cdn.example.net");
+        // The same file asked for again — a page naming one spacer in forty
+        // places asked for one thing, and saying "40 blocked" would overstate
+        // what the reader is missing by thirty-nine.
+        withheld.record("https://cdn.example.net/a.png", "cdn.example.net");
+        withheld.record("https://ads.example.org/pixel.gif", "ads.example.org");
+
+        assert_eq!(withheld.subresources(), 3);
+        assert_eq!(
+            withheld.hosts(),
+            ["cdn.example.net", "ads.example.org"],
+            "hosts are listed once each, in the order the page first asked"
+        );
+        assert!(!withheld.is_empty());
+        assert!(Withheld::default().is_empty());
     }
 
     #[test]

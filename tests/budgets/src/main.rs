@@ -316,23 +316,36 @@ fn third_party_requests() -> Check {
 
     let mut fonts = text::FontStore::new();
     net::reset_third_party_request_count();
+    net::reset_third_party_refusal_count();
     shell::render::render_with_base(page, 400, 400, &mut fonts, Some((&origin, &path)));
     let third_party = net::third_party_request_count();
+    // The other half of the pair (issue #118). Zero issued is only evidence
+    // when something was asked for: a loader that had stopped resolving `src`
+    // attributes at all would report zero issued and pass, and the same-origin
+    // control below would not catch it if it broke only for absolute URLs.
+    // Three refusals say the policy was reached three times and held.
+    let refused = net::third_party_refusal_count();
     let same_origin =
         shell::render::render_with_base(control, 400, 400, &mut fonts, Some((&origin, &path)))
             .images_loaded;
 
-    match (third_party, same_origin) {
-        (0, 1) => Check {
+    match (third_party, refused, same_origin) {
+        (0, 3, 1) => Check {
             name,
             limit,
             outcome: Outcome::Pass {
-                measured: "0 of 3 third-party issued, 1 of 1 same-origin loaded".to_owned(),
+                measured: "0 of 3 third-party issued, 3 refused, 1 of 1 same-origin loaded"
+                    .to_owned(),
             },
         },
-        (0, _) => fail(
+        (0, 3, _) => fail(
             format!("{same_origin} of 1 same-origin"),
             "the same-origin control did not load, so the zero above proves nothing".to_owned(),
+        ),
+        (0, _, _) => fail(
+            format!("{refused} of 3 third-party refused"),
+            "the page's third-party subresources never reached the policy, so nothing was proved"
+                .to_owned(),
         ),
         _ => fail(
             format!("{third_party} of 3 third-party issued"),

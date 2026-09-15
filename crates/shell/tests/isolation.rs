@@ -424,6 +424,46 @@ fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
 }
 
 #[test]
+fn a_page_knows_how_much_of_it_the_policy_refused() {
+    // Issue #118. ADR-0006's rule has worked since the first commit and never
+    // said so, which leaves a page missing a third of its images looking
+    // exactly like a page whose CDN is having a bad afternoon. No network is
+    // touched: every one of these is refused before a socket is opened.
+    let mut page = viewport(
+        "<body>\
+         <img src=\"https://cdn.example.net/a.png\">\
+         <img src=\"https://cdn.example.net/b.png\">\
+         <img src=\"https://cdn.example.net/a.png\">\
+         <img src=\"https://ads.example.org/pixel.gif\">\
+         </body>",
+        300,
+    );
+
+    let withheld = page.withheld();
+    assert_eq!(
+        withheld.subresources(),
+        3,
+        "three distinct files, one of them asked for twice"
+    );
+    assert_eq!(
+        withheld.hosts(),
+        ["cdn.example.net", "ads.example.org"],
+        "the hosts a per-site exception would be granted against"
+    );
+
+    // A resize is the same page, so it must not double the number the reader is
+    // shown. The child asks again for everything it needs on every render, and
+    // the refused ones are refused again — so the record is rebuilt rather than
+    // added to.
+    page.resize(700, 2000).expect("re-renders");
+    assert_eq!(
+        page.withheld().subresources(),
+        3,
+        "re-rendering the same page counted its refusals a second time"
+    );
+}
+
+#[test]
 fn resizing_re_lays_out_without_a_new_page() {
     let mut page = viewport(
         "<body><p>a paragraph long enough that how many lines it needs depends \

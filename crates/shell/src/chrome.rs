@@ -355,6 +355,14 @@ pub struct State<'a> {
     pub saved: bool,
     /// Whether the certificate chain verified only against a local root.
     pub local_root: bool,
+    /// How many subresources this page asked for and the policy refused.
+    ///
+    /// ADR-0006's third-party rule, counted. Zero on a page that asked for
+    /// nothing off-site, which is most of the era's web and none of the
+    /// modern one.
+    pub withheld: usize,
+    /// The hosts those subresources were on, in the order first asked for.
+    pub withheld_hosts: &'a [String],
     /// Which colour scheme to draw in.
     pub theme: Theme,
 }
@@ -525,6 +533,36 @@ pub fn scheme_notice(url: &str) -> Option<&'static str> {
     }
 }
 
+/// What to say about the subresources the policy refused, if any.
+///
+/// The half of ADR-0006 that was missing (issue #118). The rule itself has
+/// worked from the first commit; what it did not do was admit to it, so a page
+/// missing a third of its images looked exactly like a page whose CDN was
+/// having a bad afternoon. A browser that quietly changes what a page contains
+/// is the same problem as one that quietly changes how it is laid out, and
+/// ADR-0009 already settled that argument: never silently.
+///
+/// Counted in resources and in hosts, because they are different facts and the
+/// reader needs both — eleven files from one font host is one decision to make,
+/// and three files from three trackers is three.
+pub fn withheld_notice(state: &State<'_>) -> Option<String> {
+    if state.withheld == 0 {
+        return None;
+    }
+    let files = state.withheld;
+    let sites = state.withheld_hosts.len();
+    // Short, and front-loaded like the rest: this shares a line with a URL, and
+    // on an unencrypted page it shares it with the scheme notice as well. The
+    // first draft said "other sites", which is more precise and six characters
+    // longer, and those six characters were the difference between a sentence
+    // and "11 blocked from 3 othe…" on a 700px bar. The count is the part that
+    // has to survive.
+    Some(format!(
+        "{files} blocked from {sites} {}",
+        if sites == 1 { "site" } else { "sites" }
+    ))
+}
+
 /// The message the bar shows on the right, if any.
 ///
 /// A navigation error outranks the rendering mode: the page on screen is not
@@ -533,14 +571,26 @@ pub fn status(state: &State<'_>) -> Option<String> {
     if let Some(error) = state.error {
         return Some(error.to_owned());
     }
+    // Appended rather than ranked against the rest, because it is a different
+    // kind of fact: the others describe the page that arrived, and this one
+    // describes the part of it that did not. Neither can stand in for the
+    // other — "not encrypted" and "4 blocked from 2 other sites" are both
+    // worth a reader's attention, and dropping either to save room would be
+    // choosing which truth to tell.
+    let withheld = withheld_notice(state);
+    let joined = |before: Option<String>| match (before, withheld.clone()) {
+        (Some(before), Some(withheld)) => Some(format!("{before} · {withheld}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    };
     // Above the rendering mode. Who can read this connection outranks how the
     // page was laid out, and unlike the scheme notice it applies whichever mode
     // the page ended up in — an intercepted page rendered as a document is
     // still intercepted.
     if state.local_root {
-        return Some("local certificate — readable in transit".to_owned());
+        return joined(Some("local certificate — readable in transit".to_owned()));
     }
-    match state.mode {
+    joined(match state.mode {
         RenderMode::Authored => scheme_notice(state.url).map(str::to_owned),
         // Short enough to fit beside a URL. The words that matter are at the
         // front, so what truncation there is costs the least.
@@ -556,7 +606,7 @@ pub fn status(state: &State<'_>) -> Option<String> {
         RenderMode::RequiresScripting => {
             Some("rendered as a document — needs JavaScript".to_owned())
         }
-    }
+    })
 }
 
 /// Draws the bar.
@@ -1218,8 +1268,60 @@ mod tests {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
             theme: Theme::LIGHT,
         }
+    }
+
+    #[test]
+    fn a_page_says_how_much_of_it_the_policy_refused() {
+        // Issue #118: the third-party rule worked from the first commit and
+        // never admitted to it, so a page missing a third of its images looked
+        // exactly like a page whose CDN was having a bad afternoon.
+        let hosts = ["cdn.example.net".to_owned(), "ads.example.org".to_owned()];
+        let mut page = state("https://example.com/a.html", &RenderMode::Authored);
+        assert_eq!(
+            status(&page),
+            None,
+            "a page that asked for nothing off-site"
+        );
+
+        page.withheld = 4;
+        page.withheld_hosts = &hosts;
+        assert_eq!(status(&page).as_deref(), Some("4 blocked from 2 sites"));
+
+        // One host reads as one host. A browser that says "1 other sites" is a
+        // browser nobody proofread, and this line is the one that has to be
+        // believed.
+        page.withheld = 1;
+        page.withheld_hosts = &hosts[..1];
+        assert_eq!(status(&page).as_deref(), Some("1 blocked from 1 site"));
+    }
+
+    #[test]
+    fn what_was_refused_and_how_the_page_arrived_are_both_said() {
+        // Two different facts — what came, and what did not — and neither can
+        // stand in for the other. The earlier version of this returned the
+        // first one that applied, which meant an unencrypted page silently
+        // stopped reporting what it had been refused.
+        let hosts = ["cdn.example.net".to_owned()];
+        let mut page = state("http://example.com/a.html", &RenderMode::Authored);
+        page.withheld = 2;
+        page.withheld_hosts = &hosts;
+        let said = status(&page).expect("says something");
+        assert!(said.contains("not encrypted"), "{said}");
+        assert!(said.contains("2 blocked"), "{said}");
+
+        // Including on a page the certificate marking has something to say
+        // about, which takes an early exit of its own.
+        let mut intercepted = state("https://example.com/a.html", &RenderMode::Authored);
+        intercepted.local_root = true;
+        intercepted.withheld = 2;
+        intercepted.withheld_hosts = &hosts;
+        let said = status(&intercepted).expect("says something");
+        assert!(said.contains("local certificate"), "{said}");
+        assert!(said.contains("2 blocked"), "{said}");
     }
 
     #[test]
@@ -1492,6 +1594,16 @@ mod tests {
             }
         }
         state.local_root = true;
+        if let Some(text) = status(&state) {
+            wanted.push(text);
+        }
+        // The refusal marker and the separator that joins it to the rest. The
+        // separator is the point: it is a middle dot, not an ASCII hyphen, and
+        // a bundled family without it would draw the busiest line in the bar
+        // with a hollow box in the middle of it.
+        let hosts = ["cdn.example.net".to_owned()];
+        state.withheld = 3;
+        state.withheld_hosts = &hosts;
         if let Some(text) = status(&state) {
             wanted.push(text);
         }
