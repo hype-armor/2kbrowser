@@ -90,7 +90,10 @@ author asked for rather than the order they happen to be written in; images,
 including ones sitting in a line; `background-position`, including the
 percentage form, which aligns a point on the image with the same point on the
 box rather than offsetting from the corner; relative and absolute positioning;
-framesets; quirks-mode value parsing; the presentational attributes the era's
+the **root element's own box** — its margin, border and padding hold the body
+away from the window, while §14.2 sends its background to the whole canvas and
+anchors a tile there to the root's padding box rather than to the corner of the
+window; framesets; quirks-mode value parsing; the presentational attributes the era's
 markup actually used (`bgcolor`, `align`, `<font>`, `border`, and `width` on an
 image — including `width="100%"`, which is how a page drew a rule across a
 column or held a layout open with a spacer GIF); list markers;
