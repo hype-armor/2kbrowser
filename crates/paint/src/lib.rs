@@ -10,16 +10,19 @@ use css::style::Visibility;
 use css::value::Color;
 use layout::{Layout, LayoutBox, Rect, line_offset};
 use text::FontStore;
-use tiny_skia::{FillRule, Paint, PathBuilder};
 
 // Re-exported so consumers do not need their own tiny-skia dependency, and so
 // the rasteriser choice stays an implementation detail of this crate.
 pub use images::{DecodedImage, ImageKey, ImageSlot, ImageStore, decode};
 // Re-exported for consumers that composite pixmaps of their own, such as the
 // frameset renderer.
+// The rasteriser's own types, re-exported rather than depended on twice. The
+// shell draws one thing of its own — the application icon — and a second
+// `tiny-skia` in another crate's manifest would be a second version to keep in
+// step for no gain (ADR-0007).
 pub use tiny_skia::{
-    Color as RasterColor, IntSize, Pixmap, PixmapPaint, PremultipliedColorU8 as PremultipliedColor,
-    Transform,
+    Color as RasterColor, FillRule, IntSize, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
+    PremultipliedColorU8 as PremultipliedColor, Rect as RasterRect, Stroke, Transform,
 };
 
 /// An opaque magenta, for debugging overlays: nothing on a real page is this.

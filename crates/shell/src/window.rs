@@ -1878,6 +1878,24 @@ impl App {
     }
 }
 
+/// How big the icon handed to the window manager is drawn.
+///
+/// One size, because that is what winit takes. Large enough that a desktop
+/// scaling it up has something to work with, and the drawing carries its own
+/// answer for the small end — `shell::icon` weights the outlines heavier below
+/// about thirty pixels, so a manager that scales this down and one that asks
+/// for a small size directly do not get wildly different pictures.
+const ICON_SIZE: u32 = 128;
+
+/// The icon, if it can be drawn and the platform will take it.
+///
+/// `None` rather than a failure: a window with no icon is a window, and one
+/// that refused to open because a decoration could not be built would not be.
+fn app_icon() -> Option<winit::window::Icon> {
+    let (rgba, width, height) = crate::icon::rgba(ICON_SIZE)?;
+    winit::window::Icon::from_rgba(rgba, width, height).ok()
+}
+
 /// How far along the loading bar sits while the document is being fetched.
 ///
 /// Not zero: the bar has to be visible the instant a link is clicked, because
@@ -2226,6 +2244,7 @@ impl ApplicationHandler<BandReady> for App {
         };
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
+            .with_window_icon(app_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();

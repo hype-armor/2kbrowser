@@ -16,6 +16,31 @@ record for everything earlier.
 
 ## Unreleased
 
+**The browser has an icon**: a beige-box computer with a lit screen, which is
+what it is for. It appears wherever a program appears outside its own window —
+a dock, a task bar, an alt-tab list — and until now this one appeared there as
+whatever blank rectangle the desktop uses for a program that never said.
+
+Drawn rather than shipped. A picture would be one file per size, six things to
+keep in step, every one a binary nobody reviews; this is a page of geometry on a
+1024-unit grid, rendered at whatever size it is handed through the rasteriser
+the pages already go through. No new dependency, no asset pipeline, and it is
+reviewed by looking at it — `cargo run -p shell --example app-icon` draws it at
+every size a desktop asks for, the way `chrome-strip` draws the bar.
+
+Below about thirty pixels it draws heavier. At the grid weight a sixteen-pixel
+icon's outlines are four tenths of a pixel and antialias into a grey wash — the
+drawing is all still there and nobody can see it, which is the failure every
+icon set in existence solves by drawing the small sizes differently. The drive
+slot drops out below twenty-four pixels for the same reason from the other
+direction: under three pixels wide it is a smudge beside the screen rather than
+a detail, and a detail nobody can resolve is noise.
+
+The case is painted white rather than left transparent. The artwork is line work
+on white and its white is load-bearing — it is the computer's shell, not the
+page behind it — so leaving it out would give a dark task bar a teal outline
+with a screen floating inside it, which is a different drawing.
+
 **An image that did not arrive leaves a box, not a hole** (#118). It says
 `Load image`, because that is what pressing it does. Until now a page whose
 pictures were all on a CDN rendered as a screenful of gaps with nothing to
