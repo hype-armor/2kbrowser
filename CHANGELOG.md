@@ -16,6 +16,14 @@ record for everything earlier.
 
 ## Unreleased
 
+**An anonymous table sits beside a float** rather than on top of it. §9.5 says
+a table may not overlap one, and a table §17.2.1 generated is a table like any
+other — the child walk asks this of every box with a formatting context of its
+own, and the branch that places an inferred table places its own box, so it had
+to be told to ask too. No conformance test moves either way; the case is a run
+of orphan `display: table-cell` boxes after a float, which the suite does not
+cover and Chromium draws beside it.
+
 **A box with a formatting context of its own does not overlap a float**
 (§9.5). Its border box narrows and moves beside the float; where it cannot fit
 beside it, it goes below. **Worth 15 conformance tests against nothing lost.**
