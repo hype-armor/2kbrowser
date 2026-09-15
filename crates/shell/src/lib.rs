@@ -7,7 +7,6 @@ pub mod bookmarks;
 pub mod chrome;
 pub mod field;
 pub mod history;
-pub mod icon;
 pub mod isolated;
 pub mod menu;
 pub mod preview;

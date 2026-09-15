@@ -120,25 +120,24 @@ what it is for. It appears wherever a program appears outside its own window —
 a dock, a task bar, an alt-tab list — and until now this one appeared there as
 whatever blank rectangle the desktop uses for a program that never said.
 
-Drawn rather than shipped. A picture would be one file per size, six things to
-keep in step, every one a binary nobody reviews; this is a page of geometry on a
-1024-unit grid, rendered at whatever size it is handed through the rasteriser
-the pages already go through. No new dependency, no asset pipeline, and it is
-reviewed by looking at it — `cargo run -p shell --example app-icon` draws it at
-every size a desktop asks for, the way `chrome-strip` draws the bar.
+One master, `assets/icon.png`, and `cargo run -p icons` derives the rest: the
+256px copy the binary embeds for the window, the eight sizes the freedesktop
+hicolor theme asks for, a Windows `.ico` and a macOS `.icns`. Both containers
+are written by hand in that tool — each is a header and a list of PNGs — which
+costs two fewer dependencies and, more usefully, no platform tool: the macOS
+icon is produced on Linux by somebody who does not own a Mac.
 
-Below about thirty pixels it draws heavier. At the grid weight a sixteen-pixel
-icon's outlines are four tenths of a pixel and antialias into a grey wash — the
-drawing is all still there and nobody can see it, which is the failure every
-icon set in existence solves by drawing the small sizes differently. The drive
-slot drops out below twenty-four pixels for the same reason from the other
-direction: under three pixels wide it is a smudge beside the screen rather than
-a detail, and a detail nobody can resolve is noise.
+The containers are checked by parsing them back and confirming every directory
+offset and every payload's real dimensions, because a container written here is
+one that nothing here can open. The window icon is checked by opening a window
+under Xvfb and asking X whether `_NET_WM_ICON` arrived, and by a test that the
+embedded copy decodes at all — `window_icon` returns `None` on failure, since a
+browser should not refuse to open over a decoration, which means nothing at
+runtime would otherwise ever report it missing.
 
-The case is painted white rather than left transparent. The artwork is line work
-on white and its white is load-bearing — it is the computer's shell, not the
-page behind it — so leaving it out would give a dark task bar a teal outline
-with a screen floating inside it, which is a different drawing.
+The artwork is a rendered image rather than flat colour, so it does not
+compress the way a drawn one would: `packaging/` comes to 2.2 MB, carried in the
+repository and not in the program, which embeds only the 72 KB window copy.
 
 **An image that did not arrive leaves a box, not a hole** (#118). It says
 `Load image`, because that is what pressing it does. Until now a page whose

@@ -494,8 +494,8 @@ are readable rather than jumbled.
 them: back and forward with a real history stack, an editable URL bar,
 find-in-page, tabs with a strip that only appears once there are two, the
 document-fallback notice and its override, the HTTP-transparency marker §4
-requires, bookmarks in a text file, an application icon drawn the same way the
-bar is rather than shipped as a folder of PNGs, and the address of the link
+requires, bookmarks in a text file, an application icon derived from one
+master by `cargo run -p icons`, and the address of the link
 under the pointer in the corner of the window — which matters more in a browser that
 spends this much of its chrome on *which host you are dealing with* than in one
 that does not (#139). The chrome is drawn by building a

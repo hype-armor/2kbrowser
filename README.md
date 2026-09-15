@@ -50,15 +50,13 @@ Every state the bar can be in, drawn by `cargo run -p shell --example
 chrome-strip` — which is also how it is reviewed, since a headless test can
 compare pixels and a person cannot compare descriptions.
 
-![The application icon at the sizes it is used at](docs/images/icon-sizes.png)
-
-The application icon, at every size a desktop asks for. It is *drawn* rather
-than shipped as a set of PNGs — a page of geometry that renders at whatever size
-it is handed, through the same rasteriser the pages go through — so there is one
-of it instead of six files to keep in step, and it is reviewed the way the bar
-is: `cargo run -p shell --example app-icon`. Below about thirty pixels it draws
-its outlines heavier, because at the grid weight a sixteen-pixel icon's lines
-come out four tenths of a pixel thick and antialias into a grey smudge.
+The application icon is the one image in this repository that is not a
+screenshot. `assets/icon.png` is the master and `cargo run -p icons` derives
+everything else from it: the copy the binary embeds for the window, the eight
+sizes the freedesktop hicolor theme wants, a Windows `.ico` and a macOS
+`.icns` — both written by hand in that tool, since each is a header and a list
+of PNGs, and neither then needs a platform tool to produce. Replacing the icon
+is one file and one command.
 
 ## Status
 

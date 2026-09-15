@@ -170,20 +170,6 @@ fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Optio
 /// allowance rather than a measurement, and it is only ever a shrink — a
 /// monitor smaller than the floor leaves the request alone rather than
 /// producing a window too small to use.
-/// The window icon, decoded from the copy built into the binary.
-///
-/// Generated from `assets/icon.png` by `cargo run -p icons`; see that tool for
-/// why there is one master and everything else is derived from it.
-///
-/// winit wants straight alpha and one size, and scaling to a title bar or a
-/// taskbar is the compositor's job from there.
-fn window_icon() -> Option<winit::window::Icon> {
-    const BYTES: &[u8] = include_bytes!("../../../assets/generated/window-256.png");
-    let decoded = image::load_from_memory(BYTES).ok()?.into_rgba8();
-    let (width, height) = (decoded.width(), decoded.height());
-    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
-}
-
 fn clamp_to_monitor(requested: (u32, u32), monitor: (u32, u32)) -> (u32, u32) {
     const EDGES: u32 = 96;
     const FLOOR: (u32, u32) = (360, 320);
@@ -2064,22 +2050,18 @@ impl App {
     }
 }
 
-/// How big the icon handed to the window manager is drawn.
+/// The window icon, decoded from the copy built into the binary.
 ///
-/// One size, because that is what winit takes. Large enough that a desktop
-/// scaling it up has something to work with, and the drawing carries its own
-/// answer for the small end — `shell::icon` weights the outlines heavier below
-/// about thirty pixels, so a manager that scales this down and one that asks
-/// for a small size directly do not get wildly different pictures.
-const ICON_SIZE: u32 = 128;
-
-/// The icon, if it can be drawn and the platform will take it.
+/// Generated from `assets/icon.png` by `cargo run -p icons`; see that tool for
+/// why there is one master and everything else is derived from it.
 ///
-/// `None` rather than a failure: a window with no icon is a window, and one
-/// that refused to open because a decoration could not be built would not be.
-fn app_icon() -> Option<winit::window::Icon> {
-    let (rgba, width, height) = crate::icon::rgba(ICON_SIZE)?;
-    winit::window::Icon::from_rgba(rgba, width, height).ok()
+/// winit wants straight alpha and one size, and scaling to a title bar or a
+/// taskbar is the compositor's job from there.
+fn window_icon() -> Option<winit::window::Icon> {
+    const BYTES: &[u8] = include_bytes!("../../../assets/generated/window-256.png");
+    let decoded = image::load_from_memory(BYTES).ok()?.into_rgba8();
+    let (width, height) = (decoded.width(), decoded.height());
+    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
 }
 
 /// `url` with `query` as its query string, replacing whatever it had.
@@ -2442,16 +2424,10 @@ impl ApplicationHandler<BandReady> for App {
             Some(monitor) => clamp_to_monitor(self.size, monitor),
             None => self.size,
         };
-        let mut attributes = Window::default_attributes()
+        let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
-            .with_window_icon(app_icon())
+            .with_window_icon(window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
-        // A window with no icon gets whatever the desktop uses for "unknown
-        // program", which on a taskbar of a dozen windows is the one that looks
-        // like it crashed. Not fatal if it fails: an icon is decoration, and a
-        // browser that refused to open over one would be worse than a plain
-        // one.
-        attributes = attributes.with_window_icon(window_icon());
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
             return;

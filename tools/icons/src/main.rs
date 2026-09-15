@@ -115,6 +115,14 @@ fn run() -> Result<usize, String> {
     )?;
     written += 1;
 
+    // The README's own copy, so the picture in the documentation is the icon
+    // the program actually uses rather than one exported by hand once.
+    write_png(
+        &root.join("docs/images/icon.png"),
+        &resize(&master, WINDOW_ICON_SIZE),
+    )?;
+    written += 1;
+
     // Linux: the hicolor theme, installed under share/icons.
     for size in HICOLOR_SIZES {
         let path = root.join(format!(
