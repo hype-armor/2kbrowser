@@ -85,6 +85,18 @@ and a non-trivial number of `<script>` elements — an SPA shell such as an empt
 honest "this page requires JavaScript" state naming the reason. Do not show a
 blank page, and do not show an empty reader view, both of which read as a crash.
 
+"Near-zero" needs two measures, and the implementation began with one. A
+character count alone answers "is this page short", which is a different
+question: a table of twenty-six one-letter rows is a hundred and fifty
+characters and a *complete* rendering, and a browser that tells its reader such
+a page needs JavaScript is lying about a page already on the screen. So the
+second measure is how many elements carry any text at all. The shell this state
+is for has none — an empty `<div id="root">` — or the single `<noscript>` line a
+framework's template ships with. Both measures must agree before the state is
+chosen, because each one alone has a page it gets wrong: the count would call a
+long article in three paragraphs near-empty, and the character total called a
+short complete page a shell.
+
 Reader mode therefore moves from **M5 to M3**, and the detection hook lands in
 **M2** with layout. It is no longer a feature that polishes the browser; it is
 what makes it work at all on the modern web.

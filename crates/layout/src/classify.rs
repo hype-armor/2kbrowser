@@ -68,9 +68,22 @@ impl RenderMode {
 /// the user needs the override.
 pub const UNSUPPORTED_SHARE_THRESHOLD: f32 = 0.40;
 
-/// Below this many characters, a document with scripts is treated as an empty
-/// shell rather than a short page.
+/// Below this many characters, a document with scripts is short enough to be
+/// an empty shell rather than a short page.
 const MIN_CONTENT_CHARS: usize = 200;
+
+/// And below this many elements carrying any text of their own.
+///
+/// The character count alone said "short", and ADR-0009 asks for "near-zero
+/// content … there is nothing to extract". Those are not the same question, and
+/// the difference is a page with real content that happens to be brief: a table
+/// of twenty-six one-word rows is a hundred and fifty characters and a complete
+/// rendering, and telling its reader the page needs JavaScript is a lie about a
+/// page that is already on the screen. The shell ADR-0009 describes has nothing
+/// carrying text at all — an empty `<div id="root">` — or the one line of
+/// `<noscript>` a framework's template ships with. Three is above both and
+/// below anything that is really a page.
+const MIN_CONTENT_ELEMENTS: usize = 3;
 
 /// How many row-forming containers make a page's *frame* unsupported.
 ///
@@ -106,7 +119,10 @@ pub fn classify(doc: &Document, styles: &StyleMap) -> RenderMode {
     let body = doc.find_element("body").unwrap_or_else(|| doc.root());
     let total_text = visible_text_len(doc, styles, body);
 
-    if total_text < MIN_CONTENT_CHARS && script_count(doc) > 0 {
+    if total_text < MIN_CONTENT_CHARS
+        && text_bearing_elements(doc, styles, body) < MIN_CONTENT_ELEMENTS
+        && script_count(doc) > 0
+    {
         return RenderMode::RequiresScripting;
     }
     if total_text == 0 {
@@ -181,6 +197,30 @@ fn script_count(doc: &Document) -> usize {
         .into_iter()
         .filter(|&n| doc.element(n).is_some_and(|e| e.local_name() == "script"))
         .count()
+}
+
+/// How many elements carry text of their own, skipping `display: none`
+/// subtrees for the same reason [`visible_text_len`] does.
+///
+/// Counted per *element* and not per text node, because an element's text is
+/// often split by the markup inside it and a paragraph holding two links is one
+/// thing on the page rather than five.
+fn text_bearing_elements(doc: &Document, styles: &StyleMap, node: NodeId) -> usize {
+    if is_display_none(styles, node) {
+        return 0;
+    }
+    let own = usize::from(
+        doc.element(node).is_some()
+            && doc
+                .children(node)
+                .iter()
+                .any(|&child| doc.text(child).is_some_and(|text| !text.trim().is_empty())),
+    );
+    own + doc
+        .children(node)
+        .iter()
+        .map(|&child| text_bearing_elements(doc, styles, child))
+        .sum::<usize>()
 }
 
 /// Length of text that would actually be painted, skipping `display: none`
@@ -397,6 +437,41 @@ mod tests {
     fn an_empty_spa_shell_reports_that_it_needs_scripting() {
         let html = r#"<body><div id="root"></div><script src="app.js"></script></body>"#;
         assert_eq!(classify_html(html, ""), RenderMode::RequiresScripting);
+    }
+
+    #[test]
+    fn a_shell_with_a_noscript_line_is_still_a_shell() {
+        // What a framework's default template ships: one sentence and nothing
+        // else. Forty-five characters is near-zero content by any reading.
+        let html = r#"<body><div id="root"><noscript>You need to enable JavaScript to run this app.</noscript></div><script src="app.js"></script></body>"#;
+        assert_eq!(classify_html(html, ""), RenderMode::RequiresScripting);
+    }
+
+    #[test]
+    fn a_short_page_with_a_script_is_not_a_shell() {
+        // Twenty-six rows of two letters each is a hundred and fifty
+        // characters and a complete rendering. Telling its reader the page
+        // needs JavaScript is a lie about a page already on the screen — and
+        // it was the old rule's answer, because the rule asked only how long
+        // the text was. The script here is a control this browser does not
+        // run; the content does not come from it.
+        let rows = (b'a'..=b'z')
+            .map(|c| format!("<div>{} {}</div>", (c - 32) as char, c as char))
+            .collect::<String>();
+        let html = format!("<body>{rows}<script>function f() {{}}</script></body>");
+        assert_eq!(classify_html(&html, ""), RenderMode::Authored);
+    }
+
+    #[test]
+    fn a_long_article_in_three_paragraphs_is_not_a_shell_either() {
+        // The element count alone would call this one near-empty. The two
+        // measures are both required for that reason: one asks how much there
+        // is to read, the other how much of the page is carrying it.
+        let html = format!(
+            "<body>{}<script src=\"analytics.js\"></script></body>",
+            paragraphs(3, "x")
+        );
+        assert_eq!(classify_html(&html, ""), RenderMode::Authored);
     }
 
     #[test]
