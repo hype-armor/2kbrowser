@@ -111,7 +111,7 @@ start_on() {
     DISPLAY=$display "$browser" open "$on" --width "$width" --height "$height" \
         >/dev/null 2>&1 &
     app=$!
-    local waited=0
+    local waited=0 title=""
     while [ "$waited" -lt 60 ]; do
         window=$(DISPLAY=$display xdotool search --onlyvisible --name . 2>/dev/null | head -1 || true)
         if [ -n "$window" ]; then
@@ -124,8 +124,19 @@ start_on() {
         sleep 0.5
         waited=$((waited + 1))
     done
-    fail "no page rendered within 30s — the browser never became ready, so no \
-click below would have meant anything"
+    # What the window said, and whether there was a window at all. The three
+    # ways this fails look identical without it: a browser that never opened a
+    # window, one still showing the URL it was launched with because the page
+    # has not rendered, and one showing a *different* page because something
+    # earlier left it somewhere unexpected. Only the last is a bug in the
+    # browser, and a bare timeout cannot tell them apart — which matters most
+    # on CI, where this is the only evidence there will be.
+    if [ -z "$window" ]; then
+        fail "no window within 30s waiting for \"$ready\" — the browser never \
+opened one, so no click below would have meant anything"
+    fi
+    fail "no page rendered within 30s — the window says \"$title\" rather than \
+\"$ready\", so no click below would have meant anything"
 }
 
 # Stops the browser and waits for its window to actually go, which is not the
