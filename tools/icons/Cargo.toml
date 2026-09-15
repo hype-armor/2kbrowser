@@ -1,0 +1,18 @@
+[package]
+name = "icons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "icons"
+path = "src/main.rs"
+
+# The same version `paint` already pins, so this adds an edge to the graph and
+# not a crate to it.
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[lints]
+workspace = true

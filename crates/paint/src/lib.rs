@@ -10,7 +10,6 @@ use css::style::Visibility;
 use css::value::Color;
 use layout::{Layout, LayoutBox, Rect, line_offset};
 use text::FontStore;
-use tiny_skia::{FillRule, Paint, PathBuilder};
 
 // Re-exported so consumers do not need their own tiny-skia dependency, and so
 // the rasteriser choice stays an implementation detail of this crate.
@@ -21,6 +20,7 @@ pub use tiny_skia::{
     Color as RasterColor, IntSize, Pixmap, PixmapPaint, PremultipliedColorU8 as PremultipliedColor,
     Transform,
 };
+use tiny_skia::{FillRule, Paint, PathBuilder};
 
 /// An opaque magenta, for debugging overlays: nothing on a real page is this.
 pub fn magenta() -> PremultipliedColor {
@@ -63,6 +63,13 @@ pub enum DisplayItem {
     Image {
         /// The element the image belongs to, used to look it up at raster time.
         node: dom::NodeId,
+        /// Whether a box with no image in it is a picture that did not arrive.
+        ///
+        /// True for an `<img>` and false for every other replaced element. An
+        /// `<iframe>` has no image by nature, and without this every empty
+        /// frame on the page grew a `Load image` button offering to fetch one
+        /// (#118).
+        placeholder: bool,
         /// Destination rectangle; the image is scaled to fill it.
         rect: Rect,
     },
@@ -310,6 +317,7 @@ fn paint_box(
     if drawn && let Some(node) = box_.replaced {
         list.items.push(DisplayItem::Image {
             node,
+            placeholder: box_.replaced_image,
             rect: Rect {
                 x: x + box_.content_origin.0,
                 y: y + box_.content_origin.1,
@@ -986,12 +994,18 @@ pub fn rasterise_band(
                     fill_ellipse(&mut pixmap, &rect, *color);
                 }
             }
-            DisplayItem::Image { node, rect } => {
+            DisplayItem::Image {
+                node,
+                rect,
+                placeholder,
+            } => {
                 let rect = shifted(rect, top);
-                if drawable(&rect)
-                    && let Some(image) = images.get(&ImageKey::content(*node))
-                {
-                    draw_image(&mut pixmap, image, &rect);
+                if drawable(&rect) {
+                    match images.get(&ImageKey::content(*node)) {
+                        Some(image) => draw_image(&mut pixmap, image, &rect),
+                        None if *placeholder => draw_missing(&mut pixmap, fonts, &rect),
+                        None => {}
+                    }
                 }
             }
             DisplayItem::Tile {
@@ -1116,6 +1130,98 @@ fn drawable(rect: &Rect) -> bool {
         && in_range(rect.height)
         && in_range(rect.x + rect.width)
         && in_range(rect.y + rect.height)
+}
+
+/// What the placeholder for an image that did not arrive says (#118).
+pub const MISSING_IMAGE_LABEL: &str = "Load image";
+
+/// Text size in that placeholder.
+const MISSING_TEXT: f32 = 12.0;
+
+/// Room left around the label, so it does not touch the outline.
+const MISSING_PAD: f32 = 4.0;
+
+/// Smallest box that is outlined at all.
+const MISSING_OUTLINE_MIN: f32 = 12.0;
+
+/// Draws the box where an image was going to be, and did not arrive.
+///
+/// Not a broken-image icon and not nothing. Nothing is what this used to draw,
+/// and on a page whose pictures are all on a CDN the reader got a screenful of
+/// holes with no way to tell a refused image from a dead server — the report
+/// that became issue #109 was exactly that, and it was a browser working as
+/// designed being indistinguishable from a broken one.
+///
+/// It says `Load image` because that is what pressing it does. It deliberately
+/// does *not* say "blocked": this side of the renderer boundary has no business
+/// knowing whether a resource was refused by policy or was merely missing, and
+/// the wire makes the two identical on purpose so a compromised renderer cannot
+/// probe the user's configuration (ADR-0012). The parent knows which it was and
+/// says so in the chrome.
+///
+/// Fixed colours rather than the page's. There is no theme on this side, and a
+/// placeholder tinted to blend into the document would be a hole again — this
+/// is a control sitting on someone else's page and reads better for saying so.
+fn draw_missing(pixmap: &mut Pixmap, fonts: &mut FontStore, rect: &Rect) {
+    if rect.width < MISSING_OUTLINE_MIN || rect.height < MISSING_OUTLINE_MIN {
+        return;
+    }
+    const PLATE: Color = Color::rgb(0xf4, 0xf4, 0xf2);
+    const EDGE: Color = Color::rgb(0x9a, 0x9a, 0x96);
+    const INK: Color = Color::rgb(0x44, 0x44, 0x44);
+
+    fill_rect(pixmap, rect, EDGE);
+    fill_rect(
+        pixmap,
+        &Rect {
+            x: rect.x + 1.0,
+            y: rect.y + 1.0,
+            width: rect.width - 2.0,
+            height: rect.height - 2.0,
+        },
+        PLATE,
+    );
+    // Sans, at a fixed size, whatever the page set. This is the browser
+    // speaking rather than the document, and a placeholder that inherited the
+    // author's face would read as content — which is the one thing it is not.
+    let style = css::style::ComputedStyle {
+        font_size: MISSING_TEXT,
+        line_height: css::style::LineHeight::Px(MISSING_TEXT * 1.2),
+        font_family: css::style::FontStack {
+            families: Vec::new(),
+            generic: css::style::GenericFamily::SansSerif,
+        },
+        ..css::style::ComputedStyle::default()
+    };
+    let height = MISSING_TEXT * 1.2;
+    let layout = fonts.layout(MISSING_IMAGE_LABEL, &style, f32::MAX);
+    let Some(line) = layout.lines.first() else {
+        return;
+    };
+    // Measured, not guessed at with a minimum size. A great deal of the era's
+    // markup is 1x1 spacers and 10px bullets, and two words written across
+    // those would turn a page of invisible scaffolding into a page of smudges
+    // — which is the failure mode of every broken-image icon that ever
+    // shipped. A fixed threshold got this nearly right and then clipped the
+    // label at both ends in an 80x30 box, which is the size half the era's
+    // thumbnails are.
+    if line.width + MISSING_PAD * 2.0 > rect.width || height + MISSING_PAD > rect.height {
+        return;
+    }
+
+    // Centred in the box rather than pinned to a corner: the box is whatever
+    // size the author's `width` and `height` asked for, and a label in the
+    // middle of it is the one position that reads the same at every size.
+    //
+    // `origin_y` is the *line's* top, not its baseline: a glyph carries its own
+    // offset within the run, the way the ordinary text path passes the line
+    // box's y and lets `draw_glyph` add the rest. Passing a baseline here put
+    // the words a whole ascent too low, hard against the bottom edge.
+    let x = rect.x + (rect.width - line.width) / 2.0;
+    let y = rect.y + (rect.height - height) / 2.0;
+    for glyph in &line.glyphs {
+        draw_glyph(pixmap, fonts, glyph, x, y, INK);
+    }
 }
 
 /// Draws an image scaled into `rect`.
@@ -2779,6 +2885,106 @@ mod canvas_background_tests {
                 .any(|item| matches!(item, DisplayItem::Rect { color, .. }
                     if !color.is_transparent())),
             "a paragraph's background went missing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod missing_image_tests {
+    use super::*;
+
+    /// A canvas with one `<img>`-shaped hole in it, and no image to fill it.
+    fn placeholder(width: f32, height: f32) -> Pixmap {
+        let mut pixmap = Pixmap::new(width as u32 + 20, height as u32 + 20).expect("a pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
+        let mut fonts = FontStore::new();
+        draw_missing(
+            &mut pixmap,
+            &mut fonts,
+            &Rect {
+                x: 10.0,
+                y: 10.0,
+                width,
+                height,
+            },
+        );
+        pixmap
+    }
+
+    /// How many pixels are not the white the canvas started as.
+    fn marked(pixmap: &Pixmap) -> usize {
+        pixmap
+            .pixels()
+            .iter()
+            .filter(|pixel| pixel.red() != 0xff || pixel.green() != 0xff || pixel.blue() != 0xff)
+            .count()
+    }
+
+    #[test]
+    fn a_spacer_gif_stays_invisible() {
+        // The failure every broken-image icon has shipped with. A great deal of
+        // the era's markup is 1x1 spacers and 10px bullets holding a table
+        // layout open, and drawing anything at all in those turns a page of
+        // invisible scaffolding into a page of smudges.
+        for size in [1.0, 4.0, 10.0] {
+            assert_eq!(
+                marked(&placeholder(size, size)),
+                0,
+                "a {size}x{size} image drew something"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_gets_an_outline_and_no_words() {
+        // Big enough to be a picture somebody would miss, too small to say two
+        // words in. The outline alone is the honest answer: there is a box
+        // here, it is empty, and there is nowhere to explain why.
+        let small = placeholder(40.0, 40.0);
+        assert!(marked(&small) > 0, "a 40x40 image drew nothing at all");
+
+        // The label would need more than 40px. If this ever stops being true
+        // the assertion below is what says so, rather than the words quietly
+        // being clipped at both ends — which is how this was first wrong.
+        let mut fonts = FontStore::new();
+        let width = fonts
+            .layout(
+                MISSING_IMAGE_LABEL,
+                &css::style::ComputedStyle {
+                    font_size: MISSING_TEXT,
+                    ..css::style::ComputedStyle::default()
+                },
+                f32::MAX,
+            )
+            .width;
+        assert!(width + MISSING_PAD * 2.0 > 40.0, "{width}");
+    }
+
+    #[test]
+    fn a_picture_sized_box_says_what_pressing_it_does() {
+        let big = placeholder(240.0, 160.0);
+        let small = placeholder(40.0, 40.0);
+        // Per pixel of box, because the big one is thirty times the area: what
+        // says the words are there is ink in the middle, not ink at all.
+        let density = |pixmap: &Pixmap, area: f32| marked(pixmap) as f32 / area;
+        assert!(
+            density(&big, 240.0 * 160.0) > density(&small, 40.0 * 40.0) / 4.0,
+            "the large box has no more in it than its outline"
+        );
+
+        // And there is ink across the middle of it, which is where the label is
+        // and nowhere else. A band rather than one pixel: the centre of
+        // "Load image" is the space between the two words, so the single
+        // sample this started as landed on the plate and called it empty.
+        let row = (160 / 2 + 10) * big.width() as usize;
+        let inked = big.pixels()[row + 20..row + 240]
+            .iter()
+            .filter(|pixel| pixel.red() < 0xc0)
+            .count();
+        assert!(
+            inked > 10,
+            "only {inked} inked pixels across the middle of a 240x160 \
+             placeholder, so the label is not there"
         );
     }
 }

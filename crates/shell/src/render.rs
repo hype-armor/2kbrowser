@@ -29,6 +29,14 @@ pub struct Frame {
     pub origin: Origin,
     /// Path it was fetched from.
     pub path: String,
+    /// The `<img>` elements whose picture never arrived, with what they asked
+    /// for (#118).
+    ///
+    /// Kept rather than recomputed, because the answer is a fetch outcome and
+    /// nothing downstream has one: by the time a rectangle is wanted the
+    /// document is all that is left, and a document cannot tell a refused
+    /// image from a decoded one.
+    pub missing: Vec<(dom::NodeId, String)>,
 }
 
 /// A rendered page.
@@ -184,6 +192,141 @@ impl Page {
                     .map(move |rect| (rect, link.url.clone()))
             })
             .collect()
+    }
+
+    /// Every placeholder rectangle on the canvas, with the URL behind it.
+    ///
+    /// The same shape as [`Page::links`] and hit-tested the same way: the
+    /// window has no box tree — it is in another process — so a rectangle
+    /// missing from this list is a placeholder that does nothing when pressed.
+    pub fn missing_images(&self) -> Vec<(layout::Rect, String)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for (node, url) in &frame.missing {
+                out.extend(frame.layout.rects_for(*node).into_iter().map(|mut rect| {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    (rect, url.clone())
+                }));
+            }
+        }
+        out
+    }
+
+    /// Every text control on the page, in document order, with where it is.
+    ///
+    /// Text controls only: a checkbox has nothing to type into, and a button
+    /// has nothing to type into *and* nothing yet to press. Tab order is
+    /// document order, which is what HTML says when nothing declares otherwise
+    /// and what this engine can honestly offer — `tabindex` is not read (#110).
+    pub fn text_controls(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                let editable = layout::forms::control_of(&frame.doc, node).is_some_and(|control| {
+                    matches!(
+                        control,
+                        layout::forms::Control::Text
+                            | layout::forms::Control::Password
+                            | layout::forms::Control::TextArea
+                    )
+                });
+                if !editable {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every control that can be pressed, in document order, with where it is.
+    ///
+    /// Buttons, so a form can be sent (#110). Checkboxes and radios are not
+    /// here: pressing one has to *change* it, and nothing can yet — offering a
+    /// target that does nothing would be worse than offering none.
+    pub fn buttons(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                if layout::forms::control_of(&frame.doc, node)
+                    != Some(layout::forms::Control::Button)
+                {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// The button at a point on the canvas, if there is one.
+    pub fn button_at(&self, x: f32, y: f32) -> Option<dom::NodeId> {
+        self.buttons()
+            .into_iter()
+            .rev()
+            .find(|(_, rect)| {
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|(node, _)| node)
+    }
+
+    /// The form `node` belongs to, collected and ready to send (#110).
+    ///
+    /// `submitter` is the control that asked — a button, or `None` when it was
+    /// Enter in a text field, which presses nothing.
+    pub fn submission_from(&self, node: dom::NodeId) -> Option<layout::forms::Submission> {
+        self.frames.iter().find_map(|frame| {
+            let form = layout::forms::form_of(&frame.doc, node)?;
+            let submitter = (layout::forms::control_of(&frame.doc, node)
+                == Some(layout::forms::Control::Button))
+            .then_some(node);
+            Some(layout::forms::submission(&frame.doc, form, submitter))
+        })
+    }
+
+    /// The text control at a point on the canvas, if there is one.
+    ///
+    /// Last match wins, the way the hit test for links does: a control drawn
+    /// over another is the one a press lands on.
+    pub fn control_at(&self, x: f32, y: f32) -> Option<dom::NodeId> {
+        self.text_controls()
+            .into_iter()
+            .rev()
+            .find(|(_, rect)| {
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|(node, _)| node)
+    }
+
+    /// What a control holds, as the renderer would draw it.
+    ///
+    /// The typed value where there is one, and what the markup said otherwise
+    /// — which is what focusing a field has to start from, so that clicking
+    /// into `<input value="Smith">` and pressing a key appends rather than
+    /// replacing.
+    pub fn control_value(&self, node: dom::NodeId) -> String {
+        for frame in &self.frames {
+            if frame.doc.element(node).is_some() {
+                return layout::forms::value_of(&frame.doc, node);
+            }
+        }
+        String::new()
+    }
+
+    /// Whether a control holds more than one line — a `<textarea>`.
+    pub fn is_multiline(&self, node: dom::NodeId) -> bool {
+        self.frames.iter().any(|frame| {
+            layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::TextArea)
+        })
     }
 
     /// The same links, with each one's rectangles kept together.
@@ -629,7 +772,7 @@ pub fn render_as_authored_with(
 }
 
 /// How to render, beyond the document itself.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Settings {
     /// Fill the canvas to the height given rather than shrinking to content.
     pub(crate) fill_height: bool,
@@ -642,6 +785,16 @@ pub(crate) struct Settings {
     /// so asking for one is a different request rather than the absence of
     /// this one.
     pub(crate) force_document: bool,
+    /// What has been typed into this page's form controls, by node (#110).
+    ///
+    /// Applied to the document straight after it is parsed, before anything
+    /// looks at it. A render re-parses the bytes every time — the document is
+    /// not kept between them — so the typed values have to be re-applied, and
+    /// the node ids line up because parsing the same bytes builds the same
+    /// arena in the same order.
+    pub(crate) values: Vec<(dom::NodeId, String)>,
+    /// The control the reader is typing in, and where its caret is.
+    pub(crate) focus: Option<(dom::NodeId, usize)>,
     /// How much bigger than its own pixels the page is drawn.
     ///
     /// 1.0 is the page as written. It is applied in the cascade, where every
@@ -658,6 +811,8 @@ impl Default for Settings {
             force_authored: false,
             force_document: false,
             zoom: 1.0,
+            values: Vec::new(),
+            focus: None,
         }
     }
 }
@@ -677,7 +832,11 @@ pub(crate) fn render_sized(
     loader: &mut dyn Loader,
     base: Option<(&Origin, &str)>,
 ) -> Page {
-    let doc = dom::parse(html);
+    let mut doc = dom::parse(html);
+    for (node, value) in &settings.values {
+        doc.set_value(*node, value.clone());
+    }
+    let doc = doc;
 
     // A frameset document has no body to lay out: each frame is a separate
     // page, fetched and rendered in its own right, then composited into the
@@ -813,7 +972,8 @@ pub(crate) fn render_sized(
         width as f32,
         band_height.max(1) as f32,
     );
-    let list = build_display_list(&laid_out);
+    let mut list = build_display_list(&laid_out);
+    mark_focus(&mut list, &laid_out, &styles, settings.focus);
     // The band asked for, clipped to what the document actually has below it.
     // A page shorter than the band gets a canvas its own height, which is what
     // every page did before bands existed and is why a short page still paints
@@ -846,6 +1006,7 @@ pub(crate) fn render_sized(
                 // still be clickable once scrolled.
                 height: content_height.max(height as f32),
             },
+            missing: missing_images(&doc, &intrinsic, origin, path),
             doc,
             layout: laid_out,
             origin: origin.clone(),
@@ -1297,6 +1458,125 @@ fn draws_something(
 ///
 /// The caption stays. It is text, the reader can still learn what the picture
 /// showed, and losing it as well would be a second, quieter kind of hole.
+/// Every `<img>` whose picture did not arrive, with the URL it asked for.
+///
+/// What makes the placeholder a control rather than a label (#118): the window
+/// needs somewhere to send a click, and the only thing worth sending is what
+/// the page wanted. Resolved here, against the document that named it, because
+/// nothing further out knows what it was relative to.
+///
+/// "Did not arrive" means failed or refused rather than still coming — this
+/// runs after the fetch, and `intrinsic` holds every image that loaded and
+/// decoded. Which of the two it was is deliberately not recorded: it is the
+/// distinction the renderer boundary exists to keep from this side (ADR-0012).
+fn missing_images(
+    doc: &dom::Document,
+    intrinsic: &IntrinsicSizes,
+    origin: &Origin,
+    path: &str,
+) -> Vec<(dom::NodeId, String)> {
+    doc.descendants(doc.root())
+        .into_iter()
+        .filter(|node| !intrinsic.contains_key(node))
+        .filter_map(|node| {
+            let element = doc.element(node)?;
+            (element.local_name() == "img")
+                .then(|| element.attr("src"))
+                .flatten()
+                .map(|src| (node, net::resolve(origin, path, src)))
+        })
+        .collect()
+}
+
+/// Colour of the caret and the ring around the control being typed in.
+///
+/// The chrome's focus blue, so a field on the page and the URL bar say "the
+/// typing goes here" the same way. Fixed rather than taken from the page: this
+/// is the browser speaking, and a focus ring tinted to match the author's
+/// colours is one the author can make invisible.
+const FOCUS: css::Color = css::Color::rgb(0x3a, 0x6e, 0xa5);
+
+/// How thick the ring is.
+const FOCUS_RING: f32 = 2.0;
+
+/// Draws the caret and the ring around the focused control (#110).
+///
+/// Appended to the display list rather than built into the box, for the same
+/// reason the URL bar's caret is drawn where it is: this is not something the
+/// document contains. The page has no idea it has a focused control, no rule in
+/// the author's stylesheet can reach it, and putting it in layout would make it
+/// something the cascade could argue with.
+///
+/// Outside the box rather than inside it, so a field whose own border the
+/// author has styled does not have it painted over — and so a full field does
+/// not lose a character's width of its text to the ring.
+fn mark_focus(
+    list: &mut paint::DisplayList,
+    layout: &layout::Layout,
+    styles: &css::cascade::StyleMap,
+    focus: Option<(dom::NodeId, usize)>,
+) {
+    let Some((node, at)) = focus else { return };
+    // A control the cascade hid is not one anybody is typing in, whatever the
+    // last render thought. Focus travels with the reader rather than with the
+    // page, so it can outlive the box it was on.
+    if styles.get(node).is_some_and(|style| {
+        style.display == css::style::Display::None
+            || style.visibility != css::style::Visibility::Visible
+    }) {
+        return;
+    }
+    for rect in layout.rects_for(node) {
+        for side in ring(&rect) {
+            list.items.push(paint::DisplayItem::Rect {
+                rect: side,
+                color: FOCUS,
+            });
+        }
+    }
+    if let Some(caret) = layout.caret_in(node, at) {
+        list.items.push(paint::DisplayItem::Rect {
+            rect: caret,
+            color: FOCUS,
+        });
+    }
+}
+
+/// The four sides of a ring drawn just outside `rect`.
+fn ring(rect: &layout::Rect) -> [layout::Rect; 4] {
+    let (x, y) = (rect.x - FOCUS_RING, rect.y - FOCUS_RING);
+    let (width, height) = (
+        rect.width + FOCUS_RING * 2.0,
+        rect.height + FOCUS_RING * 2.0,
+    );
+    [
+        layout::Rect {
+            x,
+            y,
+            width,
+            height: FOCUS_RING,
+        },
+        layout::Rect {
+            x,
+            y: y + height - FOCUS_RING,
+            width,
+            height: FOCUS_RING,
+        },
+        layout::Rect {
+            x,
+            y,
+            width: FOCUS_RING,
+            height,
+        },
+        layout::Rect {
+            x: x + width - FOCUS_RING,
+            y,
+            width: FOCUS_RING,
+            height,
+        },
+    ]
+}
+
 fn hide_missing_images(
     doc: &dom::Document,
     intrinsic: &IntrinsicSizes,

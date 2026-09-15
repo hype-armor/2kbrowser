@@ -96,6 +96,20 @@ pub struct Document {
     nodes: Vec<Node>,
     root: NodeId,
     quirks: QuirksMode,
+    /// What form controls currently hold, where that is no longer what the
+    /// markup said (#110).
+    ///
+    /// Separate from the attributes on purpose, because in HTML they are
+    /// separate things: `<input value="...">` is the field's *default*, and
+    /// what a reader has typed is a property of the control rather than of the
+    /// document. Writing the attribute instead would mean a page that styles
+    /// `input[value=""]` changed how it looked as soon as somebody typed —
+    /// which is a rule about the markup being answered with a fact about the
+    /// session.
+    ///
+    /// Empty on a freshly parsed document, which is every document until a key
+    /// is pressed in one.
+    values: std::collections::HashMap<NodeId, String>,
 }
 
 impl Document {
@@ -109,12 +123,31 @@ impl Document {
             }],
             root: NodeId(0),
             quirks: QuirksMode::NoQuirks,
+            values: std::collections::HashMap::new(),
         }
     }
 
     /// The document root.
     pub fn root(&self) -> NodeId {
         self.root
+    }
+
+    /// What a form control currently holds, if it is not what the markup said.
+    ///
+    /// `None` means nobody has typed in it, and the caller falls back to the
+    /// markup — the `value` attribute, or a `<textarea>`'s content.
+    pub fn value_of(&self, id: NodeId) -> Option<&str> {
+        self.values.get(&id).map(String::as_str)
+    }
+
+    /// Records what a control holds now.
+    pub fn set_value(&mut self, id: NodeId, value: impl Into<String>) {
+        self.values.insert(id, value.into());
+    }
+
+    /// Whether anything has been typed into this document at all.
+    pub fn is_edited(&self) -> bool {
+        !self.values.is_empty()
     }
 
     /// Quirks mode, as determined by the parser from the doctype.

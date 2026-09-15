@@ -417,10 +417,13 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden, each with the issue that carries
 it:
 
-- **Forms draw but do not work** — no control can be typed into, clicked or
-  submitted. The stopping point this milestone chose, not an oversight: a
-  control that draws correctly makes the page read correctly, and interaction
-  is separate work with a separate risk.
+- **Forms take typing and submit** — text fields and `<textarea>`s can be
+  clicked into, tabbed between and typed in, and a form can be sent with its
+  submit button or with Enter in a one-line field (#110). What cannot be done
+  is *changing* the controls that are not text: a checkbox cannot be ticked or
+  unticked and a dropdown cannot be opened, so those submit whatever the markup
+  says they hold. That is the remaining gap and it is a real one — a form with a
+  box you need to untick cannot be filled in correctly.
 - **`list-style-image`** parses and is ignored, the last property still on that
   list. It needs an image fetched for a box that is not an element, which is
   the same blocker `url()` in `content` has and the same scope decision.
@@ -491,7 +494,11 @@ are readable rather than jumbled.
 them: back and forward with a real history stack, an editable URL bar,
 find-in-page, tabs with a strip that only appears once there are two, the
 document-fallback notice and its override, the HTTP-transparency marker §4
-requires, and bookmarks in a text file. The chrome is drawn by building a
+requires, bookmarks in a text file, an application icon derived from one
+master by `cargo run -p icons`, and the address of the link
+under the pointer in the corner of the window — which matters more in a browser that
+spends this much of its chrome on *which host you are dealing with* than in one
+that does not (#139). The chrome is drawn by building a
 display list and handing it to the same rasteriser the page goes through, so it
 is not a second rendering path that can drift — and so it is tested headlessly,
 which is where nearly all of its coverage comes from. What is *not* tested is
@@ -507,6 +514,36 @@ why, so the browser is indistinguishable from one that is simply broken. Said
 here rather than quietly left out of the list, because "done" that omits a
 milestone's own commitment is the kind of claim §10 spends a paragraph warning
 about.
+
+Built after the fact, and recorded here rather than by editing the paragraph
+above, because a milestone that quietly rewrites what it did not do is a
+milestone whose "done" means nothing. Refusals are counted — process-wide for
+the budget harness, which could previously only measure that nothing left the
+origin and not that anything had tried, and per page for the chrome, which says
+how many subresources a page asked for and did not get and from how many sites.
+The record lives on the parent's side of the renderer boundary and stays there:
+a refusal and a failure are the same shape on the wire on purpose, so telling
+the child would leak the user's configuration to the untrusted side.
+
+The override itself is the padlock left of the URL. It opens what this page was
+refused and what this site has already been allowed, and either list can be
+changed from there — granting and revoking in one place, because an allow-list
+that only grows is one a reader stops being able to reason about. An exception
+is a *pair*, the site and the host it may load from, which is what ADR-0006
+means by per-site and is the amendment the ADR now carries: a bare host allowed
+everywhere would rebuild the cross-site identifier the rule removes. Kept in
+`sites.tsv` beside the bookmarks.
+
+The padlock reverses what ADR-0006 said about marking the secure case, and the
+ADR records the change of mind rather than being left to contradict the code.
+The *words* still mark only the exception.
+
+An image that did not arrive now leaves a box saying `Load image` rather than a
+hole. Pressing it retries a picture that merely failed, and opens the panel for
+one the policy refused — the browser cannot tell the reader which it was
+without telling the renderer, and the renderer is the one process that must not
+be told (ADR-0012), so the box says what pressing it does and the chrome
+carries the reason.
 
 Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
 Discarding the author's layout without also discarding the author's furniture

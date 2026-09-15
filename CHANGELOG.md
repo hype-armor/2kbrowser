@@ -14,6 +14,297 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
+## Unreleased
+
+**Forms submit** (#110). This is the first thing this browser sends *up* to a
+server, and it was held back to last for that reason rather than because it was
+hard. Press a submit button, or Enter in a one-line field, and the form goes:
+`get` puts its fields in the query string, `post` in a body, both
+`application/x-www-form-urlencoded`.
+
+Which controls are sent is HTML 4 §17.13.2's rule, including the parts that
+surprise people. A control needs a `name` and must not be disabled. A checkbox
+or radio contributes only when ticked, and a ticked box with no value of its own
+sends `on`. A dropdown sends what it is showing — its first option when nothing
+is marked — while a `multiple` list with nothing marked sends nothing. And
+**only the button that was pressed** is sent, which is why the submitter is
+asked for rather than inferred: a form with `name="action"` on a Save and a
+Delete means opposite things depending on which one you hit, and guessing picks
+one of them.
+
+**The split across the renderer boundary is the part worth reading.** The form
+is collected by the child, because the form is part of the document and the
+document never leaves that side (ADR-0012). What crosses is a destination *as
+the markup wrote it*, a method, and the encoded pairs. The parent resolves that
+destination against the page it actually has — not against anything the child
+claimed — applies the network policy to the result, refuses a `post` to a
+`file:` URL, and caps the body at a megabyte. A page can *ask* for a request; it
+cannot make one. That cap is not a limit any form needs, since the era's are a
+few hundred bytes: it bounds what a compromised renderer can push out of this
+machine in one request, which is the one direction the boundary could not
+otherwise measure, because a body — unlike a URL — has no length anything agrees
+on.
+
+**A `post`'s history entry is the URL alone**, so Back, Forward and Reload ask
+for it with a `get`. Re-sending a form because somebody pressed reload is how a
+comment gets posted twice and a payment taken twice, and a browser that does it
+quietly is worse than one that shows whatever the server says to a bare request.
+
+A `get` form's pairs *are* the query string, so an action that came with one of
+its own loses it — `action="/search?lang=en"` does not keep `lang`. That is
+HTML's rule and it is the one people are surprised by, so it has a test saying
+so rather than a comment.
+
+`multipart/form-data` is not here, and neither is `type="file"` — this engine
+does not draw a file picker and must not pretend to offer one. `text/plain`
+encoding is not here either: almost nothing reads it, and offering it would be
+another shape of "sent it wrong" for no page that needs it.
+
+What still cannot be done is **changing** the controls that are not text. A
+checkbox cannot be ticked or unticked and a dropdown cannot be opened, so they
+submit whatever the markup says they hold. A form with a box you need to untick
+cannot be filled in correctly, which is the honest shape of the remaining gap.
+
+**Text fields and `<textarea>`s can be typed into** (#110). Every form control
+has drawn correctly for a while and none of them did anything, which PLAN.md
+recorded as this milestone's chosen stopping point rather than an oversight —
+and which reads, on a page with a search box, as a browser that has hung.
+
+Click into a field or Tab to it and you get a caret and a focus ring, then
+characters, Backspace and Delete, arrows with word motion on Ctrl (or Alt,
+which is where macOS keeps it), Home and End *by line* rather than by field,
+selection with Shift, Ctrl+A, and Escape to let go. Tab walks the page's fields
+in document order and then its links; past the last field the child gives the
+focus up, which is what hands the key back to the window rather than trapping
+it in a form with no way out.
+
+**The editing lives in the renderer child**, with the document it belongs to.
+The window sends *named* keys — "delete a word", not a scancode and a modifier
+mask — so the untrusted side never interprets a keyboard and no platform's idea
+of a key crosses the line. What comes back is a fresh render and one bit saying
+whether the typing now belongs to the page. One bit and no more: the parent
+needs to know where the next keystroke goes and has no business knowing which
+field is focused or what is in it.
+
+What a reader has typed is kept **separately from the `value` attribute**,
+because in HTML they are separate things — the attribute is the field's default
+and the contents are a property of the control. Writing the attribute instead
+would mean a page styling `input[value=""]` changed how it looked the moment
+somebody typed, which is a rule about the markup being answered with a fact
+about the session. A password field still shows bullets and never its value,
+including after you have typed in it.
+
+Two bugs the tests found on the way, both older than this change:
+
+* **Nothing typed into a `<textarea>` ever appeared.** The arm of `label_of`
+  that reads a control's content sat above the arm that reads what was typed in
+  it and shadowed it completely. The failure looked exactly like the keystrokes
+  not arriving, which is how it survived a first round of manual testing.
+* **The caret landed one character short at the end of every field.** The walk
+  that finds which line an offset falls on subtracted a newline that was not
+  there when the offset was past the end, so the last position in a field
+  measured as the second-to-last.
+
+A form still cannot be ticked, pressed or submitted. Submission is deliberately
+last: it is the first thing this browser would send *up* to a server, which is a
+different kind of risk from everything else here.
+
+Checked with real keystrokes in `scripts/window-clicks.sh`, which is the only
+honest place for it. The path runs from winit's key event through the modifier
+state and the chrome's own fields, across the process boundary, into an editing
+state the child owns, and back as pixels; `cargo test` can drive the far half of
+that and nothing but a window can drive the near half.
+
+**The browser has an icon**: a beige-box computer with a lit screen, which is
+what it is for. It appears wherever a program appears outside its own window —
+a dock, a task bar, an alt-tab list — and until now this one appeared there as
+whatever blank rectangle the desktop uses for a program that never said.
+
+One master, `assets/icon.png`, and `cargo run -p icons` derives the rest: the
+256px copy the binary embeds for the window, the eight sizes the freedesktop
+hicolor theme asks for, a Windows `.ico` and a macOS `.icns`. Both containers
+are written by hand in that tool — each is a header and a list of PNGs — which
+costs two fewer dependencies and, more usefully, no platform tool: the macOS
+icon is produced on Linux by somebody who does not own a Mac.
+
+The containers are checked by parsing them back and confirming every directory
+offset and every payload's real dimensions, because a container written here is
+one that nothing here can open. The window icon is checked by opening a window
+under Xvfb and asking X whether `_NET_WM_ICON` arrived, and by a test that the
+embedded copy decodes at all — `window_icon` returns `None` on failure, since a
+browser should not refuse to open over a decoration, which means nothing at
+runtime would otherwise ever report it missing.
+
+The artwork is a rendered image rather than flat colour, so it does not
+compress the way a drawn one would: `packaging/` comes to 2.2 MB, carried in the
+repository and not in the program, which embeds only the 72 KB window copy.
+
+**An image that did not arrive leaves a box, not a hole** (#118). It says
+`Load image`, because that is what pressing it does. Until now a page whose
+pictures were all on a CDN rendered as a screenful of gaps with nothing to
+distinguish a refused image from a dead server — which is exactly the report
+that became #109: a browser working precisely as designed being
+indistinguishable from a broken one.
+
+Pressing it does one of two things, and only the parent can tell which is
+right. If the policy refused the picture, retrying would refuse it again, so
+the site panel opens instead with the host it wanted one press from being
+allowed — that is the question actually standing between the reader and the
+picture. If the image merely failed — a server that was down, a connection that
+dropped — the renderer child is dropped and the page rendered again, which is
+what makes the retry a retry: that child remembers the failure on purpose, so a
+broken image is not re-fetched on every resize.
+
+The box deliberately does not say "blocked". A refusal and a failure are the
+same shape on the wire (ADR-0012) so that a compromised renderer cannot use a
+page to probe what the user has allowed, and the placeholder is drawn on the
+renderer's side. The chrome, which does know, is where the reason lives.
+
+Sized by measurement rather than a threshold. A great deal of the era's markup
+is 1x1 spacers and 10px bullets holding a table layout open, and drawing
+anything in those would turn a page of invisible scaffolding into a page of
+smudges — which is the failure mode of every broken-image icon that ever
+shipped. So a box too small to outline gets nothing, one too small for the
+words gets the outline, and the words appear only where they measurably fit.
+The first version used a fixed minimum, got 80x30 wrong, and clipped the label
+at both ends in the size half the era's thumbnails are.
+
+Checked against a placeholder before the link under it: an `<img>` inside an
+`<a>` is the era's whole navigation, and a button whose press was swallowed by
+the link beneath it would be a button that does nothing. The link is still
+reachable from its caption and from the keyboard.
+
+Only where the page is rendered as authored. A document rendering has already
+thrown the author's layout away *because* it was not serving the reader, and it
+drops the gaps a missing picture leaves along with it (ADR-0009) — a reading
+view of an article is the one place a row of empty boxes is not an improvement
+on nothing.
+
+And only for `<img>`. An `<iframe>` is a replaced element too and has no image
+by nature, so the first version grew a `Load image` button on every empty frame
+on the page. The conformance suite caught it — fourteen tests of §10.4's
+replaced-element sizing, every one of them built out of `<iframe>` elements
+used as plain boxes and none of them about images at all.
+
+**A site can be allowed to load from a host** (#118). ADR-0006 refuses
+off-origin subresources by default and names the per-site override as the
+reason that default is allowed to be as absolute as it is. Until now there was
+no override, so the escape hatch the ADR leans on did not exist — a page whose
+images were on a CDN simply rendered without them, for ever, with nothing a
+reader could do about it.
+
+The padlock left of the URL opens the list. What this page asked for and did
+not get is at the top, each line one press from `allow`; what this site has
+already been allowed is under it, each line one press from `revoke`. Both
+directions in one place on purpose: an allow-list that only grows is one a
+reader stops being able to reason about, and "I let this through once to see
+the images" becomes permanent by accident.
+
+**An exception is a pair** — this site may load from that host — and not a bare
+host. The bare-host version is the obvious one and it is wrong: a reader who
+allows a font CDN because one site will not lay out without it has said
+something about that site, and putting the host in the browser's good books
+everywhere hands it to every other page on the web. That is a cross-site
+identifier reassembled by consent, which is the precise mechanism the rule
+exists to remove. An override that quietly rebuilds what the default removes is
+not an override. Local files share one key, because they are already one origin
+to this policy.
+
+Kept in `sites.tsv` beside the bookmarks, one pair per line, editable in
+anything. A permission list nobody can read is a permission list nobody audits.
+It is the second piece of state this browser keeps between runs and that cost
+is paid deliberately: a permission that did not survive the window closing
+would be granted again on every visit, and a prompt asked often enough stops
+being a decision and becomes a reflex.
+
+Granting one drops the renderer child rather than re-rendering in it. The child
+holding the page also holds what it fetched, refusals included — it remembers
+them as failures so a broken image is not retried on every resize — so the
+newly allowed host would never actually be asked for. The document itself is
+not fetched again.
+
+**The padlock reverses what ADR-0006 said**, and the ADR now records the change
+of mind rather than being left to contradict the code. The position was that
+the chrome marks only the exception, because decorating the secure case teaches
+people to look for a positive signal whose absence is easy to miss. That is
+still right about *words* and the words have not changed — HTTPS says nothing,
+and nothing anywhere says "secure". What changed is that the bar now has a
+control for what a site may load from, and a control needs somewhere to be: one
+that appeared only on pages with something to decide would be missing on
+exactly the page a reader goes looking for it on, the one whose images did not
+arrive. So the padlock is on every page, shut on HTTPS and open otherwise.
+
+Drawn from rectangles and an ellipse, not set as text: ADR-0008 bundles four
+Liberation families and none has U+1F512, so a padlock asked for as a glyph
+would draw as the hollow box the reload arrow once did. The insecure state is
+an open shackle rather than a struck-through lock, because the display list has
+no primitive that can draw a diagonal. A dot above its shoulder says this page
+has something in the panel worth opening.
+
+The padlock takes 26px from the URL's share of the bar, so on a narrow window
+`11 blocked from 3 sites` now elides to `11 blocked from 3 …`. That is the
+designed degradation — the count is front-loaded so what goes is the least of
+it — and the breakdown it loses is the first thing the padlock beside it opens.
+
+**The address of the link under the pointer**, in the bottom-left corner
+(#139). Every browser has had this since before it had tabs, and it is not
+decoration: a link's text says whatever its author wanted it to say, and only
+the address says where it goes. Without somewhere to read that, the only way to
+find out where a link leads is to follow it — which is a browser handing the
+question back.
+
+It matters more here than in a browser with JavaScript rather than less. This
+one refuses off-site subresources and says when a page is not encrypted, both
+of which are about *which host you are dealing with*, and the link about to be
+clicked was the one place that question went unanswered.
+
+Over the page rather than in a row of its own, because a strip of chrome that
+is empty almost all the time would cost every page a line of height. Capped at
+three quarters of the window and elided with the same marker the URL bar uses —
+a long address is not worth more than the page it would be lying across, and a
+reader cannot move a strip that follows their own pointer. It comes down when
+the pointer leaves the link, when it leaves the window, and it is recomputed
+rather than blanked when the page relayouts, so a window drag does not make it
+flicker.
+
+Checked by `scripts/window-clicks.sh` rather than by `cargo test`, which is the
+only honest place for it: the unit tests pin where the strip goes and what it
+says, and none of them can prove the event loop asks for one or that a redraw
+happens without a click to force it. A strip drawn into a buffer nobody
+presents is a passing test and an invisible feature.
+
+**The third-party rule says what it did** (#118). ADR-0006 has refused
+off-origin subresources since the first commit and has never once mentioned
+it, which is the half of the feature that was missing rather than a polish
+item: a page missing a third of its images because its CDN was refused looks
+exactly like a page whose CDN is having a bad afternoon. The bar now says how
+many subresources a page asked for and did not get, and from how many sites —
+`4 blocked from 2 sites`, beside the URL, where the *not encrypted* marker
+already lives and alongside it rather than instead of it.
+
+It is counted twice over, in two places that answer different questions. The
+process-wide counter is the other side of the pair the budget harness has
+always measured: "no third-party request left this process" and "no
+third-party request was ever made" read the same at zero, and only one of them
+is evidence, so the budget now asserts three issued-zero *and* three refused
+rather than a zero that a loader which had stopped resolving `src` attributes
+would also produce. The per-page record is what the chrome reads, and it counts
+distinct resources rather than requests — a page naming one tracking pixel in
+forty places is missing one thing, not forty.
+
+The record is assembled on the parent's side of the renderer boundary and never
+sent across it. A refusal and a failure are deliberately the same shape on the
+wire (ADR-0012): the child has no business knowing which it got, because
+telling it would hand a compromised renderer a way to probe what the user has
+allowed. So it is read from the session rather than carried on the rendered
+page, and it is rebuilt on every render rather than accumulated — a resize asks
+for the same subresources again, and a reader watching the number double while
+they widened a window would be right not to believe it.
+
+This is #118's first two parts. The third — a per-site exception, so the rule
+has the escape hatch ADR-0006 names as the reason it is allowed to be absolute
+— is still to come.
+
 ## 0.4.0
 
 A release about boxes this engine never generated. CSS 2.1 says several exist

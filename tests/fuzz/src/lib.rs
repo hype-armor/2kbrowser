@@ -851,7 +851,23 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                 group: 0,
                 jump_to: None,
             }],
+            missing: vec![sandbox::Missing {
+                rect: layout::Rect {
+                    x: 5.0,
+                    y: 6.0,
+                    width: 40.0,
+                    height: 30.0,
+                },
+                url: "https://cdn.example.net/photo.jpg".to_owned(),
+            }],
+            buttons: Vec::new(),
+            submit: Some(sandbox::Submission {
+                action: "/search".to_owned(),
+                post: true,
+                body: "q=tables".to_owned(),
+            }),
             can_toggle_layout: true,
+            editing: false,
             images_loaded: 2,
             background: 0x0011_2233,
             top: 0,

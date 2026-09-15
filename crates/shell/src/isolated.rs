@@ -10,7 +10,7 @@
 //! produced without one.
 
 use sandbox::child::{Fetched, Render};
-use sandbox::message::{Link, Mode, Rendered};
+use sandbox::message::{Link, Missing, Mode, Rendered};
 use sandbox::{Error, ToChild};
 use text::FontStore;
 
@@ -82,6 +82,29 @@ pub struct PageRenderer {
     /// The zoom this page was rendered at, so a band matches the page it is
     /// part of. Remembered for the same reason as the overrides.
     zoom: f32,
+    /// The render request this page came from (#110).
+    ///
+    /// Typing changes the layout, so it needs a whole render rather than a
+    /// repaint — and a render needs everything the parent said the first time.
+    /// Kept here rather than asked for again, because a keystroke that had to
+    /// go back to the parent for the document's bytes would be a keystroke that
+    /// crossed the boundary twice.
+    last: Option<ToChild>,
+    /// What has been typed into this page's controls, by node.
+    ///
+    /// The document is re-parsed on every render and these are re-applied to
+    /// it. Node ids survive that because parsing the same bytes builds the same
+    /// arena in the same order — and the bytes are the same bytes, since they
+    /// are the ones in `last`.
+    values: Vec<(dom::NodeId, String)>,
+    /// The control being typed in, and its editing state.
+    focus: Option<(dom::NodeId, crate::field::Field)>,
+    /// A form the reader asked to send, waiting for the next render to carry
+    /// it out (#110).
+    ///
+    /// Taken rather than held: one press sends one form, and a submission left
+    /// lying here would be re-sent by the next resize.
+    submit: Option<sandbox::message::Submission>,
 }
 
 impl Default for PageRenderer {
@@ -99,6 +122,10 @@ impl PageRenderer {
             force_authored: false,
             zoom: 1.0,
             force_document: false,
+            last: None,
+            values: Vec::new(),
+            focus: None,
+            submit: None,
         }
     }
 
@@ -156,6 +183,19 @@ fn links_of(page: &crate::render::Page) -> Vec<Link> {
         .collect()
 }
 
+/// Every placeholder on the page, for a parent that has to route a click to
+/// one (#118).
+///
+/// The same shape as [`links_of`] and for the same reason: the parent has no
+/// box tree, so a rectangle missing from this list is a placeholder that does
+/// nothing when pressed.
+fn missing_of(page: &crate::render::Page) -> Vec<Missing> {
+    page.missing_images()
+        .into_iter()
+        .map(|(rect, url)| Missing { rect, url })
+        .collect()
+}
+
 /// A canvas colour packed for the wire, as `0x00RRGGBB`.
 ///
 /// The alpha is dropped rather than carried: the display list's canvas colour
@@ -165,12 +205,195 @@ fn packed(colour: css::Color) -> u32 {
     (u32::from(colour.r) << 16) | (u32::from(colour.g) << 8) | u32::from(colour.b)
 }
 
+impl PageRenderer {
+    /// Focuses whatever text control sits at `at`, or nothing (#110).
+    ///
+    /// Answered here because the box tree is the only thing that knows where a
+    /// control is, and it never crosses the boundary. A press on nothing gives
+    /// up the focus, which is what pressing the margin of a page means
+    /// everywhere.
+    fn focus_at(&mut self, at: (f32, f32)) {
+        // A button first: it is a press rather than a place to type, and a
+        // button that sat inside a field's rectangle would otherwise be
+        // unreachable (#110).
+        if let Some(button) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.button_at(at.0, at.1))
+        {
+            self.set_focus(None);
+            self.ask_to_send(button);
+            return;
+        }
+        let found = self
+            .page
+            .as_ref()
+            .and_then(|page| page.control_at(at.0, at.1));
+        self.set_focus(found);
+    }
+
+    /// Collects the form `node` is in, for the parent to send.
+    ///
+    /// Nothing happens here beyond the collecting. Where it goes and whether it
+    /// goes at all is the parent's decision, because a stranger's page must not
+    /// be able to make this process talk to a server of its choosing — only to
+    /// ask (ADR-0012).
+    fn ask_to_send(&mut self, node: dom::NodeId) {
+        // What has been typed has to be in the document before the form is
+        // read out of it, and it is only written there by a render.
+        self.flush_focus();
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        let Some(collected) = page.submission_from(node) else {
+            return;
+        };
+        self.submit = Some(sandbox::message::Submission {
+            action: collected.action,
+            post: collected.method == layout::forms::Method::Post,
+            body: collected.body,
+        });
+    }
+
+    /// Moves the focus to a control, starting its editing state from what the
+    /// control currently holds.
+    fn set_focus(&mut self, node: Option<dom::NodeId>) {
+        self.flush_focus();
+        self.focus = node.map(|node| {
+            let value = self
+                .page
+                .as_ref()
+                .map(|page| page.control_value(node))
+                .unwrap_or_default();
+            (node, crate::field::Field::with_cursor_at_end(value))
+        });
+    }
+
+    /// Writes what is being edited back into the values the next render reads.
+    fn flush_focus(&mut self) {
+        let Some((node, field)) = &self.focus else {
+            return;
+        };
+        let (node, text) = (*node, field.text().to_owned());
+        match self.values.iter_mut().find(|(at, _)| *at == node) {
+            Some(entry) => entry.1 = text,
+            None => self.values.push((node, text)),
+        }
+    }
+
+    /// Moves to the next text control in document order, or the previous one.
+    ///
+    /// Past the end it gives up the focus rather than wrapping. Wrapping is
+    /// what a browser does inside a *form*, and this engine has no form
+    /// submission to make that boundary mean anything yet — so falling out is
+    /// the honest behaviour, and it hands Tab back to the window, which walks
+    /// the page's links with it.
+    fn step_focus(&mut self, back: bool) {
+        let controls: Vec<dom::NodeId> = self
+            .page
+            .as_ref()
+            .map(|page| {
+                page.text_controls()
+                    .into_iter()
+                    .map(|(node, _)| node)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let at = self
+            .focus
+            .as_ref()
+            .and_then(|(node, _)| controls.iter().position(|it| it == node));
+        let next = match (at, back) {
+            (Some(at), false) => controls.get(at + 1).copied(),
+            (Some(at), true) => at.checked_sub(1).and_then(|at| controls.get(at).copied()),
+            (None, false) => controls.first().copied(),
+            (None, true) => controls.last().copied(),
+        };
+        self.set_focus(next);
+    }
+
+    /// Applies one keystroke to whatever is focused.
+    fn apply(&mut self, key: &sandbox::message::Key) {
+        use sandbox::message::Key;
+        match key {
+            Key::Tab { back } => return self.step_focus(*back),
+            Key::Escape => return self.set_focus(None),
+            _ => {}
+        }
+        let multiline = self
+            .focus
+            .as_ref()
+            .zip(self.page.as_ref())
+            .is_some_and(|((node, _), page)| page.is_multiline(*node));
+        let mut submitting = false;
+        let Some((node, field)) = &mut self.focus else {
+            return;
+        };
+        let node = *node;
+        match key {
+            // A newline belongs in a `<textarea>` and nowhere else. The parent
+            // sends the character and this decides, because the parent has no
+            // idea what kind of control it is typing into and should not have
+            // to. In a one-line field Enter means *send the form*, which is
+            // how every search box on the era's web is used — and a literal
+            // newline in one would be a field holding something no browser
+            // would ever put there.
+            Key::Insert(text) if text.contains('\n') && !multiline => {
+                let without: String = text.chars().filter(|c| *c != '\n').collect();
+                if !without.is_empty() {
+                    field.insert(&without);
+                }
+                submitting = true;
+            }
+            Key::Insert(text) => field.insert(text),
+            Key::Backspace => field.backspace(),
+            Key::Delete => field.delete(),
+            Key::Left { extend, word } if *word => field.word_left(*extend),
+            Key::Left { extend, .. } => field.left(*extend),
+            Key::Right { extend, word } if *word => field.word_right(*extend),
+            Key::Right { extend, .. } => field.right(*extend),
+            Key::Home { extend } => field.home(*extend),
+            Key::End { extend } => field.end(*extend),
+            Key::SelectAll => field.select_all(),
+            Key::Tab { .. } | Key::Escape => {}
+        }
+        self.flush_focus();
+        if submitting {
+            // Nothing was pressed, so no button is a successful control. That
+            // is HTML's own rule and it is the difference between a search box
+            // and a form with two buttons meaning opposite things.
+            self.ask_to_send(node);
+        }
+    }
+}
+
 impl Render for PageRenderer {
     fn render(
         &mut self,
         request: &ToChild,
         fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
     ) -> Result<Rendered, String> {
+        // Typing and focusing are re-renders of the page already held, so they
+        // borrow the request it came from. Kept here rather than asked for
+        // again: a keystroke that had to go back over the pipe for the
+        // document's bytes would cross the boundary twice to move a cursor.
+        let held;
+        let request = match request {
+            ToChild::Focus { at } => {
+                self.focus_at(*at);
+                held = self.last.clone();
+                held.as_ref().ok_or("nothing has been rendered yet")?
+            }
+            ToChild::Type { key } => {
+                self.apply(key);
+                held = self.last.clone();
+                held.as_ref().ok_or("nothing has been rendered yet")?
+            }
+            other => {
+                self.last = Some(other.clone());
+                other
+            }
+        };
         let ToChild::Render {
             body,
             content_type,
@@ -210,6 +433,11 @@ impl Render for PageRenderer {
                 force_authored: *force_authored,
                 force_document: *force_document,
                 zoom: *zoom,
+                values: self.values.clone(),
+                focus: self
+                    .focus
+                    .as_ref()
+                    .map(|(node, field)| (*node, field.cursor())),
             },
             &mut self.fonts,
             &mut loader,
@@ -228,7 +456,11 @@ impl Render for PageRenderer {
             mode: mode_of(&page),
             title: page.title.clone(),
             links: links_of(&page),
+            missing: missing_of(&page),
+            buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            submit: self.submit.take(),
             can_toggle_layout: self.can_toggle_layout(&page),
+            editing: self.focus.is_some(),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
         };
@@ -239,6 +471,19 @@ impl Render for PageRenderer {
     }
 
     fn band(&mut self, top: u32, height: u32) -> Result<Rendered, String> {
+        // Remembered so that a keystroke re-renders the rows the reader is
+        // looking at (#110). Typing is a re-render of the whole page, built
+        // from the request the page came from — and that request names the band
+        // the page *opened* at. Without this, clicking into a field halfway
+        // down a long page would answer by painting the top of it.
+        if let Some(ToChild::Render {
+            top: at,
+            height: rows,
+            ..
+        }) = &mut self.last
+        {
+            (*at, *rows) = (top, height);
+        }
         let Some(page) = &self.page else {
             return Err("no page to paint a band of".to_owned());
         };
@@ -260,7 +505,13 @@ impl Render for PageRenderer {
             mode: mode_of(page),
             title: page.title.clone(),
             links: links_of(page),
+            missing: missing_of(page),
+            buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            // A band is a repaint of rows already laid out, and repainting is
+            // not a thing anybody asked a form to be sent by.
+            submit: None,
             can_toggle_layout: self.can_toggle_layout(page),
+            editing: self.focus.is_some(),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
         })

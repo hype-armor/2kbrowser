@@ -9,7 +9,8 @@ pub mod policy;
 pub mod tls;
 
 pub use policy::{
-    Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path, parse_url, resolve,
+    Exception, LOCAL_SITE, Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path,
+    parse_url, resolve,
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +28,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// images whether the policy works or not, so success counts prove nothing.
 static THIRD_PARTY_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Count of third-party subresource requests the policy refused.
+///
+/// The other side of the pair. On its own, `THIRD_PARTY_REQUESTS` reads the
+/// same at zero whether the policy is working or the page asked for nothing:
+/// "no third-party request left this process" and "no third-party request was
+/// ever made" are different facts, and only one of them is evidence. Counting
+/// refusals separates them, and it is what lets the chrome say how much of a
+/// page was withheld rather than only that none of it escaped (issue #118).
+///
+/// Only [`Refusal::ThirdParty`] is counted. A malformed URL and an unsupported
+/// scheme are the page being wrong about itself rather than the policy holding
+/// a line, and folding them in here would inflate the number the reader is
+/// being shown with things nobody could allow even if they wanted to.
+static THIRD_PARTY_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
 /// How many third-party subresource requests have been issued this process.
 pub fn third_party_request_count() -> usize {
     THIRD_PARTY_REQUESTS.load(Ordering::Relaxed)
@@ -35,6 +51,30 @@ pub fn third_party_request_count() -> usize {
 /// Resets the count. For tests and the budget harness.
 pub fn reset_third_party_request_count() {
     THIRD_PARTY_REQUESTS.store(0, Ordering::Relaxed);
+}
+
+/// How many third-party subresource requests have been refused this process.
+pub fn third_party_refusal_count() -> usize {
+    THIRD_PARTY_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Resets the count. For tests and the budget harness.
+pub fn reset_third_party_refusal_count() {
+    THIRD_PARTY_REFUSALS.store(0, Ordering::Relaxed);
+}
+
+/// Records a refusal, if it was the third-party rule that did it.
+///
+/// Public because the fetch this crate would have counted does not always
+/// happen here: the sandbox parent checks a whole batch of URLs against the
+/// policy before it fetches any of them, so a refused subresource is dropped
+/// one layer up and never reaches [`Fetcher::fetch_raw`]. That path has to
+/// count for itself, and the two never see the same URL — anything refused in
+/// the batch pre-pass is excluded from what is fetched.
+pub fn count_refusal(refusal: &Refusal) {
+    if matches!(refusal, Refusal::ThirdParty { .. }) {
+        THIRD_PARTY_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Records a request that the policy let through, if it left the origin.
@@ -115,6 +155,15 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
+/// Largest form body this browser will send.
+///
+/// Not a limit any form needs: the era's are a few hundred bytes and a long
+/// comment is a few thousand. It is a bound on what a *compromised renderer*
+/// can push out of this machine in one request — the one direction the
+/// boundary could not otherwise measure, since a body, unlike a URL, has no
+/// length anything agrees on.
+pub const MAX_FORM_BYTES: u64 = 1024 * 1024;
+
 /// Largest response we will read into memory.
 ///
 /// A browser must not let a hostile server exhaust its memory, and 32 MiB is
@@ -188,9 +237,10 @@ impl Fetcher {
         kind: RequestKind,
     ) -> Result<Resource, FetchError> {
         let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        self.policy
-            .check(document, &origin, kind)
-            .map_err(FetchError::Refused)?;
+        if let Err(refusal) = self.policy.check(document, &origin, kind) {
+            count_refusal(&refusal);
+            return Err(FetchError::Refused(refusal));
+        }
 
         count_if_third_party(document, &origin, kind);
 
@@ -215,6 +265,49 @@ impl Fetcher {
         })
     }
 
+    /// Sends a form and fetches what comes back (#110).
+    ///
+    /// The one request this browser makes that carries data *up*. Everything
+    /// else here asks a server for something; this hands it something, which is
+    /// a different kind of act and is why it is a separate method rather than a
+    /// flag on `fetch_raw`: a caller has to mean it.
+    ///
+    /// Three rules, all enforced here rather than by whoever calls:
+    ///
+    /// * **Network schemes only.** There is nothing to post to a `file:` URL,
+    ///   and a page that asked to would be asking to write to the disk.
+    /// * **Bounded.** A body is not a URL and has no length anyone has ever
+    ///   agreed on, so [`MAX_FORM_BYTES`] is what leaves this machine at most.
+    ///   The cap is about what a *compromised renderer* can push, not about
+    ///   what a form needs — the era's forms are a few hundred bytes.
+    /// * **Navigation, so the third-party rule does not apply.** Posting to
+    ///   another host is what a form to another host means, and refusing it
+    ///   would break the sign-in on half the surviving web. ADR-0006 is about
+    ///   what a page loads *without being asked*, and this was asked for.
+    pub fn post(&self, url: &str, body: &str) -> Result<Fetched, FetchError> {
+        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
+        if origin.scheme == Scheme::File {
+            return Err(FetchError::Refused(Refusal::UnsupportedScheme {
+                scheme: "file".to_owned(),
+            }));
+        }
+        if body.len() as u64 > MAX_FORM_BYTES {
+            return Err(FetchError::TooLarge);
+        }
+        self.policy
+            .check(None, &origin, RequestKind::Navigation)
+            .map_err(FetchError::Refused)?;
+
+        let (bytes, content_type, trust) = post_http(url, body)?;
+        Ok(Fetched {
+            body: bytes,
+            content_type,
+            origin,
+            path,
+            trust,
+        })
+    }
+
     /// Fetches a URL without decoding it, keeping the `Content-Type`.
     ///
     /// What a navigation uses now that decoding happens in the renderer child
@@ -227,9 +320,10 @@ impl Fetcher {
         kind: RequestKind,
     ) -> Result<Fetched, FetchError> {
         let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        self.policy
-            .check(document, &origin, kind)
-            .map_err(FetchError::Refused)?;
+        if let Err(refusal) = self.policy.check(document, &origin, kind) {
+            count_refusal(&refusal);
+            return Err(FetchError::Refused(refusal));
+        }
         count_if_third_party(document, &origin, kind);
 
         let (body, content_type, trust) = match origin.scheme {
@@ -301,6 +395,46 @@ fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError>
             Ok((bytes, content_type, Trust::LocalRoot))
         }
     }
+}
+
+/// One form, through the same two-agent dance `fetch_http` does.
+fn post_http(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
+    match send(tls::agent(), url, body) {
+        Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
+        Err(error) => {
+            if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
+                return Err(into_fetch_error(error));
+            }
+            let (bytes, content_type) =
+                send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
+            Ok((bytes, content_type, Trust::LocalRoot))
+        }
+    }
+}
+
+/// One form sent through a given agent.
+fn send(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &str,
+) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
+    let response = agent
+        .post(url)
+        .content_type("application/x-www-form-urlencoded")
+        .send(body)?;
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let bytes = response
+        .into_body()
+        .with_config()
+        .limit(MAX_BODY_BYTES)
+        .read_to_vec()?;
+    Ok((bytes, content_type))
 }
 
 /// One request through a given agent.
@@ -378,6 +512,12 @@ mod tests {
         // a blocked request should never touch the network at all.
         let fetcher = Fetcher::default();
         let document = parse_url("https://example.com/").expect("parses").0;
+        // A delta rather than a reset: the counter is process-wide and the test
+        // binary is not. This is the only test here that refuses a third party,
+        // so nothing else can move it underneath us — but resetting it would
+        // stamp on whatever else was counting, which is a different bug and a
+        // much harder one to see.
+        let before = third_party_refusal_count();
         let result = fetcher.fetch(
             "https://tracker.invalid/pixel.gif",
             Some(&document),
@@ -389,6 +529,11 @@ mod tests {
             }
             other => panic!("expected a policy refusal, got {other:?}"),
         }
+        assert_eq!(
+            third_party_refusal_count(),
+            before + 1,
+            "the refusal was not counted, so the chrome has nothing to report (#118)"
+        );
     }
 
     #[test]

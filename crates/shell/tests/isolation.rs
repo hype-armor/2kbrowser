@@ -424,6 +424,46 @@ fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
 }
 
 #[test]
+fn a_page_knows_how_much_of_it_the_policy_refused() {
+    // Issue #118. ADR-0006's rule has worked since the first commit and never
+    // said so, which leaves a page missing a third of its images looking
+    // exactly like a page whose CDN is having a bad afternoon. No network is
+    // touched: every one of these is refused before a socket is opened.
+    let mut page = viewport(
+        "<body>\
+         <img src=\"https://cdn.example.net/a.png\">\
+         <img src=\"https://cdn.example.net/b.png\">\
+         <img src=\"https://cdn.example.net/a.png\">\
+         <img src=\"https://ads.example.org/pixel.gif\">\
+         </body>",
+        300,
+    );
+
+    let withheld = page.withheld();
+    assert_eq!(
+        withheld.subresources(),
+        3,
+        "three distinct files, one of them asked for twice"
+    );
+    assert_eq!(
+        withheld.hosts(),
+        ["cdn.example.net", "ads.example.org"],
+        "the hosts a per-site exception would be granted against"
+    );
+
+    // A resize is the same page, so it must not double the number the reader is
+    // shown. The child asks again for everything it needs on every render, and
+    // the refused ones are refused again — so the record is rebuilt rather than
+    // added to.
+    page.resize(700, 2000).expect("re-renders");
+    assert_eq!(
+        page.withheld().subresources(),
+        3,
+        "re-rendering the same page counted its refusals a second time"
+    );
+}
+
+#[test]
 fn resizing_re_lays_out_without_a_new_page() {
     let mut page = viewport(
         "<body><p>a paragraph long enough that how many lines it needs depends \
@@ -1668,4 +1708,561 @@ fn the_pages_canvas_colour_crosses_the_boundary_with_it() {
     let (r, g, b) = unpack(page.background());
     let brightness = (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0;
     assert!(brightness < 0.2, "the fallback canvas is {r},{g},{b}");
+}
+
+/// Opens a page served from `port` under `host`, with `policy`, in a real
+/// child.
+///
+/// Two names for one loopback address is what makes a third-party request
+/// testable without a network: `localhost` and `127.0.0.1` are different hosts
+/// to the policy — which is all it looks at — and the same server to the
+/// socket.
+fn over_http_as(
+    host: &str,
+    port: u16,
+    html: &str,
+    policy: net::Policy,
+) -> shell::viewport::Viewport {
+    let (origin, at) = net::parse_url(&format!("http://{host}:{port}/p.html")).expect("parses");
+    let mut renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    *renderer.policy_mut() = policy;
+    shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            origin,
+            path: at,
+        },
+        200,
+        200,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens")
+}
+
+#[test]
+fn a_site_exception_is_what_lets_a_refused_subresource_through() {
+    // #118's third part, end to end through a real renderer child and a real
+    // socket. ADR-0006 names the per-site override as the reason the rule is
+    // allowed to be as absolute as it is, and until now there was nothing that
+    // could grant one — so the escape hatch the ADR leans on did not exist.
+    let (port, served) = serve_each(vec![("/dot.png", solid_png(8, 8, (0, 0xff, 0)))]);
+    let html = format!("<html><body><img src=\"http://127.0.0.1:{port}/dot.png\"></body></html>");
+
+    let refused = over_http_as("localhost", port, &html, net::Policy::default());
+    assert_eq!(
+        refused.images_loaded(),
+        0,
+        "the default let a third-party image through"
+    );
+    assert_eq!(
+        refused.withheld().hosts(),
+        ["127.0.0.1"],
+        "the host an exception would be granted against"
+    );
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused request reached the network, which the policy exists to prevent"
+    );
+
+    let mut policy = net::Policy::default();
+    policy.allow("localhost", "127.0.0.1");
+    let allowed = over_http_as("localhost", port, &html, policy);
+    if served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        eprintln!("SKIP: the image request never reached the test server");
+        return;
+    }
+    assert_eq!(
+        allowed.images_loaded(),
+        1,
+        "the exception was granted and the image still did not load"
+    );
+    assert!(
+        allowed.withheld().is_empty(),
+        "an allowed host is not withheld: {:?}",
+        allowed.withheld().hosts()
+    );
+
+    // And it is the *site* that was allowed, not the host. The same page under
+    // a different name gets nothing, which is the whole reason an exception is
+    // a pair.
+    let mut policy = net::Policy::default();
+    policy.allow("elsewhere.example", "127.0.0.1");
+    let elsewhere = over_http_as("localhost", port, &html, policy);
+    assert_eq!(
+        elsewhere.images_loaded(),
+        0,
+        "one site's exception was honoured on another"
+    );
+}
+
+#[test]
+fn a_refused_image_leaves_a_box_the_reader_can_press() {
+    // #118's placeholder, end to end. A page whose pictures are all on a CDN
+    // used to render a screenful of holes with no way to tell a refused image
+    // from a dead server — which is the report that became #109, a browser
+    // working exactly as designed being indistinguishable from a broken one.
+    let page = viewport(
+        "<body><img src=\"https://cdn.example.net/photo.jpg\" width=\"240\" \
+         height=\"160\"></body>",
+        400,
+    );
+    let missing = page.withheld();
+    assert_eq!(
+        missing.subresources(),
+        1,
+        "nothing was refused to begin with"
+    );
+
+    // The rectangle crosses the boundary, so the window has something to
+    // hit-test against — it has no box tree of its own.
+    let inside = page.missing_at(20.0, 20.0);
+    assert_eq!(
+        inside,
+        Some("https://cdn.example.net/photo.jpg"),
+        "the placeholder does not answer a press at the top-left of the image"
+    );
+    assert_eq!(
+        page.missing_at(1000.0, 1000.0),
+        None,
+        "a point nowhere near it answered anyway"
+    );
+}
+
+#[test]
+fn an_image_that_loaded_leaves_no_placeholder() {
+    // The other half, and the one that would rot silently: a browser that drew
+    // `Load image` over a picture it had successfully loaded would be worse
+    // than one that drew nothing at all.
+    let dir = std::env::temp_dir().join("2kbrowser-placeholder");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("dot.png"), solid_png(40, 40, (0, 0x80, 0))).expect("write");
+    let path = dir.join("page.html");
+    let html = "<body><img src=\"dot.png\"></body>";
+    std::fs::write(&path, html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        400,
+        400,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens");
+
+    assert_eq!(page.images_loaded(), 1, "the image was never fetched");
+    assert_eq!(
+        page.missing_at(20.0, 20.0),
+        None,
+        "an image that loaded was given a placeholder anyway"
+    );
+}
+
+/// A cheap digest of a page's pixels.
+///
+/// Compared instead of the buffers themselves because a failed comparison of
+/// two megabyte slices prints two megabytes, which is not a test report.
+fn look(page: &shell::viewport::Viewport) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in page.pixels() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A page with two text fields and a textarea, at a known place.
+fn form_page(width: u32) -> shell::viewport::Viewport {
+    viewport(
+        "<body style=\"margin: 0\">\
+         <div><input type=\"text\" value=\"Ada\"></div>\
+         <div><input type=\"text\" value=\"\"></div>\
+         <div><textarea rows=\"3\" cols=\"20\">note</textarea></div>\
+         </body>",
+        width,
+    )
+}
+
+#[test]
+fn a_text_field_can_be_focused_and_typed_into() {
+    // #110, end to end through a real renderer child. The whole path is here:
+    // the parent knows where the pointer was and nothing else, the child works
+    // out what is there, and the only thing that comes back is pixels and one
+    // bit saying whether the typing now belongs to the page.
+    let mut page = form_page(400);
+    assert!(
+        !page.editing(),
+        "a page nobody has pressed is not being edited"
+    );
+
+    let before = look(&page);
+    assert!(
+        page.focus_at(20.0, 10.0),
+        "pressing the first field focused nothing"
+    );
+    assert!(page.editing());
+    assert_ne!(
+        look(&page),
+        before,
+        "focusing drew no ring and no caret, so nothing says where the typing goes"
+    );
+
+    // Typing appends rather than replacing: clicking into a field that already
+    // has something in it and losing it on the first keystroke is the one way
+    // this could be worse than not working at all.
+    let focused = look(&page);
+    page.type_key(sandbox::message::Key::Insert("m".to_owned()));
+    assert_ne!(
+        look(&page),
+        focused,
+        "a character was typed and the page did not change"
+    );
+}
+
+#[test]
+fn pressing_away_from_a_control_gives_up_the_typing() {
+    let mut page = form_page(400);
+    assert!(page.focus_at(20.0, 10.0));
+    // Far below the last control, which is page and not a field.
+    assert!(
+        !page.focus_at(380.0, 2.0),
+        "a press to the right of a 200px field focused something"
+    );
+    assert!(!page.editing(), "the focus survived a press on nothing");
+}
+
+#[test]
+fn tab_walks_the_controls_and_then_lets_go() {
+    // The half of #110 the report actually named: "can't add text or tab to
+    // them". Tab from nothing reaches the first control, steps through the
+    // rest, and past the last gives the focus up — which is what hands the key
+    // back to the window, whose own Tab walks the page's links.
+    let mut page = form_page(400);
+    let tab = || sandbox::message::Key::Tab { back: false };
+
+    page.type_key(tab());
+    assert!(page.editing(), "Tab on a fresh page focused nothing");
+
+    let first = look(&page);
+    page.type_key(tab());
+    assert!(page.editing(), "Tab left the second control unfocused");
+    assert_ne!(
+        look(&page),
+        first,
+        "Tab drew the ring in the same place twice"
+    );
+
+    page.type_key(tab());
+    assert!(page.editing(), "Tab left the textarea unfocused");
+    page.type_key(tab());
+    assert!(
+        !page.editing(),
+        "Tab past the last control kept the focus, so the key never reaches \
+         the window and the page's links become unreachable"
+    );
+}
+
+#[test]
+fn escape_gives_up_the_typing() {
+    let mut page = form_page(400);
+    assert!(page.focus_at(20.0, 10.0));
+    page.type_key(sandbox::message::Key::Escape);
+    assert!(!page.editing());
+}
+
+#[test]
+fn a_newline_reaches_a_textarea_and_stops_at_a_one_line_field() {
+    // The parent sends the character and the child decides, because the parent
+    // has no idea what kind of control it is typing into and should not have
+    // to. Enter in a one-line field means submit, which this browser does not
+    // do — and a literal newline in one would be something no browser would
+    // ever put there.
+    let mut page = form_page(400);
+    assert!(page.focus_at(20.0, 10.0), "the one-line field");
+    let before = look(&page);
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    assert_eq!(look(&page), before, "a newline went into a one-line field");
+
+    // The textarea is the third control, so three tabs from nothing. A newline
+    // and then a character, because a newline at the end of the text moves
+    // nothing that is already drawn — the proof it went in is what comes after
+    // it landing on a new row.
+    let mut page = form_page(400);
+    for _ in 0..3 {
+        page.type_key(sandbox::message::Key::Tab { back: false });
+    }
+    page.type_key(sandbox::message::Key::Insert("x".to_owned()));
+    let one_line = look(&page);
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    page.type_key(sandbox::message::Key::Insert("x".to_owned()));
+    assert_ne!(
+        look(&page),
+        one_line,
+        "a newline did not reach the textarea"
+    );
+}
+
+#[test]
+fn typing_repaints_the_rows_the_reader_is_looking_at() {
+    // Typing is a re-render of the whole page, and a render is built from the
+    // request the page came from — which names the band the page *opened* at.
+    // Without carrying the band forward, clicking into a field halfway down a
+    // long page answers by painting the top of it, and the reader's place in
+    // the document is gone (#110).
+    let filler = "<p>a line of text to push the field down the page</p>".repeat(60);
+    let mut page = viewport(
+        &format!(
+            "<body style=\"margin: 0\">{filler}<div><input type=\"text\" value=\"\"></div></body>"
+        ),
+        400,
+    );
+    assert_eq!(page.band_top(), 0);
+
+    // Down the page, the way scrolling does it.
+    page.request_band(800, 400).expect("asks for a band");
+    while !page.accept_band() {
+        std::thread::yield_now();
+    }
+    assert_eq!(page.band_top(), 800, "the band never arrived");
+
+    // Tab into the field, which is a full re-render on the far side.
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    assert!(page.editing(), "Tab focused nothing");
+    assert_eq!(
+        page.band_top(),
+        800,
+        "typing sent the reader back to the top of the page"
+    );
+}
+
+/// A server that records what it was asked for and answers with a page.
+///
+/// Records the request line and the body, which is the whole point: a form is
+/// only sent correctly if what *arrived* is right, and nothing on this side of
+/// the socket can tell you that.
+fn serve_recording() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let recorded = Arc::clone(&recorded);
+            std::thread::spawn(move || {
+                // Read until the headers are complete, then read exactly the
+                // body they declare. One `read` is not enough and the failure
+                // is a race: a client is free to write the headers and the body
+                // separately, and whether they arrive together depends on the
+                // kernel. It passed here and failed on two of CI's three
+                // platforms, which is the signature of every such assumption.
+                let mut request = Vec::new();
+                let headers_end = loop {
+                    if let Some(at) = request.windows(4).position(|four| four == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    let mut chunk = [0u8; 2048];
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break request.len(),
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..headers_end]).into_owned();
+                let wanted: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                while request.len() < headers_end + wanted {
+                    let mut chunk = [0u8; 2048];
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let line = head.lines().next().unwrap_or_default().to_owned();
+                let body = String::from_utf8_lossy(&request[headers_end..]).into_owned();
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(format!("{line}|{body}"));
+                let page = b"<title>Answered</title><body><p>thanks</p></body>";
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    page.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(page);
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn a_post_form_arrives_as_a_post_with_its_pairs_in_the_body() {
+    // The whole path, through a real socket: the child collects the form, the
+    // parent resolves the action and sends it, and what the server sees is what
+    // the reader typed. Nothing short of this proves the encoding is right —
+    // the two sides could agree with each other and both be wrong.
+    let (port, seen) = serve_recording();
+    let fetcher = net::Fetcher::default();
+    let url = format!("http://127.0.0.1:{port}/submit");
+    let answer = fetcher.post(&url, "q=hello+world&n=2").expect("posts");
+    assert!(
+        String::from_utf8_lossy(&answer.body).contains("thanks"),
+        "the answer did not come back"
+    );
+
+    let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (line, body) = seen[0].split_once('|').expect("a record");
+    assert_eq!(line, "POST /submit HTTP/1.1");
+    assert_eq!(body, "q=hello+world&n=2");
+}
+
+#[test]
+fn a_form_is_never_posted_to_a_local_file() {
+    // There is nothing to post to a `file:` URL, and a page that asked to would
+    // be asking to write to the disk.
+    let dir = std::env::temp_dir().join("2kbrowser-post");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("page.html");
+    std::fs::write(&path, "<p>x</p>").expect("write");
+    let outcome = net::Fetcher::default().post(&net::file_url(&path), "q=1");
+    assert!(
+        matches!(
+            outcome,
+            Err(net::FetchError::Refused(
+                net::Refusal::UnsupportedScheme { .. }
+            ))
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_form_larger_than_the_cap_is_refused_before_a_socket_is_opened() {
+    // The bound is not about what a form needs — the era's are a few hundred
+    // bytes. It is about what a compromised renderer can push out of this
+    // machine in one request, which is the one direction the boundary could not
+    // otherwise measure.
+    let (port, seen) = serve_recording();
+    let url = format!("http://127.0.0.1:{port}/submit");
+    let huge = "x".repeat(net::MAX_FORM_BYTES as usize + 1);
+    let outcome = net::Fetcher::default().post(&url, &huge);
+    assert!(
+        matches!(outcome, Err(net::FetchError::TooLarge)),
+        "{outcome:?}"
+    );
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "an over-sized form reached the network before it was refused"
+    );
+}
+
+#[test]
+fn pressing_a_submit_button_asks_the_parent_to_send_the_form() {
+    // The child's half, through a real renderer child: a press on the button
+    // collects the form and hands it out. Where it goes is the parent's
+    // decision and is deliberately not made here.
+    let mut page = viewport(
+        "<body style=\"margin: 0\">\
+         <form action=\"/search\" method=\"get\">\
+         <input name=\"q\" value=\"tables\">\
+         <input type=\"submit\" name=\"go\" value=\"Search\">\
+         </form></body>",
+        400,
+    );
+    assert!(page.take_submission().is_none(), "nothing was pressed yet");
+
+    // The button sits after the field on the same line.
+    let button = page
+        .buttons()
+        .first()
+        .copied()
+        .expect("the fixture has a submit button");
+    let at = (
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    page.focus_at(at.0, at.1);
+
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(sent.action, "/search");
+    assert!(!sent.post);
+    assert_eq!(sent.body, "q=tables&go=Search");
+    assert!(
+        page.take_submission().is_none(),
+        "one press must send one form, not every press after it"
+    );
+}
+
+#[test]
+fn enter_in_a_one_line_field_sends_the_form_and_presses_no_button() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\">\
+         <form action=\"/search\">\
+         <input name=\"q\" value=\"\">\
+         <input type=\"submit\" name=\"go\" value=\"Search\">\
+         </form></body>",
+        400,
+    );
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    assert!(page.editing(), "Tab focused nothing");
+    for letter in ["c", "s", "s"] {
+        page.type_key(sandbox::message::Key::Insert(letter.to_owned()));
+    }
+    assert!(page.take_submission().is_none(), "typing is not sending");
+
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    let sent = page.take_submission().expect("Enter asked to send");
+    // What was typed, and no button: Enter presses nothing, which is the
+    // difference between a search box and a form with two buttons that mean
+    // opposite things.
+    assert_eq!(sent.body, "q=css");
+}
+
+#[test]
+fn enter_in_a_textarea_is_a_newline_rather_than_a_send() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\">\
+         <form action=\"/post\"><textarea name=\"body\" rows=\"3\" cols=\"20\">a</textarea></form>\
+         </body>",
+        400,
+    );
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    assert!(page.editing());
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    assert!(
+        page.take_submission().is_none(),
+        "Enter in a textarea sent the form instead of starting a line"
+    );
 }

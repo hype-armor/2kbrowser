@@ -40,6 +40,15 @@ fn main() {
     let mut fruitless = shell::field::Field::with_all_selected("");
     fruitless.insert("nothing here");
 
+    // What ADR-0006 refused a page, which until #118 the bar never mentioned.
+    let one_host = ["fonts.example.net".to_owned()];
+    let already = ["fonts.example.net".to_owned()];
+    let several_hosts = [
+        "fonts.example.net".to_owned(),
+        "ads.example.org".to_owned(),
+        "beacon.example.com".to_owned(),
+    ];
+
     let cases: Vec<chrome::State> = vec![
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -55,6 +64,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -70,6 +82,9 @@ fn main() {
             finding: None,
             saved: true,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         // A connection an intercepting proxy signed. Marked, because trusting
         // this computer's roots silently would make it look ordinary.
@@ -87,6 +102,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: true,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -102,6 +120,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -117,6 +138,9 @@ fn main() {
             finding: None,
             saved: true,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         // The other direction: an ordinary page the reader asked to simplify.
         // Not the absence of the state above — that one is a fallback being
@@ -136,6 +160,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -151,6 +178,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -166,6 +196,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -181,6 +214,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -196,6 +232,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -211,6 +250,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -226,6 +268,9 @@ fn main() {
             finding: Some((&searching, 2, 7)),
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::LIGHT,
@@ -241,6 +286,49 @@ fn main() {
             finding: Some((&fruitless, 0, 0)),
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
+        },
+        // What the policy refused, on its own and stacked with something else
+        // the bar already had to say. The second row is the case worth looking
+        // at: two facts of different kinds sharing one line, neither of which
+        // may be dropped to make room for the other.
+        chrome::State {
+            theme: chrome::Theme::LIGHT,
+            url: "https://example.com/a-page-with-a-font-cdn.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            forcing_document: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: None,
+            saved: false,
+            local_root: false,
+            withheld: 1,
+            withheld_hosts: &one_host,
+            allowed_hosts: &already,
+        },
+        chrome::State {
+            theme: chrome::Theme::LIGHT,
+            url: "http://example.org/an-old-page-with-trackers.html",
+            mode: &authored,
+            error: None,
+            can_go_back: true,
+            can_go_forward: false,
+            forcing_authored: false,
+            forcing_document: false,
+            can_toggle_layout: false,
+            editing: None,
+            finding: None,
+            saved: false,
+            local_root: false,
+            withheld: 11,
+            withheld_hosts: &several_hosts,
+            allowed_hosts: &[],
         },
         // The dark scheme, which until now this sheet did not draw at all — so
         // "every state the bar can be in" was every state of one of the two
@@ -266,6 +354,9 @@ fn main() {
             finding: None,
             saved: false,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
         chrome::State {
             theme: chrome::Theme::DARK,
@@ -281,6 +372,9 @@ fn main() {
             finding: None,
             saved: true,
             local_root: false,
+            withheld: 0,
+            withheld_hosts: &[],
+            allowed_hosts: &[],
         },
     ];
 
@@ -299,9 +393,30 @@ fn main() {
         ),
     ];
 
+    // The site panel the padlock opens, in both schemes. It is chrome, it is
+    // drawn by the same rasteriser, and it is the one piece of this browser's
+    // interface that changes what the network policy does — which makes
+    // looking at it rather more than a nicety (#118).
+    let panels: Vec<(chrome::Theme, Option<usize>)> =
+        vec![(chrome::Theme::LIGHT, None), (chrome::Theme::DARK, Some(2))];
+    let panel_rows = shell::site_panel::rows_for(
+        "example.com",
+        &[
+            "ads.example.org".to_owned(),
+            "beacon.example.com".to_owned(),
+        ],
+        &["fonts.example.net".to_owned()],
+    );
+    let panel_height: f32 =
+        shell::site_panel::Panel::open((0.0, 0.0), panel_rows.clone(), (900, 900))
+            .expect("opens")
+            .rect()
+            .height;
+
     let gap = 6u32;
     let height = cases.len() as u32 * (chrome::HEIGHT + gap)
-        + strips.len() as u32 * (chrome::TAB_HEIGHT + gap);
+        + strips.len() as u32 * (chrome::TAB_HEIGHT + gap)
+        + panels.len() as u32 * (panel_height as u32 + gap);
     let mut sheet = paint::Pixmap::new(width, height).expect("sheet");
     sheet.fill(paint::RasterColor::from_rgba8(0x60, 0x60, 0x60, 0xff));
 
@@ -328,10 +443,18 @@ fn main() {
         place(&mut sheet, &strip, &mut y);
     }
 
+    for (theme, hovered) in &panels {
+        let mut panel = shell::site_panel::Panel::open((0.0, 0.0), panel_rows.clone(), (900, 900))
+            .expect("opens");
+        panel.hovered = *hovered;
+        place(&mut sheet, &panel.render(&mut fonts, *theme), &mut y);
+    }
+
     sheet.save_png(&output).expect("write");
     println!(
-        "wrote {output} with {} bar states and {} strips",
+        "wrote {output} with {} bar states, {} strips and {} panels",
         cases.len(),
-        strips.len()
+        strips.len(),
+        panels.len()
     );
 }

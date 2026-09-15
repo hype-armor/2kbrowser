@@ -1,5 +1,7 @@
 # 2kbrowser
 
+<img src="docs/images/icon.png" alt="" width="96" align="right">
+
 A web browser without the slop.
 
 2kbrowser renders HTML and CSS as the web did around the year 2000, and does not
@@ -29,8 +31,12 @@ HTTPS has nothing to say.
 ![The first website in 2kbrowser](docs/images/first-website.png)
 
 The first website, still up, still plain HTTP. The bar marks it *not encrypted*
-— never the reverse, because decorating the secure case teaches people to look
-for a signal whose absence is easy to miss (ADR-0006).
+in words, and never the reverse: decorating the secure case teaches people to
+look for a signal whose absence is easy to miss, so nothing anywhere says
+"secure" (ADR-0006). The padlock beside it is a control rather than a verdict —
+it opens what this site is allowed to load from — and it is on every page for
+the reason every control is: one that came and went would be missing on exactly
+the page you went looking for it on.
 
 ![A modern page re-rendered as a document](docs/images/document-fallback.png)
 
@@ -43,6 +49,14 @@ and offers you the author's layout anyway (ADR-0009).
 Every state the bar can be in, drawn by `cargo run -p shell --example
 chrome-strip` — which is also how it is reviewed, since a headless test can
 compare pixels and a person cannot compare descriptions.
+
+The application icon is the one image in this repository that is not a
+screenshot. `assets/icon.png` is the master and `cargo run -p icons` derives
+everything else from it: the copy the binary embeds for the window, the eight
+sizes the freedesktop hicolor theme wants, a Windows `.ico` and a macOS
+`.icns` — both written by hand in that tool, since each is a header and a list
+of PNGs, and neither then needs a platform tool to produce. Replacing the icon
+is one file and one command.
 
 ## Status
 
@@ -214,15 +228,44 @@ containers that would have arranged a row of blocks and now stack them instead.
 Every page in the corpus that should keep its author's layout scores zero of
 those; a Wikipedia article scores sixteen.
 
-**Forms are drawn but do not work.** Every control has a box now — text and
-password fields, buttons, checkboxes, radios, `<textarea>`, `<select>` and the
-rule around a `<fieldset>` — sized in the era's own units, since `size`, `cols`
-and `rows` count characters and lines rather than pixels, and a field follows
-the font it is set in. A password field shows bullets and never its value.
-**Nothing can be typed into, clicked, or submitted**, and that is the stopping
-point rather than an oversight: a control that draws correctly makes the page
-read correctly, and interaction is separate work with a separate risk. A radio
-button is drawn round and a checkbox square — the shape is the question, "one of
+**Forms take typing.** Every control has a box — text and password fields,
+buttons, checkboxes, radios, `<textarea>`, `<select>` and the rule around a
+`<fieldset>` — sized in the era's own units, since `size`, `cols` and `rows`
+count characters and lines rather than pixels, and a field follows the font it
+is set in. A password field shows bullets and never its value, including after
+you have typed in it.
+
+Text fields and `<textarea>`s can be **clicked into, tabbed between and typed
+in**: a caret, a focus ring, arrows and word motion, Home and End by line,
+selection with Shift, Ctrl+A, and Escape to let go. Tab walks the page's fields
+first and then its links, and past the last field it hands the key back rather
+than trapping it. What a reader types lives in the renderer child with the
+document it belongs to; the window sends named keys — "delete a word", not a
+scancode — and gets pixels back, so the untrusted side never has to interpret a
+keyboard and no platform's idea of a key leaves its own side of the line.
+
+**Forms submit.** Press a submit button, or Enter in a one-line field, and the
+form goes — `get` puts its fields in the query string, `post` in a body, both
+`application/x-www-form-urlencoded`. Which controls are sent is HTML 4
+§17.13.2's rule: named, not disabled, ticked if it is a box, and *only the
+button that was pressed*, since a form with two buttons named `action` means
+opposite things depending on which one you hit.
+
+The form is collected by the renderer child, because the form is part of the
+document and the document stays there. What crosses the boundary is a
+destination as the markup wrote it, a method, and the encoded pairs — and the
+parent resolves the destination against the real page, applies the network
+policy, and caps the body. A page can *ask* for a request; it cannot make one.
+
+A `post`'s history entry is the URL alone, so Back and Reload ask for it with a
+`get`. Re-sending a form because somebody pressed reload is how a comment gets
+posted twice and a payment taken twice, and a browser that does it quietly is
+worse than one that shows whatever the server says to a bare request.
+
+**A checkbox and a dropdown still cannot be changed.** They draw, and they
+submit whatever the markup says they hold — so a form with a preset radio sends
+it, and a box you want to untick cannot be unticked. A radio button is drawn
+round and a checkbox square — the shape is the question, "one of
 these" against "any of these" — and a `<legend>` sits *in* its group's rule, with
 the rule stopping either side of it, as HTML's rendering section has it.
 
@@ -453,6 +496,12 @@ and its own bugs. `2kbrowser bookmarks` prints the same list. It is stored as a
 tab-separated file under your config directory: a few kilobytes, editable in
 anything, and the only state this browser keeps between runs.
 
+Hovering a link puts its address in the bottom-left corner. A link's text says
+whatever its author wanted it to say; only the address says where it goes, and
+without somewhere to read that the only way to find out is to follow it. It sits
+over the page rather than in a row of its own, because a strip of chrome that is
+empty almost all the time would cost every page a line of height.
+
 Links can be followed without a pointer: Tab walks them in document order,
 Shift+Tab goes back, Enter follows, Escape drops the focus. The focused link is
 outlined rather than tinted, so it does not read as a find match — both can be
@@ -633,6 +682,32 @@ Third-party requests are refused by default, so one policy rule removes
 essentially all advertising and tracking with no filter lists (ADR-0006). Plain
 HTTP is allowed, because much of the old web needs it, and is always marked as
 unauthenticated rather than presented as secure.
+
+What the rule refused is marked too — `4 blocked from 2 sites`, beside the URL.
+A page missing a third of its images because a CDN was refused otherwise looks
+identical to a page whose CDN is down, and a browser that quietly changes what
+a page contains has the same problem as one that quietly changes how it is laid
+out.
+
+An image that did not arrive leaves a box saying **Load image** where the
+picture was going to be, rather than a hole. Pressing it loads the picture if
+the server was simply having a bad day; if it was the third-party rule that
+refused it, pressing it opens the panel below, where the host is one press from
+being allowed — because retrying something the policy refuses would refuse it
+again, and a button that visibly does nothing is worse than no button. The box
+does not say "blocked": the renderer is deliberately not told whether a
+resource was refused or merely missing, so that a compromised one cannot use a
+page to probe what you have allowed. The chrome, which does know, says so.
+
+The padlock left of the URL opens the list: what this page asked for and did
+not get, each line one press from being allowed, and what this site has already
+been allowed to load from, each line one press from being taken back. An
+exception is scoped to the pair — this site may load from that host — so
+allowing a font CDN for one site does not hand it to every other site on the
+web, which would rebuild the cross-site identifier the rule exists to remove.
+They are kept in `sites.tsv` beside the bookmarks, one pair per line, editable
+in anything: a permission list nobody can read is a permission list nobody
+audits.
 
 When a page's layout depends on features this engine does not implement, it is
 re-rendered as a document and told so — never silently (ADR-0009):

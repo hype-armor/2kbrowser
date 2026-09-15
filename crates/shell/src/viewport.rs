@@ -265,6 +265,16 @@ impl Viewport {
         }
     }
 
+    /// What the policy refused this page (ADR-0006, issue #118).
+    ///
+    /// Asked of the session rather than carried on [`sandbox::Rendered`],
+    /// because it is the parent's knowledge and not the child's: a refusal and
+    /// a failure look identical on the wire on purpose, so this never crosses
+    /// the boundary in either direction.
+    pub fn withheld(&self) -> sandbox::Withheld {
+        self.session.withheld()
+    }
+
     /// Every link, with each one's rectangles kept together, in document order.
     pub fn links(&self) -> Vec<Link> {
         let mut out: Vec<Link> = Vec::new();
@@ -302,6 +312,25 @@ impl Viewport {
             .map(|link| (link.url.as_str(), link.jump_to))
     }
 
+    /// The image a placeholder at this point was asking for (#118).
+    ///
+    /// Checked *before* links by the window, because an `<img>` inside an `<a>`
+    /// is the era's whole navigation: a thumbnail that is also a link. A
+    /// placeholder that could not be pressed because the link underneath it
+    /// swallowed the click would be a button that does nothing, and the link is
+    /// still reachable from the caption or the keyboard.
+    pub fn missing_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.page
+            .missing
+            .iter()
+            .rev()
+            .find(|missing| {
+                let rect = missing.rect;
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|missing| missing.url.as_str())
+    }
+
     fn wire_link_at(&self, x: f32, y: f32) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
         self.page.links.iter().rev().find(|link| {
@@ -329,6 +358,53 @@ impl Viewport {
         // and then highlighted nothing when stepped to. Bands removed the
         // reason: any row can be painted, so any match can be scrolled to.
         self.session.find(query).unwrap_or_default()
+    }
+
+    /// Tells the child the reader pressed a point on the page (#110).
+    ///
+    /// Returns whether anything ended up focused, which is what the window
+    /// needs in order to decide whether the next keystroke is the page's or
+    /// its own.
+    pub fn focus_at(&mut self, x: f32, y: f32) -> bool {
+        match self.session.focus((x, y)) {
+            Ok(page) => {
+                self.page = page;
+                self.page.editing
+            }
+            // A child that cannot answer is not one to start routing keystrokes
+            // at. The page on screen stays as it was, which is the same answer
+            // every other failed question here gives.
+            Err(_) => false,
+        }
+    }
+
+    /// Sends a keystroke to whatever control the child has focused.
+    pub fn type_key(&mut self, key: sandbox::message::Key) {
+        if let Ok(page) = self.session.type_key(key) {
+            self.page = page;
+        }
+    }
+
+    /// Where this page's buttons are, in document order (#110).
+    ///
+    /// Asked of the child at render time and carried with the page, for the
+    /// same reason the links are: the parent has no box tree, so a rectangle
+    /// missing from this list is a button that does nothing when pressed.
+    pub fn buttons(&self) -> Vec<Rect> {
+        self.page.buttons.clone()
+    }
+
+    /// A form the page asked to send, if it did (#110).
+    ///
+    /// Taken rather than read: one press sends one form, and a submission left
+    /// here would be sent again by whatever asked next.
+    pub fn take_submission(&mut self) -> Option<sandbox::message::Submission> {
+        self.page.submit.take()
+    }
+
+    /// Whether a form control on this page is taking the typing.
+    pub fn editing(&self) -> bool {
+        self.page.editing
     }
 
     /// Re-renders at a new width, in the same child.

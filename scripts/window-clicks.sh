@@ -52,6 +52,12 @@ toggle=96
 # pinned there by its own tests, and repeated here because a pointer has to be
 # told a number.
 scrollbar=8
+# The left-hand controls, from `chrome.rs`: two 40px arrows, the reload word,
+# then the padlock. Same caveat again — pinned there by `controls()`'s own
+# tests, repeated here because a pointer has to be told a number.
+button=40
+reload=58
+site_x=$((padding + button * 2 + reload + 13))
 toggle_x=$((width - padding - bookmark - toggle / 2))
 # Down the middle of the URL bar, which is below the strip rather than at the
 # top of the window.
@@ -486,6 +492,337 @@ after=$(pixel 100 $((chrome + 1)))
 [ "$after" != "$accent" ] || fail "the loading bar is still on screen after the \
 page arrived, so it says nothing about whether anything is loading"
 echo "ok: the loading bar showed during a navigation and went away after it"
+stop
+
+# N. Hovering a link shows its address in the bottom-left corner, and moving off
+#    it takes the strip away again (#139).
+#
+#    Unreachable from `cargo test` for the same reason every check in this file
+#    is: `preview.rs` pins what the strip looks like and where it goes, and
+#    nothing there proves the event loop asks for it, that a redraw happens
+#    without a click to force one, or that it lands over the page rather than
+#    under it. A strip drawn into a buffer nobody presents is a passing test and
+#    an invisible feature.
+start
+# Two pixels in from the corner, which is inside the strip's surface and clear
+# of the hairline along its top edge.
+corner_x=2
+corner_y=$((height - 6))
+empty=$(pixel "$corner_x" "$corner_y")
+DISPLAY=$display xdotool mousemove "$click_x" "$click_y"
+hovered=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$corner_x" "$corner_y")" != "$empty" ]; then
+        hovered=yes
+        break
+    fi
+done
+[ -n "$hovered" ] || fail "hovering the link drew nothing in the corner, so the \
+link preview never reached the screen"
+
+# Straight down from the link, which the earlier checks already established is
+# page and not a link.
+DISPLAY=$display xdotool mousemove "$click_x" $((click_y + link_h * 2))
+gone=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$corner_x" "$corner_y")" = "$empty" ]; then
+        gone=yes
+        break
+    fi
+done
+[ -n "$gone" ] || fail "the link preview stayed up after the pointer left the \
+link, so it is showing an address for nothing"
+echo "ok: hovering a link showed its address and moving off took it away"
+stop
+
+# N. The padlock opens the site panel, and opens it again closed (#118).
+#
+#    `site_panel.rs` pins what the panel holds and where a click in it lands.
+#    What it cannot pin is that pressing the padlock reaches any of that: the
+#    control routing, the panel being drawn over the page rather than under it,
+#    and the second press closing what the first opened all live in the event
+#    loop. A panel that only ever opens is a browser with no way out of it.
+start
+# Just below the bar and a little in from the left, which the panel covers and
+# an ordinary page does not.
+panel_x=$((site_x + 20))
+panel_y=$((chrome + 30))
+closed=$(pixel "$panel_x" "$panel_y")
+DISPLAY=$display xdotool mousemove "$site_x" "$toggle_y"
+DISPLAY=$display xdotool click 1
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$panel_x" "$panel_y")" != "$closed" ]; then
+        opened=yes
+        break
+    fi
+done
+[ -n "$opened" ] || fail "pressing the padlock drew nothing over the page, so \
+the site panel never reached the screen"
+
+DISPLAY=$display xdotool mousemove "$site_x" "$toggle_y"
+DISPLAY=$display xdotool click 1
+shut=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$panel_x" "$panel_y")" = "$closed" ]; then
+        shut=yes
+        break
+    fi
+done
+[ -n "$shut" ] || fail "pressing the padlock a second time did not close the \
+panel, so there is no way out of it with the pointer"
+echo "ok: the padlock opened the site panel and closed it again"
+stop
+
+# N. A refused image leaves a box that answers a press (#118).
+#
+#    `paint` pins what the placeholder looks like and `isolation.rs` pins that
+#    its rectangle crosses the boundary. Neither can show that the rectangle
+#    lands where the pixels are — the click path runs from winit's pointer
+#    position through the chrome offset and the scroll to a list the child
+#    sent, and every one of those has been wrong at some point in this file's
+#    history.
+#
+#    A local page asking for an image over the network is a third-party request
+#    by ADR-0006's own argument — a file has no host for anything to be
+#    first-party to — so this is refused without a socket being opened.
+placeholders="$here/target/window-placeholder"
+mkdir -p "$placeholders"
+cat > "$placeholders/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Placeholder</title>
+<body style="margin: 0">
+<img src="https://cdn.example.net/photo.jpg" width="240" height="160">
+</body>
+FIXTURE
+
+start_on "$placeholders/p.html" "Placeholder"
+# The plate colour from `paint::draw_missing`, as the pixel reader prints it.
+plate="244 244 242"
+seen=""
+for _ in $(seq 1 20); do
+    if [ "$(pixel 120 $((chrome + 40)))" = "$plate" ]; then
+        seen=yes
+        break
+    fi
+    sleep 0.2
+done
+[ -n "$seen" ] || fail "a refused image drew no placeholder, so the reader gets \
+a hole with nothing to press"
+
+# Pressing it opens the site panel, because the policy is what refused this one
+# and retrying would refuse it again.
+#
+# Sampled to the right of the image and inside the panel: the panel hangs off
+# the padlock, so it starts further right than the placeholder does and is
+# wider. A point inside both would compare the panel's surface against the
+# placeholder's, which differ by two in each channel — true, and not something
+# to rest a check on.
+panel_probe_x=350
+panel_probe_y=$((chrome + 40))
+before=$(pixel "$panel_probe_x" "$panel_probe_y")
+DISPLAY=$display xdotool mousemove 120 $((chrome + 40))
+DISPLAY=$display xdotool click 1
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$panel_probe_x" "$panel_probe_y")" != "$before" ]; then
+        opened=yes
+        break
+    fi
+done
+[ -n "$opened" ] || fail "pressing the placeholder did nothing — a refused \
+image needs the panel, because retrying it would refuse it again"
+echo "ok: a refused image drew a placeholder and pressing it offered the host"
+stop
+
+# N. A text field can be clicked into and typed in (#110).
+#
+#    Unreachable from `cargo test` and not by a little: the path runs from
+#    winit's key event, through the modifier state and the chrome's own fields,
+#    across the process boundary as a named key, into an editing state the child
+#    owns, back as a fresh render. `isolation.rs` drives the far half of that
+#    directly. Nothing but a real window drives the near half.
+typing="$here/target/window-typing"
+mkdir -p "$typing"
+cat > "$typing/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Typing</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: absolute; left: 40px; top: 40px">
+<input type="text" value="" size="30">
+</div>
+</body>
+FIXTURE
+
+start_on "$typing/p.html" "Typing"
+
+# Where that field actually is, asked of the browser rather than assumed — the
+# same rule the link coordinates above follow. Read off the screen rather than
+# out of a rendered file: measuring a PNG means decoding one, and the only way
+# to do that without writing an inflater is an image library CI does not have.
+# The fixture has nothing on it but the field, so the ink below the chrome is
+# the field.
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 1)) $((height - 1)))
+[ -n "$box" ] || fail "nothing was drawn below the chrome, so the fixture's \
+field never reached the screen"
+set -- $box
+# Back into document coordinates, which is what the rest of this reads in.
+field_left=$1 field_top=$(($2 - chrome)) field_right=$3 field_bottom=$(($4 - chrome))
+# Somewhere across the first few characters, since exactly which pixels the
+# glyphs land on is the shaper's business and not this harness's. Started clear
+# of the caret: a focused empty field has one, a couple of pixels in from the
+# border, and a scan that included it would report "there is text here" the
+# moment the field took the click.
+text_y=$((chrome + (field_top + field_bottom) / 2))
+inked_in_field() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-ink.py" $((field_left + 12)) $((field_left + 70)) "$text_y"
+}
+[ "$(inked_in_field)" = "clear" ] || fail "the field had text in it before \
+anything was typed, so the check below would pass without a single key arriving"
+
+# Two pixels above the field's border box, which is where the focus ring goes
+# and where nothing else ever draws.
+ring_y=$((chrome + field_top - 2))
+ring_x=$(((field_left + field_right) / 2))
+unfocused=$(pixel "$ring_x" "$ring_y")
+
+DISPLAY=$display xdotool mousemove "$ring_x" $((chrome + (field_top + field_bottom) / 2))
+DISPLAY=$display xdotool click 1
+focused=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$ring_x" "$ring_y")" != "$unfocused" ]; then
+        focused=yes
+        break
+    fi
+done
+[ -n "$focused" ] || fail "clicking a text field drew no focus ring, so the \
+click never reached the control"
+
+# The window has to hold the *keyboard* focus, which no check before this one
+# has ever needed: they are all pointer-driven, and XTEST clicks go wherever the
+# pointer is whether or not the window is focused. Keystrokes do not — they go
+# to whatever the window manager last focused, which under a bare Xvfb with no
+# window manager at all is nothing. Without this the keys are delivered to the
+# void and the failure reads exactly like a browser that ignores the keyboard.
+DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null \
+    || DISPLAY=$display xdotool windowfocus --sync "$window" 2>/dev/null \
+    || true
+sleep 0.3
+DISPLAY=$display xdotool type --delay 60 "hello"
+typed=""
+for _ in $(seq 1 25); do
+    sleep 0.2
+    if [ "$(inked_in_field)" = "ink" ]; then
+        typed=yes
+        break
+    fi
+done
+[ -n "$typed" ] || fail "five characters were typed into a focused field and \
+nothing appeared in it"
+
+# Escape gives the field up, which is what puts the keyboard back on the page.
+DISPLAY=$display xdotool key Escape
+released=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$ring_x" "$ring_y")" = "$unfocused" ]; then
+        released=yes
+        break
+    fi
+done
+[ -n "$released" ] || fail "Escape left the field focused, so the page can no \
+longer be scrolled with the keyboard"
+echo "ok: a text field took a click, took five characters, and let go on Escape"
+stop
+
+# N. Pressing a submit button sends the form (#110).
+#
+#    The one check in this file that involves a server, because it is the one
+#    behaviour that cannot be seen without one: a form is sent correctly only if
+#    what *arrived* is right, and nothing on this side of the socket can tell
+#    you that. `isolation.rs` proves the encoding against a real socket; this
+#    proves that a press in a real window reaches it at all.
+#
+#    Local, on a port the kernel picks, and killed with the harness.
+form_port=8737
+python3 - "$form_port" >/dev/null 2>&1 <<'SERVER' &
+import http.server, socketserver, sys, pathlib
+
+seen = pathlib.Path("/tmp/2kbrowser-form-seen")
+seen.unlink(missing_ok=True)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def page(self, body):
+        body = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.page(
+            "<title>A form</title><body style='margin:0'>"
+            "<form action='/submit' method='post'>"
+            "<input name='q' value='tables'>"
+            "<input type='submit' name='go' value='Send'>"
+            "</form></body>"
+        )
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        seen.write_text(self.rfile.read(length).decode())
+        self.page("<title>Answered</title><body><p>thanks</p></body>")
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as server:
+    server.serve_forever()
+SERVER
+form_server=$!
+# Waited for rather than slept on: a port that is not listening yet fails the
+# navigation below, and the failure would read as a browser that cannot fetch.
+for _ in $(seq 1 40); do
+    (echo > "/dev/tcp/127.0.0.1/$form_port") >/dev/null 2>&1 && break
+    sleep 0.25
+done
+
+start_on "http://127.0.0.1:$form_port/form" "A form"
+DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null || true
+sleep 0.3
+# Where the button is, asked of the screen: the fixture has the field and the
+# button on one line, so the rightmost ink below the chrome is the button.
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 1)) $((height - 1)))
+[ -n "$box" ] || fail "the form never reached the screen"
+set -- $box
+DISPLAY=$display xdotool mousemove $(($3 - 12)) $((($2 + $4) / 2))
+DISPLAY=$display xdotool click 1
+
+sent=""
+for _ in $(seq 1 30); do
+    sleep 0.3
+    case "$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null)" in
+        Answered*) sent=yes; break ;;
+    esac
+done
+kill "$form_server" 2>/dev/null || true
+[ -n "$sent" ] || fail "pressing the submit button did not navigate, so the \
+form never left the browser"
+arrived=$(cat /tmp/2kbrowser-form-seen 2>/dev/null || true)
+[ "$arrived" = "q=tables&go=Send" ] || fail "the server was sent \
+\"$arrived\" rather than the form's own fields"
+echo "ok: pressing submit sent the form and the server got its fields"
 stop
 
 echo "all window click checks passed"

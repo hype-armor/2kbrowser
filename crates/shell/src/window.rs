@@ -404,8 +404,16 @@ struct App {
     rendered_size: (u32, u32),
     /// Last known pointer position, in window coordinates.
     pointer: (f32, f32),
-    /// Whether the pointer is over a link, so the cursor can say so.
-    over_link: bool,
+    /// The address of the link under the pointer (#139).
+    ///
+    /// One field for two jobs — the cursor shape and the preview strip — so
+    /// that the two cannot disagree about what the pointer is on. It was a
+    /// bool for the cursor alone; keeping a second copy of "is there a link
+    /// here" would have been a bug waiting for the day the answers diverged.
+    over_link: Option<String>,
+    /// Whether the pointer is over something that answers a press, so the
+    /// cursor can say so. A link, or an image placeholder (#118).
+    over_pressable: bool,
     /// How far through a navigation the browser is, or `None` when it is not
     /// in one.
     ///
@@ -454,6 +462,15 @@ struct App {
     waker: Option<winit::event_loop::EventLoopProxy<BandReady>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
+    /// The open site panel, if the padlock has been pressed (#118).
+    panel: Option<crate::site_panel::Panel>,
+    /// Where the granted exceptions are written back to.
+    ///
+    /// The policy itself lives on the two fetchers — this window's, for
+    /// navigations, and the renderer's, which is cloned into every child that
+    /// asks the parent for subresources. There is no third copy here, so
+    /// nothing can hold a stale one.
+    sites_path: std::path::PathBuf,
 }
 
 impl App {
@@ -627,6 +644,12 @@ impl App {
         // Same reason: the focused link is still the same link, but it is no
         // longer in the same place.
         self.refresh_focus();
+        // And the preview strip was showing an address from the layout that
+        // has just been replaced (#139). Recomputed rather than cleared: the
+        // pointer has not moved, so it may still be over a link — and a strip
+        // that blanked on every relayout would flicker for the whole of a
+        // window drag.
+        self.over_link = self.link_under_pointer();
 
         if let Some(window) = &self.window {
             // The page's own title, falling back to the URL: a titled page is
@@ -663,6 +686,23 @@ impl App {
         let fetched = self
             .fetcher
             .fetch_raw(url, None, net::RequestKind::Navigation);
+        self.install(fetched);
+    }
+
+    /// Sends a form and shows what comes back (#110).
+    ///
+    /// The one request this browser makes that carries data up, and it is
+    /// deliberately a method of its own rather than a flag on `show`: a caller
+    /// has to mean it. Everything after the request is identical, because what
+    /// comes back from a form is a page like any other.
+    fn send(&mut self, url: &str, body: &str) {
+        self.stage(Some(FETCHING));
+        let fetched = self.fetcher.post(url, body);
+        self.install(fetched);
+    }
+
+    /// Installs whatever a navigation came back with, or says why it did not.
+    fn install(&mut self, fetched: Result<net::Fetched, net::FetchError>) {
         // Painted before the page is cleared, so what stays on screen behind
         // the bar is the page being left rather than a white window.
         self.stage(Some(LAYING_OUT));
@@ -759,6 +799,9 @@ impl App {
     /// difference between a field that feels instant and one that stutters on
     /// every character of a long document.
     fn refresh_chrome(&mut self) {
+        // Taken before the destructure below, because it asks the renderer's
+        // policy and the tab at once and the destructure splits them.
+        let allowed = self.allowed_hosts();
         // Destructured for disjoint borrows: the bar is drawn with the font
         // store while reading the tab it describes.
         let App {
@@ -777,6 +820,11 @@ impl App {
             .as_ref()
             .map(crate::viewport::Viewport::mode)
             .unwrap_or(layout::RenderMode::Authored);
+        let withheld = tab
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
         *chrome = crate::chrome::render(
             &crate::chrome::State {
                 theme: *theme,
@@ -795,6 +843,9 @@ impl App {
                     .map(|field| (field, tab.current_match, tab.matches.len())),
                 saved: bookmarks.contains(tab.history.current()),
                 local_root: tab.local_root,
+                withheld: withheld.subresources(),
+                withheld_hosts: withheld.hosts(),
+                allowed_hosts: &allowed,
             },
             size.0,
             fonts,
@@ -823,6 +874,101 @@ impl App {
             self.tab().history.current(),
         ));
         self.refresh_chrome();
+    }
+
+    /// Tells the page a point on it was pressed (#110).
+    ///
+    /// The child works out whether there is a form control there — the box tree
+    /// is the only thing that knows, and it stays on that side of the boundary
+    /// (ADR-0012). All that comes back is a fresh render and one bit saying
+    /// whether anything is now taking the typing.
+    fn press_page(&mut self) {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)
+        else {
+            return;
+        };
+        let was = self.page_is_editing();
+        let Some(page) = self.tab_mut().page.as_mut() else {
+            return;
+        };
+        let now = page.focus_at(x, y);
+        // A redraw only when something changed. Pressing the margin of a page
+        // with nothing focused is the commonest click there is, and repainting
+        // the window for it would be work nobody asked for.
+        if (was || now)
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+        self.act_on_page();
+    }
+
+    /// Sends a form the page asked to send (#110).
+    ///
+    /// Everything the child said is treated as a request rather than an
+    /// instruction. The destination resolves against *this* document — not
+    /// against anything the child claimed — the network policy is applied to
+    /// the result by `fetch_raw` or `post`, and the reader sees where they went
+    /// in the URL bar like any other navigation.
+    ///
+    /// A `get` puts the pairs in the query string and is an ordinary
+    /// navigation. A `post` carries them in a body, and its history entry is
+    /// the URL alone: Back, Forward and Reload therefore ask for it with a
+    /// `get`. That is deliberate. Re-sending a form because somebody pressed
+    /// reload is how a comment gets posted twice and a payment gets taken
+    /// twice, and a browser that does it quietly is worse than one that shows
+    /// whatever the server says to a bare request.
+    fn submit(&mut self, submission: sandbox::Submission) {
+        let (origin, path) = {
+            let loaded = &self.tab().loaded;
+            (loaded.origin.clone(), loaded.path.clone())
+        };
+        // An empty action is the document's own URL, which is what HTML says
+        // and what the era's forms lean on hardest.
+        let action = if submission.action.is_empty() {
+            path.clone()
+        } else {
+            submission.action.clone()
+        };
+        let url = net::resolve(&origin, &path, &action);
+        if submission.post {
+            self.tab_mut().history.visit(url.clone());
+            let target = self.tab().history.current().to_owned();
+            self.send(&target, &submission.body);
+        } else {
+            self.navigate(with_query(&url, &submission.body));
+        }
+    }
+
+    /// Carries out whatever the page asked for after a press or a keystroke.
+    fn act_on_page(&mut self) {
+        let asked = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .and_then(crate::viewport::Viewport::take_submission);
+        if let Some(submission) = asked {
+            self.submit(submission);
+        }
+    }
+
+    /// Whether a form control on the page is taking the typing (#110).
+    fn page_is_editing(&self) -> bool {
+        self.tab()
+            .page
+            .as_ref()
+            .is_some_and(crate::viewport::Viewport::editing)
+    }
+
+    /// Hands one keystroke to the page's focused control.
+    fn type_into_page(&mut self, key: sandbox::message::Key) {
+        if let Some(page) = self.tab_mut().page.as_mut() {
+            page.type_key(key);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        self.act_on_page();
     }
 
     /// Gives up editing without navigating.
@@ -1070,6 +1216,161 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// The key this page's exceptions are stored under (#118).
+    ///
+    /// `None` on a page no exception can be written for — there is nothing to
+    /// scope one to, so the panel has nothing to offer.
+    fn site(&self) -> Option<String> {
+        net::Policy::site_of(&self.tab().loaded.origin).map(str::to_owned)
+    }
+
+    /// What this site has already been allowed to load from.
+    fn allowed_hosts(&self) -> Vec<String> {
+        let Some(site) = self.site() else {
+            return Vec::new();
+        };
+        self.renderer
+            .policy()
+            .allowed_on(&site)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// What this page asked for and did not get.
+    fn withheld_hosts(&self) -> Vec<String> {
+        self.tab()
+            .page
+            .as_ref()
+            .map(|page| page.withheld().hosts().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// What pressing a `Load image` placeholder does (#118).
+    ///
+    /// Two different things, because there are two reasons a picture is not
+    /// there and only the parent can tell them apart. The child is told nothing
+    /// — a refusal and a failure are the same shape on the wire on purpose
+    /// (ADR-0012) — so the placeholder says `Load image` and this decides what
+    /// that means:
+    ///
+    /// * **The policy refused it.** Retrying would refuse it again, and a
+    ///   button that visibly does nothing is worse than no button. So this
+    ///   opens the site panel, where the host it wanted is one press from being
+    ///   allowed. The reader asked to see the picture; that is the question
+    ///   actually standing between them and it.
+    /// * **It simply failed** — a server that was down, a connection that
+    ///   dropped, a file that has moved. Then retrying is exactly right, and
+    ///   the child is dropped so the page renders again with an empty cache:
+    ///   the one holding this page remembers the failure, deliberately, so a
+    ///   broken image is not re-fetched on every resize.
+    fn load_image(&mut self, url: &str) {
+        let document = self.tab().loaded.origin.clone();
+        let refused = net::parse_url(url).is_ok_and(|(target, _)| {
+            matches!(
+                self.renderer.policy().check(
+                    Some(&document),
+                    &target,
+                    net::RequestKind::Subresource
+                ),
+                Err(net::Refusal::ThirdParty { .. })
+            )
+        });
+        if refused {
+            self.open_site_panel();
+            return;
+        }
+        self.tab_mut().page = None;
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Opens the site panel under the padlock.
+    ///
+    /// Under the control rather than under the pointer, unlike the context
+    /// menu: this one is opened from a fixed place in the bar, so it has a
+    /// fixed place to hang from, and a panel that appeared wherever the click
+    /// landed would move by a few pixels every time it was opened.
+    fn open_site_panel(&mut self) {
+        let Some(site) = self.site() else { return };
+        let rows =
+            crate::site_panel::rows_for(&site, &self.withheld_hosts(), &self.allowed_hosts());
+        let at = crate::chrome::control_rect(
+            &crate::chrome::Control::Site,
+            self.size.0 as f32,
+            self.chrome_height() as f32,
+        );
+        self.panel = crate::site_panel::Panel::open(at, rows, self.size);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Acts on whatever the pointer is over in the panel, and closes it.
+    fn choose_from_site_panel(&mut self) {
+        let Some(panel) = self.panel.take() else {
+            return;
+        };
+        let chosen = panel.choice_at(self.pointer.0, self.pointer.1).cloned();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let Some(site) = self.site() else { return };
+        match chosen {
+            Some(crate::site_panel::Row::Allow(host)) => self.set_exception(&site, &host, true),
+            Some(crate::site_panel::Row::Revoke(host)) => self.set_exception(&site, &host, false),
+            // A click outside the panel, or on a line that only explains
+            // something, dismisses it and does nothing else.
+            _ => {}
+        }
+    }
+
+    /// Grants or takes back one exception, and shows the page it changed.
+    ///
+    /// Written to disk before the page is redrawn rather than after. If the
+    /// write fails the reader must not be shown a page loading from a host the
+    /// browser will have forgotten about by the next run — a permission that
+    /// appears to have been granted and was not is worse than one that visibly
+    /// failed.
+    fn set_exception(&mut self, site: &str, host: &str, allow: bool) {
+        let policy = self.renderer.policy_mut();
+        if allow {
+            policy.allow(site, host);
+        } else {
+            policy.revoke(site, host);
+        }
+        let policy = self.renderer.policy().clone();
+        self.fetcher.policy = policy.clone();
+        if let Err(error) = crate::sites::save(&policy, &self.sites_path) {
+            // Said rather than swallowed, and the change is left standing for
+            // this session: the reader asked for it, and refusing it because a
+            // config directory is read-only would be answering the wrong
+            // question. It will not survive the window closing.
+            eprintln!("2kbrowser: could not save site exceptions: {error}");
+        }
+        // A fresh child rather than a re-render, because the one holding this
+        // page also holds what it fetched — including the refusals, which it
+        // remembers as failures so a broken image is not retried on every
+        // resize. Dropping it is what makes the newly allowed host actually be
+        // asked for, and the document itself is not fetched again.
+        self.tab_mut().page = None;
+        self.rerender();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Closes the site panel if one is open. Whether there was one to close.
+    fn close_site_panel(&mut self) -> bool {
+        let had = self.panel.take().is_some();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
     }
 
     /// Drops the selection, which is what pressing anywhere does.
@@ -1377,6 +1678,66 @@ impl App {
         true
     }
 
+    /// One keystroke while a form control on the page has the typing (#110).
+    ///
+    /// Returns whether it was taken. The shape is `edit_key`'s, and so is the
+    /// rule: while a field has the focus, it has the focus — a key meant for it
+    /// must never also scroll the page underneath. What it deliberately does
+    /// *not* swallow is the browser's own shortcuts, which is the difference
+    /// between a field on a page and the URL bar: Ctrl+T, Ctrl+L and the rest
+    /// belong to the window wherever the caret happens to be, and a reader who
+    /// cannot open a tab because they clicked in a search box would think the
+    /// browser had hung.
+    fn page_key(&mut self, key: &Key, alt: bool, ctrl: bool, shift: bool) -> bool {
+        use sandbox::message::Key as Typed;
+        if !self.page_is_editing() {
+            return false;
+        }
+        // Word motion is Ctrl+arrow everywhere except macOS, where it is
+        // Alt+arrow. Both, for the same reason `edit_key` takes both.
+        let by_word = ctrl || alt;
+        let typed = match key {
+            Key::Named(NamedKey::Escape) => Typed::Escape,
+            Key::Named(NamedKey::Tab) => Typed::Tab { back: shift },
+            Key::Named(NamedKey::Backspace) => Typed::Backspace,
+            Key::Named(NamedKey::Delete) => Typed::Delete,
+            Key::Named(NamedKey::ArrowLeft) => Typed::Left {
+                extend: shift,
+                word: by_word,
+            },
+            Key::Named(NamedKey::ArrowRight) => Typed::Right {
+                extend: shift,
+                word: by_word,
+            },
+            Key::Named(NamedKey::Home) => Typed::Home { extend: shift },
+            Key::Named(NamedKey::End) => Typed::End { extend: shift },
+            // A newline in a `<textarea>` and nothing in a one-line field. The
+            // child decides which, because it is the side that knows what the
+            // control is; sending the character and letting it refuse is what
+            // keeps the parent from having to model the page.
+            Key::Named(NamedKey::Enter) => Typed::Insert("\n".to_owned()),
+            Key::Named(NamedKey::Space) => Typed::Insert(" ".to_owned()),
+            Key::Character(text) if ctrl => {
+                if text.as_str() != "a" {
+                    // Every other Ctrl chord is the window's.
+                    return false;
+                }
+                Typed::SelectAll
+            }
+            Key::Character(text) if alt => {
+                let _ = text;
+                return false;
+            }
+            Key::Character(text) => Typed::Insert(text.to_string()),
+            // Arrows up and down, the page keys, the function keys: not the
+            // field's, so the window keeps them and the page still scrolls
+            // under a caret.
+            _ => return false,
+        };
+        self.type_into_page(typed);
+        true
+    }
+
     /// The chrome control under the pointer, if any.
     fn control_under_pointer(&self) -> Option<crate::chrome::Control> {
         let mode = self
@@ -1385,6 +1746,13 @@ impl App {
             .as_ref()
             .map(crate::viewport::Viewport::mode);
         let mode = mode.unwrap_or(layout::RenderMode::Authored);
+        let withheld = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
+        let allowed = self.allowed_hosts();
         crate::chrome::control_at(
             &crate::chrome::State {
                 theme: self.theme,
@@ -1404,6 +1772,9 @@ impl App {
                     .map(|field| (field, self.tab().current_match, self.tab().matches.len())),
                 saved: self.bookmarks.contains(self.tab().history.current()),
                 local_root: self.tab().local_root,
+                withheld: withheld.subresources(),
+                withheld_hosts: withheld.hosts(),
+                allowed_hosts: &allowed,
             },
             self.size.0 as f32,
             self.pointer.0,
@@ -1436,6 +1807,16 @@ impl App {
         let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
         page.target_at(x, y)
             .map(|(url, jump_to)| (url.to_owned(), jump_to))
+    }
+
+    /// The image the placeholder under the pointer was asking for (#118).
+    fn missing_under_pointer(&self) -> Option<String> {
+        if self.scrollbar_grab().is_some() {
+            return None;
+        }
+        let page = self.tab().page.as_ref()?;
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
+        page.missing_at(x, y).map(str::to_owned)
     }
 
     /// Where the pointer falls on the scrollbar, if it falls on one at all.
@@ -1508,6 +1889,8 @@ impl App {
             menu,
             fonts,
             theme,
+            over_link,
+            panel,
             ..
         } = self;
         let tab = tabs.active();
@@ -1615,31 +1998,45 @@ impl App {
             (width.get(), height.get()),
             bar_height,
         );
+        // The address of the link under the pointer, in the bottom-left corner
+        // (#139). Under the menu, which is opened deliberately and takes the
+        // pointer while it is there, and over everything else, because a strip
+        // half-hidden behind a page is a strip that cannot be read.
+        if let Some(url) = over_link.as_deref() {
+            let rect = crate::preview::rect(fonts, url, (width.get(), height.get()));
+            let pixmap = crate::preview::render(fonts, url, *theme, rect);
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
+        }
+        // The site panel hangs off the padlock, so it starts under the bar and
+        // is drawn over the page. Below the menu, which can be opened on top of
+        // anything, and above everything else for the same reason a menu is.
+        if let Some(panel) = panel {
+            let pixmap = panel.render(fonts, *theme);
+            let rect = panel.rect();
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
+        }
         // Over everything else, including the bar: a menu is in front of the
         // window by definition, and one opened near the top would otherwise
         // disappear under the chrome it overlaps.
         if let Some(menu) = menu {
             let pixmap = menu.render(fonts, *theme);
             let rect = menu.rect();
-            for row in 0..pixmap.height() {
-                let y = rect.y as u32 + row;
-                if y >= height.get() {
-                    break;
-                }
-                for column in 0..pixmap.width() {
-                    let x = rect.x as u32 + column;
-                    if x >= width.get() {
-                        break;
-                    }
-                    let Some(pixel) = pixmap
-                        .pixels()
-                        .get((row * pixmap.width() + column) as usize)
-                    else {
-                        continue;
-                    };
-                    buffer[(y * width.get() + x) as usize] = pack(pixel);
-                }
-            }
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
         }
         // Over everything, because it is about the window rather than about
         // the page under it, and a page can be any colour at all.
@@ -1650,6 +2047,34 @@ impl App {
             bar_height,
         );
         let _ = buffer.present();
+    }
+}
+
+/// The window icon, decoded from the copy built into the binary.
+///
+/// Generated from `assets/icon.png` by `cargo run -p icons`; see that tool for
+/// why there is one master and everything else is derived from it.
+///
+/// winit wants straight alpha and one size, and scaling to a title bar or a
+/// taskbar is the compositor's job from there.
+fn window_icon() -> Option<winit::window::Icon> {
+    const BYTES: &[u8] = include_bytes!("../../../assets/generated/window-256.png");
+    let decoded = image::load_from_memory(BYTES).ok()?.into_rgba8();
+    let (width, height) = (decoded.width(), decoded.height());
+    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
+}
+
+/// `url` with `query` as its query string, replacing whatever it had.
+///
+/// What a `get` form does: the pairs *are* the query, so an action that came
+/// with one of its own loses it. That is HTML's rule and it is the one people
+/// are surprised by — `action="/search?lang=en"` does not keep `lang`.
+fn with_query(url: &str, query: &str) -> String {
+    let base = url.split_once('#').map_or(url, |(before, _)| before);
+    let base = base.split_once('?').map_or(base, |(before, _)| before);
+    match query.is_empty() {
+        true => base.to_owned(),
+        false => format!("{base}?{query}"),
     }
 }
 
@@ -1694,6 +2119,35 @@ fn draw_loading(buffer: &mut [u32], progress: Option<f32>, size: (u32, u32), bar
     for row in bar_height..(bar_height + LOADING_HEIGHT).min(height) {
         let start = row as usize * width as usize;
         buffer[start..start + filled].fill(LOADING_COLOUR);
+    }
+}
+
+/// Draws a pixmap over the window buffer at `at`, clipped to `size`.
+///
+/// What the overlays share: a menu and a link preview are both an opaque
+/// rectangle the parent draws on top of whatever is already there, and the only
+/// thing that differs is where. Clipped rather than assumed to fit, because
+/// both are placed relative to a window that can be resized to smaller than
+/// they are.
+fn blit_over(buffer: &mut [u32], pixmap: &paint::Pixmap, at: (u32, u32), size: (u32, u32)) {
+    for row in 0..pixmap.height() {
+        let y = at.1 + row;
+        if y >= size.1 {
+            break;
+        }
+        for column in 0..pixmap.width() {
+            let x = at.0 + column;
+            if x >= size.0 {
+                break;
+            }
+            let Some(pixel) = pixmap
+                .pixels()
+                .get((row * pixmap.width() + column) as usize)
+            else {
+                continue;
+            };
+            buffer[(y * size.0 + x) as usize] = pack(pixel);
+        }
     }
 }
 
@@ -1972,6 +2426,7 @@ impl ApplicationHandler<BandReady> for App {
         };
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
+            .with_window_icon(window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
@@ -2031,6 +2486,17 @@ impl ApplicationHandler<BandReady> for App {
                     self.scroll_by(pixels);
                 }
             }
+            // The pointer left the window without passing over anything that
+            // is not a link, so nothing else would have taken the strip down.
+            // A preview of a link that is no longer under anything is a
+            // browser answering a question nobody is asking (#139).
+            WindowEvent::CursorLeft { .. } => {
+                if self.over_link.take().is_some()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
                 // A drag in progress owns the pointer. It deliberately does not
@@ -2055,18 +2521,47 @@ impl ApplicationHandler<BandReady> for App {
                     }
                     return;
                 }
+                // And the site panel, the same way.
+                if let Some(panel) = &mut self.panel {
+                    let hovered = panel.row_at(self.pointer.0, self.pointer.1);
+                    if hovered != panel.hovered {
+                        panel.hovered = hovered;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 if self.selecting.is_some() {
                     self.extend_selection();
                     return;
                 }
                 // The cursor says whether there is a link here, which is how a
-                // pointer-driven browser has always answered that question.
-                let over = self.link_under_pointer().is_some();
+                // pointer-driven browser has always answered that question —
+                // and the strip in the corner says *where* it goes, which the
+                // cursor cannot (#139).
+                let over = self.link_under_pointer();
                 if over != self.over_link
                     && let Some(window) = &self.window
                 {
                     self.over_link = over;
-                    window.set_cursor(if over {
+                    // Moving from one link straight to another changes the
+                    // address without changing the cursor, so the redraw is
+                    // asked for on its own terms rather than as part of any
+                    // shape change.
+                    window.request_redraw();
+                }
+                // A placeholder is pressable too (#118), and a button that
+                // leaves the cursor an arrow reads as dead. Tracked separately
+                // from the address above because it is a different question
+                // with a different answer: the strip says where a link goes,
+                // and a placeholder is not going anywhere.
+                let pressable = self.over_link.is_some() || self.missing_under_pointer().is_some();
+                if pressable != self.over_pressable
+                    && let Some(window) = &self.window
+                {
+                    self.over_pressable = pressable;
+                    window.set_cursor(if pressable {
                         winit::window::CursorIcon::Pointer
                     } else {
                         winit::window::CursorIcon::Default
@@ -2124,6 +2619,16 @@ impl ApplicationHandler<BandReady> for App {
                         self.choose_from_menu();
                         return;
                     }
+                    // The same for the site panel, with one exception: a click
+                    // on the padlock itself falls through to the control
+                    // routing below, which closes the panel. Otherwise pressing
+                    // it a second time would dismiss and immediately reopen.
+                    if self.panel.is_some()
+                        && self.control_under_pointer() != Some(crate::chrome::Control::Site)
+                    {
+                        self.choose_from_site_panel();
+                        return;
+                    }
                     // Letting go of the thumb is not a click on whatever the
                     // pointer happens to be over by then.
                     if self.dragging.take().is_some() {
@@ -2167,6 +2672,15 @@ impl ApplicationHandler<BandReady> for App {
                             Some(crate::chrome::Control::Forward) => self.go_forward(),
                             Some(crate::chrome::Control::Reload) => self.reload(),
                             Some(crate::chrome::Control::Bookmark) => self.toggle_bookmark(),
+                            // Pressing the padlock again closes what it
+                            // opened, which is what a control that opens a
+                            // panel has to do — otherwise the only way out is
+                            // to click somewhere that does something else.
+                            Some(crate::chrome::Control::Site) => {
+                                if !self.close_site_panel() {
+                                    self.open_site_panel();
+                                }
+                            }
                             Some(crate::chrome::Control::ToggleLayout) => {
                                 self.tab_mut().toggle_layout();
                                 self.rerender();
@@ -2182,8 +2696,22 @@ impl ApplicationHandler<BandReady> for App {
                         // A click on the page is a click on the page, even if
                         // it is not on a link: the URL bar loses focus.
                         self.cancel_editing();
-                        if let Some((url, jump_to)) = self.target_under_pointer() {
+                        // Before links, not after. An `<img>` inside an `<a>`
+                        // is the era's whole navigation — a thumbnail that is
+                        // also a link — and a placeholder whose click was
+                        // swallowed by the link under it would be a button
+                        // that does nothing. The link is still reachable from
+                        // the caption beside it and from the keyboard (#118).
+                        if let Some(url) = self.missing_under_pointer() {
+                            self.load_image(&url);
+                        } else if let Some((url, jump_to)) = self.target_under_pointer() {
                             self.follow(url, jump_to);
+                        } else {
+                            // Everything else goes to the page, which decides
+                            // whether there is a form control there. Including
+                            // a press on nothing, which is how a field is let
+                            // go of (#110).
+                            self.press_page();
                         }
                     }
                 }
@@ -2221,6 +2749,13 @@ impl ApplicationHandler<BandReady> for App {
                 }
                 if self.tab().finding.is_some() {
                     self.find_key(&event.logical_key, alt, ctrl, shift);
+                    return;
+                }
+                // A control on the page, after the chrome's own fields and
+                // before everything else: the chrome is focused deliberately
+                // and wins, and the page's scrolling is what a keystroke aimed
+                // at a field must not also do (#110).
+                if self.page_key(&event.logical_key, alt, ctrl, shift) {
                     return;
                 }
                 if ctrl && matches!(&event.logical_key, Key::Character(c) if c == "f") {
@@ -2329,10 +2864,23 @@ impl ApplicationHandler<BandReady> for App {
                     self.focus_url();
                     return;
                 }
-                // Tab walks the page's links, Enter follows the one it is on.
-                // A browser that can only be driven with a pointer is not
-                // keyboard-first however many shortcuts its chrome has.
+                // Tab walks the page's form controls and then its links, and
+                // Enter follows the link it is on. A browser that can only be
+                // driven with a pointer is not keyboard-first however many
+                // shortcuts its chrome has.
+                //
+                // The controls come first because the child owns them: it is
+                // the side that knows where they are, so the window offers Tab
+                // to the page and only walks links when the page says it has
+                // nothing to focus. Past the last control the child gives the
+                // focus up, which is what hands the key back here (#110).
                 if matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
+                    if self.tab().focused_link.is_none() {
+                        self.type_into_page(sandbox::message::Key::Tab { back: shift });
+                        if self.page_is_editing() {
+                            return;
+                        }
+                    }
                     self.step_link(!shift);
                     return;
                 }
@@ -2361,8 +2909,13 @@ impl ApplicationHandler<BandReady> for App {
                     // meant to drop a focus ring would be unforgivable.
                     Key::Named(NamedKey::Escape) => {
                         // An open menu is the innermost thing in progress, so
-                        // it is the first thing Escape gives up.
-                        if !self.close_menu() && !self.clear_focused_link() {
+                        // it is the first thing Escape gives up — then the
+                        // site panel, which is opened the same deliberate way
+                        // and must not need a click somewhere else to close.
+                        if !self.close_menu()
+                            && !self.close_site_panel()
+                            && !self.clear_focused_link()
+                        {
                             event_loop.exit();
                         }
                     }
@@ -2398,7 +2951,14 @@ pub fn open(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
-    let renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
+    let mut renderer = sandbox::Renderer::new().map_err(|error| error.to_string())?;
+    // The exceptions the reader granted on earlier visits (#118). Onto the
+    // renderer's fetcher, which is what every child clones when it is spawned,
+    // and onto the window's own below — navigations are not subject to the
+    // third-party rule, but the two policies being visibly the same object is
+    // what stops them drifting.
+    let allowed = crate::sites::load(&crate::sites::default_path());
+    renderer.fetcher_mut().policy = allowed.clone();
     // Said once, here, rather than by every renderer child on spawn: twenty
     // copies of a warning in one run is how a warning becomes something people
     // scroll past. Someone deciding whether to point this at a strange page
@@ -2435,7 +2995,7 @@ pub fn open(
             },
             url,
         )),
-        fetcher: net::Fetcher::default(),
+        fetcher: net::Fetcher { policy: allowed },
         renderer,
         fonts: FontStore::new(),
         window: None,
@@ -2446,7 +3006,8 @@ pub fn open(
         // first resize to arrive is never mistaken for one already shown.
         rendered_size: (0, 0),
         pointer: (0.0, 0.0),
-        over_link: false,
+        over_link: None,
+        over_pressable: false,
         loading: None,
         dragging: None,
         selecting: None,
@@ -2459,11 +3020,57 @@ pub fn open(
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        panel: None,
+        sites_path: crate::sites::default_path(),
         waker: Some(event_loop.create_proxy()),
     };
     event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::with_query;
+
+    #[test]
+    fn a_get_form_replaces_the_actions_own_query() {
+        // HTML's rule, and the one people are surprised by: the pairs *are* the
+        // query string, so an action that came with one loses it.
+        assert_eq!(
+            with_query("https://example.com/search?lang=en", "q=tables"),
+            "https://example.com/search?q=tables"
+        );
+        assert_eq!(
+            with_query("https://example.com/search", "q=tables"),
+            "https://example.com/search?q=tables"
+        );
+    }
+
+    #[test]
+    fn a_fragment_goes_with_the_query_it_belonged_to() {
+        // A form's destination is a resource, not a place on a page. Keeping
+        // the fragment would send the reader to an anchor of the *old* page's
+        // making, which the new one has no reason to have.
+        assert_eq!(
+            with_query("https://example.com/p#results", "q=x"),
+            "https://example.com/p?q=x"
+        );
+        assert_eq!(
+            with_query("https://example.com/p?a=1#results", "q=x"),
+            "https://example.com/p?q=x"
+        );
+    }
+
+    #[test]
+    fn a_form_with_nothing_in_it_asks_for_the_bare_url() {
+        // Not `?`, which some servers treat as a query and some do not. A form
+        // whose every control is unnamed has nothing to say.
+        assert_eq!(
+            with_query("https://example.com/search?old=1", ""),
+            "https://example.com/search"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2557,6 +3164,21 @@ mod tests {
         // Shrinking to fit is only worth doing while what is left is usable; a
         // 200px-tall screen is not a reason to hand back a 104px window.
         assert_eq!(clamp_to_monitor((800, 800), (300, 200)), (800, 800));
+    }
+
+    #[test]
+    fn the_window_icon_is_there_and_decodes() {
+        // `window_icon` swallows a failure on purpose — a browser that refused
+        // to open over a decoration would be worse than a plain one — so
+        // nothing at runtime would ever say the icon had gone missing. A
+        // mistyped path, a truncated regeneration, or a master saved in a
+        // format `image` was not built to read would all show up as a window
+        // that quietly has no icon, on somebody else's desktop.
+        let icon = window_icon();
+        assert!(
+            icon.is_some(),
+            "the embedded window icon did not decode; regenerate with `cargo run -p icons`"
+        );
     }
 
     #[test]
