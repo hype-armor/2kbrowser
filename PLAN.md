@@ -417,12 +417,13 @@ The bulk of the engine work, ordered by how much of the 2000s web each unlocks:
 Known-wrong and recorded rather than hidden, each with the issue that carries
 it:
 
-- **Forms take typing and nothing else** — text fields and `<textarea>`s can
-  be clicked into, tabbed between and typed in (#110). A checkbox still cannot
-  be ticked, a button cannot be pressed, a dropdown cannot be opened, and no
-  form can be submitted. Submission is the sharp one and is deliberately last:
-  it is the first thing this browser would send *up* to a server, which is a
-  different kind of risk from everything else here.
+- **Forms take typing and submit** — text fields and `<textarea>`s can be
+  clicked into, tabbed between and typed in, and a form can be sent with its
+  submit button or with Enter in a one-line field (#110). What cannot be done
+  is *changing* the controls that are not text: a checkbox cannot be ticked or
+  unticked and a dropdown cannot be opened, so those submit whatever the markup
+  says they hold. That is the remaining gap and it is a real one — a form with a
+  box you need to untick cannot be filled in correctly.
 - **`list-style-image`** parses and is ignored, the last property still on that
   list. It needs an image fetched for a box that is not an element, which is
   the same blocker `url()` in `content` has and the same scope decision.

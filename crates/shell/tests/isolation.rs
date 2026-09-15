@@ -2050,3 +2050,219 @@ fn typing_repaints_the_rows_the_reader_is_looking_at() {
         "typing sent the reader back to the top of the page"
     );
 }
+
+/// A server that records what it was asked for and answers with a page.
+///
+/// Records the request line and the body, which is the whole point: a form is
+/// only sent correctly if what *arrived* is right, and nothing on this side of
+/// the socket can tell you that.
+fn serve_recording() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port");
+    let port = listener.local_addr().expect("has an address").port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let recorded = Arc::clone(&recorded);
+            std::thread::spawn(move || {
+                // Read until the headers are complete, then read exactly the
+                // body they declare. One `read` is not enough and the failure
+                // is a race: a client is free to write the headers and the body
+                // separately, and whether they arrive together depends on the
+                // kernel. It passed here and failed on two of CI's three
+                // platforms, which is the signature of every such assumption.
+                let mut request = Vec::new();
+                let headers_end = loop {
+                    if let Some(at) = request.windows(4).position(|four| four == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    let mut chunk = [0u8; 2048];
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break request.len(),
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..headers_end]).into_owned();
+                let wanted: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                while request.len() < headers_end + wanted {
+                    let mut chunk = [0u8; 2048];
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let line = head.lines().next().unwrap_or_default().to_owned();
+                let body = String::from_utf8_lossy(&request[headers_end..]).into_owned();
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(format!("{line}|{body}"));
+                let page = b"<title>Answered</title><body><p>thanks</p></body>";
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    page.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(page);
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn a_post_form_arrives_as_a_post_with_its_pairs_in_the_body() {
+    // The whole path, through a real socket: the child collects the form, the
+    // parent resolves the action and sends it, and what the server sees is what
+    // the reader typed. Nothing short of this proves the encoding is right —
+    // the two sides could agree with each other and both be wrong.
+    let (port, seen) = serve_recording();
+    let fetcher = net::Fetcher::default();
+    let url = format!("http://127.0.0.1:{port}/submit");
+    let answer = fetcher.post(&url, "q=hello+world&n=2").expect("posts");
+    assert!(
+        String::from_utf8_lossy(&answer.body).contains("thanks"),
+        "the answer did not come back"
+    );
+
+    let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (line, body) = seen[0].split_once('|').expect("a record");
+    assert_eq!(line, "POST /submit HTTP/1.1");
+    assert_eq!(body, "q=hello+world&n=2");
+}
+
+#[test]
+fn a_form_is_never_posted_to_a_local_file() {
+    // There is nothing to post to a `file:` URL, and a page that asked to would
+    // be asking to write to the disk.
+    let dir = std::env::temp_dir().join("2kbrowser-post");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("page.html");
+    std::fs::write(&path, "<p>x</p>").expect("write");
+    let outcome = net::Fetcher::default().post(&net::file_url(&path), "q=1");
+    assert!(
+        matches!(
+            outcome,
+            Err(net::FetchError::Refused(
+                net::Refusal::UnsupportedScheme { .. }
+            ))
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_form_larger_than_the_cap_is_refused_before_a_socket_is_opened() {
+    // The bound is not about what a form needs — the era's are a few hundred
+    // bytes. It is about what a compromised renderer can push out of this
+    // machine in one request, which is the one direction the boundary could not
+    // otherwise measure.
+    let (port, seen) = serve_recording();
+    let url = format!("http://127.0.0.1:{port}/submit");
+    let huge = "x".repeat(net::MAX_FORM_BYTES as usize + 1);
+    let outcome = net::Fetcher::default().post(&url, &huge);
+    assert!(
+        matches!(outcome, Err(net::FetchError::TooLarge)),
+        "{outcome:?}"
+    );
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "an over-sized form reached the network before it was refused"
+    );
+}
+
+#[test]
+fn pressing_a_submit_button_asks_the_parent_to_send_the_form() {
+    // The child's half, through a real renderer child: a press on the button
+    // collects the form and hands it out. Where it goes is the parent's
+    // decision and is deliberately not made here.
+    let mut page = viewport(
+        "<body style=\"margin: 0\">\
+         <form action=\"/search\" method=\"get\">\
+         <input name=\"q\" value=\"tables\">\
+         <input type=\"submit\" name=\"go\" value=\"Search\">\
+         </form></body>",
+        400,
+    );
+    assert!(page.take_submission().is_none(), "nothing was pressed yet");
+
+    // The button sits after the field on the same line.
+    let button = page
+        .buttons()
+        .first()
+        .copied()
+        .expect("the fixture has a submit button");
+    let at = (
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    page.focus_at(at.0, at.1);
+
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(sent.action, "/search");
+    assert!(!sent.post);
+    assert_eq!(sent.body, "q=tables&go=Search");
+    assert!(
+        page.take_submission().is_none(),
+        "one press must send one form, not every press after it"
+    );
+}
+
+#[test]
+fn enter_in_a_one_line_field_sends_the_form_and_presses_no_button() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\">\
+         <form action=\"/search\">\
+         <input name=\"q\" value=\"\">\
+         <input type=\"submit\" name=\"go\" value=\"Search\">\
+         </form></body>",
+        400,
+    );
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    assert!(page.editing(), "Tab focused nothing");
+    for letter in ["c", "s", "s"] {
+        page.type_key(sandbox::message::Key::Insert(letter.to_owned()));
+    }
+    assert!(page.take_submission().is_none(), "typing is not sending");
+
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    let sent = page.take_submission().expect("Enter asked to send");
+    // What was typed, and no button: Enter presses nothing, which is the
+    // difference between a search box and a form with two buttons that mean
+    // opposite things.
+    assert_eq!(sent.body, "q=css");
+}
+
+#[test]
+fn enter_in_a_textarea_is_a_newline_rather_than_a_send() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\">\
+         <form action=\"/post\"><textarea name=\"body\" rows=\"3\" cols=\"20\">a</textarea></form>\
+         </body>",
+        400,
+    );
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    assert!(page.editing());
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    assert!(
+        page.take_submission().is_none(),
+        "Enter in a textarea sent the form instead of starting a line"
+    );
+}

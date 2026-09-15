@@ -16,6 +16,55 @@ record for everything earlier.
 
 ## Unreleased
 
+**Forms submit** (#110). This is the first thing this browser sends *up* to a
+server, and it was held back to last for that reason rather than because it was
+hard. Press a submit button, or Enter in a one-line field, and the form goes:
+`get` puts its fields in the query string, `post` in a body, both
+`application/x-www-form-urlencoded`.
+
+Which controls are sent is HTML 4 §17.13.2's rule, including the parts that
+surprise people. A control needs a `name` and must not be disabled. A checkbox
+or radio contributes only when ticked, and a ticked box with no value of its own
+sends `on`. A dropdown sends what it is showing — its first option when nothing
+is marked — while a `multiple` list with nothing marked sends nothing. And
+**only the button that was pressed** is sent, which is why the submitter is
+asked for rather than inferred: a form with `name="action"` on a Save and a
+Delete means opposite things depending on which one you hit, and guessing picks
+one of them.
+
+**The split across the renderer boundary is the part worth reading.** The form
+is collected by the child, because the form is part of the document and the
+document never leaves that side (ADR-0012). What crosses is a destination *as
+the markup wrote it*, a method, and the encoded pairs. The parent resolves that
+destination against the page it actually has — not against anything the child
+claimed — applies the network policy to the result, refuses a `post` to a
+`file:` URL, and caps the body at a megabyte. A page can *ask* for a request; it
+cannot make one. That cap is not a limit any form needs, since the era's are a
+few hundred bytes: it bounds what a compromised renderer can push out of this
+machine in one request, which is the one direction the boundary could not
+otherwise measure, because a body — unlike a URL — has no length anything agrees
+on.
+
+**A `post`'s history entry is the URL alone**, so Back, Forward and Reload ask
+for it with a `get`. Re-sending a form because somebody pressed reload is how a
+comment gets posted twice and a payment taken twice, and a browser that does it
+quietly is worse than one that shows whatever the server says to a bare request.
+
+A `get` form's pairs *are* the query string, so an action that came with one of
+its own loses it — `action="/search?lang=en"` does not keep `lang`. That is
+HTML's rule and it is the one people are surprised by, so it has a test saying
+so rather than a comment.
+
+`multipart/form-data` is not here, and neither is `type="file"` — this engine
+does not draw a file picker and must not pretend to offer one. `text/plain`
+encoding is not here either: almost nothing reads it, and offering it would be
+another shape of "sent it wrong" for no page that needs it.
+
+What still cannot be done is **changing** the controls that are not text. A
+checkbox cannot be ticked or unticked and a dropdown cannot be opened, so they
+submit whatever the markup says they hold. A form with a box you need to untick
+cannot be filled in correctly, which is the honest shape of the remaining gap.
+
 **Text fields and `<textarea>`s can be typed into** (#110). Every form control
 has drawn correctly for a while and none of them did anything, which PLAN.md
 recorded as this milestone's chosen stopping point rather than an oversight —

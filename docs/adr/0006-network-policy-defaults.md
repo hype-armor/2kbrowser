@@ -58,6 +58,44 @@ and revoking are the same list in the same panel, because an allow-list that
 only grows is one a reader stops being able to reason about — "I let this
 through once to see the images" becomes permanent by accident.
 
+### Sending a form
+
+Amended again when M3 built submission (#110). Everything above is about what a
+page may *fetch*. A form is the other direction — the first thing this browser
+sends up to a server — and it is worth saying why the rules above do not simply
+extend to it.
+
+**The third-party rule does not apply.** A form's `action` frequently names
+another host: a search box that posts to a search service, a sign-in that posts
+to an identity provider. Refusing those would break the sign-in on much of the
+surviving web, and it would be refusing the wrong thing — this rule is about
+what a page loads *without being asked*, and a submission is asked for by a
+person pressing a button. A navigation has always been exempt for the same
+reason, and a submission is a navigation that carries something.
+
+**What replaces it is a bound and a split.** A `post` is refused to a `file:`
+URL, because there is nothing to post to one and a page asking to would be
+asking to write to the disk. A body is capped, which a URL never needed: a query
+string is bounded by everything that handles it and a body is bounded by
+nothing, so a megabyte is the most that leaves this machine in one request.
+Neither number is what a form needs — the era's forms are a few hundred bytes —
+and both are about what a *compromised renderer* could push.
+
+The split matters more than either. The form is collected inside the renderer,
+because the form is part of the document and the document stays there
+(ADR-0012). What crosses is a destination as the markup wrote it, a method, and
+the encoded pairs. The parent resolves that destination against the page it
+actually holds, applies this policy to the result, and decides whether anything
+is sent. **A page can ask for a request. It cannot make one.** That is the same
+shape as everything else here: the untrusted side proposes and the trusted side
+disposes.
+
+**A `post` is not repeated by going back to it.** Its history entry is the URL
+alone, so Back, Forward and Reload ask with a `get`. Re-sending a form because
+somebody pressed reload is how a comment is posted twice and a payment taken
+twice; showing whatever the server says to a bare request is the lesser of the
+two wrongs, and it is the one the reader can see.
+
 ### Marking the secure case, which this ADR used to forbid
 
 Also amended, and this one is a change of mind rather than a detail. The

@@ -344,6 +344,212 @@ pub fn is_single_line(doc: &Document, node: NodeId, control: Control) -> bool {
     }
 }
 
+/// How a form's data reaches the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// In the URL's query string.
+    Get,
+    /// In a request body.
+    Post,
+}
+
+/// A form, collected and ready to send (#110).
+///
+/// Assembled on this side of the renderer boundary because the form is part of
+/// the document, and the document never leaves it (ADR-0012). What crosses is
+/// this: a destination as the markup wrote it, a method, and the encoded pairs.
+/// The parent resolves the destination, applies the network policy to it, and
+/// decides whether anything is sent at all — which is the half that must not be
+/// decided by a stranger's page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    /// The `action` attribute as written, empty when it said nothing.
+    ///
+    /// Empty means the document's own URL, which is what HTML says and what the
+    /// era's forms rely on most.
+    pub action: String,
+    /// `get` or `post`.
+    pub method: Method,
+    /// The successful controls, `application/x-www-form-urlencoded`.
+    pub body: String,
+}
+
+/// The `<form>` a control belongs to, if any.
+///
+/// By containment only. HTML5's `form` attribute, which lets a control name a
+/// form it is not inside, is not read — the era's markup does not use it, and a
+/// control that claimed to belong to a form somewhere else would be a way for a
+/// page to send one form's contents to another's destination.
+pub fn form_of(doc: &Document, node: NodeId) -> Option<NodeId> {
+    doc.ancestors(node).find(|&id| {
+        doc.element(id)
+            .is_some_and(|element| element.local_name() == "form")
+    })
+}
+
+/// Collects a form's successful controls, in document order.
+///
+/// "Successful" is HTML 4 §17.13.2's word and its rules: a control contributes
+/// only if it has a `name`, is not disabled, and — for a checkbox or a radio —
+/// is checked. A submit button contributes only when it is the one that was
+/// pressed, which is why `submitter` is asked for rather than inferred: a form
+/// with `<button name="action" value="delete">` beside `value="save"` means
+/// entirely different things depending on which was pressed, and guessing would
+/// pick one of them.
+///
+/// Not here: `type="file"`, which this engine does not draw and must not
+/// pretend to offer, and `type="image"`, which submits coordinates.
+pub fn submission(doc: &Document, form: NodeId, submitter: Option<NodeId>) -> Submission {
+    let element = doc.element(form);
+    let action = element
+        .and_then(|form| form.attr("action"))
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let method = match element
+        .and_then(|form| form.attr("method"))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("post") => Method::Post,
+        // Anything else is `get`, including a method this browser has never
+        // heard of. HTML says an invalid value is the default, and the default
+        // is the one that cannot change anything on the far side.
+        _ => Method::Get,
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for node in doc.descendants(form) {
+        // A control inside a nested form belongs to that one. Nested forms are
+        // invalid HTML and the parser usually drops the inner one, but a
+        // document arrives from a stranger and this is cheaper than trusting it.
+        if form_of(doc, node) != Some(form) {
+            continue;
+        }
+        let Some(control) = control_of(doc, node) else {
+            continue;
+        };
+        let Some(element) = doc.element(node) else {
+            continue;
+        };
+        if element.attr("disabled").is_some() {
+            continue;
+        }
+        let Some(name) = element.attr("name").filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let name = name.to_owned();
+        match control {
+            Control::Checkbox | Control::Radio => {
+                if element.attr("checked").is_some() {
+                    // HTML's default for a ticked box with no value of its own.
+                    pairs.push((name, element.attr("value").unwrap_or("on").to_owned()));
+                }
+            }
+            Control::Button => {
+                // Only the button that was pressed, and never a reset.
+                if submitter == Some(node) && !is_reset(element) {
+                    pairs.push((name, button_value(doc, node, element)));
+                }
+            }
+            Control::Select => {
+                for option in selected_options(doc, node) {
+                    pairs.push((name.clone(), option_value(doc, option)));
+                }
+            }
+            Control::Text | Control::Password | Control::TextArea => {
+                pairs.push((name, value_of(doc, node)));
+            }
+        }
+    }
+
+    Submission {
+        action,
+        method,
+        body: urlencoded(&pairs),
+    }
+}
+
+/// Whether a button resets rather than submits.
+fn is_reset(element: &dom::ElementData) -> bool {
+    element
+        .attr("type")
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("reset"))
+}
+
+/// What a button sends: its `value`, or its content for a `<button>`.
+fn button_value(doc: &Document, node: NodeId, element: &dom::ElementData) -> String {
+    element
+        .attr("value")
+        .map(str::to_owned)
+        .unwrap_or_else(|| match element.local_name() {
+            "button" => descendant_text(doc, node).trim().to_owned(),
+            _ => String::new(),
+        })
+}
+
+/// Every option a `<select>` sends.
+///
+/// One for a dropdown, and however many are marked for a `multiple` list. A
+/// list box with nothing marked sends nothing, which is where it differs from
+/// the dropdown that shows its first option by default.
+fn selected_options(doc: &Document, select: NodeId) -> Vec<NodeId> {
+    let element = doc.element(select);
+    if element.is_some_and(is_list_box) {
+        return options_of(doc, select)
+            .into_iter()
+            .filter(|&id| {
+                doc.element(id)
+                    .is_some_and(|option| option.attr("selected").is_some())
+            })
+            .collect();
+    }
+    selected_option(doc, select).into_iter().collect()
+}
+
+/// What an `<option>` sends: its `value`, or the text it shows.
+fn option_value(doc: &Document, option: NodeId) -> String {
+    doc.element(option)
+        .and_then(|element| element.attr("value"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| descendant_text(doc, option).trim().to_owned())
+}
+
+/// Encodes pairs as `application/x-www-form-urlencoded`.
+///
+/// The one encoding here. `multipart/form-data` exists for file upload, which
+/// this engine does not offer, and `text/plain` is a curiosity almost nothing
+/// reads — offering either would be more shapes of "sent it wrong" for no page
+/// that needs them.
+fn urlencoded(pairs: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (name, value) in pairs {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        encode_into(name, &mut out);
+        out.push('=');
+        encode_into(value, &mut out);
+    }
+    out
+}
+
+/// One field, percent-encoded with a space as `+`.
+fn encode_into(text: &str, out: &mut String) {
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            // Everything else by its bytes, which is what makes a value in a
+            // language other than English arrive as what was typed rather than
+            // as question marks.
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+}
+
 /// Every `option` under a `select`, in document order.
 fn options_of(doc: &Document, node: NodeId) -> Vec<NodeId> {
     let mut out = Vec::new();
@@ -639,5 +845,219 @@ mod tests {
         let (node, control) = only_control(&doc);
         doc.set_value(node, "");
         assert_eq!(label_of(&doc, node, control).as_deref(), Some(""));
+    }
+
+    /// The one `<form>` in a fixture, and its submission with nothing pressed.
+    fn sent(html: &str) -> Submission {
+        let doc = dom::parse(html);
+        let form = doc
+            .descendants(doc.root())
+            .into_iter()
+            .find(|&node| {
+                doc.element(node)
+                    .is_some_and(|it| it.local_name() == "form")
+            })
+            .expect("a form");
+        submission(&doc, form, None)
+    }
+
+    #[test]
+    fn a_form_sends_its_named_controls_in_document_order() {
+        let sent = sent(
+            "<form action=\"/search\" method=\"get\">\
+             <input name=\"q\" value=\"hello world\">\
+             <input name=\"page\" value=\"2\">\
+             </form>",
+        );
+        assert_eq!(sent.action, "/search");
+        assert_eq!(sent.method, Method::Get);
+        // A space is a plus and not `%20`, which is the one thing about this
+        // encoding that surprises everybody who meets it.
+        assert_eq!(sent.body, "q=hello+world&page=2");
+    }
+
+    #[test]
+    fn a_control_with_no_name_sends_nothing() {
+        // HTML 4 §17.13.2's first rule, and the one that matters most in
+        // practice: the era's forms are full of unnamed decoration.
+        let sent = sent("<form><input value=\"kept out\"><input name=\"in\" value=\"1\"></form>");
+        assert_eq!(sent.body, "in=1");
+    }
+
+    #[test]
+    fn a_disabled_control_sends_nothing() {
+        let sent = sent(
+            "<form><input name=\"off\" value=\"1\" disabled><input name=\"on\" value=\"2\"></form>",
+        );
+        assert_eq!(sent.body, "on=2");
+    }
+
+    #[test]
+    fn a_box_sends_only_when_it_is_ticked() {
+        let sent = sent(
+            "<form>\
+             <input type=\"checkbox\" name=\"a\" checked>\
+             <input type=\"checkbox\" name=\"b\">\
+             <input type=\"radio\" name=\"c\" value=\"yes\" checked>\
+             <input type=\"radio\" name=\"c\" value=\"no\">\
+             </form>",
+        );
+        // `on` is HTML's default for a ticked box that carries no value.
+        assert_eq!(sent.body, "a=on&c=yes");
+    }
+
+    #[test]
+    fn only_the_button_that_was_pressed_is_sent() {
+        // The rule with the sharpest consequence: a form with `name="action"`
+        // on two buttons means entirely different things depending on which was
+        // pressed, so the submitter is asked for rather than guessed at.
+        let doc = dom::parse(
+            "<form>\
+             <input name=\"q\" value=\"x\">\
+             <button name=\"do\" value=\"save\">Save</button>\
+             <button name=\"do\" value=\"delete\">Delete</button>\
+             </form>",
+        );
+        let form = doc.find_element("form").expect("a form");
+        let buttons: Vec<NodeId> = doc
+            .descendants(form)
+            .into_iter()
+            .filter(|&node| {
+                doc.element(node)
+                    .is_some_and(|it| it.local_name() == "button")
+            })
+            .collect();
+
+        assert_eq!(submission(&doc, form, Some(buttons[0])).body, "q=x&do=save");
+        assert_eq!(
+            submission(&doc, form, Some(buttons[1])).body,
+            "q=x&do=delete"
+        );
+        // Enter in a text field presses nothing, so neither button is sent.
+        assert_eq!(submission(&doc, form, None).body, "q=x");
+    }
+
+    #[test]
+    fn a_reset_button_is_never_sent_even_when_it_is_the_one_pressed() {
+        let doc = dom::parse(
+            "<form><input name=\"q\" value=\"x\">\
+             <input type=\"reset\" name=\"clear\" value=\"Clear\"></form>",
+        );
+        let form = doc.find_element("form").expect("a form");
+        let reset = doc
+            .descendants(form)
+            .into_iter()
+            .find(|&node| {
+                doc.element(node)
+                    .is_some_and(|it| it.attr("type") == Some("reset"))
+            })
+            .expect("a reset");
+        assert_eq!(submission(&doc, form, Some(reset)).body, "q=x");
+    }
+
+    #[test]
+    fn a_dropdown_sends_what_it_shows_and_a_list_sends_what_is_marked() {
+        // A closed dropdown always sends something — its first option when
+        // nothing is marked, which is what it is showing. A list box with
+        // nothing marked sends nothing, because it is showing nothing chosen.
+        let dropdown = sent(
+            "<form><select name=\"s\"><option>one<option value=\"2\" selected>two</select></form>",
+        );
+        assert_eq!(dropdown.body, "s=2");
+
+        let unmarked = sent("<form><select name=\"s\"><option>one<option>two</select></form>");
+        assert_eq!(unmarked.body, "s=one", "a dropdown shows its first option");
+
+        let list = sent(
+            "<form><select name=\"s\" multiple>\
+             <option selected>one<option>two<option selected>three</select></form>",
+        );
+        assert_eq!(list.body, "s=one&s=three");
+    }
+
+    #[test]
+    fn what_was_typed_is_what_is_sent() {
+        // The seam this whole feature turns on: the `value` attribute is the
+        // field's default and what the reader typed is the control's contents,
+        // and it is the contents that go to the server (#110).
+        let mut doc = dom::parse("<form><input name=\"q\" value=\"Ada\"></form>");
+        let form = doc.find_element("form").expect("a form");
+        let field = doc
+            .descendants(form)
+            .into_iter()
+            .find(|&node| control_of(&doc, node).is_some())
+            .expect("a field");
+        assert_eq!(submission(&doc, form, None).body, "q=Ada");
+        doc.set_value(field, "Byron & co");
+        assert_eq!(submission(&doc, form, None).body, "q=Byron+%26+co");
+    }
+
+    #[test]
+    fn a_value_in_another_language_is_sent_as_its_bytes() {
+        let mut doc = dom::parse("<form><input name=\"q\" value=\"\"></form>");
+        let form = doc.find_element("form").expect("a form");
+        let field = doc
+            .descendants(form)
+            .into_iter()
+            .find(|&node| control_of(&doc, node).is_some())
+            .expect("a field");
+        doc.set_value(field, "日本");
+        assert_eq!(submission(&doc, form, None).body, "q=%E6%97%A5%E6%9C%AC");
+    }
+
+    #[test]
+    fn a_method_this_browser_has_never_heard_of_is_a_get() {
+        // HTML's rule, and the safe direction: the default is the method that
+        // cannot change anything on the far side.
+        assert_eq!(sent("<form method=\"put\"></form>").method, Method::Get);
+        assert_eq!(sent("<form method=\"POST\"></form>").method, Method::Post);
+        assert_eq!(sent("<form></form>").method, Method::Get);
+    }
+
+    #[test]
+    fn a_control_belongs_to_the_form_it_is_inside() {
+        // Two forms on one page is the era's login-and-search layout, and
+        // sending one form's contents to the other's destination would be a
+        // page leaking its own fields.
+        let doc = dom::parse(
+            "<body>\
+             <form action=\"/login\"><input name=\"user\" value=\"ada\"></form>\
+             <form action=\"/search\"><input name=\"q\" value=\"tables\"></form>\
+             </body>",
+        );
+        let forms: Vec<NodeId> = doc
+            .descendants(doc.root())
+            .into_iter()
+            .filter(|&node| {
+                doc.element(node)
+                    .is_some_and(|it| it.local_name() == "form")
+            })
+            .collect();
+        assert_eq!(submission(&doc, forms[0], None).body, "user=ada");
+        assert_eq!(submission(&doc, forms[1], None).body, "q=tables");
+    }
+
+    #[test]
+    fn a_field_finds_the_form_it_is_in() {
+        let doc = dom::parse("<form action=\"/go\"><p><input name=\"q\"></p></form>");
+        let field = doc
+            .descendants(doc.root())
+            .into_iter()
+            .find(|&node| control_of(&doc, node).is_some())
+            .expect("a field");
+        let form = form_of(&doc, field).expect("a form");
+        assert_eq!(
+            doc.element(form).and_then(|it| it.attr("action")),
+            Some("/go")
+        );
+        // And a field with no form around it belongs to none, rather than to
+        // the first one on the page.
+        let loose = dom::parse("<body><input name=\"q\"></body>");
+        let node = loose
+            .descendants(loose.root())
+            .into_iter()
+            .find(|&node| control_of(&loose, node).is_some())
+            .expect("a field");
+        assert_eq!(form_of(&loose, node), None);
     }
 }

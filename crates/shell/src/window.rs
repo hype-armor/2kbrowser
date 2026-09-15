@@ -686,6 +686,23 @@ impl App {
         let fetched = self
             .fetcher
             .fetch_raw(url, None, net::RequestKind::Navigation);
+        self.install(fetched);
+    }
+
+    /// Sends a form and shows what comes back (#110).
+    ///
+    /// The one request this browser makes that carries data up, and it is
+    /// deliberately a method of its own rather than a flag on `show`: a caller
+    /// has to mean it. Everything after the request is identical, because what
+    /// comes back from a form is a page like any other.
+    fn send(&mut self, url: &str, body: &str) {
+        self.stage(Some(FETCHING));
+        let fetched = self.fetcher.post(url, body);
+        self.install(fetched);
+    }
+
+    /// Installs whatever a navigation came back with, or says why it did not.
+    fn install(&mut self, fetched: Result<net::Fetched, net::FetchError>) {
         // Painted before the page is cleared, so what stays on screen behind
         // the bar is the page being left rather than a white window.
         self.stage(Some(LAYING_OUT));
@@ -883,6 +900,56 @@ impl App {
         {
             window.request_redraw();
         }
+        self.act_on_page();
+    }
+
+    /// Sends a form the page asked to send (#110).
+    ///
+    /// Everything the child said is treated as a request rather than an
+    /// instruction. The destination resolves against *this* document — not
+    /// against anything the child claimed — the network policy is applied to
+    /// the result by `fetch_raw` or `post`, and the reader sees where they went
+    /// in the URL bar like any other navigation.
+    ///
+    /// A `get` puts the pairs in the query string and is an ordinary
+    /// navigation. A `post` carries them in a body, and its history entry is
+    /// the URL alone: Back, Forward and Reload therefore ask for it with a
+    /// `get`. That is deliberate. Re-sending a form because somebody pressed
+    /// reload is how a comment gets posted twice and a payment gets taken
+    /// twice, and a browser that does it quietly is worse than one that shows
+    /// whatever the server says to a bare request.
+    fn submit(&mut self, submission: sandbox::Submission) {
+        let (origin, path) = {
+            let loaded = &self.tab().loaded;
+            (loaded.origin.clone(), loaded.path.clone())
+        };
+        // An empty action is the document's own URL, which is what HTML says
+        // and what the era's forms lean on hardest.
+        let action = if submission.action.is_empty() {
+            path.clone()
+        } else {
+            submission.action.clone()
+        };
+        let url = net::resolve(&origin, &path, &action);
+        if submission.post {
+            self.tab_mut().history.visit(url.clone());
+            let target = self.tab().history.current().to_owned();
+            self.send(&target, &submission.body);
+        } else {
+            self.navigate(with_query(&url, &submission.body));
+        }
+    }
+
+    /// Carries out whatever the page asked for after a press or a keystroke.
+    fn act_on_page(&mut self) {
+        let asked = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .and_then(crate::viewport::Viewport::take_submission);
+        if let Some(submission) = asked {
+            self.submit(submission);
+        }
     }
 
     /// Whether a form control on the page is taking the typing (#110).
@@ -901,6 +968,7 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+        self.act_on_page();
     }
 
     /// Gives up editing without navigating.
@@ -2000,6 +2068,20 @@ fn app_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba, width, height).ok()
 }
 
+/// `url` with `query` as its query string, replacing whatever it had.
+///
+/// What a `get` form does: the pairs *are* the query, so an action that came
+/// with one of its own loses it. That is HTML's rule and it is the one people
+/// are surprised by — `action="/search?lang=en"` does not keep `lang`.
+fn with_query(url: &str, query: &str) -> String {
+    let base = url.split_once('#').map_or(url, |(before, _)| before);
+    let base = base.split_once('?').map_or(base, |(before, _)| before);
+    match query.is_empty() {
+        true => base.to_owned(),
+        false => format!("{base}?{query}"),
+    }
+}
+
 /// How far along the loading bar sits while the document is being fetched.
 ///
 /// Not zero: the bar has to be visible the instant a link is clicked, because
@@ -2949,6 +3031,50 @@ pub fn open(
     event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::with_query;
+
+    #[test]
+    fn a_get_form_replaces_the_actions_own_query() {
+        // HTML's rule, and the one people are surprised by: the pairs *are* the
+        // query string, so an action that came with one loses it.
+        assert_eq!(
+            with_query("https://example.com/search?lang=en", "q=tables"),
+            "https://example.com/search?q=tables"
+        );
+        assert_eq!(
+            with_query("https://example.com/search", "q=tables"),
+            "https://example.com/search?q=tables"
+        );
+    }
+
+    #[test]
+    fn a_fragment_goes_with_the_query_it_belonged_to() {
+        // A form's destination is a resource, not a place on a page. Keeping
+        // the fragment would send the reader to an anchor of the *old* page's
+        // making, which the new one has no reason to have.
+        assert_eq!(
+            with_query("https://example.com/p#results", "q=x"),
+            "https://example.com/p?q=x"
+        );
+        assert_eq!(
+            with_query("https://example.com/p?a=1#results", "q=x"),
+            "https://example.com/p?q=x"
+        );
+    }
+
+    #[test]
+    fn a_form_with_nothing_in_it_asks_for_the_bare_url() {
+        // Not `?`, which some servers treat as a query and some do not. A form
+        // whose every control is unnamed has nothing to say.
+        assert_eq!(
+            with_query("https://example.com/search?old=1", ""),
+            "https://example.com/search"
+        );
+    }
 }
 
 #[cfg(test)]

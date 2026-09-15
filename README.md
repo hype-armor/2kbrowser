@@ -246,10 +246,28 @@ document it belongs to; the window sends named keys — "delete a word", not a
 scancode — and gets pixels back, so the untrusted side never has to interpret a
 keyboard and no platform's idea of a key leaves its own side of the line.
 
-**Nothing can be ticked, pressed, or submitted.** A checkbox, a button and a
-dropdown still only draw. Submission is deliberately last: it is the first thing
-this browser would send *up* to a server, which is a different kind of risk from
-everything else here. A radio button is drawn round and a checkbox square — the shape is the question, "one of
+**Forms submit.** Press a submit button, or Enter in a one-line field, and the
+form goes — `get` puts its fields in the query string, `post` in a body, both
+`application/x-www-form-urlencoded`. Which controls are sent is HTML 4
+§17.13.2's rule: named, not disabled, ticked if it is a box, and *only the
+button that was pressed*, since a form with two buttons named `action` means
+opposite things depending on which one you hit.
+
+The form is collected by the renderer child, because the form is part of the
+document and the document stays there. What crosses the boundary is a
+destination as the markup wrote it, a method, and the encoded pairs — and the
+parent resolves the destination against the real page, applies the network
+policy, and caps the body. A page can *ask* for a request; it cannot make one.
+
+A `post`'s history entry is the URL alone, so Back and Reload ask for it with a
+`get`. Re-sending a form because somebody pressed reload is how a comment gets
+posted twice and a payment taken twice, and a browser that does it quietly is
+worse than one that shows whatever the server says to a bare request.
+
+**A checkbox and a dropdown still cannot be changed.** They draw, and they
+submit whatever the markup says they hold — so a form with a preset radio sends
+it, and a box you want to untick cannot be unticked. A radio button is drawn
+round and a checkbox square — the shape is the question, "one of
 these" against "any of these" — and a `<legend>` sits *in* its group's rule, with
 the rule stopping either side of it, as HTML's rendering section has it.
 
