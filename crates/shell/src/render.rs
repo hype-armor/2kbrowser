@@ -29,6 +29,14 @@ pub struct Frame {
     pub origin: Origin,
     /// Path it was fetched from.
     pub path: String,
+    /// The `<img>` elements whose picture never arrived, with what they asked
+    /// for (#118).
+    ///
+    /// Kept rather than recomputed, because the answer is a fetch outcome and
+    /// nothing downstream has one: by the time a rectangle is wanted the
+    /// document is all that is left, and a document cannot tell a refused
+    /// image from a decoded one.
+    pub missing: Vec<(dom::NodeId, String)>,
 }
 
 /// A rendered page.
@@ -184,6 +192,25 @@ impl Page {
                     .map(move |rect| (rect, link.url.clone()))
             })
             .collect()
+    }
+
+    /// Every placeholder rectangle on the canvas, with the URL behind it.
+    ///
+    /// The same shape as [`Page::links`] and hit-tested the same way: the
+    /// window has no box tree — it is in another process — so a rectangle
+    /// missing from this list is a placeholder that does nothing when pressed.
+    pub fn missing_images(&self) -> Vec<(layout::Rect, String)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for (node, url) in &frame.missing {
+                out.extend(frame.layout.rects_for(*node).into_iter().map(|mut rect| {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    (rect, url.clone())
+                }));
+            }
+        }
+        out
     }
 
     /// The same links, with each one's rectangles kept together.
@@ -846,6 +873,7 @@ pub(crate) fn render_sized(
                 // still be clickable once scrolled.
                 height: content_height.max(height as f32),
             },
+            missing: missing_images(&doc, &intrinsic, origin, path),
             doc,
             layout: laid_out,
             origin: origin.clone(),
@@ -1297,6 +1325,36 @@ fn draws_something(
 ///
 /// The caption stays. It is text, the reader can still learn what the picture
 /// showed, and losing it as well would be a second, quieter kind of hole.
+/// Every `<img>` whose picture did not arrive, with the URL it asked for.
+///
+/// What makes the placeholder a control rather than a label (#118): the window
+/// needs somewhere to send a click, and the only thing worth sending is what
+/// the page wanted. Resolved here, against the document that named it, because
+/// nothing further out knows what it was relative to.
+///
+/// "Did not arrive" means failed or refused rather than still coming — this
+/// runs after the fetch, and `intrinsic` holds every image that loaded and
+/// decoded. Which of the two it was is deliberately not recorded: it is the
+/// distinction the renderer boundary exists to keep from this side (ADR-0012).
+fn missing_images(
+    doc: &dom::Document,
+    intrinsic: &IntrinsicSizes,
+    origin: &Origin,
+    path: &str,
+) -> Vec<(dom::NodeId, String)> {
+    doc.descendants(doc.root())
+        .into_iter()
+        .filter(|node| !intrinsic.contains_key(node))
+        .filter_map(|node| {
+            let element = doc.element(node)?;
+            (element.local_name() == "img")
+                .then(|| element.attr("src"))
+                .flatten()
+                .map(|src| (node, net::resolve(origin, path, src)))
+        })
+        .collect()
+}
+
 fn hide_missing_images(
     doc: &dom::Document,
     intrinsic: &IntrinsicSizes,

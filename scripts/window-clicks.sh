@@ -578,4 +578,66 @@ panel, so there is no way out of it with the pointer"
 echo "ok: the padlock opened the site panel and closed it again"
 stop
 
+# N. A refused image leaves a box that answers a press (#118).
+#
+#    `paint` pins what the placeholder looks like and `isolation.rs` pins that
+#    its rectangle crosses the boundary. Neither can show that the rectangle
+#    lands where the pixels are — the click path runs from winit's pointer
+#    position through the chrome offset and the scroll to a list the child
+#    sent, and every one of those has been wrong at some point in this file's
+#    history.
+#
+#    A local page asking for an image over the network is a third-party request
+#    by ADR-0006's own argument — a file has no host for anything to be
+#    first-party to — so this is refused without a socket being opened.
+placeholders="$here/target/window-placeholder"
+mkdir -p "$placeholders"
+cat > "$placeholders/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Placeholder</title>
+<body style="margin: 0">
+<img src="https://cdn.example.net/photo.jpg" width="240" height="160">
+</body>
+FIXTURE
+
+start_on "$placeholders/p.html" "Placeholder"
+# The plate colour from `paint::draw_missing`, as the pixel reader prints it.
+plate="244 244 242"
+seen=""
+for _ in $(seq 1 20); do
+    if [ "$(pixel 120 $((chrome + 40)))" = "$plate" ]; then
+        seen=yes
+        break
+    fi
+    sleep 0.2
+done
+[ -n "$seen" ] || fail "a refused image drew no placeholder, so the reader gets \
+a hole with nothing to press"
+
+# Pressing it opens the site panel, because the policy is what refused this one
+# and retrying would refuse it again.
+#
+# Sampled to the right of the image and inside the panel: the panel hangs off
+# the padlock, so it starts further right than the placeholder does and is
+# wider. A point inside both would compare the panel's surface against the
+# placeholder's, which differ by two in each channel — true, and not something
+# to rest a check on.
+panel_probe_x=350
+panel_probe_y=$((chrome + 40))
+before=$(pixel "$panel_probe_x" "$panel_probe_y")
+DISPLAY=$display xdotool mousemove 120 $((chrome + 40))
+DISPLAY=$display xdotool click 1
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    if [ "$(pixel "$panel_probe_x" "$panel_probe_y")" != "$before" ]; then
+        opened=yes
+        break
+    fi
+done
+[ -n "$opened" ] || fail "pressing the placeholder did nothing — a refused \
+image needs the panel, because retrying it would refuse it again"
+echo "ok: a refused image drew a placeholder and pressing it offered the host"
+stop
+
 echo "all window click checks passed"

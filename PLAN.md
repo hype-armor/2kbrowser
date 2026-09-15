@@ -534,6 +534,13 @@ The padlock reverses what ADR-0006 said about marking the secure case, and the
 ADR records the change of mind rather than being left to contradict the code.
 The *words* still mark only the exception.
 
+An image that did not arrive now leaves a box saying `Load image` rather than a
+hole. Pressing it retries a picture that merely failed, and opens the panel for
+one the policy refused — the browser cannot tell the reader which it was
+without telling the renderer, and the renderer is the one process that must not
+be told (ADR-0012), so the box says what pressing it does and the chrome
+carries the reason.
+
 Reader mode grew the content extraction ADR-0009 asks for, in `crates/slop`.
 Discarding the author's layout without also discarding the author's furniture
 turned out not to be reader mode at all: the navigation, the sidebar and the

@@ -312,6 +312,25 @@ impl Viewport {
             .map(|link| (link.url.as_str(), link.jump_to))
     }
 
+    /// The image a placeholder at this point was asking for (#118).
+    ///
+    /// Checked *before* links by the window, because an `<img>` inside an `<a>`
+    /// is the era's whole navigation: a thumbnail that is also a link. A
+    /// placeholder that could not be pressed because the link underneath it
+    /// swallowed the click would be a button that does nothing, and the link is
+    /// still reachable from the caption or the keyboard.
+    pub fn missing_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.page
+            .missing
+            .iter()
+            .rev()
+            .find(|missing| {
+                let rect = missing.rect;
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|missing| missing.url.as_str())
+    }
+
     fn wire_link_at(&self, x: f32, y: f32) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
         self.page.links.iter().rev().find(|link| {

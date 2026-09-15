@@ -423,6 +423,17 @@ pub struct LayoutBox {
     /// Set when this box is a replaced element, naming the node so paint can
     /// find its decoded image.
     pub replaced: Option<NodeId>,
+    /// Whether that replaced element is an `<img>`.
+    ///
+    /// Separate from `replaced` because paint has no document to ask. It draws
+    /// a `Load image` placeholder where a picture did not arrive (#118), and a
+    /// replaced box with no image is not always a missing picture: an
+    /// `<iframe>` is replaced too and has no image by nature, so without this
+    /// every empty frame on the page grew a button offering to load one. Found
+    /// by the conformance suite, which is full of `<iframe>` elements used as
+    /// plain boxes — fourteen tests of §10.4's replaced-element sizing, none of
+    /// them about images at all.
+    pub replaced_image: bool,
     /// The element this box was generated from, where there is one.
     ///
     /// Anonymous boxes — the canvas root, a list marker — have none. Paint uses
@@ -1067,6 +1078,7 @@ pub fn layout(
         content_width: viewport_width,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: None,
         round: false,
         top_border_gap: None,
@@ -1362,6 +1374,7 @@ fn marker_box(
         content_width: width,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: None,
         round: false,
         top_border_gap: None,
@@ -1479,6 +1492,7 @@ fn layout_inline_block(
         content_width: effective,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: None,
         round: false,
         top_border_gap: None,
@@ -1656,6 +1670,7 @@ fn emit_replaced_boxes(
                     content_width: 0.0,
                     children: Vec::new(),
                     replaced: None,
+                    replaced_image: false,
                     node: None,
                     round,
                     top_border_gap: None,
@@ -1675,6 +1690,10 @@ fn emit_replaced_boxes(
                 content_width: inner,
                 children,
                 replaced: control.is_none().then_some(node),
+                replaced_image: control.is_none()
+                    && doc
+                        .element(node)
+                        .is_some_and(|element| element.local_name() == "img"),
                 node: Some(node),
                 round,
                 top_border_gap: None,
@@ -2337,6 +2356,7 @@ fn flush_inline(
         content_width,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: None,
         round: false,
         top_border_gap: None,
@@ -2494,6 +2514,9 @@ fn layout_block(
             content_width: image_width,
             children: Vec::new(),
             replaced: Some(node),
+            replaced_image: doc
+                .element(node)
+                .is_some_and(|element| element.local_name() == "img"),
             node: Some(node),
             round: false,
             top_border_gap: None,
@@ -2524,6 +2547,7 @@ fn layout_block(
         content_width,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: Some(node),
         round: false,
         top_border_gap: None,
@@ -2750,6 +2774,7 @@ fn layout_block(
                     content_width: width,
                     children: Vec::new(),
                     replaced: None,
+                    replaced_image: false,
                     node: None,
                     round: false,
                     top_border_gap: None,
@@ -2999,6 +3024,7 @@ fn layout_block(
                 content_width: room,
                 children: Vec::new(),
                 replaced: None,
+                replaced_image: false,
                 node: None,
                 round: false,
                 top_border_gap: None,
@@ -3485,6 +3511,7 @@ fn layout_block(
             content_width: 0.0,
             children: Vec::new(),
             replaced: None,
+            replaced_image: false,
             node: None,
             round: false,
             top_border_gap: None,
@@ -3875,6 +3902,7 @@ fn layout_table(
                 content_width: width,
                 children: Vec::new(),
                 replaced: None,
+                replaced_image: false,
                 node: None,
                 round: false,
                 top_border_gap: None,
@@ -4051,6 +4079,7 @@ fn layout_table(
         content_width: rect.width,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: Some(node),
         round: false,
         top_border_gap: None,
@@ -4286,6 +4315,7 @@ fn emit_collapsed_borders(
             content_width: rect.width,
             children: Vec::new(),
             replaced: None,
+            replaced_image: false,
             node: None,
             round: false,
             top_border_gap: None,
@@ -4429,6 +4459,7 @@ fn place_float(
         content_width: float_width,
         children: Vec::new(),
         replaced: None,
+        replaced_image: false,
         node: None,
         round: false,
         top_border_gap: None,
