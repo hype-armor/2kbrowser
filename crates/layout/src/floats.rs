@@ -161,6 +161,55 @@ impl FloatContext {
         }
     }
 
+    /// How many floats this context holds.
+    ///
+    /// Used to tell the ones a descendant added from the ones it inherited: a
+    /// descendant is handed a translated *copy*, so everything past the length
+    /// at handoff is its own (#41).
+    pub fn len(&self) -> usize {
+        self.floats.len()
+    }
+
+    /// The floats added since `from`, moved into an ancestor's coordinates.
+    ///
+    /// A float belongs to its block formatting context rather than to the
+    /// block that declared it, so one that overhangs its parent still narrows
+    /// the lines of the parent's *later* siblings. That only works if it comes
+    /// back up: a descendant gets a copy, places into it, and the copy is
+    /// dropped — which was invisible while every parent grew to enclose its
+    /// floats, and is exactly what stops being true when it does not (#41).
+    pub fn added_since(&self, from: usize, dx: f32, dy: f32) -> Vec<PlacedFloat> {
+        self.floats
+            .iter()
+            .skip(from)
+            .map(|float| PlacedFloat {
+                left: float.left + dx,
+                right: float.right + dx,
+                top: float.top + dy,
+                bottom: float.bottom + dy,
+                ..*float
+            })
+            .collect()
+    }
+
+    /// Takes floats a descendant placed, moved into this context by `(dx, dy)`.
+    ///
+    /// Two translations reach here rather than one, and deliberately: the
+    /// descendant knows where its floats sit inside itself, and only the parent
+    /// knows where the descendant sits inside *it* — the cursor it was laid out
+    /// at, and how far it was pushed aside by an earlier float. Doing the whole
+    /// sum on either side alone means one of them guessing at the other's.
+    pub fn absorb(&mut self, floats: Vec<PlacedFloat>, dx: f32, dy: f32) {
+        self.floats
+            .extend(floats.into_iter().map(|float| PlacedFloat {
+                left: float.left + dx,
+                right: float.right + dx,
+                top: float.top + dy,
+                bottom: float.bottom + dy,
+                ..float
+            }));
+    }
+
     /// The lowest edge of any float, used so a container encloses its floats.
     pub fn lowest_edge(&self) -> f32 {
         self.floats

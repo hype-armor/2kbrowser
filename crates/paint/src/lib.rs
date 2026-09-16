@@ -123,6 +123,36 @@ pub struct DisplayList {
     )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
+    /// Half-open ranges of `items` that came from `position: fixed` subtrees.
+    ///
+    /// Those items are the one thing on the page whose coordinates are the
+    /// *window's* rather than the document's: a page is laid out once and
+    /// `rasterise_band` draws a slice of it by shifting every item up by the
+    /// band's top, and a fixed box must not move when the reader scrolls
+    /// (#108). So it must not be shifted.
+    ///
+    /// Ranges rather than a list of their own, so the items stay in paint
+    /// order where they were emitted. A separate list has to be drawn at some
+    /// fixed point — last, in the obvious version — and that is wrong:
+    /// `left-offset-position-fixed-001` covers a fixed red square with an
+    /// absolutely positioned green one that comes after it in the source, and
+    /// a fixed box painted last shows the red.
+    ///
+    /// The same trick `clip` above uses, and for the same reason: a subtree
+    /// emits a contiguous run, so where it starts and stops is all that has to
+    /// be remembered.
+    pub pinned: Vec<(usize, usize)>,
+}
+
+impl DisplayList {
+    /// Whether the item at `at` came from a `position: fixed` subtree, and so
+    /// is drawn at the window's coordinates rather than the document's.
+    ///
+    /// A linear scan of the ranges, which is the right shape here: almost
+    /// every page has none at all, and a page with one has one.
+    pub fn is_pinned(&self, at: usize) -> bool {
+        self.pinned.iter().any(|&(from, to)| at >= from && at < to)
+    }
 }
 
 impl Default for DisplayList {
@@ -133,6 +163,7 @@ impl Default for DisplayList {
             canvas: Color::WHITE,
             canvas_image: None,
             items: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 }
@@ -146,6 +177,7 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
         canvas: layout.canvas_background.over(Color::WHITE),
         canvas_image: layout.canvas_image,
         items: Vec::new(),
+        pinned: Vec::new(),
     };
     // §14.2 again: an element whose background was propagated to the canvas
     // does not paint it a second time. Drawing it twice is invisible while the
@@ -461,14 +493,19 @@ fn paint_box(
     });
     for stacked in order {
         let child = stacked.box_;
-        paint_box(
-            child,
-            stacked.x,
-            stacked.y,
-            propagated,
-            list,
-            forms_a_stacking_context(child),
-        );
+        let inside = forms_a_stacking_context(child);
+        // A fixed subtree's items are pinned where they are emitted.
+        // Everything inside it is positioned against the viewport already —
+        // §10.1 made that the containing block — so what is left is to stop
+        // the band rasteriser shifting it with the page, and the cleanest
+        // place to mark that is where the subtree begins.
+        if child.style.position == css::style::Position::Fixed {
+            let from = list.items.len();
+            paint_box(child, stacked.x, stacked.y, propagated, list, inside);
+            list.pinned.push((from, list.items.len()));
+            continue;
+        }
+        paint_box(child, stacked.x, stacked.y, propagated, list, inside);
     }
 
     if let Some(clip) = clip {
@@ -638,17 +675,20 @@ fn paint_inline_box(
         border.top.used_width(font_size),
         border.bottom.used_width(font_size),
     );
+    // Which *physical* side each of the box's two logical ends is on. §8.4 puts
+    // the start side on the first fragment and the end side on the last, and
+    // §9.10 decides which is which: in right-to-left text a box opens on the
+    // right and closes on the left. Painting `opens` as the left unconditionally
+    // drew both sides on the first fragment of an rtl box and neither on the
+    // last (#113).
+    let rtl = style.direction == css::style::Direction::Rtl;
+    let has_left = if rtl { fragment.closes } else { fragment.opens };
+    let has_right = if rtl { fragment.opens } else { fragment.closes };
     // The reserved stretch starts at the margin's outer edge, so the border box
     // is inside it by whichever margins are on this fragment.
-    let left = origin_x
-        + fragment.x
-        + if fragment.opens {
-            px(style.margin.left)
-        } else {
-            0.0
-        };
+    let left = origin_x + fragment.x + if has_left { px(style.margin.left) } else { 0.0 };
     let right = origin_x + fragment.x + fragment.width
-        - if fragment.closes {
+        - if has_right {
             px(style.margin.right)
         } else {
             0.0
@@ -701,7 +741,7 @@ fn paint_inline_box(
             &border.left,
             Side::Left,
             border.left.used_width(font_size),
-            fragment.opens,
+            has_left,
             Rect {
                 y: rect.y + border_top,
                 width: border.left.used_width(font_size),
@@ -713,7 +753,7 @@ fn paint_inline_box(
             &border.right,
             Side::Right,
             border.right.used_width(font_size),
-            fragment.closes,
+            has_right,
             Rect {
                 x: rect.x + rect.width - border.right.used_width(font_size),
                 y: rect.y + border_top,
@@ -1096,7 +1136,36 @@ pub fn rasterise_band(
         }
     }
 
-    for item in &list.items {
+    // In one pass and in order, with the pinned runs drawn at no shift at all:
+    // their coordinates are already the window's, which is the whole of what
+    // `position: fixed` means once the containing block is the viewport (#108).
+    for (at, item) in list.items.iter().enumerate() {
+        let shift = if list.is_pinned(at) { 0.0 } else { top };
+        draw_items(
+            &mut pixmap,
+            fonts,
+            images,
+            std::slice::from_ref(item),
+            shift,
+        );
+    }
+    Some(pixmap)
+}
+
+/// Draws a run of display items into a band, shifting them up by `top`.
+///
+/// Called twice: once for the page's own items, and once for the pinned ones
+/// with a shift of zero. That second call is the whole of `position: fixed`'s
+/// painting half — a page is laid out once and a band is a slice of it, so an
+/// item that must not scroll is simply an item that is not shifted (#108).
+fn draw_items(
+    pixmap: &mut Pixmap,
+    fonts: &mut FontStore,
+    images: &ImageStore,
+    items: &[DisplayItem],
+    top: f32,
+) {
+    for item in items {
         // Nothing beyond the drawable range is drawn at all. See `MAX_COORD`:
         // this is the one place every item passes through, so it is the one
         // place the check has to be.
@@ -1104,13 +1173,13 @@ pub fn rasterise_band(
             DisplayItem::Rect { rect, color } => {
                 let rect = shifted(rect, top);
                 if drawable(&rect) {
-                    fill_rect(&mut pixmap, &rect, *color);
+                    fill_rect(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Ellipse { rect, color } => {
                 let rect = shifted(rect, top);
                 if drawable(&rect) {
-                    fill_ellipse(&mut pixmap, &rect, *color);
+                    fill_ellipse(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Image {
@@ -1121,8 +1190,8 @@ pub fn rasterise_band(
                 let rect = shifted(rect, top);
                 if drawable(&rect) {
                     match images.get(&ImageKey::content(*node)) {
-                        Some(image) => draw_image(&mut pixmap, image, &rect),
-                        None if *placeholder => draw_missing(&mut pixmap, fonts, &rect),
+                        Some(image) => draw_image(pixmap, image, &rect),
+                        None if *placeholder => draw_missing(pixmap, fonts, &rect),
                         None => {}
                     }
                 }
@@ -1142,13 +1211,7 @@ pub fn rasterise_band(
                     let anchor = anchor_of(rect, *position, image);
                     let slice = shifted(&slice, top);
                     if drawable(&slice) {
-                        tile_image(
-                            &mut pixmap,
-                            image,
-                            &slice,
-                            (anchor.0, anchor.1 - top),
-                            *repeat,
-                        );
+                        tile_image(pixmap, image, &slice, (anchor.0, anchor.1 - top), *repeat);
                     }
                 }
             }
@@ -1160,12 +1223,11 @@ pub fn rasterise_band(
             } => {
                 let origin_y = *origin_y - top;
                 if in_range(*origin_x) && in_range(origin_y) {
-                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, origin_y, *color);
+                    draw_glyph(pixmap, fonts, glyph, *origin_x, origin_y, *color);
                 }
             }
         }
     }
-    Some(pixmap)
 }
 
 /// The same rectangle, moved into a band's coordinates.
@@ -3362,6 +3424,110 @@ mod tofu_tests {
             }
         }
         assert_eq!(inked(&pixmap), 0);
+    }
+}
+
+#[cfg(test)]
+mod rtl_inline_side_tests {
+    use super::*;
+    use css::style::{BorderSide, BorderStyle, Direction};
+
+    /// A span's style with a border only on the side named, so which side got
+    /// drawn can be read off the display list by colour.
+    fn bordered(direction: Direction) -> css::style::ComputedStyle {
+        let side = |color: Color| BorderSide {
+            width: css::value::Length::Px(4.0),
+            style: BorderStyle::Solid,
+            color: Some(color),
+        };
+        let mut style = css::style::ComputedStyle {
+            direction,
+            ..css::style::ComputedStyle::default()
+        };
+        style.border.left = side(Color::rgb(0xff, 0x00, 0x00));
+        style.border.right = side(Color::rgb(0x00, 0x00, 0xff));
+        style
+    }
+
+    /// Which border colours a fragment drew.
+    fn sides(fragment: &text::InlineBoxFragment, style: &css::style::ComputedStyle) -> Vec<Color> {
+        let mut list = DisplayList::default();
+        paint_inline_box(fragment, style, 0.0, 0.0, &mut list);
+        list.items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fragment(opens: bool, closes: bool) -> text::InlineBoxFragment {
+        text::InlineBoxFragment {
+            source: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 16.0,
+            opens,
+            closes,
+        }
+    }
+
+    const RED: Color = Color::rgb(0xff, 0x00, 0x00);
+    const BLUE: Color = Color::rgb(0x00, 0x00, 0xff);
+
+    #[test]
+    fn a_left_to_right_box_opens_on_the_left() {
+        let style = bordered(Direction::Ltr);
+        let first = sides(&fragment(true, false), &style);
+        assert!(first.contains(&RED), "the first fragment drew no left side");
+        assert!(
+            !first.contains(&BLUE),
+            "the first fragment drew the closing side too",
+        );
+        let last = sides(&fragment(false, true), &style);
+        assert!(last.contains(&BLUE));
+        assert!(!last.contains(&RED));
+    }
+
+    #[test]
+    fn a_right_to_left_box_opens_on_the_right() {
+        // #113. §9.10: a right-to-left box begins on the right, so its opening
+        // side is the physical *right* border. Painting `opens` as the left
+        // unconditionally put both sides on the first fragment of an rtl box
+        // and neither on the last.
+        let style = bordered(Direction::Rtl);
+        let first = sides(&fragment(true, false), &style);
+        assert!(
+            first.contains(&BLUE),
+            "the first fragment of an rtl box drew no right side",
+        );
+        assert!(
+            !first.contains(&RED),
+            "it drew the left side, which belongs to the last fragment",
+        );
+        let last = sides(&fragment(false, true), &style);
+        assert!(last.contains(&RED));
+        assert!(!last.contains(&BLUE));
+    }
+
+    #[test]
+    fn a_middle_fragment_draws_neither_side_in_either_direction() {
+        for direction in [Direction::Ltr, Direction::Rtl] {
+            let drawn = sides(&fragment(false, false), &bordered(direction));
+            assert!(!drawn.contains(&RED), "{direction:?} drew a left side");
+            assert!(!drawn.contains(&BLUE), "{direction:?} drew a right side");
+        }
+    }
+
+    #[test]
+    fn a_box_on_one_line_draws_both_sides_in_either_direction() {
+        for direction in [Direction::Ltr, Direction::Rtl] {
+            let drawn = sides(&fragment(true, true), &bordered(direction));
+            assert!(drawn.contains(&RED), "{direction:?} lost its left side");
+            assert!(drawn.contains(&BLUE), "{direction:?} lost its right side");
+        }
     }
 }
 

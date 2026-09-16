@@ -523,7 +523,7 @@ fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
 /// entirely and become the parent's own (§8.3.1), and a caller placing the next
 /// sibling has to collapse against the previous one's bottom margin rather than
 /// against a total it can no longer take apart.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Consumed {
     /// Border-box height, margins excluded.
     height: f32,
@@ -547,12 +547,22 @@ struct Consumed {
     /// the rest of their stylesheet and the UA sheet's margins then apply to
     /// everything.
     collapses_through: bool,
+    /// Floats this box placed that hang below its own bottom edge, in the
+    /// *parent's* coordinates.
+    ///
+    /// §10.6.3 stops a block growing to enclose its floats, and a float that
+    /// overhangs still belongs to the block formatting context rather than to
+    /// the block that declared it — so it goes on narrowing the lines of what
+    /// comes after, in the parent. That only works if it comes back up, which
+    /// is what this carries (#41). Empty for almost every box on almost every
+    /// page.
+    floats: Vec<floats::PlacedFloat>,
 }
 
 impl Consumed {
     /// Everything the box occupies, which is what a caller that does not
     /// collapse still wants.
-    fn outer(self) -> f32 {
+    fn outer(&self) -> f32 {
         self.margin_top + self.height + self.margin_bottom
     }
 }
@@ -738,6 +748,28 @@ impl Layout {
             width: CARET_WIDTH,
             height: line.baseline + box_.style.font_size * 0.25,
         })
+    }
+
+    /// Whether `node`'s box is inside a `position: fixed` subtree.
+    ///
+    /// Such a box is laid out against the viewport (§10.1) and painted at the
+    /// window's coordinates rather than the document's (#108), so anything
+    /// that turns a *window* point into a document one — a click, a keyboard
+    /// focus ring — has to know not to add the scroll for it. Answered from
+    /// the box tree because that is where the answer is: the subtree root
+    /// carries the property, and everything under it inherits the consequence
+    /// without inheriting the property.
+    pub fn is_pinned(&self, node: NodeId) -> bool {
+        fn walk(box_: &LayoutBox, node: NodeId, inside: bool) -> Option<bool> {
+            let inside = inside || box_.style.position == Position::Fixed;
+            if box_.node == Some(node) {
+                return Some(inside);
+            }
+            box_.children
+                .iter()
+                .find_map(|child| walk(child, node, inside))
+        }
+        walk(&self.root, node, false).unwrap_or(false)
     }
 
     /// Which row of a control's own text a canvas point falls on.
@@ -2930,6 +2962,9 @@ fn layout_block(
             margin_top,
             margin_bottom: style.margin.bottom.to_px(font_size, available_width),
             collapses_through: false,
+            // A control, a replaced box and a table each establish a context of
+            // their own, so nothing floated inside one overhangs into here.
+            floats: Vec::new(),
         };
         shift_if_relative(&mut box_, style, available_width);
         parent.children.push(box_);
@@ -2974,6 +3009,7 @@ fn layout_block(
             // formatting context of its own; neither can have a margin pass
             // through it.
             collapses_through: false,
+            floats: Vec::new(),
         };
         shift_if_relative(&mut box_, style, available_width);
         parent.children.push(box_);
@@ -3045,6 +3081,9 @@ fn layout_block(
         padding_top + border_top,
         content_width,
     );
+    // What this box inherited, so that what it *adds* can be told apart and
+    // handed back to the parent (#41).
+    let inherited_float_count = context.len();
 
     // Floats declared before any in-flow block are placed first, so this
     // block's own text knows to flow around them. Floats declared later are
@@ -3323,6 +3362,7 @@ fn layout_block(
             // formatting context of its own; neither can have a margin pass
             // through it.
             collapses_through: false,
+            floats: Vec::new(),
         };
         // The captions move with the table: they are its furniture, and a
         // relatively positioned table that left its heading behind would be
@@ -3743,6 +3783,9 @@ fn layout_block(
         let child_containing = containing
             .descend(padding_left + border_left, cursor_y)
             .with_definite_height(own_definite_height);
+        // Where the child actually went, kept because the cursor moves past it
+        // below and the floats it hands back are measured from here.
+        let child_top = cursor_y;
         let consumed = layout_block(
             doc,
             styles,
@@ -3807,6 +3850,13 @@ fn layout_block(
             cursor_y += consumed.height + consumed.margin_bottom;
         } else {
             cursor_y += consumed.outer();
+        }
+        // A float the child placed that hangs below its bottom edge is still in
+        // this formatting context, so later siblings have to flow around it
+        // (#41). The child measured it from its own top-left; this adds where
+        // that was.
+        if !consumed.floats.is_empty() {
+            context.absorb(consumed.floats.clone(), beside, child_top - into_context);
         }
         previous_bottom = Some(child_margins.1);
         trailing_bottom = Some(consumed.margin_bottom);
@@ -3892,9 +3942,31 @@ fn layout_block(
         _ => None,
     };
 
-    let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
-        + padding_bottom
-        + border_bottom;
+    // §10.6.3: a block's `auto` height is decided by its **in-flow** content.
+    // A float taller than that content hangs out below the bottom edge — that
+    // overhang is the whole reason `clear` exists, and the reason `overflow` on
+    // a container is the usual way to make a float count (#41).
+    //
+    // §10.6.7 is the exception and the reason this is a question rather than a
+    // deletion: a box that establishes a block formatting context of its own
+    // *does* grow to enclose its floats. `keeps_its_childrens_margins` is the
+    // wider of the two tests here, and the right one — a float, an out-of-flow
+    // box, a table cell, a caption and an inline-block all establish a context
+    // as well as keeping their margins, which is the same list.
+    //
+    // The floor stays either way. This `max` was doing two jobs — holding the
+    // bottom edge at or below the top of the content box, and letting a float
+    // push it down — and only the second is §10.6.3's. Dropping both together
+    // let a box with a large negative bottom margin end *above* its own
+    // content, which `normal-flow/height-114` catches and which has nothing to
+    // do with floats at all.
+    let floats = if keeps_its_childrens_margins(style) {
+        context.lowest_edge()
+    } else {
+        0.0
+    };
+    let content_end =
+        cursor_y.max(padding_top + border_top + floats) + padding_bottom + border_bottom;
     let surround = padding_top + padding_bottom + border_top + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
@@ -4034,6 +4106,19 @@ fn layout_block(
         collapses_through: box_.rect.height == 0.0
             && matches!(style.height, Length::Auto | Length::Px(0.0))
             && !keeps_its_childrens_margins(style),
+        // Floats this box placed, handed up so the parent's later children
+        // still flow around whichever of them overhang (#41). A box that
+        // establishes a formatting context keeps its own: nothing floated
+        // inside it is visible to anything outside.
+        floats: if keeps_its_childrens_margins(style) {
+            Vec::new()
+        } else {
+            context.added_since(
+                inherited_float_count,
+                margin_left + padding_left + border_left,
+                settled_top + padding_top + border_top,
+            )
+        },
     };
     parent.children.push(box_);
     consumed
@@ -5861,7 +5946,13 @@ fn open_a_box(
     available_width: f32,
     out: &mut Vec<InlineRun>,
 ) -> Vec<usize> {
-    let (left, _) = inline_edges(style, available_width);
+    // The *start* side, which is the physical right in right-to-left text
+    // (§8.4, §9.10). `inline_edges` answers in physical terms because margins,
+    // borders and padding are physical properties; which of the two opens the
+    // box is what `direction` decides.
+    let (left, right) = inline_edges(style, available_width);
+    let rtl = style.direction == Direction::Rtl;
+    let opening = if rtl { right } else { left };
     if !brackets(style, available_width) {
         return boxes.to_vec();
     }
@@ -5871,9 +5962,9 @@ fn open_a_box(
         InlineRun::edge(
             source,
             text::InlineEdge {
-                width: left,
+                width: opening,
                 opening: true,
-                rtl: style.direction == Direction::Rtl,
+                rtl,
             },
             style.clone(),
         )
@@ -5895,14 +5986,17 @@ fn close_a_box(
     if inside.len() == boxes.len() {
         return;
     }
-    let (_, right) = inline_edges(style, available_width);
+    let (left, right) = inline_edges(style, available_width);
+    let rtl = style.direction == Direction::Rtl;
+    // The *end* side, which is the physical left in right-to-left text.
+    let closing = if rtl { left } else { right };
     out.push(
         InlineRun::edge(
             source,
             text::InlineEdge {
-                width: right,
+                width: closing,
                 opening: false,
-                rtl: style.direction == Direction::Rtl,
+                rtl,
             },
             style.clone(),
         )
@@ -10235,8 +10329,13 @@ mod tests {
     }
 
     #[test]
-    fn a_container_encloses_a_float_taller_than_its_text() {
-        // Otherwise the next block starts beside the float and overlaps it.
+    fn a_container_does_not_enclose_a_float_taller_than_its_text() {
+        // §10.6.3: a block's `auto` height comes from its **in-flow** content,
+        // and a float taller than that hangs out below the bottom edge. This
+        // test used to assert the opposite — that the container grew to 120px
+        // — which is what #41 was filed about: the overhang is the whole reason
+        // `clear` exists and the reason `overflow` on a container is the usual
+        // way to make a float count.
         let rendered = run(
             "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
             "body { margin: 0 } .f { float: left; width: 60px; height: 120px }",
@@ -10244,9 +10343,31 @@ mod tests {
         );
         let container = content_boxes(&rendered)[0];
         assert!(
-            container.rect.height >= 120.0,
-            "container must enclose its float, got {}",
+            container.rect.height < 120.0,
+            "the container grew to enclose its float, got {}",
             container.rect.height
+        );
+    }
+
+    #[test]
+    fn a_container_with_its_own_formatting_context_does_enclose_its_float() {
+        // §10.6.7, and the reason the rule above is a question rather than a
+        // deletion: a box that establishes a block formatting context of its
+        // own grows to enclose its floats. `overflow: hidden` on a container is
+        // how the era's markup asked for that, long before anyone called it a
+        // clearfix.
+        let rendered = run(
+            "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
+            "body { margin: 0 } .box { overflow: hidden } \
+             .f { float: left; width: 60px; height: 120px }",
+            400.0,
+        );
+        let container = content_boxes(&rendered)[0];
+        assert!(
+            container.rect.height >= 120.0,
+            "a container with its own formatting context must still enclose \
+             its float, got {}",
+            container.rect.height,
         );
     }
 
@@ -12338,5 +12459,43 @@ mod over_constrained_tests {
             "a",
         );
         assert_eq!(shifted.rect.x, 30.0);
+    }
+}
+
+#[cfg(test)]
+mod rtl_edge_width_tests {
+    use super::*;
+
+    /// The widths the two edge runs of a bordered span reserve, opening first.
+    fn edges(direction: Direction) -> (f32, f32) {
+        let mut style = ComputedStyle {
+            direction,
+            font_size: 16.0,
+            ..ComputedStyle::default()
+        };
+        style.padding.left = Length::Px(10.0);
+        style.padding.right = Length::Px(30.0);
+        let mut numbering = Numbering::default();
+        let mut out = Vec::new();
+        let inside = open_a_box(&style, None, &[], &mut numbering, 400.0, &mut out);
+        close_a_box(&style, None, &inside, &[], 400.0, &mut out);
+        let widths: Vec<f32> = out
+            .iter()
+            .filter_map(|run| run.edge.map(|edge| edge.width))
+            .collect();
+        (widths[0], widths[1])
+    }
+
+    #[test]
+    fn a_left_to_right_box_reserves_its_left_side_first() {
+        assert_eq!(edges(Direction::Ltr), (10.0, 30.0));
+    }
+
+    #[test]
+    fn a_right_to_left_box_reserves_its_right_side_first() {
+        // #113. The *start* side of an rtl box is the physical right, so that
+        // is what the line makes room for where the box opens. Reserving the
+        // left there put the wrong amount of space at each end of the box.
+        assert_eq!(edges(Direction::Rtl), (30.0, 10.0));
     }
 }

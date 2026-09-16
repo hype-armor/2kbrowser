@@ -220,12 +220,13 @@ fn links_of(page: &crate::render::Page) -> Vec<Link> {
         .into_iter()
         .enumerate()
         .flat_map(|(group, link)| {
-            let (url, jump_to) = (link.url, link.jump_to);
+            let (url, jump_to, pinned) = (link.url, link.jump_to, link.pinned);
             link.rects.into_iter().map(move |rect| Link {
                 rect,
                 url: url.clone(),
                 group: group as u32,
                 jump_to,
+                pinned,
             })
         })
         .collect()
