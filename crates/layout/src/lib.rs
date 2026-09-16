@@ -7956,6 +7956,45 @@ mod tests {
     }
 
     #[test]
+    fn a_preformatted_runs_spaces_survive_the_blocks_trim() {
+        // #126. The block drops its own leading and trailing whitespace, but a
+        // `white-space: pre` run's spaces are not the block's whitespace —
+        // they are content, and the author said to keep them.
+        let rendered = run(
+            "<body><p>text<span></span></p></body>",
+            "body { margin: 0 } p { font: 16px/16px serif }
+             span::after { content: \"  \"; white-space: pre }",
+            600.0,
+        );
+        let line = &all_lines(&rendered)[0];
+        assert!(
+            line.text.ends_with("  "),
+            "the two spaces were trimmed away: {:?}",
+            line.text,
+        );
+    }
+
+    #[test]
+    fn a_preformatted_runs_spaces_count_toward_the_line() {
+        // A line's width is its inked extent, so an ordinary trailing space is
+        // excluded from it — that is what lets a centred line ignore the space
+        // the break ate. Preserved spaces are not that: an inline box's
+        // background is drawn across them, and leaving them out of the width
+        // is what made `generated-content/content-175`'s navy stripe short.
+        let of = |css: &str| {
+            let rendered = run("<body><p>text<span></span></p></body>", css, 600.0);
+            all_lines(&rendered)[0].width
+        };
+        let bare = of("body { margin: 0 } p { font: 16px/16px serif }");
+        let spaced = of("body { margin: 0 } p { font: 16px/16px serif }
+             span::after { content: \"  \"; white-space: pre }");
+        assert!(
+            spaced > bare,
+            "the preserved spaces took no room: {spaced} against {bare}",
+        );
+    }
+
+    #[test]
     fn a_trailing_break_is_still_trimmed_away() {
         // A preserved run of nothing but line breaks is still the block's own
         // trailing whitespace: a `<br>` at the very end of a paragraph has

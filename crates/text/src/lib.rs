@@ -728,6 +728,22 @@ struct Segment {
     source: Option<usize>,
     /// Width of collapsed whitespace following this segment.
     trailing_space: f32,
+    /// The whitespace that width stands for, as text.
+    ///
+    /// A collapsed run holds at most one space and this is that space; a
+    /// `white-space: pre` run can hold a row of them, and the difference
+    /// matters because they are content rather than a gap (#126). Kept as the
+    /// characters rather than recovered from the width, which cannot say how
+    /// many there were.
+    trailing_text: String,
+    /// Whether that whitespace is content rather than a gap between words.
+    ///
+    /// True only for a preserved run. A line's *width* is its inked extent, so
+    /// an ordinary trailing space is excluded from it — that is what lets a
+    /// centred line ignore the space the break ate. Preserved spaces are not
+    /// that: the author asked for them, and an inline box's background is drawn
+    /// across them.
+    space_is_content: bool,
     /// Whether a line break is required after this segment.
     mandatory_break: bool,
     /// Where this segment hangs on the line. Read for atomic inline boxes
@@ -1741,13 +1757,20 @@ impl FontStore {
                 });
             }
             // The space between two segments is real text even though it has
-            // no glyphs: a search for "one two" has to find it.
-            if segment.trailing_space > 0.0 {
-                text.push(' ');
-            }
+            // no glyphs: a search for "one two" has to find it. A preserved run
+            // may have put several there, and how many is content (#126).
+            text.push_str(&segment.trailing_text);
             // Trailing spaces are excluded from the *width*: a line's width is
-            // its inked extent, which is what centring must measure.
-            width = width.max(segment.x + segment.shaped.width);
+            // its inked extent, which is what centring must measure. Preserved
+            // spaces are the exception — the author asked for them, and an
+            // inline box's background is drawn across them.
+            let inked = segment.shaped.width
+                + if segment.space_is_content {
+                    segment.trailing_space
+                } else {
+                    0.0
+                };
+            width = width.max(segment.x + inked);
         }
         layout.lines.push(Line {
             glyphs,
@@ -2118,6 +2141,8 @@ impl FontStore {
                         height: box_.height,
                     },
                     trailing_space: 0.0,
+                    trailing_text: String::new(),
+                    space_is_content: false,
                     mandatory_break: false,
                     align: run.style.vertical_align,
                     x: 0.0,
@@ -2159,6 +2184,8 @@ impl FontStore {
                         ..metrics
                     },
                     trailing_space: 0.0,
+                    trailing_text: String::new(),
+                    space_is_content: false,
                     mandatory_break: false,
                     align: run.style.vertical_align,
                     x: 0.0,
@@ -2214,6 +2241,16 @@ impl FontStore {
                     .chars()
                     .filter(|c| *c != '\n' && *c != '\r')
                     .collect();
+                // What that width stands for, as characters. A collapsed run
+                // is one space however many the source held; a preserved one is
+                // every one of them.
+                let trailing_text = if spacing.is_empty() {
+                    String::new()
+                } else if preserve {
+                    spacing.clone()
+                } else {
+                    " ".to_owned()
+                };
                 let space_width = if spacing.is_empty() {
                     0.0
                 } else if preserve {
@@ -2242,6 +2279,8 @@ impl FontStore {
                         && !already_breaking
                     {
                         last.trailing_space += space_width;
+                        last.trailing_text.push_str(&trailing_text);
+                        last.space_is_content |= preserve && !spacing.is_empty();
                         last.space_level = bidi.at(run_start + piece_start);
                         last.mandatory_break |= mandatory;
                     } else if mandatory {
@@ -2253,6 +2292,8 @@ impl FontStore {
                                 ..Shaped::default()
                             },
                             trailing_space: space_width,
+                            trailing_text: trailing_text.clone(),
+                            space_is_content: preserve && !spacing.is_empty(),
                             mandatory_break: true,
                             align: run.style.vertical_align,
                             x: 0.0,
@@ -2288,6 +2329,12 @@ impl FontStore {
                         // Only the last piece of a word carries what follows
                         // the word.
                         trailing_space: if tail { space_width } else { 0.0 },
+                        trailing_text: if tail {
+                            trailing_text.clone()
+                        } else {
+                            String::new()
+                        },
+                        space_is_content: tail && preserve && !spacing.is_empty(),
                         mandatory_break: mandatory && tail,
                         align: run.style.vertical_align,
                         x: 0.0,
