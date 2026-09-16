@@ -2503,27 +2503,126 @@ fn inline_stretches(doc: &Document, styles: &StyleMap, node: NodeId) -> Vec<Vec<
     out
 }
 
+/// Applies `position: relative` to a box that its own branch is about to return.
+///
+/// §9.4.3 shifts a relatively positioned box after everything around it has
+/// been placed, and `layout_block` does that at the end — which three of its
+/// branches never reach, because they build their box and `return`. So a
+/// block-level replaced element, a form control and a table all ignored
+/// `position: relative` entirely (#112 found it in a *reference* file, where
+/// `img { display: block; position: relative; left: 177px }` drew at the left
+/// margin and made a test pass by cancelling out a second bug in the test).
+///
+/// The same shape as the out-of-flow walk those branches also skipped (#132),
+/// and a function for the same reason: three call sites that must not drift.
+fn shift_if_relative(box_: &mut LayoutBox, style: &ComputedStyle, available_width: f32) {
+    if style.position == Position::Relative {
+        let (dx, dy) = relative_shift(style, (available_width, available_width));
+        box_.rect.x += dx;
+        box_.rect.y += dy;
+    }
+}
+
+/// Whether §10.3.3's equation is the one that decides this box's margins.
+///
+/// "Block-level, non-replaced elements in normal flow" is the section's own
+/// heading, and both exclusions matter, because every one of these reaches
+/// `layout_block` looking like an ordinary block:
+///
+/// * an **absolutely positioned** box solves §10.3.7 or §10.3.8 instead, where
+///   over-constraint moves an offset rather than a margin — and is resolved in
+///   `absolute_offset`, so applying §10.3.3 here as well moves it twice;
+/// * a **float** solves §10.3.5, which shrinks to fit and has no leftover to
+///   assign in the first place;
+/// * an **inline-block** solves §10.3.9, which also shrinks to fit — it is an
+///   atomic inline rather than a block-level box, so it never had to fill its
+///   containing block and is not over-constrained by failing to.
+///
+/// Replaced elements are *not* excluded: §10.3.4 sends a block-level replaced
+/// element through §10.3.3's margin rules unchanged once its width is known.
+fn in_normal_flow(style: &ComputedStyle) -> bool {
+    !style.position.is_out_of_flow() && style.float == Float::None && !style.display.is_inline()
+}
+
+/// The `direction` of the block that contains `node`.
+///
+/// §10.3.3 resolves an over-constrained box against the containing block's
+/// direction rather than the box's own. `direction` inherits, so for almost
+/// every box these are the same value; they part company exactly when a box
+/// declares `direction` on itself, and that is the case the distinction exists
+/// for. The box's own is the fallback for a box with no element parent, which
+/// is the root.
+fn containing_direction(
+    doc: &Document,
+    styles: &StyleMap,
+    node: NodeId,
+    style: &ComputedStyle,
+) -> Direction {
+    doc.ancestors(node)
+        .find_map(|ancestor| styles.get(ancestor))
+        .map_or(style.direction, |parent| parent.direction)
+}
+
 /// Resolves `margin-left: auto` and `margin-right: auto` against the space a
 /// box leaves over.
 ///
 /// Two auto margins split it, which centres the box. One takes all of it,
 /// which pushes the box to the other side.
 ///
-/// Neither, and the leftover simply sits to the right, as an over-constrained
-/// box does in left-to-right text. §10.3.3 says a right-to-left one should put
-/// it on the left instead, which is not done here: the one-line version of it
-/// moved every absolutely positioned and replaced box as well, because they
-/// reach this by a path with over-constraint rules of their own (§10.3.7 and
-/// §10.3.8). Measured at 8 recovered against 37 lost, and backed out.
-fn distribute_auto_margins(style: &ComputedStyle, leftover: f32, left: &mut f32, right: &mut f32) {
-    let leftover = leftover.max(0.0);
+/// Neither, and the box is *over-constrained*: §10.3.3 solves the equation by
+/// ignoring one of the two margins, and which one depends on `direction`.
+/// Left-to-right ignores `margin-right`, so the leftover sits on the right;
+/// right-to-left ignores `margin-left`, so the box sits against the right edge
+/// of its containing block instead.
+///
+/// `in_flow` is what makes that second half safe to apply, and is the whole of
+/// why this took two attempts (#112). §10.3.3 is a rule about *block-level
+/// elements in normal flow*; an absolutely positioned box solves a different
+/// equation (§10.3.7 and §10.3.8) in which over-constraint is resolved by
+/// moving an offset rather than a margin, and it is resolved there, in
+/// `absolute_offset`. But an absolutely positioned box is laid out by
+/// `layout_block` like any other, so it arrives here too — and the one-line
+/// version of this rule moved it a second time. Measured at the time as 8
+/// recovered against 37 lost. Told apart, both halves are right.
+///
+/// §10.3.4 sends a block-level *replaced* element through §10.3.3's margin
+/// rules unchanged, so a replaced box in normal flow belongs in the same arm
+/// rather than being excluded with the positioned ones.
+///
+/// `containing` is the **containing block's** direction, which is what §10.3.3
+/// names — not the box's own. They are usually the same, because `direction`
+/// inherits; they differ exactly when a box sets `direction` on itself, and
+/// reading the box's own there resolves the equation against a direction the
+/// containing block does not have.
+fn distribute_auto_margins(
+    style: &ComputedStyle,
+    leftover: f32,
+    in_flow: bool,
+    containing: Direction,
+    left: &mut f32,
+    right: &mut f32,
+) {
+    // Floored for the `auto` arms below, where a negative leftover means the box
+    // already overflows its containing block and an auto margin has nothing to
+    // take. The over-constrained arm needs the *raw* value: it is solving an
+    // equation rather than sharing out a surplus, and a box with a negative
+    // margin legitimately produces a negative leftover — `margin-right: -98px`
+    // beside a 2px border resolves `margin-left` to 96px, and flooring first
+    // resolves it to 98.
+    let surplus = leftover.max(0.0);
     match (style.margin.left, style.margin.right) {
         (Length::Auto, Length::Auto) => {
-            *left = leftover / 2.0;
-            *right = leftover / 2.0;
+            *left = surplus / 2.0;
+            *right = surplus / 2.0;
         }
-        (Length::Auto, _) => *left = (leftover - *right).max(0.0),
-        (_, Length::Auto) => *right = (leftover - *left).max(0.0),
+        (Length::Auto, _) => *left = (surplus - *right).max(0.0),
+        (_, Length::Auto) => *right = (surplus - *left).max(0.0),
+        // Over-constrained, and in normal flow, so §10.3.3 decides it: the
+        // ignored margin is the start-side one, and in right-to-left text that
+        // is the left. Recomputed to satisfy the equation rather than added to,
+        // and not floored — §8.3 allows a negative margin and the equation can
+        // ask for one.
+        _ if in_flow && containing == Direction::Rtl => *left = leftover - *right,
         _ => {}
     }
 }
@@ -2773,6 +2872,8 @@ fn layout_block(
         distribute_auto_margins(
             style,
             available_width - outer_width,
+            in_normal_flow(style),
+            containing_direction(doc, styles, node, style),
             &mut margin_left,
             &mut margin_right,
         );
@@ -2803,7 +2904,7 @@ fn layout_block(
             height + padding_top + padding_bottom + border_top + border_bottom,
         );
         let parts = control_parts(doc, fonts, node, control, style, border_box, width);
-        let box_ = LayoutBox {
+        let mut box_ = LayoutBox {
             rect: Rect {
                 x: x + margin_left,
                 y: y + margin_top,
@@ -2830,6 +2931,7 @@ fn layout_block(
             margin_bottom: style.margin.bottom.to_px(font_size, available_width),
             collapses_through: false,
         };
+        shift_if_relative(&mut box_, style, available_width);
         parent.children.push(box_);
         return consumed;
     }
@@ -2843,7 +2945,7 @@ fn layout_block(
             size_attr(doc, node, "height"),
             available_width,
         );
-        let box_ = LayoutBox {
+        let mut box_ = LayoutBox {
             rect: Rect {
                 x: x + margin_left,
                 y: y + margin_top,
@@ -2873,6 +2975,7 @@ fn layout_block(
             // through it.
             collapses_through: false,
         };
+        shift_if_relative(&mut box_, style, available_width);
         parent.children.push(box_);
         return consumed;
     }
@@ -3048,6 +3151,8 @@ fn layout_block(
             distribute_auto_margins(
                 style,
                 available_width - box_.rect.width,
+                in_normal_flow(style),
+                containing_direction(doc, styles, node, style),
                 &mut left,
                 &mut right,
             );
@@ -3219,6 +3324,13 @@ fn layout_block(
             // through it.
             collapses_through: false,
         };
+        // The captions move with the table: they are its furniture, and a
+        // relatively positioned table that left its heading behind would be
+        // two boxes rather than one.
+        shift_if_relative(&mut box_, style, available_width);
+        for caption in &mut captions {
+            shift_if_relative(caption, style, available_width);
+        }
         parent.children.push(box_);
         parent.children.extend(captions);
         return consumed;
@@ -3892,11 +4004,7 @@ fn layout_block(
 
     // `position: relative` shifts the box after everything around it has been
     // placed, so siblings keep the space it would have occupied.
-    if style.position == Position::Relative {
-        let (dx, dy) = relative_shift(style, (available_width, available_width));
-        box_.rect.x += dx;
-        box_.rect.y += dy;
-    }
+    shift_if_relative(&mut box_, style, available_width);
 
     // Computed here rather than taken from `outer_height`, which resolves
     // percentages against a basis of zero — harmless while the answer was only
@@ -12053,6 +12161,192 @@ mod root_float_tests {
             positioned.rect.x, 10.0,
             "placed by `left`, not by the float"
         );
+    }
+}
+
+#[cfg(test)]
+mod over_constrained_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// The box laid out for the element carrying `id`, in page coordinates.
+    fn box_of(html: &str, css_text: &str, id: &str) -> LayoutBox {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            400.0,
+        );
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|element| element.id() == Some(id))
+            })
+            .expect("the fixture has that id");
+        fn walk(box_: &LayoutBox, node: NodeId, x: f32, y: f32, out: &mut Option<LayoutBox>) {
+            if box_.node == Some(node) {
+                let mut moved = box_.clone();
+                moved.rect.x += x;
+                moved.rect.y += y;
+                *out = Some(moved);
+            }
+            for child in &box_.children {
+                walk(child, node, x + box_.rect.x, y + box_.rect.y, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, wanted, 0.0, 0.0, &mut found);
+        found.expect("it was laid out")
+    }
+
+    #[test]
+    fn an_over_constrained_block_puts_the_leftover_on_the_right_in_ltr() {
+        let box_ = box_of(
+            "<body><div id=\"a\"></div></body>",
+            "body { margin: 0; width: 200px } #a { width: 50px; height: 10px }",
+            "a",
+        );
+        assert_eq!(box_.rect.x, 0.0);
+    }
+
+    #[test]
+    fn an_over_constrained_block_sits_at_the_right_edge_in_rtl() {
+        // §10.3.3: right-to-left ignores `margin-left` and recomputes it, so
+        // the box goes against the right edge of its containing block (#112).
+        let box_ = box_of(
+            "<body><div id=\"a\"></div></body>",
+            "body { margin: 0; width: 200px; direction: rtl } \
+             #a { width: 50px; height: 10px }",
+            "a",
+        );
+        assert_eq!(box_.rect.x, 150.0);
+    }
+
+    #[test]
+    fn it_is_the_containing_blocks_direction_that_decides() {
+        // Not the box's own, which is what §10.3.3 says and what tells these
+        // two apart. `direction` inherits, so they differ only when a box
+        // declares it on itself.
+        let own = box_of(
+            "<body><div id=\"a\"></div></body>",
+            "body { margin: 0; width: 200px } \
+             #a { width: 50px; height: 10px; direction: rtl }",
+            "a",
+        );
+        assert_eq!(own.rect.x, 0.0, "an ltr container, whatever the box says");
+    }
+
+    #[test]
+    fn a_negative_margin_is_solved_rather_than_floored() {
+        // The equation, not a surplus shared out: `margin-right: -98px` beside
+        // a 2px border in a zero-width container resolves `margin-left` to
+        // 96px. Flooring the leftover at zero first resolves it to 98.
+        // Measured against the wrapper, which is itself over-constrained and
+        // so is itself against the right edge — the offset between them is
+        // what the equation decides.
+        let markup = "<body><div id=\"w\"><div id=\"a\"></div></div></body>";
+        let sheet = "body { margin: 0; direction: rtl } \
+             #w { width: 0; height: 20px } \
+             #a { width: 0; height: 10px; border-right: 2px solid black; \
+                  margin-right: -98px }";
+        let wrapper = box_of(markup, sheet, "w");
+        let inner = box_of(markup, sheet, "a");
+        assert_eq!(inner.rect.x - wrapper.rect.x, 96.0);
+    }
+
+    #[test]
+    fn a_float_is_not_over_constrained() {
+        // §10.3.5 shrinks a float to fit, so it never had to fill its
+        // containing block and is not over-constrained by failing to.
+        let box_ = box_of(
+            "<body><div id=\"a\"></div></body>",
+            "body { margin: 0; width: 200px; direction: rtl } \
+             #a { float: left; width: 50px; height: 10px }",
+            "a",
+        );
+        assert_eq!(box_.rect.x, 0.0);
+    }
+
+    #[test]
+    fn only_a_block_level_box_in_normal_flow_is_over_constrained() {
+        // Asserted against the decision rather than against a position,
+        // because the other three all legitimately end up at the right edge in
+        // right-to-left for reasons of their own — a float is placed by
+        // §10.3.5, an inline-block by the line it sits on — and a test that
+        // watched where they landed would pass whether or not this was right.
+        // Spelled out rather than taken from the default, whose `display` is
+        // CSS's initial value of `inline`.
+        let block = ComputedStyle {
+            display: Display::Block,
+            ..ComputedStyle::default()
+        };
+        assert!(in_normal_flow(&block));
+
+        let positioned = ComputedStyle {
+            position: Position::Absolute,
+            ..block.clone()
+        };
+        assert!(!in_normal_flow(&positioned), "§10.3.7 decides this one");
+
+        let floated = ComputedStyle {
+            float: Float::Left,
+            ..block.clone()
+        };
+        assert!(!in_normal_flow(&floated), "§10.3.5 decides this one");
+
+        let inline_block = ComputedStyle {
+            display: Display::InlineBlock,
+            ..block.clone()
+        };
+        assert!(!in_normal_flow(&inline_block), "§10.3.9 decides this one");
+
+        // Not excluded: §10.3.4 sends a block-level replaced element through
+        // §10.3.3's margin rules once its width is known, so nothing about
+        // being replaced changes the answer here.
+        assert!(in_normal_flow(&block));
+    }
+
+    #[test]
+    fn a_block_level_replaced_box_takes_position_relative() {
+        // §9.4.3 applies to every box, and `layout_block`'s replaced branch
+        // returned before the shift at the end of the function — so a
+        // `display: block` image ignored `position: relative` entirely.
+        let shifted = box_of(
+            "<body><img id=\"a\" width=\"15\" height=\"15\"></body>",
+            "body { margin: 0 } \
+             #a { display: block; position: relative; left: 100px }",
+            "a",
+        );
+        assert_eq!(shifted.rect.x, 100.0);
+    }
+
+    #[test]
+    fn a_block_level_control_takes_position_relative() {
+        // The branch added for #145 returns in the same place and had the same
+        // gap.
+        let shifted = box_of(
+            "<body><input id=\"a\"></body>",
+            "body { margin: 0 } #a { display: block; position: relative; left: 40px }",
+            "a",
+        );
+        assert_eq!(shifted.rect.x, 40.0);
+    }
+
+    #[test]
+    fn a_table_takes_position_relative() {
+        let shifted = box_of(
+            "<body><div id=\"a\">x</div></body>",
+            "body { margin: 0 } \
+             #a { display: table; position: relative; left: 30px }",
+            "a",
+        );
+        assert_eq!(shifted.rect.x, 30.0);
     }
 }
 
