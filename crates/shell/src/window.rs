@@ -2941,46 +2941,73 @@ impl ApplicationHandler<Wake> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => match self.scrollbar_grab() {
-                Some(crate::scrollbar::Grab::Thumb(held)) => self.dragging = Some(held),
-                // A press on the track puts the middle of the thumb where the
-                // pointer is — one movement to anywhere in the document — and
-                // then goes on holding it, so a press that turns into a drag
-                // carries on from there rather than needing a second grab.
-                Some(crate::scrollbar::Grab::Track) => {
-                    let page = self
-                        .tab()
-                        .page
-                        .as_ref()
-                        .map(|page| page.scrollable_height());
-                    let Some(content) = page else { return };
-                    let track = self.viewport_height();
-                    let Some((_, height)) =
-                        crate::scrollbar::thumb(self.tab().scroll, content, track)
-                    else {
-                        return;
-                    };
-                    let y = self.pointer.1 - self.chrome_height() as f32;
-                    self.dragging = Some(height / 2.0);
-                    self.drag_thumb_to(y - height / 2.0);
+            } => {
+                // An open overlay owns the whole click and not just the end of
+                // it. The release below already knows this; the press did not,
+                // and the two halves disagreeing is #182.
+                //
+                // A menu is drawn *over* the page, so the press under it landed
+                // on the page as far as this arm was concerned: it started a
+                // selection, and then the release was claimed by the overlay
+                // and returned before anything cleared it. The pointer was left
+                // selecting with no button held, so the next movement — a bare
+                // move, on the way to anywhere — dragged a highlight across the
+                // page. And the same press wiped the selection the menu was
+                // opened to act on, which is why Copy copied nothing.
+                //
+                // Nothing to do rather than something careful: with an overlay
+                // up there is no press on the page or the scrollbar to be had.
+                if self.menu.is_some() || self.panel.is_some() || self.dropdown.is_some() {
+                    return;
                 }
-                // Not on the bar: a press on the page is where a selection
-                // starts. Whether it turns out to be one is decided on release
-                // — a press that never moved is a click.
-                None => {
-                    self.selecting =
-                        document_point(self.pointer, self.chrome_height(), self.tab().scroll);
-                    if self.selecting.is_some() {
-                        self.clear_selection();
+                match self.scrollbar_grab() {
+                    Some(crate::scrollbar::Grab::Thumb(held)) => self.dragging = Some(held),
+                    // A press on the track puts the middle of the thumb where the
+                    // pointer is — one movement to anywhere in the document — and
+                    // then goes on holding it, so a press that turns into a drag
+                    // carries on from there rather than needing a second grab.
+                    Some(crate::scrollbar::Grab::Track) => {
+                        let page = self
+                            .tab()
+                            .page
+                            .as_ref()
+                            .map(|page| page.scrollable_height());
+                        let Some(content) = page else { return };
+                        let track = self.viewport_height();
+                        let Some((_, height)) =
+                            crate::scrollbar::thumb(self.tab().scroll, content, track)
+                        else {
+                            return;
+                        };
+                        let y = self.pointer.1 - self.chrome_height() as f32;
+                        self.dragging = Some(height / 2.0);
+                        self.drag_thumb_to(y - height / 2.0);
+                    }
+                    // Not on the bar: a press on the page is where a selection
+                    // starts. Whether it turns out to be one is decided on
+                    // release — a press that never moved is a click.
+                    None => {
+                        self.selecting =
+                            document_point(self.pointer, self.chrome_height(), self.tab().scroll);
+                        if self.selecting.is_some() {
+                            self.clear_selection();
+                        }
                     }
                 }
-            },
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button,
                 ..
             } => match button {
                 MouseButton::Left => {
+                    // The button is up, so the pointer is not selecting —
+                    // whatever else this release turns out to be. Unconditional
+                    // and first because the cost of getting it wrong is not a
+                    // lost click but a pointer that goes on selecting with
+                    // nothing held down (#182), and every early return below is
+                    // a chance to get it wrong.
+                    self.selecting = None;
                     // An open menu owns the next click, wherever it lands: on
                     // an entry it chooses, anywhere else it dismisses. Either
                     // way the click does not also reach the page under it.
@@ -3016,7 +3043,6 @@ impl ApplicationHandler<Wake> for App {
                     // a drag across the text and not a click on whatever is
                     // under the pointer at the end of it — which on a page of
                     // prose is very often a link.
-                    self.selecting = None;
                     if !self.tab().selected.is_empty() {
                         return;
                     }

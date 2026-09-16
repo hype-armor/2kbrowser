@@ -639,6 +639,84 @@ panel, so there is no way out of it with the pointer"
 echo "ok: the padlock opened the site panel and closed it again"
 stop
 
+# N. An open menu owns the whole click, not just the end of it (#182).
+#
+#    Both halves of one bug, and neither is reachable from `cargo test`: the
+#    press and the release are two arms of the event loop, and what went wrong
+#    is that they disagreed about who owned the click.
+#
+#    A menu is drawn over the page, so a press on an entry looked to the press
+#    arm like a press on the page. It started a selection there and wiped the
+#    one already made; the release was then claimed by the menu and returned
+#    before anything cleared it. So the pointer was left selecting with no
+#    button held — the next bare move dragged a highlight across the page,
+#    which is what was reported — and Copy had nothing left to copy.
+selected() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-selection.py" "$chrome" "$((chrome + 300))"
+}
+start
+# The page's own blue, which is not a selection. Everything below is measured
+# against this rather than against zero.
+plain=$(selected)
+
+# Open the menu on the page, then dismiss it by clicking away from it — still
+# over the page, which is the press that used to start the phantom selection.
+DISPLAY=$display xdotool mousemove 300 $((chrome + 200))
+sleep 0.3
+DISPLAY=$display xdotool click 3
+sleep 1
+DISPLAY=$display xdotool mousemove 600 $((chrome + 40))
+DISPLAY=$display xdotool click 1
+sleep 0.5
+# Now move the pointer across the text with nothing held down. A browser that
+# is not selecting does not care; the bug painted the page blue.
+DISPLAY=$display xdotool mousemove 400 $((chrome + 20))
+sleep 0.3
+DISPLAY=$display xdotool mousemove 60 $((chrome + 8))
+sleep 0.8
+drifted=$(selected)
+[ "$drifted" -le "$plain" ] || fail "moving the pointer after dismissing a menu \
+highlighted the page ($drifted tinted pixels against $plain before), so the \
+press left the pointer selecting with no button held"
+echo "ok: dismissing a menu did not leave the pointer selecting"
+
+# And the other half: a selection has to survive being right-clicked on, or the
+# Copy entry the menu offers because of it copies nothing.
+DISPLAY=$display xdotool mousemove 20 $((chrome + 4))
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+sleep 0.2
+DISPLAY=$display xdotool mousemove 500 $((chrome + 30))
+sleep 0.4
+DISPLAY=$display xdotool mousemove 700 $((chrome + 60))
+sleep 0.6
+DISPLAY=$display xdotool mouseup 1
+sleep 0.6
+marked=$(selected)
+[ "$marked" -gt "$plain" ] || fail "dragging across the text highlighted \
+nothing ($marked tinted pixels against $plain before), so the check below \
+would prove nothing"
+DISPLAY=$display xdotool mousemove 300 $((chrome + 30))
+sleep 0.3
+DISPLAY=$display xdotool click 3
+sleep 1
+# Held rather than clicked, because what has to survive is the *press* — the
+# release is where the menu acts on the selection, and by then it is too late
+# to find out it has gone.
+DISPLAY=$display xdotool mousemove 320 $((chrome + 42))
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+sleep 0.8
+held=$(selected)
+DISPLAY=$display xdotool mouseup 1
+sleep 0.3
+[ "$held" -gt "$plain" ] || fail "pressing a menu entry cleared the selection \
+($held tinted pixels against $plain unselected), so Copy would have copied \
+nothing"
+echo "ok: a selection survived the press on the menu entry that acts on it"
+stop
+
 # N. A refused image leaves a box that answers a press (#118).
 #
 #    `paint` pins what the placeholder looks like and `isolation.rs` pins that
