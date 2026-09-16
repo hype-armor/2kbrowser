@@ -523,7 +523,7 @@ fn keeps_its_childrens_margins(style: &ComputedStyle) -> bool {
 /// entirely and become the parent's own (§8.3.1), and a caller placing the next
 /// sibling has to collapse against the previous one's bottom margin rather than
 /// against a total it can no longer take apart.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Consumed {
     /// Border-box height, margins excluded.
     height: f32,
@@ -547,12 +547,22 @@ struct Consumed {
     /// the rest of their stylesheet and the UA sheet's margins then apply to
     /// everything.
     collapses_through: bool,
+    /// Floats this box placed that hang below its own bottom edge, in the
+    /// *parent's* coordinates.
+    ///
+    /// §10.6.3 stops a block growing to enclose its floats, and a float that
+    /// overhangs still belongs to the block formatting context rather than to
+    /// the block that declared it — so it goes on narrowing the lines of what
+    /// comes after, in the parent. That only works if it comes back up, which
+    /// is what this carries (#41). Empty for almost every box on almost every
+    /// page.
+    floats: Vec<floats::PlacedFloat>,
 }
 
 impl Consumed {
     /// Everything the box occupies, which is what a caller that does not
     /// collapse still wants.
-    fn outer(self) -> f32 {
+    fn outer(&self) -> f32 {
         self.margin_top + self.height + self.margin_bottom
     }
 }
@@ -2952,6 +2962,9 @@ fn layout_block(
             margin_top,
             margin_bottom: style.margin.bottom.to_px(font_size, available_width),
             collapses_through: false,
+            // A control, a replaced box and a table each establish a context of
+            // their own, so nothing floated inside one overhangs into here.
+            floats: Vec::new(),
         };
         shift_if_relative(&mut box_, style, available_width);
         parent.children.push(box_);
@@ -2996,6 +3009,7 @@ fn layout_block(
             // formatting context of its own; neither can have a margin pass
             // through it.
             collapses_through: false,
+            floats: Vec::new(),
         };
         shift_if_relative(&mut box_, style, available_width);
         parent.children.push(box_);
@@ -3067,6 +3081,9 @@ fn layout_block(
         padding_top + border_top,
         content_width,
     );
+    // What this box inherited, so that what it *adds* can be told apart and
+    // handed back to the parent (#41).
+    let inherited_float_count = context.len();
 
     // Floats declared before any in-flow block are placed first, so this
     // block's own text knows to flow around them. Floats declared later are
@@ -3345,6 +3362,7 @@ fn layout_block(
             // formatting context of its own; neither can have a margin pass
             // through it.
             collapses_through: false,
+            floats: Vec::new(),
         };
         // The captions move with the table: they are its furniture, and a
         // relatively positioned table that left its heading behind would be
@@ -3765,6 +3783,9 @@ fn layout_block(
         let child_containing = containing
             .descend(padding_left + border_left, cursor_y)
             .with_definite_height(own_definite_height);
+        // Where the child actually went, kept because the cursor moves past it
+        // below and the floats it hands back are measured from here.
+        let child_top = cursor_y;
         let consumed = layout_block(
             doc,
             styles,
@@ -3829,6 +3850,13 @@ fn layout_block(
             cursor_y += consumed.height + consumed.margin_bottom;
         } else {
             cursor_y += consumed.outer();
+        }
+        // A float the child placed that hangs below its bottom edge is still in
+        // this formatting context, so later siblings have to flow around it
+        // (#41). The child measured it from its own top-left; this adds where
+        // that was.
+        if !consumed.floats.is_empty() {
+            context.absorb(consumed.floats.clone(), beside, child_top - into_context);
         }
         previous_bottom = Some(child_margins.1);
         trailing_bottom = Some(consumed.margin_bottom);
@@ -3914,9 +3942,31 @@ fn layout_block(
         _ => None,
     };
 
-    let content_end = cursor_y.max(padding_top + border_top + context.lowest_edge())
-        + padding_bottom
-        + border_bottom;
+    // §10.6.3: a block's `auto` height is decided by its **in-flow** content.
+    // A float taller than that content hangs out below the bottom edge — that
+    // overhang is the whole reason `clear` exists, and the reason `overflow` on
+    // a container is the usual way to make a float count (#41).
+    //
+    // §10.6.7 is the exception and the reason this is a question rather than a
+    // deletion: a box that establishes a block formatting context of its own
+    // *does* grow to enclose its floats. `keeps_its_childrens_margins` is the
+    // wider of the two tests here, and the right one — a float, an out-of-flow
+    // box, a table cell, a caption and an inline-block all establish a context
+    // as well as keeping their margins, which is the same list.
+    //
+    // The floor stays either way. This `max` was doing two jobs — holding the
+    // bottom edge at or below the top of the content box, and letting a float
+    // push it down — and only the second is §10.6.3's. Dropping both together
+    // let a box with a large negative bottom margin end *above* its own
+    // content, which `normal-flow/height-114` catches and which has nothing to
+    // do with floats at all.
+    let floats = if keeps_its_childrens_margins(style) {
+        context.lowest_edge()
+    } else {
+        0.0
+    };
+    let content_end =
+        cursor_y.max(padding_top + border_top + floats) + padding_bottom + border_bottom;
     let surround = padding_top + padding_bottom + border_top + border_bottom;
     box_.rect.height = match style.height {
         Length::Auto => content_end,
@@ -4056,6 +4106,19 @@ fn layout_block(
         collapses_through: box_.rect.height == 0.0
             && matches!(style.height, Length::Auto | Length::Px(0.0))
             && !keeps_its_childrens_margins(style),
+        // Floats this box placed, handed up so the parent's later children
+        // still flow around whichever of them overhang (#41). A box that
+        // establishes a formatting context keeps its own: nothing floated
+        // inside it is visible to anything outside.
+        floats: if keeps_its_childrens_margins(style) {
+            Vec::new()
+        } else {
+            context.added_since(
+                inherited_float_count,
+                margin_left + padding_left + border_left,
+                settled_top + padding_top + border_top,
+            )
+        },
     };
     parent.children.push(box_);
     consumed
@@ -10266,8 +10329,13 @@ mod tests {
     }
 
     #[test]
-    fn a_container_encloses_a_float_taller_than_its_text() {
-        // Otherwise the next block starts beside the float and overlaps it.
+    fn a_container_does_not_enclose_a_float_taller_than_its_text() {
+        // §10.6.3: a block's `auto` height comes from its **in-flow** content,
+        // and a float taller than that hangs out below the bottom edge. This
+        // test used to assert the opposite — that the container grew to 120px
+        // — which is what #41 was filed about: the overhang is the whole reason
+        // `clear` exists and the reason `overflow` on a container is the usual
+        // way to make a float count.
         let rendered = run(
             "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
             "body { margin: 0 } .f { float: left; width: 60px; height: 120px }",
@@ -10275,9 +10343,31 @@ mod tests {
         );
         let container = content_boxes(&rendered)[0];
         assert!(
-            container.rect.height >= 120.0,
-            "container must enclose its float, got {}",
+            container.rect.height < 120.0,
+            "the container grew to enclose its float, got {}",
             container.rect.height
+        );
+    }
+
+    #[test]
+    fn a_container_with_its_own_formatting_context_does_enclose_its_float() {
+        // §10.6.7, and the reason the rule above is a question rather than a
+        // deletion: a box that establishes a block formatting context of its
+        // own grows to enclose its floats. `overflow: hidden` on a container is
+        // how the era's markup asked for that, long before anyone called it a
+        // clearfix.
+        let rendered = run(
+            "<body><div class=\"box\"><div class=\"f\">side</div>short</div></body>",
+            "body { margin: 0 } .box { overflow: hidden } \
+             .f { float: left; width: 60px; height: 120px }",
+            400.0,
+        );
+        let container = content_boxes(&rendered)[0];
+        assert!(
+            container.rect.height >= 120.0,
+            "a container with its own formatting context must still enclose \
+             its float, got {}",
+            container.rect.height,
         );
     }
 
