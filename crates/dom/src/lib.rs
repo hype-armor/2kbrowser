@@ -21,6 +21,49 @@ use html5ever::{Attribute, LocalName, Namespace, ParseOpts, QualName, TokenizerR
 
 use meta_charset::DefuseMetaCharset;
 
+/// Deepest a document may nest.
+///
+/// Markup past this is flattened rather than refused (#176). The number is not
+/// about markup at all — it is about *stack*, because everything that consumes
+/// this tree walks it recursively and the tree's depth is therefore the depth
+/// of three recursions in a row.
+///
+/// Measured, per nesting level, in a release build:
+///
+/// | walk | stack per level |
+/// | --- | --- |
+/// | cascade | ~4 KiB |
+/// | layout | ~16 KiB |
+/// | paint | ~16 KiB |
+///
+/// A debug build costs four times that. So 512 levels is around 8 MiB of stack
+/// in release and 32 MiB in debug — which is why the renderer runs on a stack
+/// sized for it rather than on a thread's default 8 MiB, and why that stack and
+/// this number have to move together.
+///
+/// 512 is the number Blink uses for the same job, and it is far past anything
+/// real: the era fixture here is 14 deep across 185 elements, and the deepest
+/// document in the CSS 2.1 suite is 13.
+pub const MAX_DEPTH: usize = 512;
+
+/// Stack a walk over a [`MAX_DEPTH`] document needs.
+///
+/// Here, beside the cap, because the two are a pair: raising one without the
+/// other is how #176 comes back. It is not a fact about the DOM — the walks
+/// that spend this stack are the cascade, layout and paint, in three other
+/// crates — but it is a fact about what this cap *costs*, and splitting the
+/// pair across crates is exactly how the pairing gets lost.
+///
+/// A debug build spends about 64 KiB per nesting level across those three
+/// walks, so the cap costs around 32 MiB. This is that with room to spare.
+///
+/// Reserved address space rather than memory: pages are committed as they are
+/// touched, so a thread that renders an ordinary page costs what it always did.
+/// Anything that renders a page a stranger wrote needs a thread with this much
+/// — the renderer child, and the fuzzer, which is a renderer with worse taste
+/// in documents.
+pub const DEPTH_STACK: usize = 64 * 1024 * 1024;
+
 /// Index of a node within a [`Document`]'s arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub usize);
@@ -359,6 +402,48 @@ impl Document {
         }
     }
 
+    /// How deep `id` sits below the root.
+    ///
+    /// Walked rather than stored because the parser moves subtrees around —
+    /// the adoption agency algorithm exists to do exactly that — and a stored
+    /// depth would be wrong for every descendant of anything it moved. The walk
+    /// is bounded by [`MAX_DEPTH`], which is the invariant `no_deeper_than`
+    /// keeps, so this is a short climb and not a tree traversal.
+    fn depth_of(&self, id: NodeId) -> usize {
+        let mut depth = 0;
+        let mut at = id;
+        while let Some(parent) = self.nodes[at.0].parent {
+            depth += 1;
+            at = parent;
+        }
+        depth
+    }
+
+    /// `id`, or its nearest ancestor shallow enough to take a child.
+    ///
+    /// The whole of the depth cap (#176). Everything downstream of the parser
+    /// — the cascade, layout, and paint — walks this tree recursively, so the
+    /// depth of the tree is the depth of three recursions in a row, and a page
+    /// that nests deeply enough overflows the stack of the process holding it.
+    /// Bounding it here rather than in each of those three is one rule in one
+    /// place, and it is what every browser does: the markup past the cap is
+    /// flattened rather than refused, so the page still renders and the content
+    /// is still there.
+    fn no_deeper_than(&self, id: NodeId, limit: usize) -> NodeId {
+        let depth = self.depth_of(id);
+        if depth < limit {
+            return id;
+        }
+        let mut at = id;
+        for _ in 0..=(depth - limit) {
+            match self.nodes[at.0].parent {
+                Some(parent) => at = parent,
+                None => break,
+            }
+        }
+        at
+    }
+
     fn append(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
         self.nodes[child.0].parent = Some(parent);
@@ -452,9 +537,15 @@ impl TreeSink for DomSink {
 
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
         let mut doc = self.doc.borrow_mut();
+        // The one place nesting is created, and so the one place it is capped
+        // (#176). Past the cap the markup is flattened: the element is still
+        // created and still in the tree, just as a sibling rather than a child,
+        // which is what a browser does with markup this deep and is a great
+        // deal better than not rendering the page at all.
+        let parent = doc.no_deeper_than(*parent, MAX_DEPTH);
         match child {
-            NodeOrText::AppendNode(node) => doc.append(*parent, node),
-            NodeOrText::AppendText(text) => doc.append_text(*parent, &text),
+            NodeOrText::AppendNode(node) => doc.append(parent, node),
+            NodeOrText::AppendText(text) => doc.append_text(parent, &text),
         }
     }
 
@@ -739,5 +830,63 @@ mod tests {
         let doc = parse(r#"<body><p id="">x</p><a name="">y</a></body>"#);
 
         assert_eq!(doc.fragment_target(""), None);
+    }
+
+    #[test]
+    fn nesting_past_the_cap_is_flattened_rather_than_kept() {
+        // #176. Everything downstream of this walks the tree recursively — the
+        // cascade, layout, and paint, one after another — so the tree's depth
+        // is the depth of three recursions and a deep enough page took the
+        // renderer's stack with it.
+        let deep = format!(
+            "<body>{}<p>bottom</p>{}</body>",
+            "<div>".repeat(MAX_DEPTH * 4),
+            "</div>".repeat(MAX_DEPTH * 4),
+        );
+        let doc = parse(&deep);
+        let deepest = (0..doc.len())
+            .map(NodeId)
+            .map(|id| doc.depth_of(id))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            deepest <= MAX_DEPTH,
+            "{deepest} deep against a cap of {MAX_DEPTH}",
+        );
+    }
+
+    #[test]
+    fn the_content_past_the_cap_is_still_there() {
+        // Flattened, not refused. A page that nests too deeply is still a page,
+        // and the words at the bottom of it are still what somebody came to
+        // read — which is the whole difference between this and giving up.
+        let deep = format!(
+            "<body>{}<p>bottom</p>{}</body>",
+            "<div>".repeat(MAX_DEPTH * 4),
+            "</div>".repeat(MAX_DEPTH * 4),
+        );
+        let doc = parse(&deep);
+        assert!(
+            doc.text_content(doc.root()).contains("bottom"),
+            "the text past the cap was dropped",
+        );
+    }
+
+    #[test]
+    fn an_ordinary_page_is_untouched_by_the_cap() {
+        // The cap is far past anything real — the era fixture here is 14 deep
+        // and the deepest document in the CSS 2.1 suite is 13 — so this is the
+        // assertion that matters most: the common case does not notice.
+        let doc = parse(
+            "<body><div><table><tr><td><p>Words <b>and <i>more</i></b></p>\
+             </td></tr></table></div></body>",
+        );
+        let deepest = (0..doc.len())
+            .map(NodeId)
+            .map(|id| doc.depth_of(id))
+            .max()
+            .unwrap_or(0);
+        assert!(deepest < 16, "an ordinary page came out {deepest} deep");
+        assert!(doc.text_content(doc.root()).contains("Words and more"));
     }
 }

@@ -793,6 +793,37 @@ impl Render for PageRenderer {
 /// interleave with a frame and corrupt it, and this is the one process where a
 /// stray `println!` is a protocol violation rather than noise.
 pub fn run_child() -> Result<(), Error> {
+    // The renderer runs on a thread of its own, and a large one (#176).
+    //
+    // The cascade, layout and paint each recurse once per nesting level, so a
+    // document's depth is the depth of three recursions in a row.
+    // `dom::MAX_DEPTH` caps that depth; this is the other half of the same
+    // decision, because a cap is only safe if a stack can hold it. Measured at
+    // the cap: about 8 MiB in release and 32 MiB in debug, against a main
+    // thread's 8 MiB — so release sat exactly on the edge and debug was well
+    // past it.
+    //
+    // Reserved address space rather than memory: pages are committed as they
+    // are touched, so an ordinary page costs what it always did.
+    //
+    // Spawned *before* the filter is installed, because `clone` is not on the
+    // allowlist and putting it there to make room for this thread would put it
+    // there for an attacker's thread too. The filter goes on inside the thread
+    // instead, and reaches back over the main one.
+    std::thread::Builder::new()
+        .name("renderer".to_owned())
+        .stack_size(dom::DEPTH_STACK)
+        .spawn(render_until_the_parent_goes)
+        .map_err(Error::Io)?
+        .join()
+        // A panic on the render thread has already said why on stderr.
+        // Reported rather than resumed: resuming across a join loses the
+        // original location and gains nothing.
+        .unwrap_or(Err(Error::Died))
+}
+
+/// The renderer proper, on the thread [`run_child`] made for it.
+fn render_until_the_parent_goes() -> Result<(), Error> {
     // Before anything is read. The very first frame carries the document, so it
     // is already attacker-influenced — confining afterwards would be confining
     // after the interesting bytes had arrived.
@@ -800,7 +831,12 @@ pub fn run_child() -> Result<(), Error> {
     // The font store is built after this on purpose too: it reads only embedded
     // data (ADR-0010), and building it under the filter is the check that it
     // really does not touch the filesystem.
-    let confinement = sandbox::confine::apply();
+    //
+    // Every thread and not just this one. The main thread is asleep in `join`
+    // and is not where a compromise starts, but an attacker already inside the
+    // renderer could aim at the address it returns to and land somewhere with
+    // no filter on it. `TSYNC` closes that for the cost of a flag.
+    let confinement = sandbox::confine::apply_to_every_thread();
     // Only when the platform *has* a sandbox and it failed anyway — a kernel
     // too old, or a container that forbids installing a filter. That is a fact
     // about this machine and worth a line every time.
@@ -1285,5 +1321,36 @@ mod tests {
 
         assert_eq!(refused, 1, "it was asked for exactly once");
         assert!(page.width > 0, "the page still rendered");
+    }
+
+    #[test]
+    fn a_page_nested_far_past_the_cap_still_renders() {
+        // #176, end to end. The cascade, layout and paint each recurse once per
+        // nesting level, so this used to be three stack overflows waiting for a
+        // page deep enough — and what died was the renderer process, taking the
+        // page with it.
+        //
+        // Two things fixed it and both are load-bearing: `dom::MAX_DEPTH` caps
+        // the tree the parser builds, and the renderer runs on a stack sized
+        // for that cap. This test needs the second as much as the first,
+        // because a libtest thread gets 2 MiB and the cap costs around 32 in a
+        // debug build.
+        let deep = format!(
+            "<body>{}<p>bottom</p>{}</body>",
+            "<div>".repeat(dom::MAX_DEPTH * 8),
+            "</div>".repeat(dom::MAX_DEPTH * 8),
+        );
+        let rendered = std::thread::Builder::new()
+            .stack_size(dom::DEPTH_STACK)
+            .spawn(move || {
+                let mut renderer = PageRenderer::new();
+                renderer
+                    .render(&request(deep.as_bytes(), 300), &mut no_fetch)
+                    .map(|page| page.pixels.len())
+            })
+            .expect("a thread")
+            .join()
+            .expect("the renderer fell over");
+        assert!(rendered.expect("renders") > 0);
     }
 }

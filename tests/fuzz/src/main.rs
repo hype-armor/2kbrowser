@@ -51,21 +51,27 @@ fn main() -> ExitCode {
 
     let mut failed = false;
     for target in settings.targets {
-        let mut session = Session::new(target);
-        if let Some(budget) = settings.budget {
-            session.stop_after(budget);
-        }
+        // On a stack of its own, for the reason `fuzz::with_room_to_recurse`
+        // gives: a render seed can be a deeply nested page, and walking one
+        // costs far more than a main thread has (#176).
+        let (report, corpus) = fuzz::with_room_to_recurse(move || {
+            let mut session = Session::new(target);
+            if let Some(budget) = settings.budget {
+                session.stop_after(budget);
+            }
+            let corpus = session.corpus_len();
+            (session.run(settings.seed, settings.iterations), corpus)
+        });
         println!(
             "{:<8} {} seed(s), {}, seed {:#018x}",
             target.name(),
-            session.corpus_len(),
+            corpus,
             match settings.budget {
                 Some(budget) => format!("{} minute(s)", budget.as_secs() / 60),
                 None => format!("{} iteration(s)", settings.iterations),
             },
             settings.seed
         );
-        let report = session.run(settings.seed, settings.iterations);
 
         for path in &report.crashes {
             println!("  CRASH  {}", path.display());

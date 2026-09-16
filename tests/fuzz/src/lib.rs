@@ -274,6 +274,30 @@ impl Target {
     }
 }
 
+/// Runs `work` on a thread with room for the deepest document the parser will
+/// build (#176).
+///
+/// The fuzzer is a renderer — it parses, cascades, lays out and paints whatever
+/// the mutator produced — and those walks recurse once per nesting level. A
+/// document at `dom::MAX_DEPTH` costs about 32 MiB of stack in a debug build,
+/// against the 2 MiB a libtest thread gets and the 8 MiB a main thread gets.
+///
+/// So every entry point that runs a target goes through here: the soak, the
+/// corpus replay, and the long run. Missing one is not a subtle failure — it is
+/// the whole process aborting on a stack overflow, which is what the deep
+/// nesting seeds in `corpus/render` will do to anything that forgets.
+pub fn with_room_to_recurse<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .name("fuzz".to_owned())
+        .stack_size(dom::DEPTH_STACK)
+        .spawn(work)
+        .expect("a thread to fuzz on")
+        .join()
+        // Resumed rather than swallowed: a panic in a target is the finding,
+        // and the harness above has already recorded the input that caused it.
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// Runs one input through a target.
 ///
 /// Deliberately does not assert anything about the *result*. A parser given
