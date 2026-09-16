@@ -3071,15 +3071,29 @@ fn layout_block(
     // heading, most cells — lays its text out directly on this box. One with a
     // block child anywhere among them cannot: its inline stretches have to be
     // laid out where they sit, which is what the anonymous boxes below do.
-    let all_inline = !children.iter().any(|&child| {
-        styles.get(child).is_some_and(|child_style| {
-            child_style.display != Display::None
-                && !is_inline_child(doc, styles, child, child_style)
-                && !(child_style.display.is_table_internal() && inside_a_table(doc, styles, child))
-                && child_style.float == Float::None
-                && !child_style.position.is_out_of_flow()
-        })
-    });
+    // A block-level `::before` or `::after` is a block child (#135), so a
+    // container that has one is not all-inline however inline its actual
+    // children are. Without this the clearfix's whole trick — a block box
+    // appended to a container of nothing but text and floats — would be
+    // decided away before the walk that places it ever ran.
+    //
+    // A box with no element has none, whatever the node it borrows an id from
+    // may carry (#121).
+    let generated_block = !no_element
+        && [PseudoElement::Before, PseudoElement::After]
+            .into_iter()
+            .any(|which| styles.pseudo(node, which).is_some_and(generated_is_block));
+    let all_inline = !generated_block
+        && !children.iter().any(|&child| {
+            styles.get(child).is_some_and(|child_style| {
+                child_style.display != Display::None
+                    && !is_inline_child(doc, styles, child, child_style)
+                    && !(child_style.display.is_table_internal()
+                        && inside_a_table(doc, styles, child))
+                    && child_style.float == Float::None
+                    && !child_style.position.is_out_of_flow()
+            })
+        });
     let mut blocks = InlineBlocks::new();
     let runs = if all_inline {
         layout_inline_blocks(
@@ -3490,7 +3504,16 @@ fn layout_block(
     // Which split inline elements the walk is currently inside, so a block
     // child can close them and the stretch after it can pick them up again.
     let mut open: Vec<NodeId> = Vec::new();
-    let steps = walk_order(doc, styles, children, !all_inline);
+    let mut steps = walk_order(doc, styles, children, !all_inline);
+    // Before everything and after everything, which is what the names mean.
+    for (which, at) in [
+        (PseudoElement::After, steps.len()),
+        (PseudoElement::Before, 0),
+    ] {
+        if !no_element && styles.pseudo(node, which).is_some_and(generated_is_block) {
+            steps.insert(at, Step::Generated(which));
+        }
+    }
     // §17.2.1's anonymous tables, worked out over the whole walk because a run
     // is only as long as the next thing that is not part of it.
     let anonymous = anonymous_tables(doc, styles, node, &steps);
@@ -3504,6 +3527,60 @@ fn layout_block(
     for step in steps {
         let child = match step {
             Step::Node(child) => child,
+            // A generated box with a block-level `display` is a block child that
+            // is not an element (#135). It takes its turn here, before the match
+            // below, because everything there is keyed on a `NodeId` and this has
+            // none — and because what it needs is exactly what a block child
+            // needs: the run of inline content before it ended, its own clearance
+            // applied, and the cursor moved past it.
+            Step::Generated(which) => {
+                let Some(generated) = styles.pseudo(node, which) else {
+                    continue;
+                };
+                interrupt_boxes(&mut pending, &open);
+                let stretch_style = open
+                    .last()
+                    .and_then(|&element| styles.get(element))
+                    .unwrap_or(style);
+                let flushed = flush_inline(
+                    doc,
+                    styles,
+                    fonts,
+                    &mut pending,
+                    node,
+                    stretch_style,
+                    intrinsic,
+                    (padding_left + border_left, cursor_y),
+                    content_width,
+                    &context,
+                    padding_top + border_top,
+                    &mut box_,
+                    (lead.take(), None),
+                    &mut first_letter,
+                );
+                resume_boxes(&mut pending, &open);
+                cursor_y += flushed;
+                let into_context = padding_top + border_top;
+                // The clearfix's whole point: `clear` on a generated box means
+                // nothing while it is an inline run, and everything once it is a
+                // block. With it, the cursor lands below the floats and the
+                // container — which since #41 is as tall as its in-flow content and
+                // no taller — grows to enclose them after all.
+                cursor_y =
+                    context.clearance(generated.clear, cursor_y - into_context) + into_context;
+                let placed = place_generated_block(
+                    fonts,
+                    generated,
+                    padding_left + border_left,
+                    cursor_y,
+                    content_width,
+                    &mut box_,
+                );
+                cursor_y += placed;
+                previous_bottom = None;
+                trailing_bottom = None;
+                continue;
+            }
             Step::Opens(element) => {
                 pending.push(Inlines::Opens {
                     node: element,
@@ -5348,6 +5425,15 @@ enum Step {
     Opens(NodeId),
     /// And ends here.
     Closes(NodeId),
+    /// A generated box with a block-level `display`, which is a box that is
+    /// not an element (#135).
+    ///
+    /// `::before` and `::after` are ordinarily inline runs folded into the
+    /// element's own content. One given `display: block` is a block child
+    /// instead, and has to take its turn in the walk like any other — which is
+    /// the whole point of the clearfix, `.group::after { content: ""; display:
+    /// block; clear: both }`: as an inline run its `clear` applies to nothing.
+    Generated(PseudoElement),
 }
 
 /// Closes every inline box still open, because a block child is about to end
@@ -5729,7 +5815,98 @@ fn generated_run(styles: &StyleMap, node: NodeId, which: PseudoElement) -> Optio
         style.display,
         Display::None | Display::TableColumn | Display::TableColumnGroup
     );
-    (!boxless).then(|| InlineRun::text(content, style.clone()))
+    // A block-level one is not an inline run at all; the walk lays it out as a
+    // block child instead (#135), and returning it here as well would draw it
+    // twice.
+    (!boxless && !generated_is_block(style)).then(|| InlineRun::text(content, style.clone()))
+}
+
+/// Lays out a generated box that has a block-level `display` (#135).
+///
+/// Its content is a string rather than a subtree, which is what makes this a
+/// box of its own rather than a call into `layout_block`: there is no node to
+/// walk, nothing inside it can be a block, and the whole of its content is one
+/// run of text in its own style. Returns the height it consumed, margins
+/// included.
+///
+/// The clearfix — `content: ""; display: block; clear: both` — is the case this
+/// exists for, and it has no text at all: an empty box whose only job is to sit
+/// below the floats.
+fn place_generated_block(
+    fonts: &mut FontStore,
+    style: &ComputedStyle,
+    x: f32,
+    y: f32,
+    available_width: f32,
+    parent: &mut LayoutBox,
+) -> f32 {
+    let font_size = style.font_size;
+    let margin_left = style.margin.left.to_px(font_size, available_width);
+    let margin_right = style.margin.right.to_px(font_size, available_width);
+    let margin_top = style.margin.top.to_px(font_size, available_width);
+    let margin_bottom = style.margin.bottom.to_px(font_size, available_width);
+    let padding_left = style.padding.left.to_px(font_size, available_width);
+    let padding_right = style.padding.right.to_px(font_size, available_width);
+    let padding_top = style.padding.top.to_px(font_size, available_width);
+    let padding_bottom = style.padding.bottom.to_px(font_size, available_width);
+    let border_left = style.border.left.used_width(font_size);
+    let border_right = style.border.right.used_width(font_size);
+    let border_top = style.border.top.used_width(font_size);
+    let border_bottom = style.border.bottom.used_width(font_size);
+
+    let surround = padding_left + padding_right + border_left + border_right;
+    let outer_width = match style.width {
+        Length::Auto => (available_width - margin_left - margin_right).max(0.0),
+        length => length.to_px(font_size, available_width) + surround,
+    };
+    let inner = (outer_width - surround).max(0.0);
+
+    let content = style.content.clone().unwrap_or_default();
+    let text = (!content.is_empty()).then(|| {
+        let runs = [InlineRun::text(&content, style.clone())];
+        fonts.layout_runs(&runs, style, inner)
+    });
+    let content_height = match &style.height {
+        Length::Auto => text.as_ref().map_or(0.0, |layout| layout.height),
+        length => length.to_px(font_size, available_width),
+    };
+    let height = content_height + padding_top + padding_bottom + border_top + border_bottom;
+
+    parent.children.push(LayoutBox {
+        rect: Rect {
+            x: x + margin_left,
+            y: y + margin_top,
+            width: outer_width,
+            height,
+        },
+        style: style.clone(),
+        text,
+        content_origin: (padding_left + border_left, padding_top + border_top),
+        content_width: inner,
+        children: Vec::new(),
+        replaced: None,
+        replaced_image: false,
+        node: None,
+        round: false,
+        chosen_rows: Vec::new(),
+        top_border_gap: None,
+    });
+    margin_top + height + margin_bottom
+}
+
+/// Whether a generated box's `display` makes it a block child rather than an
+/// inline run.
+///
+/// `block` and `list-item` only. The other displays a `::before` can be given —
+/// the table ones, `inline-block` — each want machinery of their own, and
+/// guessing at them here would draw a box in the wrong formatting context
+/// rather than in none at all.
+fn generated_is_block(style: &ComputedStyle) -> bool {
+    // In normal flow, not merely block-level. `position: absolute` and `float`
+    // both blockify a computed `display`, so this would otherwise claim a
+    // positioned `::before` as an in-flow block child and lay it out in the
+    // flow it is meant to have left.
+    in_normal_flow(style) && matches!(style.display, Display::Block | Display::ListItem)
 }
 
 /// The marker of a `list-style-position: inside` item, as an inline run.
@@ -12574,5 +12751,124 @@ mod rtl_edge_width_tests {
         // is what the line makes room for where the box opens. Reserving the
         // left there put the wrong amount of space at each end of the box.
         assert_eq!(edges(Direction::Rtl), (30.0, 10.0));
+    }
+}
+
+#[cfg(test)]
+mod generated_block_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// The box laid out for the element carrying `id`, in page coordinates.
+    fn box_of(html: &str, css_text: &str, id: &str) -> LayoutBox {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            600.0,
+        );
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|element| element.id() == Some(id))
+            })
+            .expect("the fixture has that id");
+        fn walk(box_: &LayoutBox, node: NodeId, out: &mut Option<LayoutBox>) {
+            if box_.node == Some(node) {
+                *out = Some(box_.clone());
+            }
+            for child in &box_.children {
+                walk(child, node, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, wanted, &mut found);
+        found.expect("it was laid out")
+    }
+
+    #[test]
+    fn a_block_before_is_a_box_of_its_own_and_not_part_of_the_line() {
+        // #135. As an inline run it shared the first line with the text; as a
+        // block it takes a line to itself, so the element is two lines tall
+        // rather than one.
+        let with = box_of(
+            "<body><p id=\"a\">text</p></body>",
+            "body { margin: 0; font: 16px/20px serif }
+             p { margin: 0 }
+             #a::before { content: \"lead\"; display: block }",
+            "a",
+        );
+        let without = box_of(
+            "<body><p id=\"a\">text</p></body>",
+            "body { margin: 0; font: 16px/20px serif }
+             p { margin: 0 }
+             #a::before { content: \"lead\" }",
+            "a",
+        );
+        assert_eq!(without.rect.height, 20.0, "one line when it is inline");
+        assert_eq!(with.rect.height, 40.0, "two when it is a block");
+    }
+
+    #[test]
+    fn a_block_after_takes_its_turn_last() {
+        let box_ = box_of(
+            "<body><p id=\"a\">text</p></body>",
+            "body { margin: 0; font: 16px/20px serif }
+             p { margin: 0 }
+             #a::after { content: \"tail\"; display: block }",
+            "a",
+        );
+        let generated: Vec<&LayoutBox> = box_
+            .children
+            .iter()
+            .filter(|child| child.node.is_none() && child.style.content.is_some())
+            .collect();
+        assert_eq!(generated.len(), 1, "one generated box, not two");
+        assert!(
+            generated[0].rect.y >= 20.0,
+            "after the text, not before it: {:?}",
+            generated[0].rect,
+        );
+    }
+
+    #[test]
+    fn the_clearfix_makes_a_container_enclose_its_floats() {
+        // The case #135 exists for. `clear` on an inline run applies to
+        // nothing, because a run is not a box that can clear; on a block it
+        // moves the cursor below the float, and since #41 the container is as
+        // tall as its cursor.
+        let css = "body { margin: 0; font: 16px/20px serif }
+                   #a { }
+                   .side { float: left; width: 50px; height: 80px }";
+        let html = "<body><div id=\"a\"><div class=\"side\"></div>text</div></body>";
+        let without = box_of(html, css, "a");
+        let with = box_of(
+            html,
+            &format!("{css} #a::after {{ content: \"\"; display: block; clear: both }}"),
+            "a",
+        );
+        assert_eq!(without.rect.height, 20.0, "one line, float hanging out");
+        assert_eq!(with.rect.height, 80.0, "as tall as the float");
+    }
+
+    #[test]
+    fn a_positioned_generated_box_is_not_treated_as_a_block_child() {
+        // `position: absolute` blockifies a computed `display`, so the naive
+        // reading of "is it a block?" claims a positioned `::before` and lays
+        // it out in the flow it is meant to have left.
+        let box_ = box_of(
+            "<body><p id=\"a\">text</p></body>",
+            "body { margin: 0; font: 16px/20px serif }
+             p { margin: 0 }
+             #a::before { content: \"lead\"; position: absolute }",
+            "a",
+        );
+        assert_eq!(box_.rect.height, 20.0, "still one line");
     }
 }
