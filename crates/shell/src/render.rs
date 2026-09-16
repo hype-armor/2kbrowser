@@ -653,6 +653,7 @@ impl Page {
                 }
                 out.push(Link {
                     rects,
+                    pinned: frame.layout.is_pinned(node),
                     url: net::resolve(&frame.origin, &frame.path, href),
                     jump_to: jump_to(frame, href),
                 });
@@ -667,6 +668,14 @@ impl Page {
 pub struct Link {
     /// Its rectangles. More than one when it wraps across a line break.
     pub rects: Vec<layout::Rect>,
+    /// Whether it is inside a `position: fixed` subtree, and so sits at the
+    /// window's coordinates rather than the document's (#108).
+    ///
+    /// The window hit-tests against this list rather than against the box
+    /// tree, which is in another process — so without this a fixed navigation
+    /// bar would stay on screen and stop being clickable the moment the reader
+    /// scrolled.
+    pub pinned: bool,
     /// The absolute URL it leads to.
     pub url: String,
     /// Where on this page it goes, for a link that does not leave it.

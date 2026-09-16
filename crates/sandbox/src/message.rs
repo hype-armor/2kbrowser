@@ -174,6 +174,13 @@ pub struct Link {
     /// of the boundary. Sent with the link so that following one costs no
     /// round trip.
     pub jump_to: Option<f32>,
+    /// Whether the link sits in a `position: fixed` subtree, so its rectangle
+    /// is in *window* coordinates rather than document ones (#108).
+    ///
+    /// The parent turns a click into a document point by adding the scroll.
+    /// For a pinned link that is exactly wrong: the box stayed where it was,
+    /// so adding the scroll misses it by however far the page has moved.
+    pub pinned: bool,
 }
 
 fn write_rect(writer: &mut Writer, rect: &Rect) {
@@ -802,6 +809,7 @@ impl ToParent {
                     if let Some(top) = link.jump_to {
                         writer.f32(top);
                     }
+                    writer.some(link.pinned);
                 }
                 writer.u32(page.missing.len() as u32);
                 for missing in &page.missing {
@@ -908,6 +916,7 @@ impl ToParent {
                         url: reader.str()?,
                         group: reader.u32()?,
                         jump_to: reader.some()?.then(|| reader.f32()).transpose()?,
+                        pinned: reader.some()?,
                     });
                 }
                 let count = reader.count()?;
@@ -1058,6 +1067,7 @@ mod tests {
                 url: "https://example.com/".to_owned(),
                 group: 0,
                 jump_to: Some(920.0),
+                pinned: true,
             }],
             missing: vec![Missing {
                 rect: Rect {

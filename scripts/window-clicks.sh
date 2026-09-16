@@ -73,7 +73,13 @@ for tool in Xvfb xdotool xwd python3; do
     command -v "$tool" >/dev/null || fail "$tool is not installed"
 done
 
-Xvfb "$display" -screen 0 1200x1000x24 >/dev/null 2>&1 &
+# `-maxclients` because the default is 256 and this script goes through them.
+# Every `xdotool` and every `xwd` is a fresh X client, and there are thousands
+# across a run — so a check part way down would find the server refusing new
+# connections and the browser would exit with "Failed to open connection to X
+# server". That read as the browser dying silently for no reason, which is what
+# it did on CI three times before the harness started keeping its output.
+Xvfb "$display" -maxclients 2048 -screen 0 1200x1000x24 >/dev/null 2>&1 &
 xvfb=$!
 app=""
 applog=$(mktemp)
@@ -1063,6 +1069,58 @@ for _ in $(seq 1 20); do
 done
 [ -n "$closed" ] || fail "Escape left the dropdown's list open"
 echo "ok: the keyboard ticked a box, walked a dropdown, and opened and closed its list"
+stop
+
+# N. A `position: fixed` box stays put when the page scrolls (#108).
+#
+#    Invisible to every other kind of test here: the conformance suite renders
+#    whole pages from row zero, where a fixed box and an ordinary one land in
+#    the same place, and the child's own tests never scroll. Only a window
+#    scrolls.
+pinned="$here/target/window-pinned"
+mkdir -p "$pinned"
+cat > "$pinned/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Pinned</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: fixed; left: 40px; top: 40px; width: 120px; height: 30px; background: #000"></div>
+<div style="height: 4000px"></div>
+</body>
+FIXTURE
+
+start_on "$pinned/p.html" "Pinned"
+
+# Where the black bar is before scrolling.
+before=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 20)) $((chrome + 100)))
+[ -n "$before" ] || fail "the fixed box never reached the screen"
+set -- $before
+was_top=$2
+
+DISPLAY=$display xdotool key Page_Down
+sleep 0.6
+DISPLAY=$display xdotool key Page_Down
+stayed=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    now=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 20)) $((chrome + 100)))
+    [ -n "$now" ] || continue
+    set -- $now
+    # Same row it started on, within a pixel of rounding.
+    if [ $(( $2 - was_top )) -le 1 ] && [ $(( was_top - $2 )) -le 1 ]; then
+        stayed=yes
+        break
+    fi
+done
+[ -n "$stayed" ] || fail "the fixed box moved with the page, so \
+\`position: fixed\` is only fixed until somebody scrolls"
+
+# And the page really did scroll, or the check above proves nothing: a page
+# that ignored Page_Down would pass it trivially.
+moved=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-ink.py" 0 $((width - 1)) $((chrome + 300)))
+echo "ok: a fixed box stayed where it was while the page scrolled under it"
 stop
 
 echo "all window click checks passed"

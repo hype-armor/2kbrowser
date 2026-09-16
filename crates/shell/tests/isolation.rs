@@ -413,14 +413,20 @@ fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
     let links = page.links();
     let rect = links[0].rects[0];
 
-    let hit = page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let hit = page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0, 0.0);
     assert!(
         hit.is_some_and(|url| url.ends_with("/there.html")),
         "{hit:?}"
     );
 
-    assert_eq!(page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0), None);
-    assert_eq!(page.link_at(rect.x, rect.y + rect.height + 200.0), None);
+    assert_eq!(
+        page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0, 0.0),
+        None
+    );
+    assert_eq!(
+        page.link_at(rect.x, rect.y + rect.height + 200.0, 0.0),
+        None
+    );
 }
 
 #[test]
