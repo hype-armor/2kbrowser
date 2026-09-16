@@ -30,8 +30,15 @@ const MAX_SPAN: usize = 1000;
 /// One cell in the grid.
 #[derive(Debug, Clone)]
 pub struct Cell {
-    /// The cell element.
+    /// The cell element, or — for an anonymous cell — the row it was inferred
+    /// in, whose id it borrows so that it has a containing block to name.
     pub node: NodeId,
+    /// The children to lay out, for an anonymous cell (§17.2.1).
+    ///
+    /// `None` is an authored cell, whose content is its own children. `Some`
+    /// is a box with no element: the run of a row's children that had no cell
+    /// around them, which is why it is a list rather than a node.
+    pub content: Option<Vec<NodeId>>,
     /// Its computed style.
     pub style: ComputedStyle,
     /// Columns spanned, at least 1.
@@ -279,12 +286,43 @@ fn collect_columns(
 fn collect_cells(
     doc: &Document,
     styles: &css::cascade::StyleMap,
+    owner: NodeId,
     nodes: &[NodeId],
     occupied: &mut Vec<usize>,
 ) -> Vec<Cell> {
     let mut cells = Vec::new();
     let mut column = 0;
+    // §17.2.1: a child of a row that is not a cell gets an anonymous cell
+    // around it, together with every consecutive sibling that is also not a
+    // cell. Gathered here and emitted when the run ends, for the same reason
+    // the anonymous *row* is: "the siblings beside it" is not known until
+    // something that is a cell turns up.
+    let mut stray: Vec<NodeId> = Vec::new();
     for &cell_node in nodes {
+        let cell_style = styles.get(cell_node);
+        let is_cell = cell_style
+            .as_ref()
+            .is_some_and(|style| style.display == Display::TableCell);
+        if !is_cell {
+            match &cell_style {
+                // `display: none` generates no box at all, so it neither joins
+                // a run nor starts one.
+                Some(style) if style.display == Display::None => {}
+                Some(_) => stray.push(cell_node),
+                // A text node has no style. Whitespace between two cells is
+                // not content and §17.2.1 does not wrap it; anything else is.
+                None => {
+                    if doc
+                        .text(cell_node)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        stray.push(cell_node);
+                    }
+                }
+            }
+            continue;
+        }
+        column = flush_anonymous_cell(styles, &mut stray, owner, column, occupied, &mut cells);
         // Step over columns a cell from an earlier row still holds.
         while occupied.get(column).is_some_and(|rows| *rows > 0) {
             column += 1;
@@ -292,12 +330,9 @@ fn collect_cells(
         let Some(cell_element) = doc.element(cell_node) else {
             continue;
         };
-        let Some(cell_style) = styles.get(cell_node) else {
+        let Some(cell_style) = cell_style else {
             continue;
         };
-        if cell_style.display != Display::TableCell {
-            continue;
-        }
         let span = |name: &str| {
             cell_element
                 .attr(name)
@@ -319,6 +354,7 @@ fn collect_cells(
 
         cells.push(Cell {
             node: cell_node,
+            content: None,
             style: cell_style.clone(),
             colspan,
             rowspan,
@@ -326,12 +362,60 @@ fn collect_cells(
         });
         column += colspan;
     }
+    flush_anonymous_cell(styles, &mut stray, owner, column, occupied, &mut cells);
     // The row is finished, so every occupancy count owes one fewer row from
     // here on.
     for slot in occupied.iter_mut() {
         *slot = slot.saturating_sub(1);
     }
     cells
+}
+
+/// Emits the anonymous cell §17.2.1 puts around a run of a row's children that
+/// had no cell of their own, and empties the run.
+///
+/// Like the anonymous row, it is not an element: it borrows `owner` for an id
+/// and takes a style that paints nothing, because an anonymous box is not
+/// something an author wrote and must not draw a second background or border.
+/// It never spans, because there is no attribute on it to say so.
+///
+/// Returns the column the next cell starts at.
+fn flush_anonymous_cell(
+    styles: &css::cascade::StyleMap,
+    stray: &mut Vec<NodeId>,
+    owner: NodeId,
+    column: usize,
+    occupied: &mut Vec<usize>,
+    cells: &mut Vec<Cell>,
+) -> usize {
+    if stray.is_empty() {
+        return column;
+    }
+    let content = std::mem::take(stray);
+    let mut column = column;
+    while occupied.get(column).is_some_and(|rows| *rows > 0) {
+        column += 1;
+    }
+    if occupied.len() < column + 1 {
+        occupied.resize(column + 1, 0);
+    }
+    occupied[column] = 1;
+    let style = styles.get(owner).cloned().unwrap_or_default();
+    cells.push(Cell {
+        node: owner,
+        content: Some(content),
+        style: ComputedStyle {
+            display: Display::TableCell,
+            background_color: css::Color::TRANSPARENT,
+            background_image: None,
+            border: css::style::Borders::default(),
+            ..style
+        },
+        colspan: 1,
+        rowspan: 1,
+        column,
+    });
+    column + 1
 }
 
 /// Emits the anonymous row §17.2.1 puts around a run of cells that had no row
@@ -353,7 +437,7 @@ fn flush_anonymous_row(
         return;
     }
     let nodes = std::mem::take(stray);
-    let cells = collect_cells(doc, styles, &nodes, occupied);
+    let cells = collect_cells(doc, styles, parent, &nodes, occupied);
     if cells.is_empty() {
         return;
     }
@@ -399,7 +483,7 @@ fn collect_rows(
             Display::None => {}
             Display::TableRow => {
                 flush_anonymous_row(doc, styles, &mut stray, node, group, occupied, grid);
-                let cells = collect_cells(doc, styles, doc.children(child), occupied);
+                let cells = collect_cells(doc, styles, child, doc.children(child), occupied);
                 if !cells.is_empty() {
                     grid.rows.push(Row {
                         node: child,
@@ -1183,6 +1267,122 @@ mod tests {
         assert!(widths[1] > 10.0);
     }
 
+    #[test]
+    fn a_row_child_that_is_not_a_cell_gets_an_anonymous_cell() {
+        // §17.2.1. Without this the row yields no cells at all and the grid
+        // comes out empty, which is why the table was not inferred either.
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span>aaa</span></span></div>"#,
+            ".r { display: table-row } #t { display: table }",
+        );
+        assert_eq!(grid.rows.len(), 1);
+        assert_eq!(grid.rows[0].cells.len(), 1);
+        assert_eq!(grid.columns, 1);
+        let cell = &grid.rows[0].cells[0];
+        assert!(cell.content.is_some(), "it is a box, not an element");
+        assert_eq!(cell.style.display, Display::TableCell);
+    }
+
+    #[test]
+    fn consecutive_non_cells_share_one_anonymous_cell() {
+        // "C and all consecutive siblings of C that are not table-cell boxes",
+        // so three spans in a row are one cell, not three.
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span>a</span><span>b</span><span>c</span></span></div>"#,
+            ".r { display: table-row } #t { display: table }",
+        );
+        assert_eq!(grid.rows[0].cells.len(), 1);
+        assert_eq!(
+            grid.rows[0].cells[0].content.as_ref().map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_real_cell_ends_the_run_and_keeps_its_own_column() {
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span>a</span><span class="c">b</span><span>c</span></span></div>"#,
+            ".r { display: table-row } .c { display: table-cell } #t { display: table }",
+        );
+        let cells = &grid.rows[0].cells;
+        assert_eq!(cells.len(), 3, "anonymous, authored, anonymous");
+        assert_eq!(
+            cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+        assert!(cells[0].content.is_some());
+        assert!(cells[1].content.is_none(), "the authored one is an element");
+        assert!(cells[2].content.is_some());
+    }
+
+    #[test]
+    fn whitespace_between_two_cells_does_not_become_a_cell() {
+        // It is not content, and a cell around it would add a column that the
+        // reference renderings do not have.
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span class="c">a</span>   <span class="c">b</span></span></div>"#,
+            ".r { display: table-row } .c { display: table-cell } #t { display: table }",
+        );
+        assert_eq!(grid.rows[0].cells.len(), 2);
+        assert_eq!(grid.columns, 2);
+    }
+
+    #[test]
+    fn text_between_two_cells_does_become_one() {
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span class="c">a</span>loose<span class="c">b</span></span></div>"#,
+            ".r { display: table-row } .c { display: table-cell } #t { display: table }",
+        );
+        assert_eq!(grid.rows[0].cells.len(), 3);
+        assert!(grid.rows[0].cells[1].content.is_some());
+    }
+
+    #[test]
+    fn a_display_none_child_joins_no_run_and_starts_none() {
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span class="c">a</span><span class="gone">x</span><span class="c">b</span></span></div>"#,
+            ".r { display: table-row } .c { display: table-cell }
+             .gone { display: none } #t { display: table }",
+        );
+        assert_eq!(
+            grid.rows[0].cells.len(),
+            2,
+            "no cell around a box nobody generates"
+        );
+    }
+
+    #[test]
+    fn an_anonymous_cell_paints_nothing_of_its_own() {
+        // It borrows the row's id, so without this it would draw the row's
+        // background and border a second time, inside the row.
+        let grid = css_grid_of(
+            r#"<div id="t"><span class="r"><span>aaa</span></span></div>"#,
+            ".r { display: table-row; background: red; border: 5px solid red }
+             #t { display: table }",
+        );
+        let cell = &grid.rows[0].cells[0];
+        assert_eq!(cell.style.background_color, css::Color::TRANSPARENT);
+        assert_eq!(cell.style.border.left.used_width(16.0), 0.0);
+    }
+
+    #[test]
+    fn an_anonymous_cell_takes_the_column_a_rowspan_left_free() {
+        // The same stepping a real cell does: an anonymous cell that ignored
+        // occupancy would sit under a spanning cell and shift the row.
+        let grid = css_grid_of(
+            r#"<div id="t">
+                 <span class="r"><span class="c" rowspan="2">tall</span><span class="c">a</span></span>
+                 <span class="r"><span>loose</span></span>
+               </div>"#,
+            ".r { display: table-row } .c { display: table-cell } #t { display: table }",
+        );
+        assert_eq!(grid.rows[1].cells.len(), 1);
+        assert_eq!(
+            grid.rows[1].cells[0].column, 1,
+            "column 0 is still held by the rowspan above",
+        );
+    }
+
     fn grid_of(html: &str) -> Grid {
         let doc = dom::parse(html);
         let styles = css::cascade::cascade(&doc, &[]);
@@ -1302,13 +1502,33 @@ mod tests {
         // A row's other children are not cells. Taking every element in a row
         // as one is what a tag-name check used to prevent, and the display
         // check has to keep preventing it.
+        //
+        // Since §17.2.1's anonymous cells, the block child does get a cell —
+        // but an anonymous one wrapped *around* it, which is a different thing
+        // and is what the two assertions below separate. The block keeps its
+        // own display and its own box; it did not become a cell.
         let grid = css_grid_of(
             "<body><div id=t><div class=r><div class=c>a</div><div class=b>not a cell</div>\
              </div></div></body>",
             "#t { display: table } .r { display: table-row } \
              .c { display: table-cell } .b { display: block }",
         );
-        assert_eq!(grid.rows[0].cells.len(), 1, "a block child became a cell");
+        let cells = &grid.rows[0].cells;
+        assert_eq!(cells.len(), 2);
+        assert!(
+            cells[0].content.is_none(),
+            "the authored cell is an element"
+        );
+        assert_eq!(
+            cells[1].content.as_ref().map(Vec::len),
+            Some(1),
+            "a box around the block child, not the block child taken as a cell",
+        );
+        assert_eq!(
+            cells[1].style.display,
+            Display::TableCell,
+            "and the block's own display is untouched — this style is the box's",
+        );
     }
 
     #[test]
