@@ -4018,17 +4018,15 @@ fn layout_block(
         // box past the float — and clearance stops that margin collapsing
         // through, so an empty wrapper that should occupy nothing becomes as
         // tall as the float (#164).
-        let escapes_upwards = escaped_top.is_none()
-            && padding_top == 0.0
-            && border_top == 0.0
-            && cursor_y == padding_top + border_top
-            && !keeps_its_childrens_margins(style);
-        let hypothetical = cursor_y
-            + if escapes_upwards {
-                child_margins.0
-            } else {
-                0.0
-            };
+        let hypothetical = cursor_y + child_margins.0;
+        // Whether clearance was actually introduced, as against `clear` merely
+        // being set on a box that was already below every float it names.
+        // §8.3.1 hangs on the difference: clearance stops this box's margins
+        // collapsing — with the previous sibling's, and straight through
+        // itself — and a box that needed none goes on collapsing normally.
+        let cleared = context.clearance(child_style.clear, hypothetical - into_context)
+            + into_context
+            > hypothetical;
         // Moved *by* the clearance rather than *to* it, because the hypothetical
         // position is not where the box goes — the escaped margin is applied by
         // an ancestor, and adding it here as well would count it twice.
@@ -4094,7 +4092,11 @@ fn layout_block(
         let child_context = if establishes_a_context(child_style) {
             FloatContext::new(room)
         } else {
-            context.translated(0.0, cursor_y - into_context, content_width)
+            context.translated(
+                0.0,
+                cursor_y + child_margins.0 - into_context,
+                content_width,
+            )
         };
         // A normal-flow child's containing block is *this* box, so the
         // definite height it may resolve a percentage against is this box's,
@@ -4148,7 +4150,13 @@ fn layout_block(
         // top margin escaping, which `adjoining` above already handles, and
         // reaching into that from here would be two rules fighting over the
         // same box.
-        if consumed.collapses_through && previous_bottom.is_some() {
+        // `!cleared` is §8.3.1's exception: clearance stops a margin collapsing
+        // through the box it was introduced above. Without it an empty cleared
+        // box contributes nothing, and the parent stops short of the float the
+        // box was pushed below — `margin-collapse-clear-014`, where the lime
+        // parent came out 180 tall against the 200 its own comment works out
+        // longhand (#164).
+        if consumed.collapses_through && previous_bottom.is_some() && !cleared {
             let previous = previous_bottom.unwrap_or_default();
             let through = collapse(consumed.margin_top, consumed.margin_bottom);
             let run = collapse(previous, through);
@@ -13477,6 +13485,40 @@ mod clearance_hypothetical_tests {
         found.expect("it was laid out")
     }
 
+    /// The top edge of `id`'s border box, in page coordinates.
+    fn top_of(html: &str, css_text: &str, id: &str) -> f32 {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[css::Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            400.0,
+        );
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|element| element.id() == Some(id))
+            })
+            .expect("the fixture has that id");
+        fn walk(box_: &LayoutBox, node: NodeId, at: f32, out: &mut Option<f32>) {
+            let here = at + box_.rect.y;
+            if box_.node == Some(node) {
+                *out = Some(here);
+            }
+            for child in &box_.children {
+                walk(child, node, here, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, wanted, 0.0, &mut found);
+        found.expect("it was laid out")
+    }
+
     #[test]
     fn a_margin_that_already_clears_the_float_introduces_no_clearance() {
         // §9.5.2 measures clearance against the box's hypothetical position —
@@ -13511,6 +13553,50 @@ mod clearance_hypothetical_tests {
             height >= 5.0,
             "the wrapper must hold the cleared box: {height}",
         );
+    }
+
+    #[test]
+    fn a_cleared_box_lands_on_the_float_rather_than_a_margin_past_it() {
+        // §9.5.2 measures clearance against the *hypothetical* position — the
+        // top border edge once margins have collapsed — so a margin already
+        // counts towards reaching the float, and clearance makes up only the
+        // rest of the way. It can therefore be negative.
+        //
+        // `margin-collapse-clear-014`'s arithmetic, which the test spells out
+        // in its own comments: a 100px float whose bottom is at 200, a box
+        // below it with `margin-top: 120px`, and clearance of **-20px**. Read
+        // as "push to the float, then apply the margin", the box lands at 320.
+        let top = top_of(
+            "<body><div id=\"p\">\
+             <div class=a></div><div class=f></div><div id=\"c\"></div>\
+             </div></body>",
+            "body { margin: 0 } #p { width: 400px }
+             .a { height: 60px; margin-bottom: 40px }
+             .f { float: left; width: 100px; height: 100px }
+             #c { clear: left; margin-top: 120px }",
+            "c",
+        );
+        assert_eq!(top, 200.0, "the float's bottom edge, exactly");
+    }
+
+    #[test]
+    fn clearance_stops_an_empty_box_collapsing_through_itself() {
+        // §8.3.1: clearance stops the margins collapsing — with the previous
+        // sibling's, and straight through the box itself. Without that half the
+        // box above lands correctly and contributes nothing, so its parent
+        // stops short of the float the box was pushed below: 180 against the
+        // 200 `margin-collapse-clear-014` works out longhand (#164).
+        let height = height_of(
+            "<body><div id=\"p\">\
+             <div class=a></div><div class=f></div><div class=c></div>\
+             </div></body>",
+            "body { margin: 0 } #p { width: 400px }
+             .a { height: 60px; margin-bottom: 40px }
+             .f { float: left; width: 100px; height: 100px }
+             .c { clear: left; margin-top: 120px }",
+            "p",
+        );
+        assert_eq!(height, 200.0);
     }
 
     #[test]
