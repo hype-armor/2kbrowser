@@ -2748,6 +2748,19 @@ fn in_normal_flow(style: &ComputedStyle) -> bool {
 /// declares `direction` on itself, and that is the case the distinction exists
 /// for. The box's own is the fallback for a box with no element parent, which
 /// is the root.
+///
+/// The nearest **block container** ancestor and not simply the nearest styled
+/// one (§10.1). A plain in-flow inline is not a block container: §9.2.1.1
+/// breaks it open around a block child, so the block's containing block is the
+/// block ancestor above the inline, not the inline itself. Reading the inline's
+/// direction resolved the equation against a direction the containing block
+/// does not have — `block-in-inline-margins-001b` and `-002b`, where a `<span>`
+/// declares the opposite direction to the `<div>` around it and both are
+/// expected to render exactly as their same-direction siblings do (#159).
+///
+/// Only a plain, in-flow inline is stepped over, which is the same set
+/// `walk_order` expands: a float or an out-of-flow box is blockified by §9.7
+/// and is a container, and an inline-block is one by definition.
 fn containing_direction(
     doc: &Document,
     styles: &StyleMap,
@@ -2755,7 +2768,13 @@ fn containing_direction(
     style: &ComputedStyle,
 ) -> Direction {
     doc.ancestors(node)
-        .find_map(|ancestor| styles.get(ancestor))
+        .filter_map(|ancestor| styles.get(ancestor))
+        .find(|parent| {
+            !(parent.display.is_inline()
+                && parent.display != Display::InlineBlock
+                && parent.float == Float::None
+                && !parent.position.is_out_of_flow())
+        })
         .map_or(style.direction, |parent| parent.direction)
 }
 
@@ -13028,6 +13047,68 @@ mod over_constrained_tests {
         let wrapper = box_of(markup, sheet, "w");
         let inner = box_of(markup, sheet, "a");
         assert_eq!(inner.rect.x - wrapper.rect.x, 96.0);
+    }
+
+    #[test]
+    fn an_inline_that_a_block_broke_open_is_not_the_containing_block() {
+        // §9.2.1.1 breaks a plain inline around a block child, so the block's
+        // containing block is the *div* above the span and not the span itself
+        // — and §10.3.3 resolves against the containing block's direction.
+        // A `<span>` declaring the opposite direction to the `<div>` around it
+        // must therefore change nothing (#159, `block-in-inline-margins-001b`
+        // and `-002b`).
+        let inside_an_rtl_span = box_of(
+            "<body><div id=\"outer\"><span style=\"direction: rtl\">\
+             <span id=\"a\"></span></span></div></body>",
+            "body { margin: 0 } #outer { width: 100px; direction: ltr } \
+             #a { display: block; width: 80px; height: 20px; margin: 10px; \
+             border: 5px solid black }",
+            "a",
+        );
+        let plainly = box_of(
+            "<body><div id=\"outer\"><span>\
+             <span id=\"a\"></span></span></div></body>",
+            "body { margin: 0 } #outer { width: 100px; direction: ltr } \
+             #a { display: block; width: 80px; height: 20px; margin: 10px; \
+             border: 5px solid black }",
+            "a",
+        );
+        assert_eq!(
+            inside_an_rtl_span.rect.x, plainly.rect.x,
+            "the span's own direction decided the block's margins"
+        );
+        // And the answer is the ltr one: `margin-right` is the ignored side, so
+        // the box sits at its `margin-left`.
+        assert_eq!(inside_an_rtl_span.rect.x, 10.0);
+
+        // The mirror: an ltr span inside an rtl div is still rtl, so the
+        // ignored side is `margin-left` — recomputed to 0, which is what
+        // `block-in-inline-margins-002-ref` draws.
+        let inside_an_ltr_span = box_of(
+            "<body><div id=\"outer\"><span style=\"direction: ltr\">\
+             <span id=\"a\"></span></span></div></body>",
+            "body { margin: 0 } #outer { width: 100px; direction: rtl } \
+             #a { display: block; width: 80px; height: 20px; margin: 10px; \
+             border: 5px solid black }",
+            "a",
+        );
+        assert_eq!(inside_an_ltr_span.rect.x, 0.0);
+    }
+
+    #[test]
+    fn an_inline_block_ancestor_is_a_containing_block() {
+        // Unlike a plain inline: an inline-block is a block container, it is
+        // never broken open, and its direction is the one that decides.
+        let box_ = box_of(
+            "<body><div id=\"outer\"><span id=\"mid\">\
+             <span id=\"a\"></span></span></div></body>",
+            "body { margin: 0 } #outer { width: 200px; direction: ltr } \
+             #mid { display: inline-block; width: 100px; direction: rtl } \
+             #a { display: block; width: 50px; height: 10px }",
+            "a",
+        );
+        // Against the right edge of the inline-block's 100px content box.
+        assert_eq!(box_.rect.x, 50.0);
     }
 
     #[test]
