@@ -68,6 +68,7 @@ impl Stylesheet {
     /// decides which rules exist at all: a block whose query does not apply
     /// contributes nothing, so there is no rule left to ask about afterwards.
     pub fn parse_at(source: &str, width: f32) -> Self {
+        let source = without_cdata(source);
         let mut input = ParserInput::new(source);
         let mut parser = Parser::new(&mut input);
         let mut rule_parser = TopLevel {
@@ -84,6 +85,38 @@ impl Stylesheet {
             rules,
             imports: rule_parser.imports,
         }
+    }
+}
+
+/// Unwraps a stylesheet written inside an XML CDATA section.
+///
+/// XHTML's `<style type="text/css"><![CDATA[ … ]]></style>` is the idiom for
+/// keeping CSS out of an XML parser's way, and an XML parser removes the
+/// section markers before anything sees the text. This engine parses every
+/// document as HTML (ADR-0002), where those markers are not markup and are
+/// handed on as part of the stylesheet — so they have to come off here instead.
+///
+/// It is not enough to rely on CSS error recovery, which is why this exists at
+/// all. `[` opens a square-bracket block that runs to the matching `]`, so
+/// `[CDATA[ … ]` is *one token* swallowing every rule in the sheet: a page
+/// written this way loses not its first rule but all of them. The suite is full
+/// of it — 2 191 of its files — and a reference that renders unstyled fails a
+/// test whose own rendering was correct.
+///
+/// Only a sheet that *begins* with the marker is unwrapped, and only the last
+/// `]]>` is removed. A bare `]]>` elsewhere is left alone: it is far likelier
+/// to be inside a string than to be a section this never saw opened.
+fn without_cdata(source: &str) -> &str {
+    let trimmed = source.trim_start();
+    let Some(body) = trimmed.strip_prefix("<![CDATA[") else {
+        return source;
+    };
+    match body.rfind("]]>") {
+        Some(end) => &body[..end],
+        // Unterminated, which an XML parser would have refused. Dropping the
+        // opener alone still leaves every rule readable, and rules are what a
+        // reader came for.
+        None => body,
     }
 }
 
@@ -706,5 +739,35 @@ mod at_rule_tests {
         let sheet = Stylesheet::parse("@font-face { src: url(x.ttf) } p { color: red }");
         assert_eq!(colors(&sheet), vec!["red"]);
         assert!(sheet.imports.is_empty());
+    }
+
+    #[test]
+    fn a_stylesheet_inside_a_cdata_section_is_read() {
+        // XHTML's idiom for keeping CSS out of an XML parser's way. This engine
+        // parses every document as HTML, where the markers are not markup and
+        // arrive as part of the sheet — and CSS error recovery cannot save it,
+        // because `[` opens a block that runs to the matching `]`. So
+        // `[CDATA[ … ]` is one token swallowing every rule, and the page loses
+        // not its first rule but all of them.
+        let sheet = Stylesheet::parse("<![CDATA[\n  p { color: red }\n  div { color: blue }\n]]>");
+        assert_eq!(colors(&sheet), vec!["red", "blue"]);
+    }
+
+    #[test]
+    fn an_unterminated_cdata_section_still_yields_its_rules() {
+        // An XML parser would have refused the document. Dropping the opener
+        // alone still leaves every rule readable, and rules are what a reader
+        // came for.
+        let sheet = Stylesheet::parse("<![CDATA[ p { color: red }");
+        assert_eq!(colors(&sheet), vec!["red"]);
+    }
+
+    #[test]
+    fn a_stray_close_marker_is_left_alone() {
+        // Only a sheet that *begins* with the opener is unwrapped. A bare
+        // `]]>` is far likelier to be inside a string than to close a section
+        // this never saw opened.
+        let sheet = Stylesheet::parse("p { color: red } /* ]]> */ div { color: blue }");
+        assert_eq!(colors(&sheet), vec!["red", "blue"]);
     }
 }
