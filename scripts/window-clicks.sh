@@ -141,11 +141,24 @@ start_on() {
     if [ -z "$window" ]; then
         # Alive and silent is a different fault from dead and noisy, and the
         # two want different things looked at next.
-        local alive="no"
-        kill -0 "$app" 2>/dev/null && alive="yes"
+        # Output, exit status, and the state of the machine. The first two
+        # runs of this diagnostic said the process was dead and silent, which
+        # rules out a hang and a panic and leaves being killed — so what is
+        # left to ask is by what, and whether the page it was given was even
+        # there.
+        local alive="no" status="?"
+        if kill -0 "$app" 2>/dev/null; then
+            alive="yes"
+        else
+            wait "$app" 2>/dev/null
+            status=$?
+        fi
         echo "--- browser output ---" >&2
         tail -20 "$applog" >&2 || true
-        echo "--- still running: $alive ---" >&2
+        echo "--- still running: $alive, exit status: $status ---" >&2
+        echo "--- page: $(ls -l "$on" 2>&1) ---" >&2
+        echo "--- memory: $(free -m 2>/dev/null | sed -n 2p) ---" >&2
+        echo "--- disk: $(df -h . 2>/dev/null | sed -n 2p) ---" >&2
         fail "no window within 30s waiting for \"$ready\" — the browser never \
 opened one, so no click below would have meant anything"
     fi
