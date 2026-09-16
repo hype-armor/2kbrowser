@@ -1441,7 +1441,35 @@ impl FontStore {
         let mut first_line = true;
         available -= indent;
 
-        for segment in segments {
+        // Whether anything after each segment is content rather than the side
+        // of an inline box (§9.4.2).
+        //
+        // A mandatory break with nothing but sides left after it must not end
+        // the line, because the line it would start holds no content and so is
+        // a line box that does not exist. The sides are still drawn — they are
+        // the end of an inline box, and §8.4 puts the end of one at the end of
+        // its last fragment — but that fragment is the one the break ended, not
+        // a new one below it.
+        //
+        // `content: "  \A"` on an `::after` is the shape that needs this: the
+        // newline is the last thing in the box, so what follows it is the
+        // box's own closing side and nothing else. Without this the closing
+        // side's padding draws its background on a second line, which is one
+        // navy stripe too many in `generated-content/content-175`.
+        let content_after: Vec<bool> = segments
+            .iter()
+            .rev()
+            .scan(false, |seen, segment| {
+                let answer = *seen;
+                *seen = *seen || segment.edge.is_none();
+                Some(answer)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        for (index, segment) in segments.into_iter().enumerate() {
             let fits = current.is_empty() || x + segment.shaped.width <= available;
             if !fits {
                 // Ended because the next word would not fit, so this is not the
@@ -1451,7 +1479,7 @@ impl FontStore {
                 let (offset, room) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
-                Self::push_line(
+                if Self::push_line(
                     &mut layout,
                     &mut current,
                     Room {
@@ -1462,8 +1490,9 @@ impl FontStore {
                     ascent,
                     line_height,
                     justify,
-                );
-                y += line_height;
+                ) {
+                    y += line_height;
+                }
                 x = 0.0;
                 line_height = strut_height;
                 ascent = strut_ascent;
@@ -1512,7 +1541,7 @@ impl FontStore {
                 line_height = line_height.max(ascent + descent);
             }
             let advance = segment.shaped.width + segment.trailing_space;
-            let forced = segment.mandatory_break;
+            let forced = segment.mandatory_break && content_after[index];
             let mut placed = segment;
             placed.x = x;
             x += advance;
@@ -1524,7 +1553,7 @@ impl FontStore {
                 let (offset, room) = constraints(y, line_height);
                 let offset = offset + if first_line { indent } else { 0.0 };
                 first_line = false;
-                Self::push_line(
+                if Self::push_line(
                     &mut layout,
                     &mut current,
                     Room {
@@ -1535,8 +1564,9 @@ impl FontStore {
                     ascent,
                     line_height,
                     None,
-                );
-                y += line_height;
+                ) {
+                    y += line_height;
+                }
                 x = 0.0;
                 line_height = self.used_line_height(default_style);
                 ascent = default_style.font_size * 0.8;
@@ -1572,6 +1602,11 @@ impl FontStore {
     }
 
     /// Emits one line from the segments gathered for it.
+    ///
+    /// Returns whether a line was actually emitted. A line box that holds no
+    /// content does not exist (§9.4.2), and one that does not exist takes no
+    /// vertical room either — so the caller advances past it only when this
+    /// says there was something to advance past.
     fn push_line(
         layout: &mut TextLayout,
         current: &mut Vec<Segment>,
@@ -1580,7 +1615,7 @@ impl FontStore {
         ascent: f32,
         line_height: f32,
         justify_to: Option<f32>,
-    ) {
+    ) -> bool {
         // UAX #9's rule L2, and the whole of what bidi costs this engine: the
         // segments were filled in *logical* order, and a line is drawn in
         // visual order. `reorder_visual` returns its input's own order for an
@@ -1591,6 +1626,38 @@ impl FontStore {
         // The x positions are recomputed here rather than trusted from the
         // fill loop, which assigned them left to right as each word arrived
         // and could not have known what would land beside them.
+        // §9.4.2: a line box that holds no content after whitespace processing
+        // does not exist. Not "is zero height" — it must not take a turn on the
+        // page at all, because the space beside a float is offered to the lines
+        // that need it and a line that holds nothing does not.
+        //
+        // `<p><span style="float: left"></span><br>a long word</p>` is the case
+        // that names itself: the `<br>` ends a line before the word, and that
+        // line has nothing on it. Keeping it puts the word one line lower than
+        // the same paragraph written without the `<br>`, which is precisely
+        // what `floats/float-no-content-beside-001` says must not happen.
+        //
+        // Content is text, an atomic inline box, or the side of an inline box
+        // that reserves room — a side with no margin, border or padding draws
+        // nothing and holds nothing, which is the rest of the spec's list.
+        // Measured by width rather than by whether there is text, because the
+        // two disagree exactly where it matters. The newline a `<br>` carries
+        // is text and shapes to nothing: it is the break, not something on the
+        // line. Two spaces in `white-space: pre` are preserved white space and
+        // shape to something: they are content, and §9.4.2 lists them as such.
+        let holds_content = current
+            .iter()
+            .any(|segment| segment.replaced.is_some() || segment.shaped.width > 0.0);
+        // ...unless it ends with a preserved newline, which §9.4.2 names as its
+        // own exception and means exactly what it says: `<br>` on a line of its
+        // own is a blank line the author asked for, and it keeps its height.
+        // `text/text-indent-on-blank-line-rtl-left-align` is two 100px lines
+        // tall because the first of them is a `<br>` and nothing else.
+        let ends_in_a_break = current.last().is_some_and(|last| last.mandatory_break);
+        if !holds_content && !ends_in_a_break {
+            current.clear();
+            return false;
+        }
         let order = Self::visual_line(current);
         let mut pen = 0.0;
         // Whitespace owed to the far end of a right-to-left run: it follows the
@@ -1695,6 +1762,7 @@ impl FontStore {
             baseline: ascent,
         });
         current.clear();
+        true
     }
 
     /// The strut's half of a line box: how far it reaches above and below the
