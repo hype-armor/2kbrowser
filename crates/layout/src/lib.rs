@@ -5883,7 +5883,13 @@ fn open_a_box(
     available_width: f32,
     out: &mut Vec<InlineRun>,
 ) -> Vec<usize> {
-    let (left, _) = inline_edges(style, available_width);
+    // The *start* side, which is the physical right in right-to-left text
+    // (§8.4, §9.10). `inline_edges` answers in physical terms because margins,
+    // borders and padding are physical properties; which of the two opens the
+    // box is what `direction` decides.
+    let (left, right) = inline_edges(style, available_width);
+    let rtl = style.direction == Direction::Rtl;
+    let opening = if rtl { right } else { left };
     if !brackets(style, available_width) {
         return boxes.to_vec();
     }
@@ -5893,9 +5899,9 @@ fn open_a_box(
         InlineRun::edge(
             source,
             text::InlineEdge {
-                width: left,
+                width: opening,
                 opening: true,
-                rtl: style.direction == Direction::Rtl,
+                rtl,
             },
             style.clone(),
         )
@@ -5917,14 +5923,17 @@ fn close_a_box(
     if inside.len() == boxes.len() {
         return;
     }
-    let (_, right) = inline_edges(style, available_width);
+    let (left, right) = inline_edges(style, available_width);
+    let rtl = style.direction == Direction::Rtl;
+    // The *end* side, which is the physical left in right-to-left text.
+    let closing = if rtl { left } else { right };
     out.push(
         InlineRun::edge(
             source,
             text::InlineEdge {
-                width: right,
+                width: closing,
                 opening: false,
-                rtl: style.direction == Direction::Rtl,
+                rtl,
             },
             style.clone(),
         )
@@ -12360,5 +12369,43 @@ mod over_constrained_tests {
             "a",
         );
         assert_eq!(shifted.rect.x, 30.0);
+    }
+}
+
+#[cfg(test)]
+mod rtl_edge_width_tests {
+    use super::*;
+
+    /// The widths the two edge runs of a bordered span reserve, opening first.
+    fn edges(direction: Direction) -> (f32, f32) {
+        let mut style = ComputedStyle {
+            direction,
+            font_size: 16.0,
+            ..ComputedStyle::default()
+        };
+        style.padding.left = Length::Px(10.0);
+        style.padding.right = Length::Px(30.0);
+        let mut numbering = Numbering::default();
+        let mut out = Vec::new();
+        let inside = open_a_box(&style, None, &[], &mut numbering, 400.0, &mut out);
+        close_a_box(&style, None, &inside, &[], 400.0, &mut out);
+        let widths: Vec<f32> = out
+            .iter()
+            .filter_map(|run| run.edge.map(|edge| edge.width))
+            .collect();
+        (widths[0], widths[1])
+    }
+
+    #[test]
+    fn a_left_to_right_box_reserves_its_left_side_first() {
+        assert_eq!(edges(Direction::Ltr), (10.0, 30.0));
+    }
+
+    #[test]
+    fn a_right_to_left_box_reserves_its_right_side_first() {
+        // #113. The *start* side of an rtl box is the physical right, so that
+        // is what the line makes room for where the box opens. Reserving the
+        // left there put the wrong amount of space at each end of the box.
+        assert_eq!(edges(Direction::Rtl), (30.0, 10.0));
     }
 }
