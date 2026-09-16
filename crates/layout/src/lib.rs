@@ -740,6 +740,28 @@ impl Layout {
         })
     }
 
+    /// Whether `node`'s box is inside a `position: fixed` subtree.
+    ///
+    /// Such a box is laid out against the viewport (§10.1) and painted at the
+    /// window's coordinates rather than the document's (#108), so anything
+    /// that turns a *window* point into a document one — a click, a keyboard
+    /// focus ring — has to know not to add the scroll for it. Answered from
+    /// the box tree because that is where the answer is: the subtree root
+    /// carries the property, and everything under it inherits the consequence
+    /// without inheriting the property.
+    pub fn is_pinned(&self, node: NodeId) -> bool {
+        fn walk(box_: &LayoutBox, node: NodeId, inside: bool) -> Option<bool> {
+            let inside = inside || box_.style.position == Position::Fixed;
+            if box_.node == Some(node) {
+                return Some(inside);
+            }
+            box_.children
+                .iter()
+                .find_map(|child| walk(child, node, inside))
+        }
+        walk(&self.root, node, false).unwrap_or(false)
+    }
+
     /// Which row of a control's own text a canvas point falls on.
     ///
     /// For a list box, whose options are drawn stacked inside one atomic box:

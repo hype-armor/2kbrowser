@@ -301,14 +301,15 @@ impl Viewport {
     /// This runs on every pointer move, and a round trip per mouse motion would
     /// be absurd — but it is also all the parent *can* do, since the box tree it
     /// would hit-test against is on the other side.
-    pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
-        self.wire_link_at(x, y).map(|link| link.url.as_str())
+    pub fn link_at(&self, x: f32, y: f32, scroll: f32) -> Option<&str> {
+        self.wire_link_at(x, y, scroll)
+            .map(|link| link.url.as_str())
     }
 
     /// The same, with where on this page the link goes if it does not leave
     /// it — so a caller can tell a page to fetch from a place to scroll to.
-    pub fn target_at(&self, x: f32, y: f32) -> Option<(&str, Option<f32>)> {
-        self.wire_link_at(x, y)
+    pub fn target_at(&self, x: f32, y: f32, scroll: f32) -> Option<(&str, Option<f32>)> {
+        self.wire_link_at(x, y, scroll)
             .map(|link| (link.url.as_str(), link.jump_to))
     }
 
@@ -331,10 +332,19 @@ impl Viewport {
             .map(|missing| missing.url.as_str())
     }
 
-    fn wire_link_at(&self, x: f32, y: f32) -> Option<&sandbox::message::Link> {
+    /// `y` is a document coordinate and `scroll` is how far the page has been
+    /// scrolled, which is what turns it back into a window one for a link that
+    /// does not move with the page.
+    ///
+    /// A `position: fixed` link's rectangle is in window coordinates (#108) —
+    /// the box stays put, so adding the scroll to find it misses by however
+    /// far the reader has come down the page. That is the difference between a
+    /// fixed navigation bar and a fixed navigation bar you can click.
+    fn wire_link_at(&self, x: f32, y: f32, scroll: f32) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
         self.page.links.iter().rev().find(|link| {
             let rect = link.rect;
+            let y = if link.pinned { y - scroll } else { y };
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
         })
     }
@@ -567,6 +577,7 @@ mod tests {
             url: url.to_owned(),
             group,
             jump_to: None,
+            pinned: false,
         }
     }
 

@@ -1961,7 +1961,7 @@ impl App {
         }
         let page = self.tab().page.as_ref()?;
         let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
-        page.target_at(x, y)
+        page.target_at(x, y, self.tab().scroll)
             .map(|(url, jump_to)| (url.to_owned(), jump_to))
     }
 

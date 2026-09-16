@@ -123,6 +123,36 @@ pub struct DisplayList {
     )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
+    /// Half-open ranges of `items` that came from `position: fixed` subtrees.
+    ///
+    /// Those items are the one thing on the page whose coordinates are the
+    /// *window's* rather than the document's: a page is laid out once and
+    /// `rasterise_band` draws a slice of it by shifting every item up by the
+    /// band's top, and a fixed box must not move when the reader scrolls
+    /// (#108). So it must not be shifted.
+    ///
+    /// Ranges rather than a list of their own, so the items stay in paint
+    /// order where they were emitted. A separate list has to be drawn at some
+    /// fixed point — last, in the obvious version — and that is wrong:
+    /// `left-offset-position-fixed-001` covers a fixed red square with an
+    /// absolutely positioned green one that comes after it in the source, and
+    /// a fixed box painted last shows the red.
+    ///
+    /// The same trick `clip` above uses, and for the same reason: a subtree
+    /// emits a contiguous run, so where it starts and stops is all that has to
+    /// be remembered.
+    pub pinned: Vec<(usize, usize)>,
+}
+
+impl DisplayList {
+    /// Whether the item at `at` came from a `position: fixed` subtree, and so
+    /// is drawn at the window's coordinates rather than the document's.
+    ///
+    /// A linear scan of the ranges, which is the right shape here: almost
+    /// every page has none at all, and a page with one has one.
+    pub fn is_pinned(&self, at: usize) -> bool {
+        self.pinned.iter().any(|&(from, to)| at >= from && at < to)
+    }
 }
 
 impl Default for DisplayList {
@@ -133,6 +163,7 @@ impl Default for DisplayList {
             canvas: Color::WHITE,
             canvas_image: None,
             items: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 }
@@ -146,6 +177,7 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
         canvas: layout.canvas_background.over(Color::WHITE),
         canvas_image: layout.canvas_image,
         items: Vec::new(),
+        pinned: Vec::new(),
     };
     // §14.2 again: an element whose background was propagated to the canvas
     // does not paint it a second time. Drawing it twice is invisible while the
@@ -437,6 +469,17 @@ fn paint_box(
         (z, positioned)
     });
     for child in order {
+        // A fixed subtree is painted into a list of its own and kept there.
+        // Everything inside it is positioned against the viewport already —
+        // §10.1 made that the containing block — so what is left is to stop
+        // the band rasteriser shifting it with the page, and the cleanest
+        // place to mark that is where the subtree begins.
+        if child.style.position == css::style::Position::Fixed {
+            let from = list.items.len();
+            paint_box(child, x, y, propagated, list);
+            list.pinned.push((from, list.items.len()));
+            continue;
+        }
         paint_box(child, x, y, propagated, list);
     }
 
@@ -1010,7 +1053,36 @@ pub fn rasterise_band(
         }
     }
 
-    for item in &list.items {
+    // In one pass and in order, with the pinned runs drawn at no shift at all:
+    // their coordinates are already the window's, which is the whole of what
+    // `position: fixed` means once the containing block is the viewport (#108).
+    for (at, item) in list.items.iter().enumerate() {
+        let shift = if list.is_pinned(at) { 0.0 } else { top };
+        draw_items(
+            &mut pixmap,
+            fonts,
+            images,
+            std::slice::from_ref(item),
+            shift,
+        );
+    }
+    Some(pixmap)
+}
+
+/// Draws a run of display items into a band, shifting them up by `top`.
+///
+/// Called twice: once for the page's own items, and once for the pinned ones
+/// with a shift of zero. That second call is the whole of `position: fixed`'s
+/// painting half — a page is laid out once and a band is a slice of it, so an
+/// item that must not scroll is simply an item that is not shifted (#108).
+fn draw_items(
+    pixmap: &mut Pixmap,
+    fonts: &mut FontStore,
+    images: &ImageStore,
+    items: &[DisplayItem],
+    top: f32,
+) {
+    for item in items {
         // Nothing beyond the drawable range is drawn at all. See `MAX_COORD`:
         // this is the one place every item passes through, so it is the one
         // place the check has to be.
@@ -1018,13 +1090,13 @@ pub fn rasterise_band(
             DisplayItem::Rect { rect, color } => {
                 let rect = shifted(rect, top);
                 if drawable(&rect) {
-                    fill_rect(&mut pixmap, &rect, *color);
+                    fill_rect(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Ellipse { rect, color } => {
                 let rect = shifted(rect, top);
                 if drawable(&rect) {
-                    fill_ellipse(&mut pixmap, &rect, *color);
+                    fill_ellipse(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Image {
@@ -1035,8 +1107,8 @@ pub fn rasterise_band(
                 let rect = shifted(rect, top);
                 if drawable(&rect) {
                     match images.get(&ImageKey::content(*node)) {
-                        Some(image) => draw_image(&mut pixmap, image, &rect),
-                        None if *placeholder => draw_missing(&mut pixmap, fonts, &rect),
+                        Some(image) => draw_image(pixmap, image, &rect),
+                        None if *placeholder => draw_missing(pixmap, fonts, &rect),
                         None => {}
                     }
                 }
@@ -1056,13 +1128,7 @@ pub fn rasterise_band(
                     let anchor = anchor_of(rect, *position, image);
                     let slice = shifted(&slice, top);
                     if drawable(&slice) {
-                        tile_image(
-                            &mut pixmap,
-                            image,
-                            &slice,
-                            (anchor.0, anchor.1 - top),
-                            *repeat,
-                        );
+                        tile_image(pixmap, image, &slice, (anchor.0, anchor.1 - top), *repeat);
                     }
                 }
             }
@@ -1074,12 +1140,11 @@ pub fn rasterise_band(
             } => {
                 let origin_y = *origin_y - top;
                 if in_range(*origin_x) && in_range(origin_y) {
-                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, origin_y, *color);
+                    draw_glyph(pixmap, fonts, glyph, *origin_x, origin_y, *color);
                 }
             }
         }
     }
-    Some(pixmap)
 }
 
 /// The same rectangle, moved into a band's coordinates.
