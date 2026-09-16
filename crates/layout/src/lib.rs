@@ -1286,6 +1286,7 @@ pub fn layout(
                     styles,
                     fonts,
                     start,
+                    None,
                     &start_style,
                     intrinsic,
                     viewport_width,
@@ -1312,6 +1313,7 @@ pub fn layout(
         styles,
         fonts,
         start,
+        None,
         &start_style,
         intrinsic,
         0.0,
@@ -1706,7 +1708,8 @@ fn layout_inline_block(
     let effective = match style.width {
         Length::Auto => {
             let room = (available_width - margin).max(0.0);
-            let (min, max) = subtree_widths(doc, styles, fonts, node, style, intrinsic, room, 0);
+            let (min, max) =
+                subtree_widths(doc, styles, fonts, node, None, style, intrinsic, room, 0);
             min.max(room).min(max.max(min)) + margin
         }
         _ => available_width,
@@ -1736,6 +1739,7 @@ fn layout_inline_block(
         styles,
         fonts,
         node,
+        None,
         style,
         intrinsic,
         0.0,
@@ -2211,6 +2215,10 @@ fn subtree_widths(
     styles: &StyleMap,
     fonts: &mut FontStore,
     node: NodeId,
+    // The children to measure, where they are not the node's own; see
+    // `layout_block`. An anonymous table cell is measured the same way it is
+    // laid out, or its column is sized for content the cell does not hold.
+    content: Option<&[NodeId]>,
     style: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
     available: f32,
@@ -2232,7 +2240,7 @@ fn subtree_widths(
         return (0.0, 0.0);
     }
 
-    if is_replaced(doc, node) {
+    if content.is_none() && is_replaced(doc, node) {
         let (width, _) = replaced_size(
             style,
             intrinsic.get(&node).copied(),
@@ -2257,6 +2265,7 @@ fn subtree_widths(
         doc,
         styles,
         node,
+        content,
         style,
         intrinsic,
         &InlineBlocks::new(),
@@ -2300,7 +2309,7 @@ fn subtree_widths(
         max = widest.1;
     }
 
-    for &child in doc.children(node) {
+    for &child in content.unwrap_or_else(|| doc.children(node)) {
         let Some(child_style) = styles.get(child) else {
             continue;
         };
@@ -2321,6 +2330,7 @@ fn subtree_widths(
             styles,
             fonts,
             child,
+            None,
             child_style,
             intrinsic,
             available,
@@ -2411,6 +2421,7 @@ fn table_widths(
                 styles,
                 fonts,
                 cell.node,
+                cell.content.as_deref(),
                 &cell_style,
                 intrinsic,
                 available,
@@ -2484,6 +2495,7 @@ fn caption_floor(
                 styles,
                 fonts,
                 caption,
+                None,
                 &caption_style,
                 intrinsic,
                 available,
@@ -2820,6 +2832,14 @@ fn layout_block(
     styles: &StyleMap,
     fonts: &mut FontStore,
     node: NodeId,
+    // The children to lay out, where they are not the node's own. An anonymous
+    // table cell (§17.2.1) is a box with no element: it holds a run of a row's
+    // children, and the row whose `NodeId` it borrows for a containing block is
+    // not its parent in any sense that matters here. `Some` therefore says two
+    // things at once — these children, and no element — so the pseudo-elements,
+    // the replaced content and the form control that all belong to `node` are
+    // passed over rather than taken as this box's own.
+    content: Option<&[NodeId]>,
     style: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
     x: f32,
@@ -2829,6 +2849,10 @@ fn layout_block(
     containing: ContainingBlock,
     parent: &mut LayoutBox,
 ) -> Consumed {
+    let children = content.unwrap_or_else(|| doc.children(node));
+    // Whether this box is a box rather than an element. See `content`.
+    let no_element = content.is_some();
+
     // A collapsing table is not a box with a border around a grid; it *is* the
     // grid, and its own border is the outer half of the outermost grid lines
     // (§17.6.2). So the borders have to be resolved before anything measures
@@ -2929,7 +2953,10 @@ fn layout_block(
     // stretched the whole column, collapsed to a hairline because there was no
     // content to give it a height, and an `<input>` lost its value entirely,
     // because a value lives in an attribute and only this path ever reads it.
-    if let Some(control) = forms::control_of(doc, node) {
+    if let Some(control) = (!no_element)
+        .then(|| forms::control_of(doc, node))
+        .flatten()
+    {
         let (width, height) = control_size(doc, style, node, control, available_width);
         let border_box = (
             width + surround,
@@ -2971,7 +2998,7 @@ fn layout_block(
         return consumed;
     }
 
-    if is_replaced(doc, node) {
+    if !no_element && is_replaced(doc, node) {
         let (image_width, image_height) = replaced_size(
             style,
             intrinsic.get(&node).copied(),
@@ -3049,11 +3076,15 @@ fn layout_block(
     // children are. Without this the clearfix's whole trick — a block box
     // appended to a container of nothing but text and floats — would be
     // decided away before the walk that places it ever ran.
-    let generated_block = [PseudoElement::Before, PseudoElement::After]
-        .into_iter()
-        .any(|which| styles.pseudo(node, which).is_some_and(generated_is_block));
+    //
+    // A box with no element has none, whatever the node it borrows an id from
+    // may carry (#121).
+    let generated_block = !no_element
+        && [PseudoElement::Before, PseudoElement::After]
+            .into_iter()
+            .any(|which| styles.pseudo(node, which).is_some_and(generated_is_block));
     let all_inline = !generated_block
-        && !doc.children(node).iter().any(|&child| {
+        && !children.iter().any(|&child| {
             styles.get(child).is_some_and(|child_style| {
                 child_style.display != Display::None
                     && !is_inline_child(doc, styles, child, child_style)
@@ -3069,14 +3100,25 @@ fn layout_block(
             doc,
             styles,
             fonts,
-            doc.children(node),
+            children,
             intrinsic,
             content_width,
             &mut blocks,
         );
-        let mut runs =
-            collect_inline_runs(doc, styles, node, style, intrinsic, &blocks, content_width);
-        if let Some(first) = styles.pseudo(node, PseudoElement::FirstLetter) {
+        let mut runs = collect_inline_runs(
+            doc,
+            styles,
+            node,
+            content,
+            style,
+            intrinsic,
+            &blocks,
+            content_width,
+        );
+        if let Some(first) = (!no_element)
+            .then(|| styles.pseudo(node, PseudoElement::FirstLetter))
+            .flatten()
+        {
             apply_first_letter(&mut runs, first);
         }
         runs
@@ -3106,7 +3148,7 @@ fn layout_block(
     collect_floats(
         doc,
         styles,
-        doc.children(node),
+        children,
         &mut early,
         &mut late,
         &mut seen_in_flow,
@@ -3177,7 +3219,7 @@ fn layout_block(
             styles,
             fonts,
             node,
-            doc.children(node),
+            children,
             style,
             collapsed.as_ref(),
             intrinsic,
@@ -3245,6 +3287,7 @@ fn layout_block(
                     styles,
                     fonts,
                     caption,
+                    None,
                     &caption_style,
                     intrinsic,
                     box_.rect.width,
@@ -3283,6 +3326,7 @@ fn layout_block(
                     styles,
                     fonts,
                     caption,
+                    None,
                     &caption_style,
                     intrinsic,
                     box_.rect.x,
@@ -3318,8 +3362,7 @@ fn layout_block(
         // Their static position is the table's content top. A table has no flow
         // for them to have been seen partway through, so there is no cursor to
         // read; the top of the content box is where flow would have started.
-        let absolutes: Vec<(NodeId, ComputedStyle, f32, usize)> = doc
-            .children(node)
+        let absolutes: Vec<(NodeId, ComputedStyle, f32, usize)> = children
             .iter()
             .filter_map(|&child| Some((child, styles.get(child)?)))
             .filter(|(_, child_style)| child_style.position.is_out_of_flow())
@@ -3436,11 +3479,13 @@ fn layout_block(
     // where content is collected in stretches between the block children.
     // §5.12.2 applies to a block container, and this is one. Held as an option
     // so the first stretch that actually has a letter in it takes it.
-    let mut first_letter = styles.pseudo(node, PseudoElement::FirstLetter);
-    let mut lead = (!all_inline)
+    let mut first_letter = (!no_element)
+        .then(|| styles.pseudo(node, PseudoElement::FirstLetter))
+        .flatten();
+    let mut lead = (!all_inline && !no_element)
         .then(|| generated_run(styles, node, PseudoElement::Before))
         .flatten();
-    let tail = (!all_inline)
+    let tail = (!all_inline && !no_element)
         .then(|| generated_run(styles, node, PseudoElement::After))
         .flatten();
     // The bottom margin of the last in-flow block placed, kept so the next
@@ -3459,13 +3504,13 @@ fn layout_block(
     // Which split inline elements the walk is currently inside, so a block
     // child can close them and the stretch after it can pick them up again.
     let mut open: Vec<NodeId> = Vec::new();
-    let mut steps = walk_order(doc, styles, node, !all_inline);
+    let mut steps = walk_order(doc, styles, children, !all_inline);
     // Before everything and after everything, which is what the names mean.
     for (which, at) in [
         (PseudoElement::After, steps.len()),
         (PseudoElement::Before, 0),
     ] {
-        if styles.pseudo(node, which).is_some_and(generated_is_block) {
+        if !no_element && styles.pseudo(node, which).is_some_and(generated_is_block) {
             steps.insert(at, Step::Generated(which));
         }
     }
@@ -3813,6 +3858,7 @@ fn layout_block(
                 styles,
                 fonts,
                 child,
+                None,
                 child_style,
                 intrinsic,
                 content_width,
@@ -3864,6 +3910,7 @@ fn layout_block(
             styles,
             fonts,
             child,
+            None,
             child_style,
             intrinsic,
             padding_left + border_left + beside,
@@ -4096,7 +4143,11 @@ fn layout_block(
     // and before the out-of-flow children below are placed, which are measured
     // against the content box it leaves behind rather than the one the
     // legend's slot in flow had made.
-    let legend_overhang = forms::break_the_rule_for_a_legend(doc, node, border_top, &mut box_);
+    let legend_overhang = if no_element {
+        0.0
+    } else {
+        forms::break_the_rule_for_a_legend(doc, node, border_top, &mut box_)
+    };
 
     // Where this box's content origin sits inside the containing block it
     // *inherited*, for out-of-flow children that are still measured against
@@ -4321,6 +4372,7 @@ fn place_absolutes(
                     doc,
                     styles,
                     child,
+                    None,
                     &child_style,
                     intrinsic,
                     &InlineBlocks::new(),
@@ -4352,6 +4404,7 @@ fn place_absolutes(
             styles,
             fonts,
             child,
+            None,
             &child_style,
             intrinsic,
             0.0,
@@ -4475,6 +4528,7 @@ fn layout_table(
                 styles,
                 fonts,
                 cell.node,
+                cell.content.as_deref(),
                 &cell_style,
                 intrinsic,
                 available_width,
@@ -4646,6 +4700,7 @@ fn layout_table(
                 styles,
                 fonts,
                 cell.node,
+                cell.content.as_deref(),
                 &cell_style,
                 intrinsic,
                 cell_x,
@@ -5170,6 +5225,7 @@ fn place_float(
                 styles,
                 fonts,
                 child,
+                None,
                 child_style,
                 intrinsic,
                 content_width,
@@ -5204,6 +5260,7 @@ fn place_float(
         styles,
         fonts,
         child,
+        None,
         child_style,
         intrinsic,
         0.0,
@@ -5315,12 +5372,16 @@ fn anonymous_tables(
         }
     }
     flush(&mut run);
-    // A run that yields no cells is not a table anybody can see, and wrapping
-    // it in one loses its content: the rows this engine can build are the ones
-    // whose children are cells, and §17.2.1's anonymous *cell* — the box that
-    // would go round a row's non-cell child — is not generated yet. Leaving the
-    // run alone in that case keeps it rendering as inline content, which is
-    // where it was before the table was inferred.
+    // A run that yields no rows at all is not a table anybody can see, and
+    // wrapping it in one loses its content. Anonymous cells (§17.2.1) mean far
+    // fewer runs come out empty than before — a row of plain spans now has a
+    // cell round each stretch of them, where it used to have nothing — but not
+    // none: an orphan `table-column`, say, contributes a column band and no
+    // row. Leaving such a run alone keeps it rendering as inline content, which
+    // is where it was before the table was inferred, and is what
+    // `normal-flow/table-in-inline-001` and `visuren/table-pseudo-in-part3-1`
+    // expect. Dropping the guard also costs `table-anonymous-objects-089` and
+    // `-090`, which this change otherwise fixes.
     out.retain(|_, run| {
         !table::build_grid_of(doc, styles, holder, run)
             .rows
@@ -5341,12 +5402,12 @@ fn anonymous_tables(
 /// box is blockified by §9.7 and placed against an edge, so nothing is broken
 /// around it; and a positioned one is a containing block for its descendants,
 /// which taking it apart here would lose.
-fn walk_order(doc: &Document, styles: &StyleMap, node: NodeId, split: bool) -> Vec<Step> {
+fn walk_order(doc: &Document, styles: &StyleMap, children: &[NodeId], split: bool) -> Vec<Step> {
     let mut out = Vec::new();
-    for &child in doc.children(node) {
+    for &child in children {
         if split && splits_around_a_block(doc, styles, child) {
             out.push(Step::Opens(child));
-            out.extend(walk_order(doc, styles, child, split));
+            out.extend(walk_order(doc, styles, doc.children(child), split));
             out.push(Step::Closes(child));
         } else {
             out.push(Step::Node(child));
@@ -5616,10 +5677,18 @@ fn collapse_across_runs(runs: &mut [InlineRun]) {
 /// Each inline element contributes its own run carrying its own computed style,
 /// which is what lets `<b>` and `<code>` inside a paragraph render differently
 /// from the text around them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
 fn collect_inline_runs(
     doc: &Document,
     styles: &StyleMap,
     node: NodeId,
+    // The children to collect, where they are not the node's own; see
+    // `layout_block`. A box with no element has no marker and no
+    // pseudo-elements either, so both are passed over with them.
+    content: Option<&[NodeId]>,
     inherited: &ComputedStyle,
     intrinsic: &IntrinsicSizes,
     blocks: &InlineBlocks,
@@ -5641,7 +5710,11 @@ fn collect_inline_runs(
     // first line's text along and leave the rest of them where they were.
     //
     // Ahead of `::before`, which is where a browser puts it.
-    if let Some(marker) = inside_marker_run(doc, styles, node, inherited) {
+    if let Some(marker) = content
+        .is_none()
+        .then(|| inside_marker_run(doc, styles, node, inherited))
+        .flatten()
+    {
         push_generated(
             marker,
             node,
@@ -5651,7 +5724,11 @@ fn collect_inline_runs(
             &mut runs,
         );
     }
-    if let Some(before) = generated_run(styles, node, PseudoElement::Before) {
+    if let Some(before) = content
+        .is_none()
+        .then(|| generated_run(styles, node, PseudoElement::Before))
+        .flatten()
+    {
         push_generated(
             before,
             node,
@@ -5664,7 +5741,7 @@ fn collect_inline_runs(
     runs.extend(inline_runs_for(
         doc,
         styles,
-        doc.children(node),
+        content.unwrap_or_else(|| doc.children(node)),
         inherited,
         node,
         intrinsic,
@@ -5672,7 +5749,11 @@ fn collect_inline_runs(
         available_width,
         &mut numbering,
     ));
-    if let Some(after) = generated_run(styles, node, PseudoElement::After) {
+    if let Some(after) = content
+        .is_none()
+        .then(|| generated_run(styles, node, PseudoElement::After))
+        .flatten()
+    {
         push_generated(after, node, &[], &mut numbering, available_width, &mut runs);
     }
     runs
