@@ -250,6 +250,34 @@ fn absolute_offset(
     (x, y)
 }
 
+/// The static position of an out-of-flow box, on both axes (§10.3.7).
+///
+/// With `left` and `right` both `auto` a box stays where flow would have put
+/// it, and in a right-to-left block flow starts at the *right* edge. So the
+/// box's own right edge goes where the parent's content ends, and its width
+/// hangs back off that (#159).
+///
+/// The width here is the **parent's** content width and not the containing
+/// block's, which is the whole reason this is a function rather than a line
+/// inside `absolute_offset`. The two are the same only when the box's parent is
+/// also what positions it: an absolutely positioned box inside a `position:
+/// static` rtl div is laid out where that div's flow would have put it and
+/// measured against the initial containing block, and using the containing
+/// block's width there put it a viewport's width away from where it belongs.
+fn static_x(
+    direction: Direction,
+    content_left: f32,
+    content_width: f32,
+    width: f32,
+    y: f32,
+) -> (f32, f32) {
+    let x = match direction {
+        Direction::Rtl => content_left + content_width - width,
+        Direction::Ltr => content_left,
+    };
+    (x, y)
+}
+
 /// Shift applied by `position: relative`, which moves the box without
 /// disturbing anything around it.
 fn relative_shift(style: &ComputedStyle, containing: (f32, f32)) -> (f32, f32) {
@@ -1358,7 +1386,7 @@ pub fn layout(
             size,
             // With no offsets given the box stays where flow put it, which for
             // the root element is the corner of the viewport.
-            (0.0, 0.0),
+            static_x(start_style.direction, 0.0, viewport_width, size.0, 0.0),
         );
         box_.rect.x = x;
         box_.rect.y = y;
@@ -4455,8 +4483,11 @@ fn place_absolutes(
             child_containing.size,
             size,
             // With no offsets given the box stays where flow would have put it.
-            (
+            static_x(
+                child_style.direction,
                 child_containing.offset.0 + at_.padding.0 + at_.border.0,
+                at_.content_width,
+                size.0,
                 child_containing.offset.1 + static_y,
             ),
         );
@@ -12973,6 +13004,88 @@ mod generated_block_tests {
             "a",
         );
         assert_eq!(box_.rect.height, 20.0, "still one line");
+    }
+}
+
+#[cfg(test)]
+mod rtl_static_position_tests {
+    use super::*;
+
+    #[test]
+    fn an_auto_positioned_box_starts_at_the_right_edge_in_rtl() {
+        // §10.3.7. With `left` and `right` both `auto` the box stays where flow
+        // would have put it, and in a right-to-left block that is the right
+        // edge (#159).
+        let box_ = static_box(
+            "<body><div id=\"p\"><div id=\"a\"></div></div></body>",
+            "body { margin: 0 } #p { position: relative; direction: rtl; width: 200px }
+             #a { position: absolute; width: 50px; height: 10px }",
+        );
+        assert_eq!(box_.rect.x, 150.0, "right edge less its own width");
+    }
+
+    #[test]
+    fn an_auto_positioned_box_still_starts_at_the_left_in_ltr() {
+        let box_ = static_box(
+            "<body><div id=\"p\"><div id=\"a\"></div></div></body>",
+            "body { margin: 0 } #p { position: relative; width: 200px }
+             #a { position: absolute; width: 50px; height: 10px }",
+        );
+        assert_eq!(box_.rect.x, 0.0);
+    }
+
+    #[test]
+    fn the_static_position_is_measured_from_the_parent_not_the_containing_block() {
+        // The two differ whenever the box's parent is not what positions it. An
+        // absolutely positioned box in a `position: static` rtl div is laid out
+        // where that div's flow would have put it and measured against an
+        // ancestor — and using the ancestor's width for the static position put
+        // it that much too far right, which is
+        // `positioning/auto-position-rtl-child-viewport-scrollbar`.
+        let box_ = static_box(
+            "<body><div id=\"outer\"><div id=\"p\"><div id=\"a\"></div></div></div></body>",
+            "body { margin: 0 }
+             #outer { position: relative; width: 400px }
+             #p { direction: rtl; width: 100px }
+             #a { position: absolute; width: 20px; height: 10px }",
+        );
+        assert_eq!(
+            box_.rect.x, 80.0,
+            "the right edge of the 100px parent, not of the 400px containing block",
+        );
+    }
+
+    /// The box carrying `id`, in the coordinates of its own parent chain.
+    fn static_box(html: &str, css_text: &str) -> LayoutBox {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[css::Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            400.0,
+        );
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|element| element.id() == Some("a"))
+            })
+            .expect("the fixture has that id");
+        fn walk(box_: &LayoutBox, node: NodeId, out: &mut Option<LayoutBox>) {
+            if box_.node == Some(node) {
+                *out = Some(box_.clone());
+            }
+            for child in &box_.children {
+                walk(child, node, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, wanted, &mut found);
+        found.expect("it was laid out")
     }
 }
 

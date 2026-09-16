@@ -62,14 +62,13 @@
      applies to nothing at all, because a run is not a box that can clear.
 
      The first group has no clearfix and so is one line tall with its float
-     hanging out of the bottom; the second is as tall as its float. Layout gets
-     the pair right — the second group's float sits beside the first's overhang
+     hanging out of the bottom; the second is as tall as its float. Two rules
+     meet here. The second group's float sits beside the first group's overhang
      rather than under it, which is what an overhanging float in a shared
-     formatting context should do. What is wrong in the picture is paint order:
-     the second group's background covers the first's overhang, where Appendix
-     E puts floats (layer 4) above in-flow block backgrounds (layer 3). Filed
-     as #165; this fixture pins the behaviour so that fixing it shows
-     up here. */
+     formatting context does; and the first group's overhang draws *over* the
+     second group's background, because Appendix E puts floats (layer 4) above
+     in-flow block backgrounds (layer 3). The second of those was #165, and
+     this fixture is where it was caught. */
   .clearfix::after { content: ""; display: block; clear: both; }
   .group { background: #eef3ff; border: 1px solid #99aadd; }
   .group .side { float: left; width: 70px; height: 40px; background: #ffcc00; }
