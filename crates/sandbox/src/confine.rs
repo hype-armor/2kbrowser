@@ -551,17 +551,23 @@ const PROFILE: &str = "\
 (allow sysctl-read)
 ";
 
-/// Drops the privileges the renderer does not need.
+/// Like [`apply`], reaching every thread.
 ///
-/// Call once, in the child, *before* reading anything the parent sends. macOS
-/// is self-restriction like Linux and unlike Windows: `sandbox_init` applies to
-/// the calling process and cannot be undone, so the child does it to itself.
-/// Like [`apply`]. `sandbox_init` is process-wide already, so this is that.
+/// Only Linux has anything to do here, where a seccomp filter is per-thread.
+/// `sandbox_init` restricts the whole process already, and a platform with no
+/// sandbox has nothing to restrict, so both are [`apply`] under another name —
+/// which is the point of the name: the caller says what it needs and does not
+/// have to know which platforms care.
 #[cfg(not(target_os = "linux"))]
 pub fn apply_to_every_thread() -> Confinement {
     apply()
 }
 
+/// Drops the privileges the renderer does not need.
+///
+/// Call once, in the child, *before* reading anything the parent sends. macOS
+/// is self-restriction like Linux and unlike Windows: `sandbox_init` applies to
+/// the calling process and cannot be undone, so the child does it to itself.
 #[cfg(target_os = "macos")]
 pub fn apply() -> Confinement {
     match seatbelt::confine(PROFILE) {
