@@ -3832,7 +3832,38 @@ fn layout_block(
         // wherever collapsing left the cursor. A box that clears is separated
         // from the floats above it by construction, so it cannot end up higher
         // than it would have without the collapse.
-        cursor_y = context.clearance(child_style.clear, cursor_y - into_context) + into_context;
+        //
+        // §9.5.2 measures it against the box's *hypothetical* position — where
+        // its top border edge would be once every margin has collapsed — and
+        // introduces clearance only where that is still above the float. The
+        // catch is a top margin that has not been applied here at all: the
+        // first child of a box that does not keep its children's margins hands
+        // its margin *up*, so the cursor inside this box does not know about
+        // it, and a `margin-top: 150px; clear: left` box was measured as
+        // though it sat at zero.
+        //
+        // The same conditions as `adjoining` below, asked early. Getting it
+        // wrong introduces clearance where the margin had already carried the
+        // box past the float — and clearance stops that margin collapsing
+        // through, so an empty wrapper that should occupy nothing becomes as
+        // tall as the float (#164).
+        let escapes_upwards = escaped_top.is_none()
+            && padding_top == 0.0
+            && border_top == 0.0
+            && cursor_y == padding_top + border_top
+            && !keeps_its_childrens_margins(style);
+        let hypothetical = cursor_y
+            + if escapes_upwards {
+                child_margins.0
+            } else {
+                0.0
+            };
+        // Moved *by* the clearance rather than *to* it, because the hypothetical
+        // position is not where the box goes — the escaped margin is applied by
+        // an ancestor, and adding it here as well would count it twice.
+        cursor_y += context.clearance(child_style.clear, hypothetical - into_context)
+            + into_context
+            - hypothetical;
         // §9.5: the border box of an element that establishes a new block
         // formatting context must not overlap the margin box of a float in the
         // formatting context it sits in. It narrows and moves beside the float
@@ -12942,5 +12973,92 @@ mod generated_block_tests {
             "a",
         );
         assert_eq!(box_.rect.height, 20.0, "still one line");
+    }
+}
+
+#[cfg(test)]
+mod clearance_hypothetical_tests {
+    use super::*;
+
+    /// The height of the box carrying `id`.
+    fn height_of(html: &str, css_text: &str, id: &str) -> f32 {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(&doc, &[css::Stylesheet::parse(css_text)]);
+        let mut fonts = FontStore::new();
+        let rendered = layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &IntrinsicSizes::new(),
+            400.0,
+            400.0,
+        );
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|element| element.id() == Some(id))
+            })
+            .expect("the fixture has that id");
+        fn walk(box_: &LayoutBox, node: NodeId, out: &mut Option<f32>) {
+            if box_.node == Some(node) {
+                *out = Some(box_.rect.height);
+            }
+            for child in &box_.children {
+                walk(child, node, out);
+            }
+        }
+        let mut found = None;
+        walk(&rendered.root, wanted, &mut found);
+        found.expect("it was laid out")
+    }
+
+    #[test]
+    fn a_margin_that_already_clears_the_float_introduces_no_clearance() {
+        // §9.5.2 measures clearance against the box's hypothetical position —
+        // where its top border edge lands once the margins have collapsed. A
+        // margin big enough to carry it past the float means no clearance, and
+        // no clearance means the margin still collapses through, so the wrapper
+        // occupies nothing (#164).
+        let height = height_of(
+            "<body><div class=f></div><div id=\"w\"><div class=c></div></div></body>",
+            "body { margin: 0 }
+             .f { float: left; width: 10px; height: 100px }
+             .c { margin-top: 150px; clear: left }",
+            "w",
+        );
+        assert_eq!(
+            height, 0.0,
+            "clearance was introduced and stopped the collapse"
+        );
+    }
+
+    #[test]
+    fn a_margin_too_small_to_clear_the_float_still_gets_clearance() {
+        // The other side of the same test, so the fix cannot be "never clear".
+        let height = height_of(
+            "<body><div class=f></div><div id=\"w\"><div class=c></div></div></body>",
+            "body { margin: 0 }
+             .f { float: left; width: 10px; height: 100px }
+             .c { margin-top: 10px; clear: left; height: 5px }",
+            "w",
+        );
+        assert!(
+            height >= 5.0,
+            "the wrapper must hold the cleared box: {height}",
+        );
+    }
+
+    #[test]
+    fn the_escaped_margin_is_not_counted_twice() {
+        // The cursor moves *by* the clearance, not *to* it. The escaped margin
+        // is applied by an ancestor, so adding it here as well would put the
+        // box a second margin further down.
+        let height = height_of(
+            "<body><div id=\"w\"><div class=c></div></div></body>",
+            "body { margin: 0 } .c { margin-top: 40px; clear: left; height: 10px }",
+            "w",
+        );
+        assert_eq!(height, 10.0, "no float to clear, so just the box");
     }
 }
