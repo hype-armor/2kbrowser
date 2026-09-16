@@ -8,7 +8,7 @@
 //! runs the same inputs on every machine and every commit, and a failure here
 //! reproduces exactly. Catching *new* bugs is the soak's job, not this one's.
 
-use fuzz::{Session, Target};
+use fuzz::{Session, Target, with_room_to_recurse};
 
 /// Iterations per target.
 ///
@@ -23,8 +23,13 @@ fn iterations(target: Target) -> usize {
 }
 
 fn soak(target: Target, seed: u64) {
-    let mut session = Session::new(target);
-    let report = session.run(seed, iterations(target));
+    // On a stack of its own, for the reason `corpus.rs` says: the render seeds
+    // include a deeply nested page, and walking one costs far more than a
+    // libtest thread has (#176).
+    let report = with_room_to_recurse(move || {
+        let mut session = Session::new(target);
+        session.run(seed, iterations(target))
+    });
 
     assert_eq!(report.iterations, iterations(target));
     assert!(

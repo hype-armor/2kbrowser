@@ -161,7 +161,45 @@ impl Confinement {
 /// first frame is already attacker-influenced, since its body is the document.
 #[cfg(target_os = "linux")]
 pub fn apply() -> Confinement {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, apply_filter};
+    install(Reach::ThisThread)
+}
+
+/// Like [`apply`], but reaching every thread this process has.
+///
+/// The renderer does its work on a thread of its own, because a document's
+/// nesting depth is the depth of three recursions in a row and the main
+/// thread's stack is not big enough for the deepest document the parser will
+/// now produce (#176). That thread has to be created *before* the filter is
+/// installed — `clone` is not on the allowlist, and putting it there to make
+/// room for one thread would put it there for an attacker's thread too.
+///
+/// Which leaves the main thread. It does nothing but wait in `join`, so it is
+/// not where a compromise starts; but an attacker already running inside the
+/// renderer could aim at the address it returns to, and land on a thread with
+/// no filter on it. Seccomp's `TSYNC` closes that for the cost of one flag: the
+/// filter is installed on every thread that exists, which is both of them.
+///
+/// Only meaningful on Linux, where a filter is per-thread. macOS's
+/// `sandbox_init` is process-wide already and the other platforms have nothing
+/// to install, so both delegate.
+#[cfg(target_os = "linux")]
+pub fn apply_to_every_thread() -> Confinement {
+    install(Reach::EveryThread)
+}
+
+/// How far an installed filter reaches.
+#[cfg(target_os = "linux")]
+enum Reach {
+    /// The thread that installs it, which is seccomp's default.
+    ThisThread,
+    /// Every thread the process has, via `TSYNC`.
+    EveryThread,
+}
+
+/// Builds the filter and installs it as far as `reach` says.
+#[cfg(target_os = "linux")]
+fn install(reach: Reach) -> Confinement {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
     use std::collections::BTreeMap;
 
     // An architecture this was not built for gets no filter at all. That is not
@@ -199,7 +237,15 @@ pub fn apply() -> Confinement {
     let Ok(program) = BpfProgram::try_from(filter) else {
         return Confinement::Failed;
     };
-    match apply_filter(&program) {
+    let installed = match reach {
+        Reach::ThisThread => seccompiler::apply_filter(&program),
+        // Every thread that exists, which is this one and the one waiting in
+        // `join`. No thread is created afterwards — `clone` is not on the
+        // allowlist — so "every thread that exists" is every thread there will
+        // ever be.
+        Reach::EveryThread => seccompiler::apply_filter_all_threads(&program),
+    };
+    match installed {
         Ok(()) => Confinement::Seccomp,
         // A kernel without seccomp, or a container that forbids installing a
         // filter. Reported rather than swallowed.
@@ -510,6 +556,12 @@ const PROFILE: &str = "\
 /// Call once, in the child, *before* reading anything the parent sends. macOS
 /// is self-restriction like Linux and unlike Windows: `sandbox_init` applies to
 /// the calling process and cannot be undone, so the child does it to itself.
+/// Like [`apply`]. `sandbox_init` is process-wide already, so this is that.
+#[cfg(not(target_os = "linux"))]
+pub fn apply_to_every_thread() -> Confinement {
+    apply()
+}
+
 #[cfg(target_os = "macos")]
 pub fn apply() -> Confinement {
     match seatbelt::confine(PROFILE) {
