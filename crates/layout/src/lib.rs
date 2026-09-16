@@ -5714,18 +5714,25 @@ fn collapse_across_runs(runs: &mut [InlineRun]) {
     // run of exactly "\n", and a break at the very start or end of a block has
     // nothing to break — trimming it is why a trailing `<br>` does not add an
     // empty line, and keeping it costs `floats/float-no-content-beside-001`.
-    let trimmable = |run: &&mut InlineRun| {
-        run.edge.is_none()
-            && (run.style.white_space != css::style::WhiteSpace::Pre
-                || !run.text.contains([' ', '\t']))
+    //
+    // And the *last* such run, not the last trimmable one. A preserved run at
+    // the end is content, so the block's content does not end in collapsible
+    // whitespace at all and there is nothing to trim — reaching past it to trim
+    // the run before would take a space out of the middle of the line (#126).
+    let trimmable = |run: &InlineRun| {
+        run.style.white_space != css::style::WhiteSpace::Pre || !run.text.contains([' ', '\t'])
     };
-    if let Some(first) = runs.iter_mut().find(trimmable) {
+    if let Some(first) = runs.iter_mut().find(|run| run.edge.is_none())
+        && trimmable(first)
+    {
         first.text = first
             .text
             .trim_start_matches(text::is_collapsible_space)
             .to_owned();
     }
-    if let Some(last) = runs.iter_mut().rev().find(trimmable) {
+    if let Some(last) = runs.iter_mut().rev().find(|run| run.edge.is_none())
+        && trimmable(last)
+    {
         last.text = last
             .text
             .trim_end_matches(text::is_collapsible_space)
@@ -7991,6 +7998,25 @@ mod tests {
         assert!(
             spaced > bare,
             "the preserved spaces took no room: {spaced} against {bare}",
+        );
+    }
+
+    #[test]
+    fn the_trim_does_not_reach_past_a_preserved_run() {
+        // #126, and the last of `generated-content/content-175`. A preserved
+        // run at the end is content, so the block's content does not end in
+        // collapsible whitespace at all — and reaching past it to trim the run
+        // before takes a space out of the *middle* of the line.
+        let rendered = run(
+            "<body><p><span>a </span><span></span></p></body>",
+            "body { margin: 0 } p { font: 16px/16px serif }
+             span + span::after { content: \"  \"; white-space: pre }",
+            600.0,
+        );
+        let line = &all_lines(&rendered)[0];
+        assert_eq!(
+            line.text, "a   ",
+            "the space before the preserved run was trimmed away",
         );
     }
 
