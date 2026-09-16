@@ -216,6 +216,39 @@ pub struct Fetched {
     pub path: String,
     /// How its certificate chain was verified.
     pub trust: Trust,
+    /// Whether the response allows this to be kept once the page that asked
+    /// for it is gone (ADR-0018).
+    ///
+    /// `false` where the server said `Cache-Control: no-store` or `Pragma:
+    /// no-cache`. The second matters more here than it would in a modern
+    /// browser, because this browser is aimed at the servers of the HTTP/1.0
+    /// era and `Pragma` is what they actually send.
+    ///
+    /// Nothing else about caching is parsed. `max-age`, `Expires` and
+    /// revalidation are a freshness model, and a cache that lives for one run
+    /// does not need one — it needs to know what it is not allowed to keep.
+    pub storable: bool,
+}
+
+/// Whether a response's headers allow it to be stored (ADR-0018).
+///
+/// Both header values are comma-separated lists of directives, and a directive
+/// may carry an argument this does not read — so each is split rather than
+/// matched whole, or `Cache-Control: max-age=0, no-store` would look like
+/// nothing at all.
+fn storable(cache_control: Option<&str>, pragma: Option<&str>) -> bool {
+    let says = |value: Option<&str>, directive: &str| {
+        value.is_some_and(|value| {
+            value.split(',').any(|part| {
+                part.split('=')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case(directive)
+            })
+        })
+    };
+    !says(cache_control, "no-store") && !says(pragma, "no-cache")
 }
 
 /// Fetches resources subject to a [`Policy`].
@@ -244,10 +277,10 @@ impl Fetcher {
 
         count_if_third_party(document, &origin, kind);
 
-        let (bytes, content_type, _) = match origin.scheme {
+        let (bytes, content_type, ..) = match origin.scheme {
             // A file has no transport, so its encoding comes from the document
             // or the default.
-            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted),
+            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted, true),
             Scheme::Http | Scheme::Https => fetch_http(url)?,
         };
         // Not UTF-8 by assumption: most of the surviving old web is not, and
@@ -305,6 +338,10 @@ impl Fetcher {
             origin,
             path,
             trust,
+            // A response to a form submission is a page, not a subresource, and
+            // never reaches the cache. Saying so here rather than relying on
+            // that: the answer to "may this be kept?" for a POST is no.
+            storable: false,
         })
     }
 
@@ -326,8 +363,12 @@ impl Fetcher {
         }
         count_if_third_party(document, &origin, kind);
 
-        let (body, content_type, trust) = match origin.scheme {
-            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted),
+        let (body, content_type, trust, storable) = match origin.scheme {
+            // A local file has no headers to say otherwise. It is still never
+            // served to a second document, because the policy refuses that
+            // outright (`Refusal::LocalFile`) — a stronger rule than this flag,
+            // and applied before the cache is consulted at all.
+            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted, true),
             Scheme::Http | Scheme::Https => fetch_http(url)?,
         };
         Ok(Fetched {
@@ -336,6 +377,7 @@ impl Fetcher {
             origin,
             path,
             trust,
+            storable,
         })
     }
 }
@@ -383,16 +425,16 @@ pub enum Trust {
 /// a working browser, and the fact that it took local roots travels back so the
 /// chrome can say so. Any other certificate failure — expired, wrong name — is
 /// final, because those are wrong whoever signed them.
-fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
+fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust, bool), FetchError> {
     match get(tls::agent(), url) {
-        Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
+        Ok((bytes, content_type, keep)) => Ok((bytes, content_type, Trust::Public, keep)),
         Err(error) => {
             if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
                 return Err(into_fetch_error(error));
             }
-            let (bytes, content_type) =
+            let (bytes, content_type, keep) =
                 get(tls::platform_agent(), url).map_err(into_fetch_error)?;
-            Ok((bytes, content_type, Trust::LocalRoot))
+            Ok((bytes, content_type, Trust::LocalRoot, keep))
         }
     }
 }
@@ -438,24 +480,31 @@ fn send(
 }
 
 /// One request through a given agent.
-fn get(agent: &ureq::Agent, url: &str) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
+fn get(agent: &ureq::Agent, url: &str) -> Result<(Vec<u8>, Option<String>, bool), ureq::Error> {
     // No custom User-Agent games: this browser does not run scripts, and
     // pretending otherwise to get the script path served would produce exactly
     // the silent breakage ADR-0003 rejects.
     let response = agent.get(url).call()?;
 
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let content_type = header("content-type");
+    let keep = storable(
+        header("cache-control").as_deref(),
+        header("pragma").as_deref(),
+    );
 
     let bytes = response
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()?;
-    Ok((bytes, content_type))
+    Ok((bytes, content_type, keep))
 }
 
 /// Turns a `ureq` failure into one this browser can explain.
@@ -478,6 +527,34 @@ fn into_fetch_error(error: ureq::Error) -> FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_store_and_pragma_no_cache_stop_a_response_being_kept() {
+        assert!(storable(None, None), "nothing said means keep");
+        assert!(!storable(Some("no-store"), None));
+        assert!(!storable(None, Some("no-cache")));
+        // The one this browser is aimed at: an HTTP/1.0 server sends `Pragma`
+        // and nothing else.
+        assert!(!storable(Some("max-age=0"), Some("no-cache")));
+    }
+
+    #[test]
+    fn a_directive_in_a_list_still_counts() {
+        // Both headers are comma-separated lists, and matching the value whole
+        // would read `max-age=0, no-store` as saying nothing at all.
+        assert!(!storable(Some("max-age=0, no-store"), None));
+        assert!(!storable(Some("public, No-Store, must-revalidate"), None));
+        assert!(
+            storable(Some("no-cache"), None),
+            "`Cache-Control: no-cache` is revalidate-before-use, not do-not-store",
+        );
+    }
+
+    #[test]
+    fn a_directive_that_merely_starts_the_same_does_not_count() {
+        assert!(storable(Some("no-store-ish"), None));
+        assert!(storable(Some("no-transform"), None));
+    }
 
     #[test]
     fn reads_a_local_file() {

@@ -771,6 +771,12 @@ impl App {
     /// to do nothing.
     fn reload(&mut self) {
         let url = self.tab().history.current().to_owned();
+        // ADR-0018's sixth term: reload bypasses the cache. Only this site's
+        // entries go, because reloading one page says nothing about any other
+        // — and a reload that served the same bytes back would leave the one
+        // control a reader has over staleness doing nothing at all.
+        self.renderer
+            .forget(net::parse_url(&url).ok().map(|(origin, _)| origin).as_ref());
         self.show(&url);
     }
 
