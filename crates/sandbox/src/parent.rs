@@ -447,6 +447,7 @@ enum Job {
     Focus { at: (f32, f32) },
     Type { key: crate::message::Key },
     Choose { node: u32, index: u32 },
+    Accessibility,
 }
 
 /// A render request, boxed because it carries the whole document.
@@ -474,6 +475,7 @@ enum Kind {
     Band,
     Find,
     Select,
+    Accessibility,
 }
 
 /// What came back.
@@ -481,6 +483,7 @@ enum Answer {
     Rendered(Box<Rendered>),
     Matches(Vec<layout::Rect>),
     Selected(Vec<layout::Rect>, String),
+    Accessible(Box<crate::access::Tree>),
     Failed(Error),
 }
 
@@ -803,6 +806,26 @@ impl Session {
         }
     }
 
+    /// The page this child is holding, as a screen reader would read it.
+    ///
+    /// Asked for rather than arriving with every render (ADR-0019). A page
+    /// costs nothing when nothing is listening — and, more to the point, the
+    /// new parsing surface is not exercised at all until an assistive
+    /// technology has actually attached, which is the cheapest mitigation there
+    /// is for the risk that ADR spends most of its length on.
+    ///
+    /// The tree that comes back has already been through the bounds on the way
+    /// in: a frame that broke one was refused rather than truncated, and this
+    /// is an `Err` rather than a tree with a hole in it.
+    pub fn accessibility(&mut self) -> Result<crate::access::Tree, Error> {
+        self.submit(Job::Accessibility, Kind::Accessibility)?;
+        match self.wait_for(Kind::Accessibility)? {
+            Answer::Accessible(tree) => Ok(*tree),
+            Answer::Failed(error) => Err(error),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
     /// What lies between two points of the page, and where it is.
     ///
     /// Asked of the child because the text is in the box tree, which is on
@@ -1070,6 +1093,7 @@ impl Conversation {
                 .converse(ToChild::Band { top, height })
                 .map(|page| Answer::Rendered(Box::new(page))),
             Job::Find(query) => self.ask(&ToChild::Find { query }),
+            Job::Accessibility => self.ask(&ToChild::Accessibility),
             Job::Select { from, to } => self.ask(&ToChild::Select { from, to }),
             // Through `converse` rather than `ask`, because these re-render:
             // a field that grew a line can bring a new row of the page into
@@ -1112,6 +1136,7 @@ impl Conversation {
             ToParent::Matches { rects } => Ok(Answer::Matches(rects)),
             ToParent::Selected { rects, text } => Ok(Answer::Selected(rects, text)),
             ToParent::Rendered(page) => Ok(Answer::Rendered(page)),
+            ToParent::Accessible(tree) => Ok(Answer::Accessible(tree)),
             ToParent::Failed { message } => Err(Error::Render(message)),
             ToParent::Fetch { .. } => Err(Error::Wire(crate::WireError::Unknown)),
         }
@@ -1140,7 +1165,7 @@ impl Conversation {
             match ToParent::decode(&frame)? {
                 ToParent::Rendered(page) => return Ok(*page),
                 ToParent::Failed { message } => return Err(Error::Render(message)),
-                ToParent::Matches { .. } | ToParent::Selected { .. } => {
+                ToParent::Matches { .. } | ToParent::Selected { .. } | ToParent::Accessible(_) => {
                     // Nothing asked a question. Either the child is confused or
                     // it is not ours.
                     return Err(Error::Wire(crate::WireError::Unknown));

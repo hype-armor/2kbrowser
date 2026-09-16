@@ -751,6 +751,18 @@ impl Render for PageRenderer {
         })
     }
 
+    fn accessibility(&mut self) -> sandbox::access::Tree {
+        let Some(page) = &self.page else {
+            return sandbox::access::Tree::default();
+        };
+        crate::access::tree_of_frames(
+            page.frames
+                .iter()
+                .map(|frame| (&frame.doc, &frame.layout, (frame.rect.x, frame.rect.y))),
+            self.focus.as_ref().map(Focus::node),
+        )
+    }
+
     fn find(&mut self, query: &str) -> Vec<layout::Rect> {
         // An empty query matches everything, which is not what a reader who has
         // just cleared the box wants to see.

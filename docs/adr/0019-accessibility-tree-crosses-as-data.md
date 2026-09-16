@@ -98,7 +98,7 @@ assume the authored path is always preferable.
 - The wire stops being "a pixmap and some rectangles". That sentence appears in
   ADR-0012's consequences and in several module docs; it is superseded here for
   this one message, and those places should say so rather than quietly stop
-  being true.
+  being true. `crates/sandbox/src/message.rs` now does.
 - Three platform integrations arrive at once through one crate, which is the
   whole reason for taking it — and means three platforms' worth of behaviour
   this project cannot test on every push.

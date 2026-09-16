@@ -219,17 +219,28 @@ pub enum Target {
     /// ours (ADR-0012). The decoder on the parent's side reads bytes chosen by
     /// the sandboxed process, so it is the last boundary there is.
     Wire,
+    /// The accessibility tree (ADR-0019, #9).
+    ///
+    /// Its own target rather than a corner of `Wire`, because the property is
+    /// different. `Wire` asks that a decoder not fall over; this one asks
+    /// something stronger — that a tree the decoder *accepts* is within every
+    /// bound the parent is about to rely on. The parent walks it recursively
+    /// and allocates one native object per node, so a tree that got past the
+    /// bounds would be a stack overflow or an unbounded allocation in the
+    /// process that is supposed to be the trustworthy one.
+    Access,
 }
 
 impl Target {
     /// Every target, for a run that names none.
-    pub const ALL: [Target; 6] = [
+    pub const ALL: [Target; 7] = [
         Target::Html,
         Target::Css,
         Target::Image,
         Target::Url,
         Target::Render,
         Target::Wire,
+        Target::Access,
     ];
 
     /// Its name on the command line.
@@ -241,6 +252,7 @@ impl Target {
             Target::Url => "url",
             Target::Render => "render",
             Target::Wire => "wire",
+            Target::Access => "access",
         }
     }
 
@@ -257,7 +269,7 @@ impl Target {
             Target::Image => &["png", "gif", "jpg", "jpeg"],
             // URLs and protocol frames are short and structured; their seeds
             // are built below rather than read from disk.
-            Target::Url | Target::Wire => &[],
+            Target::Url | Target::Wire | Target::Access => &[],
         }
     }
 }
@@ -318,6 +330,48 @@ pub fn run_once(target: Target, input: &[u8], fonts: &mut text::FontStore) {
             let _ = sandbox::ToParent::decode(input);
             // And the framing itself, which is what reads the length first.
             let _ = sandbox::read_frame(&mut &input[..]);
+        }
+        Target::Access => {
+            // Not "it did not crash" — that is what `Wire` asks. This asks that
+            // a tree the decoder *accepted* is one the parent can safely walk,
+            // because everything the parent does with it afterwards is written
+            // on the strength of these four numbers.
+            if let Ok(sandbox::ToParent::Accessible(tree)) = sandbox::ToParent::decode(input) {
+                assert!(
+                    tree.nodes.len() <= sandbox::access::MAX_NODES,
+                    "{} nodes accepted against a bound of {}",
+                    tree.nodes.len(),
+                    sandbox::access::MAX_NODES,
+                );
+                let mut text = 0usize;
+                for node in &tree.nodes {
+                    let name = node.name.len();
+                    let value = node.value.as_ref().map_or(0, String::len);
+                    assert!(
+                        name <= sandbox::access::MAX_STRING && value <= sandbox::access::MAX_STRING,
+                        "a string of {} bytes was accepted",
+                        name.max(value),
+                    );
+                    text += name + value;
+                }
+                assert!(
+                    text <= sandbox::access::MAX_TEXT,
+                    "{text} bytes of text accepted against a bound of {}",
+                    sandbox::access::MAX_TEXT,
+                );
+                assert!(
+                    depth_of(&tree) <= sandbox::access::MAX_DEPTH,
+                    "a tree {} deep was accepted",
+                    depth_of(&tree),
+                );
+                if let Some(focus) = tree.focus {
+                    assert!(
+                        (focus as usize) < tree.nodes.len(),
+                        "the focus names node {focus} of {}",
+                        tree.nodes.len(),
+                    );
+                }
+            }
         }
         Target::Render => {
             let (html, ..) = net::encoding::decode_document(input, None);
@@ -467,6 +521,9 @@ impl Session {
 
         if target == Target::Wire {
             corpus.extend(wire_seeds());
+        }
+        if target == Target::Access {
+            corpus.extend(access_seeds());
         }
         if target == Target::Url {
             corpus.extend(
@@ -779,6 +836,96 @@ fn write_input(path: &Path, input: &[u8]) -> std::io::Result<()> {
 ///
 /// Built rather than stored: they are the encoder's own output, so they cannot
 /// drift out of step with the format the way a checked-in blob would.
+/// How deep a tree is, measured the way the parent's own walk would go.
+///
+/// Computed here rather than trusted from the decoder, because the decoder is
+/// the thing under test: asking it how deep the tree is would be asking the
+/// suspect for an alibi.
+fn depth_of(tree: &sandbox::access::Tree) -> usize {
+    let mut owed: Vec<u32> = Vec::new();
+    let mut deepest = 0usize;
+    for node in &tree.nodes {
+        while owed.last() == Some(&0) {
+            owed.pop();
+        }
+        if let Some(remaining) = owed.last_mut() {
+            *remaining -= 1;
+        }
+        deepest = deepest.max(owed.len() + 1);
+        owed.push(node.children);
+    }
+    deepest
+}
+
+/// Frames that are a real accessibility tree, for the mutator to work on.
+///
+/// Built here rather than read from disk for the same reason the wire's are: a
+/// tree is short and structured, and a seed corpus of random bytes would spend
+/// every iteration being rejected at the first tag.
+fn access_seeds() -> Vec<Vec<u8>> {
+    use sandbox::access::{Node, Role, Tree};
+
+    let rect = layout::Rect {
+        x: 8.0,
+        y: 16.0,
+        width: 320.0,
+        height: 24.0,
+    };
+    let page = Tree {
+        nodes: vec![
+            Node {
+                name: "A page".to_owned(),
+                children: 3,
+                ..Node::new(Role::Document, rect)
+            },
+            Node {
+                name: "Chapter one".to_owned(),
+                level: 2,
+                ..Node::new(Role::Heading, rect)
+            },
+            Node {
+                name: "Next".to_owned(),
+                value: Some("https://example.com/next".to_owned()),
+                ..Node::new(Role::Link, rect)
+            },
+            Node {
+                children: 1,
+                ..Node::new(Role::Table, rect)
+            },
+            Node {
+                children: 2,
+                ..Node::new(Role::Row, rect)
+            },
+            Node {
+                name: "Name".to_owned(),
+                ..Node::new(Role::HeaderCell, rect)
+            },
+            Node {
+                name: "Ada".to_owned(),
+                ..Node::new(Role::Cell, rect)
+            },
+        ],
+        focus: Some(2),
+    };
+    // A tree right at a bound, so a one-byte mutation is a tree just past one —
+    // which is the interesting side of every number in ADR-0019.
+    let chain = Tree {
+        nodes: (0..sandbox::access::MAX_DEPTH)
+            .map(|at| Node {
+                children: u32::from(at + 1 < sandbox::access::MAX_DEPTH),
+                ..Node::new(Role::Group, rect)
+            })
+            .collect(),
+        focus: None,
+    };
+    vec![
+        sandbox::ToParent::Accessible(Box::new(page)).encode(),
+        sandbox::ToParent::Accessible(Box::new(chain)).encode(),
+        sandbox::ToParent::Accessible(Box::default()).encode(),
+        sandbox::ToChild::Accessibility.encode(),
+    ]
+}
+
 fn wire_seeds() -> Vec<Vec<u8>> {
     use sandbox::message::{Link, Mode, Rendered};
 
