@@ -183,7 +183,7 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
     // does not paint it a second time. Drawing it twice is invisible while the
     // colour is opaque and wrong the moment it is not.
     let propagated = layout.canvas_image.map(|(node, ..)| node);
-    paint_box(&layout.root, 0.0, 0.0, propagated, &mut list);
+    paint_box(&layout.root, 0.0, 0.0, propagated, &mut list, true);
     list
 }
 
@@ -193,6 +193,9 @@ fn paint_box(
     offset_y: f32,
     propagated: Option<dom::NodeId>,
     list: &mut DisplayList,
+    // Whether this box is a stacking context, and so the one that sorts the
+    // context-forming boxes beneath it. The root always is (§9.9.1).
+    context: bool,
 ) {
     let x = offset_x + box_.rect.x;
     let y = offset_y + box_.rect.y;
@@ -455,36 +458,113 @@ fn paint_box(
     //
     // A stable sort, so boxes that tie keep document order — which is both what
     // §9.9 says and what keeps a rendering reproducible (ADR-0005).
-    let mut order: Vec<&LayoutBox> = box_.children.iter().collect();
-    order.sort_by_key(|child| {
-        let positioned = child.style.position.is_positioned();
+    //
+    // §9.9.1 decides *which* boxes sort here. A stacking context sorts its own
+    // children together with every context-forming box below them that no
+    // nearer context has claimed — a positioned box with `z-index: auto` is
+    // not one, so it seals nothing, and a `z-index: -1` descendant of it can
+    // finally get behind an ancestor's background (#107). A box that is not a
+    // context leaves those to whichever ancestor is, and paints only what is
+    // left.
+    let mut order: Vec<Stacked<'_>> = Vec::new();
+    // What paints in place either way: content that is not positioned at all.
+    // Its own positioned descendants are not its to paint — they were taken by
+    // whichever ancestor is a stacking context.
+    order.extend(
+        box_.children
+            .iter()
+            .filter(|child| !child.style.position.is_positioned())
+            .map(|child| Stacked { box_: child, x, y }),
+    );
+    if context {
+        lift_positioned(box_, x, y, &mut order);
+    }
+    order.sort_by_key(|stacked| {
+        let positioned = stacked.box_.style.position.is_positioned();
         // `z-index` means nothing on an unpositioned box, so it is not read
         // from one: honouring it there would invent a stacking order the spec
         // does not give.
         let z = if positioned {
-            child.style.z_index.unwrap_or(0)
+            stacked.box_.style.z_index.unwrap_or(0)
         } else {
             0
         };
         (z, positioned)
     });
-    for child in order {
-        // A fixed subtree is painted into a list of its own and kept there.
+    for stacked in order {
+        let child = stacked.box_;
+        let inside = forms_a_stacking_context(child);
+        // A fixed subtree's items are pinned where they are emitted.
         // Everything inside it is positioned against the viewport already —
         // §10.1 made that the containing block — so what is left is to stop
         // the band rasteriser shifting it with the page, and the cleanest
         // place to mark that is where the subtree begins.
         if child.style.position == css::style::Position::Fixed {
             let from = list.items.len();
-            paint_box(child, x, y, propagated, list);
+            paint_box(child, stacked.x, stacked.y, propagated, list, inside);
             list.pinned.push((from, list.items.len()));
             continue;
         }
-        paint_box(child, x, y, propagated, list);
+        paint_box(child, stacked.x, stacked.y, propagated, list, inside);
     }
 
     if let Some(clip) = clip {
         clip_items(&mut list.items, clip_from, clip);
+    }
+}
+
+/// A box waiting to be painted, with the origin of the parent that positions it.
+///
+/// A box lifted out of a `z-index: auto` subtree is painted a level or more
+/// above where it sits, so it carries where it actually is: recomputing the
+/// offset at the level that paints it would place it against the wrong parent.
+#[derive(Clone, Copy)]
+struct Stacked<'a> {
+    box_: &'a LayoutBox,
+    x: f32,
+    y: f32,
+}
+
+/// Whether a box forms a stacking context of its own (§9.9.1).
+///
+/// A positioned box with a numeric `z-index` does. One with `z-index: auto`
+/// does **not** — it makes a box in its parent's stacking context and nothing
+/// more, so its own positioned descendants belong to that same context and
+/// sort against its siblings rather than being sealed inside it.
+///
+/// `position: fixed` is the exception. CSS 2.1 does not say so in as many
+/// words, every browser does it, and the suite tests for both halves at once:
+/// `visuren/fixed-pos-stacking-001` has an `#absolute` half whose negative
+/// descendant must escape and a `#fixed` half whose must not.
+fn forms_a_stacking_context(box_: &LayoutBox) -> bool {
+    box_.style.position == css::style::Position::Fixed
+        || (box_.style.position.is_positioned() && box_.style.z_index.is_some())
+}
+
+/// Collects the positioned boxes inside `box_` that belong to an ancestor's
+/// stacking context, in tree order.
+///
+/// *Every* positioned descendant, not only the ones that form a context of
+/// their own: Appendix E sorts child contexts and `z-index: auto` positioned
+/// descendants together, at the context, in tree order. Collecting only the
+/// first kind leaves the second painted inside whatever parent happens to
+/// contain it, which puts it at that parent's place in the order rather than
+/// its own — `zindex/z-index-004` is two absolutely positioned siblings, one
+/// with `z-index: 0` and one without, and getting this wrong paints them in
+/// the wrong order.
+///
+/// `x` and `y` are the origin `box_`'s children are measured from. The walk
+/// stops descending at a box that forms a context, because its own descendants
+/// belong to *it* and go no further out.
+fn lift_positioned<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<Stacked<'a>>) {
+    for child in &box_.children {
+        let positioned = child.style.position.is_positioned();
+        if positioned {
+            out.push(Stacked { box_: child, x, y });
+        }
+        if !forms_a_stacking_context(child) {
+            lift_positioned(child, x + child.rect.x, y + child.rect.y, out);
+        }
     }
 }
 
@@ -3448,5 +3528,164 @@ mod rtl_inline_side_tests {
             assert!(drawn.contains(&RED), "{direction:?} lost its left side");
             assert!(drawn.contains(&BLUE), "{direction:?} lost its right side");
         }
+    }
+}
+
+#[cfg(test)]
+mod stacking_context_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// The colours of the filled rectangles a page paints, in paint order.
+    fn painted(html: &str, css_text: &str) -> Vec<Color> {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(
+            &doc,
+            &[
+                Stylesheet::parse(css::ua::UA_STYLESHEET),
+                Stylesheet::parse(css_text),
+            ],
+        );
+        let mut fonts = FontStore::new();
+        let out = layout::layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &layout::IntrinsicSizes::new(),
+            300.0,
+            300.0,
+        );
+        build_display_list(&out)
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { color, .. } if !color.is_transparent() => Some(*color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const RED: Color = Color::rgb(0xff, 0x00, 0x00);
+    const GREEN: Color = Color::rgb(0x00, 0x80, 0x00);
+
+    /// Whether `first` is painted before `last`, so `last` covers it.
+    fn before(order: &[Color], first: Color, last: Color) -> bool {
+        match (
+            order.iter().position(|c| *c == first),
+            order.iter().rposition(|c| *c == last),
+        ) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_z_index_auto_box_does_not_seal_a_negative_descendant() {
+        // #107, and the `#absolute` half of `visuren/fixed-pos-stacking-001`.
+        // §9.9.1: a positioned box with `z-index: auto` makes a box in its
+        // parent's stacking context and not a context of its own, so a
+        // `z-index: -1` descendant escapes to the nearest real context and
+        // paints behind that box's own background.
+        let order = painted(
+            "<body><div id=\"a\"><div><div id=\"b\"></div></div></div></body>",
+            "#a { position: absolute; background: #008000; width: 50px; height: 50px } \
+             #a div { position: absolute } \
+             #b { position: absolute; z-index: -1; background: #ff0000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the red descendant did not get behind the green ancestor: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_fixed_box_does_seal_one() {
+        // The `#fixed` half of the same test. CSS 2.1 does not say so in as
+        // many words; every browser does it, and the suite tests for it.
+        let order = painted(
+            "<body><div id=\"a\"><div><div id=\"b\"></div></div></div></body>",
+            "#a { position: fixed; background: #ff0000; width: 50px; height: 50px } \
+             #a div { position: absolute } \
+             #b { position: absolute; z-index: -1; background: #008000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the descendant escaped a fixed box, which is a context: {order:?}",
+        );
+    }
+
+    #[test]
+    fn positioned_siblings_keep_tree_order_when_their_z_ties() {
+        // `zindex/z-index-004`: one absolutely positioned box with `z-index: 0`
+        // and one with `z-index: auto`, siblings. They tie, so the later one
+        // wins — which only works if the lifted boxes keep their document
+        // order rather than being appended after the ones that were not
+        // lifted.
+        let order = painted(
+            "<body><div id=\"w\"><div id=\"a\"></div><div id=\"b\"></div></div></body>",
+            "#w { position: relative } \
+             #a { position: absolute; z-index: 0; background: #ff0000; \
+                  width: 50px; height: 50px } \
+             #b { position: absolute; background: #008000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the later sibling did not paint last: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_numeric_z_index_still_sorts_against_its_siblings() {
+        // The half that must not change: a negative one goes behind.
+        let order = painted(
+            "<body><div id=\"a\"></div><div id=\"b\"></div></body>",
+            "#a { position: absolute; background: #008000; width: 50px; height: 50px } \
+             #b { position: absolute; z-index: -1; background: #ff0000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(before(&order, RED, GREEN), "{order:?}");
+    }
+
+    #[test]
+    fn what_forms_a_context_and_what_does_not() {
+        let context = |position, z| {
+            let box_ = LayoutBox {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                style: css::style::ComputedStyle {
+                    position,
+                    z_index: z,
+                    ..css::style::ComputedStyle::default()
+                },
+                text: None,
+                content_origin: (0.0, 0.0),
+                content_width: 0.0,
+                children: Vec::new(),
+                replaced: None,
+                replaced_image: false,
+                node: None,
+                round: false,
+                chosen_rows: Vec::new(),
+                top_border_gap: None,
+            };
+            forms_a_stacking_context(&box_)
+        };
+        use css::style::Position;
+        assert!(!context(Position::Static, None));
+        assert!(!context(Position::Static, Some(3)), "z means nothing here");
+        assert!(
+            !context(Position::Absolute, None),
+            "`auto` is not a context"
+        );
+        assert!(context(Position::Absolute, Some(0)));
+        assert!(context(Position::Relative, Some(-1)));
+        assert!(context(Position::Fixed, None), "fixed always is");
     }
 }
