@@ -419,6 +419,16 @@ pub enum ToChild {
         /// page as written.
         zoom: f32,
     },
+    /// Which of the URLs just asked about have been followed (#181).
+    ///
+    /// One flag per URL, matched by position, exactly as [`ToChild::Resources`]
+    /// answers a fetch. A reply of the wrong length is a parent that is not
+    /// what we think it is, and the child then treats every link as unvisited
+    /// rather than guessing which flag belonged to which URL.
+    Followed {
+        /// One per URL, in the order they were asked about.
+        visited: Vec<bool>,
+    },
     /// Paint a different band of the page already held.
     ///
     /// The point of the whole arrangement: the parse, the cascade, and the
@@ -571,6 +581,13 @@ impl ToChild {
                 writer.u32(*top);
                 writer.u32(*height);
             }
+            ToChild::Followed { visited } => {
+                writer.tag(10);
+                writer.u32(visited.len() as u32);
+                for followed in visited {
+                    writer.some(*followed);
+                }
+            }
             ToChild::Resources { resources } => {
                 writer.tag(1);
                 writer.u32(resources.len() as u32);
@@ -658,6 +675,14 @@ impl ToChild {
                 index: reader.u32()?,
             },
             9 => ToChild::Accessibility,
+            10 => {
+                let count = reader.count()?;
+                let mut visited = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    visited.push(reader.some()?);
+                }
+                ToChild::Followed { visited }
+            }
             4 => ToChild::Select {
                 from: (reader.f32()?, reader.f32()?),
                 to: (reader.f32()?, reader.f32()?),
@@ -691,6 +716,20 @@ pub enum ToParent {
         /// What they are for, so the policy can tell a navigation from a
         /// subresource.
         kind: RequestKind,
+    },
+    /// Asks which of these links the reader has already followed (#181).
+    ///
+    /// The direction is the point. The parent holds the history and could
+    /// simply send it, and must not: the child is rendering a stranger's
+    /// document, and a list of everywhere its reader has been is the last thing
+    /// it should hold. So the child asks about the URLs *it parsed out of this
+    /// page*, and the answer tells it nothing it did not already know existed.
+    ///
+    /// Bounded by the page: a document with ten thousand links asks about ten
+    /// thousand URLs, and each one was already in the bytes the child was sent.
+    Visited {
+        /// Absolute URLs, resolved by the child against the document.
+        urls: Vec<String>,
     },
     /// The finished page.
     Rendered(Box<Rendered>),
@@ -893,6 +932,13 @@ impl ToParent {
                 writer.tag(5);
                 tree.write(&mut writer);
             }
+            ToParent::Visited { urls } => {
+                writer.tag(6);
+                writer.u32(urls.len() as u32);
+                for url in urls {
+                    writer.str(url);
+                }
+            }
             ToParent::Selected { rects, text } => {
                 writer.tag(4);
                 writer.u32(rects.len() as u32);
@@ -1069,6 +1115,17 @@ impl ToParent {
                 }
             }
             5 => ToParent::Accessible(Box::new(Tree::read(&mut reader)?)),
+            6 => {
+                // A count, for the reason the two above give: bounded by the
+                // bytes left, so a claim of four billion links cannot reserve
+                // for four billion links.
+                let count = reader.count()?;
+                let mut urls = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    urls.push(reader.str()?);
+                }
+                ToParent::Visited { urls }
+            }
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;

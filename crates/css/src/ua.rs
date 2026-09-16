@@ -42,6 +42,10 @@ pre { white-space: pre; margin: 1em 0; }
    destination, which was how in-page navigation worked and which must not be
    painted as though it were clickable. */
 a[href] { color: #0000ee; text-decoration: underline; }
+/* The purple every browser has used since Mosaic. It is the one piece of state
+   a page carries about the reader, and the reason people can tell which half of
+   a list of results they have already read (#181). */
+a:visited { color: #551a8b; }
 
 del, s, strike { text-decoration: line-through; }
 
@@ -150,6 +154,9 @@ body {
   color: #fbfbfe;
 }
 a[href] { color: #8cb4ff; }
+/* The same distinction, lightened to stay legible on the dark page — #551a8b
+   against #1c1b22 is very nearly invisible. */
+a:visited { color: #c9a0ff; }
 img { max-width: 100%; }
 hr { border-top: 1px solid #5b5b66; }
 "#;

@@ -28,7 +28,25 @@ pub struct Resource {
     pub content_type: Option<String>,
 }
 
-/// Renders a document, asking `fetch` for anything it references.
+/// Everything the child can ask the parent for, mid-render.
+///
+/// One object rather than a closure each, because both questions go down the
+/// same pipe and two closures cannot hold it mutably at once. It is also the
+/// honest shape: this is the child's entire reach outside itself.
+pub trait Parent {
+    /// Fetches subresources, answering one per URL in order.
+    fn fetch(&mut self, urls: &[String], kind: net::RequestKind) -> Vec<Fetched>;
+
+    /// Asks which of these addresses the reader has already been to (#181).
+    ///
+    /// Only ever about URLs taken from the document being rendered, so the
+    /// answer tells the child nothing it did not already hold. The history
+    /// itself stays in the parent, which is the point: a renderer running a
+    /// stranger's page must not be handed a list of where its reader has been.
+    fn visited(&mut self, urls: &[String]) -> Vec<bool>;
+}
+
+/// Renders a document, asking `parent` for anything it references.
 pub trait Render {
     /// Renders one page.
     ///
@@ -43,11 +61,7 @@ pub trait Render {
     /// thing is asking for a batch of one. Asking for several is what lets the
     /// parent fetch them at the same time, which is the difference between
     /// waiting for the sum of a page's latencies and waiting for the longest.
-    fn render(
-        &mut self,
-        request: &ToChild,
-        fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
-    ) -> Result<Rendered, String>;
+    fn render(&mut self, request: &ToChild, parent: &mut dyn Parent) -> Result<Rendered, String>;
 
     /// Where `query` appears on the page most recently rendered.
     ///
@@ -155,9 +169,9 @@ fn answer_until_the_parent_goes(
                 };
                 write_frame(output, &answer.encode())?;
             }
-            // Resources with nothing outstanding means the parent is not what
+            // An answer with nothing outstanding means the parent is not what
             // we think it is. Refusing beats guessing.
-            ToChild::Resources { .. } => {
+            ToChild::Resources { .. } | ToChild::Followed { .. } => {
                 write_frame(
                     output,
                     &ToParent::Failed {
@@ -171,6 +185,89 @@ fn answer_until_the_parent_goes(
     }
 }
 
+/// The child's end of the pipe, as the renderer sees it.
+struct Pipe<'a, I: Read, O: Write> {
+    input: &'a mut I,
+    output: &'a mut O,
+    /// The first pipe error, if there has been one.
+    transport: Result<(), Error>,
+}
+
+impl<I: Read, O: Write> Pipe<'_, I, O> {
+    /// Sends one question and reads back the one answer.
+    ///
+    /// `None` for a pipe that has already failed, so a dead parent costs one
+    /// error rather than one per question.
+    fn ask(&mut self, question: &ToParent) -> Option<ToChild> {
+        if self.transport.is_err() {
+            return None;
+        }
+        if let Err(error) = write_frame(self.output, &question.encode()) {
+            self.transport = Err(error);
+            return None;
+        }
+        match read_frame(self.input) {
+            Ok(frame) => match ToChild::decode(&frame) {
+                Ok(answer) => Some(answer),
+                Err(error) => {
+                    self.transport = Err(Error::Wire(error));
+                    None
+                }
+            },
+            Err(error) => {
+                self.transport = Err(error);
+                None
+            }
+        }
+    }
+}
+
+impl<I: Read, O: Write> Parent for Pipe<'_, I, O> {
+    fn fetch(&mut self, urls: &[String], kind: net::RequestKind) -> Vec<Fetched> {
+        let nothing = || vec![None; urls.len()];
+        if urls.is_empty() {
+            return nothing();
+        }
+        let asked = ToParent::Fetch {
+            urls: urls.to_vec(),
+            kind,
+        };
+        match self.ask(&asked) {
+            // One answer per URL, matched by position. A reply of the wrong
+            // length is a parent that is not what we think it is, and guessing
+            // which resource was which would be worse than rendering the page
+            // without any of them.
+            Some(ToChild::Resources { resources }) if resources.len() == urls.len() => resources
+                .into_iter()
+                .map(|resource| {
+                    resource.ok.then_some(Resource {
+                        bytes: resource.body,
+                        content_type: resource.content_type,
+                    })
+                })
+                .collect(),
+            _ => nothing(),
+        }
+    }
+
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        let nothing = || vec![false; urls.len()];
+        if urls.is_empty() {
+            return nothing();
+        }
+        match self.ask(&ToParent::Visited {
+            urls: urls.to_vec(),
+        }) {
+            // Same positional rule, and the same refusal to guess. Every link
+            // unvisited is the safe reading of a wrong answer: blue where it
+            // should be purple is cosmetic, and cannot be mistaken for the
+            // reverse.
+            Some(ToChild::Followed { visited }) if visited.len() == urls.len() => visited,
+            _ => nothing(),
+        }
+    }
+}
+
 /// Renders one page, answering the child's own resource requests along the way.
 fn serve_render(
     input: &mut impl Read,
@@ -178,56 +275,17 @@ fn serve_render(
     renderer: &mut impl Render,
     request: ToChild,
 ) -> Result<(), Error> {
-    // Errors inside the fetch closure are recorded rather than returned,
-    // because the closure's signature belongs to the renderer and a broken pipe
-    // is not something it can do anything about. The first failure stops
-    // further requests, so a dead parent does not produce hundreds of retries.
-    let mut transport: Result<(), Error> = Ok(());
-    let outcome = {
-        let mut fetch = |urls: &[String], kind: net::RequestKind| -> Vec<Fetched> {
-            let nothing = || vec![None; urls.len()];
-            if transport.is_err() || urls.is_empty() {
-                return nothing();
-            }
-            let asked = ToParent::Fetch {
-                urls: urls.to_vec(),
-                kind,
-            };
-            if let Err(error) = write_frame(output, &asked.encode()) {
-                transport = Err(error);
-                return nothing();
-            }
-            let answer = match read_frame(input) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    transport = Err(error);
-                    return nothing();
-                }
-            };
-            match ToChild::decode(&answer) {
-                // One answer per URL, matched by position. A reply of the
-                // wrong length is a parent that is not what we think it is,
-                // and guessing which resource was which would be worse than
-                // rendering the page without any of them.
-                Ok(ToChild::Resources { resources }) if resources.len() == urls.len() => resources
-                    .into_iter()
-                    .map(|resource| {
-                        resource.ok.then_some(Resource {
-                            bytes: resource.body,
-                            content_type: resource.content_type,
-                        })
-                    })
-                    .collect(),
-                Ok(_) => nothing(),
-                Err(error) => {
-                    transport = Err(Error::Wire(error));
-                    nothing()
-                }
-            }
-        };
-        renderer.render(&request, &mut fetch)
+    // Errors on the pipe are recorded rather than returned, because this
+    // object's signature belongs to the renderer and a broken pipe is not
+    // something it can do anything about. The first failure stops further
+    // requests, so a dead parent does not produce hundreds of retries.
+    let mut pipe = Pipe {
+        input,
+        output,
+        transport: Ok(()),
     };
-    transport?;
+    let outcome = renderer.render(&request, &mut pipe);
+    pipe.transport?;
 
     let reply = match outcome {
         Ok(page) => ToParent::Rendered(Box::new(page)),
@@ -248,6 +306,9 @@ mod tests {
         fail: bool,
         /// Queries this stub was asked to find, so the loop can be checked.
         queried: Vec<String>,
+        /// Links this stub asks the parent about, and what it was told (#181).
+        asks: Vec<String>,
+        followed: Vec<bool>,
     }
 
     impl Stub {
@@ -255,6 +316,8 @@ mod tests {
             Self {
                 wants: Vec::new(),
                 got: Vec::new(),
+                asks: Vec::new(),
+                followed: Vec::new(),
                 fail: false,
                 queried: Vec::new(),
             }
@@ -276,15 +339,15 @@ mod tests {
             crate::access::Tree::default()
         }
 
-        fn render(
-            &mut self,
-            _: &ToChild,
-            fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
-        ) -> Result<Rendered, String> {
+        fn render(&mut self, _: &ToChild, parent: &mut dyn Parent) -> Result<Rendered, String> {
             let wants = self.wants.clone();
             if !wants.is_empty() {
                 self.got
-                    .extend(fetch(&wants, net::RequestKind::Subresource));
+                    .extend(parent.fetch(&wants, net::RequestKind::Subresource));
+            }
+            let asked = self.asks.clone();
+            if !asked.is_empty() {
+                self.followed = parent.visited(&asked);
             }
             if self.fail {
                 return Err("nope".to_owned());

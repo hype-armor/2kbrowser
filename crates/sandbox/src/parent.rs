@@ -178,6 +178,18 @@ fn supplied(
     }
 }
 
+/// The addresses the reader has already been to (#181).
+///
+/// Held by the parent and never sent anywhere. The child asks about the links
+/// on the page in front of it and gets a yes or no for each; it never receives
+/// this, because a renderer running a stranger's document has no business
+/// holding a list of everywhere its reader has been.
+///
+/// Shared with the `Renderer` rather than owned by a session, for the same
+/// reason the subresource cache is: a session is one page, and where you have
+/// been outlives the page you are on.
+pub type Visited = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
 /// A renderer process and the conversation with it.
 pub struct Renderer {
     program: PathBuf,
@@ -201,6 +213,8 @@ pub struct Renderer {
     /// Here rather than on the session because a session is one page: the whole
     /// point is to outlive one.
     cache: std::sync::Arc<std::sync::Mutex<Cache>>,
+    /// Where the reader has been, for `:visited` (#181).
+    visited: Visited,
 }
 
 impl Renderer {
@@ -252,7 +266,24 @@ impl Renderer {
             failure,
             launch_failure: std::sync::OnceLock::new(),
             cache: std::sync::Arc::default(),
+            visited: std::sync::Arc::default(),
         }
+    }
+
+    /// Records that the reader has been to `url` (#181).
+    ///
+    /// Called by the window on every navigation that lands. Nothing else knows
+    /// about it: the set stays here, and the child only ever learns the answer
+    /// for the links on the page it was given.
+    pub fn record_visit(&self, url: &str) {
+        if let Ok(mut seen) = self.visited.lock() {
+            seen.insert(url.to_owned());
+        }
+    }
+
+    /// The set itself, for a caller that has one to restore from disk.
+    pub fn visited(&self) -> &Visited {
+        &self.visited
     }
 
     /// Forgets everything the cache holds for `site` (ADR-0018).
@@ -383,6 +414,7 @@ impl Renderer {
             self.fetcher.clone(),
             self.timeout,
             std::sync::Arc::clone(&self.cache),
+            std::sync::Arc::clone(&self.visited),
         )?;
         let page = session.render(
             body,
@@ -582,6 +614,7 @@ impl Session {
         fetcher: Fetcher,
         timeout: Duration,
         cache: std::sync::Arc<std::sync::Mutex<Cache>>,
+        visited: Visited,
     ) -> Result<Self, Error> {
         let child_id = child.id();
         let (jobs, work) = std::sync::mpsc::channel::<Job>();
@@ -601,6 +634,7 @@ impl Session {
                     timeout,
                     document: None,
                     withheld: recorded,
+                    visited,
                 };
                 // Ends when the handle is dropped and the channel closes, which
                 // is what kills the child: `Conversation` owns it.
@@ -1064,6 +1098,8 @@ struct Conversation {
     document: Option<Origin>,
     /// What the policy refused, shared with the [`Session`] handle.
     withheld: std::sync::Arc<std::sync::Mutex<Withheld>>,
+    /// Where the reader has been, shared with the `Renderer` (#181).
+    visited: Visited,
 }
 
 impl Conversation {
@@ -1138,7 +1174,9 @@ impl Conversation {
             ToParent::Rendered(page) => Ok(Answer::Rendered(page)),
             ToParent::Accessible(tree) => Ok(Answer::Accessible(tree)),
             ToParent::Failed { message } => Err(Error::Render(message)),
-            ToParent::Fetch { .. } => Err(Error::Wire(crate::WireError::Unknown)),
+            ToParent::Fetch { .. } | ToParent::Visited { .. } => {
+                Err(Error::Wire(crate::WireError::Unknown))
+            }
         }
     }
 
@@ -1169,6 +1207,21 @@ impl Conversation {
                     // Nothing asked a question. Either the child is confused or
                     // it is not ours.
                     return Err(Error::Wire(crate::WireError::Unknown));
+                }
+                // The only message whose answer is the reader's own knowledge
+                // rather than the network's, so it is the one place the policy
+                // to apply is a privacy one: answer about these URLs and say
+                // nothing about any other (#181).
+                ToParent::Visited { urls } => {
+                    let visited = match self.visited.lock() {
+                        Ok(seen) => urls.iter().map(|url| seen.contains(url)).collect(),
+                        // A poisoned lock means another thread panicked while
+                        // holding it. Nothing visited is the safe answer: a
+                        // link drawn blue that should be purple is a cosmetic
+                        // loss, and it cannot be mistaken for the reverse.
+                        Err(_) => vec![false; urls.len()],
+                    };
+                    self.send(&ToChild::Followed { visited })?;
                 }
                 ToParent::Fetch { urls, kind } => {
                     // Counted per URL rather than per message, so asking in

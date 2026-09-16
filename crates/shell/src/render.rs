@@ -788,6 +788,45 @@ pub trait Loader {
             .map(|url| self.load(url, document, kind))
             .collect()
     }
+
+    /// Which of these addresses the reader has already been to (#181).
+    ///
+    /// Asked rather than told, and asked only about URLs already on the page.
+    /// The history lives with whoever implements this; what comes back is a
+    /// yes or no for links the document named itself, so the answer reveals
+    /// nothing the asker did not already hold.
+    ///
+    /// Nothing visited by default, which is the truth for every caller without
+    /// a reader behind it: the reference tests, the command line, and anything
+    /// rendering a page for its own sake.
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        vec![false; urls.len()]
+    }
+}
+
+/// The links on the page, as `(node, absolute url)`.
+///
+/// Source anchors only — an `a` or `area` with an `href` — because those are
+/// the elements `:link` and `:visited` are defined over. A fragment is dropped
+/// before asking: `page#section` and `page` are the same visit, and keeping the
+/// fragment would leave every anchor on a page you are reading looking unvisited.
+fn link_targets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Vec<(dom::NodeId, String)> {
+    let Some((origin, path)) = base else {
+        return Vec::new();
+    };
+    doc.descendants(doc.root())
+        .into_iter()
+        .filter_map(|node| {
+            let element = doc.element(node)?;
+            if !matches!(element.local_name(), "a" | "area") {
+                return None;
+            }
+            let href = element.attr("href")?;
+            let url = net::resolve(origin, path, href);
+            let url = url.split_once('#').map_or(url.as_str(), |(head, _)| head);
+            Some((node, url.to_owned()))
+        })
+        .collect()
 }
 
 /// A fetched subresource.
@@ -1156,7 +1195,34 @@ pub(crate) fn render_sized(
     }
 
     let author_sheets = collect_stylesheets(&doc, loader, base, width as f32);
-    let styles = css::cascade::cascade_at(&doc, &author_sheets, settings.zoom);
+    // Which links have been followed, asked of whoever holds the history before
+    // the cascade needs the answer (#181). One round trip for the whole page,
+    // and only about addresses the page already named.
+    let targets = link_targets(&doc, base);
+    let visited: css::selector::VisitedLinks = {
+        let urls: Vec<String> = targets.iter().map(|(_, url)| url.clone()).collect();
+        let followed = loader.visited(&urls);
+        // A short or long answer is a loader that is not what we think it is.
+        // Every link unvisited is the safe reading: a link drawn blue that
+        // should be purple is a cosmetic loss and cannot be mistaken for the
+        // reverse.
+        if followed.len() == targets.len() {
+            targets
+                .iter()
+                .zip(followed)
+                .filter_map(|((node, _), seen)| seen.then_some(*node))
+                .collect()
+        } else {
+            css::selector::VisitedLinks::none()
+        }
+    };
+    let styles = css::cascade::cascade_with(
+        &doc,
+        &author_sheets,
+        settings.zoom,
+        css::cascade::Colours::Authors,
+        &visited,
+    );
 
     // Classify before laying out: if the page needs layout we do not implement,
     // producing the wrong layout first and discarding it would be wasted work.

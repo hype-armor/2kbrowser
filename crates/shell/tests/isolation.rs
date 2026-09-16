@@ -2622,3 +2622,92 @@ fn pressing_a_control_focuses_it_so_tab_carries_on_from_there() {
     space(&mut page);
     assert_eq!(sent(&mut page), "post=on&size=m&where=fr&q=&go=Send");
 }
+
+/// The whole of #181, across a real process boundary.
+///
+/// The parent holds the history, the child holds the document, and the only
+/// thing that crosses is a question about links the child already has. Nothing
+/// below the boundary can be checked from here, so what is checked is the one
+/// thing that matters: the page comes back with the followed link drawn in a
+/// different colour from the one beside it, and it is the purple.
+#[test]
+fn a_followed_link_comes_back_purple_and_its_neighbour_does_not() {
+    let dir = std::env::temp_dir().join("2kbrowser-visited-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("links.html");
+    // Two links side by side, one of them somewhere the reader has been. Large
+    // text on its own line each, so the pixels are easy to find.
+    std::fs::write(
+        &path,
+        "<body style=\"margin:0;background:#fff;font-size:40px\">\
+         <p style=\"margin:0\"><a href=\"seen.html\">AAAA</a></p>\
+         <p style=\"margin:0\"><a href=\"new.html\">AAAA</a></p></body>",
+    )
+    .expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    // Where the reader has been. Recorded against the resolved URL, which is
+    // what the child will ask about.
+    let seen = net::resolve(&origin, &at, "seen.html");
+    renderer.record_visit(&seen);
+
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: std::fs::read(&path).expect("read"),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        400,
+        2000,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens");
+
+    // The two links' rectangles, in document order.
+    let links = page.links();
+    assert_eq!(links.len(), 2, "two links: {links:?}");
+
+    let pixel = |x: u32, y: u32| -> (u8, u8, u8) {
+        let at = ((y * page.width() + x) * 4) as usize;
+        let px = page.pixels();
+        (px[at], px[at + 1], px[at + 2])
+    };
+    // The darkest pixel in a link's box, which is the ink of its text rather
+    // than the white around it.
+    let ink = |rect: &layout::Rect| -> (u8, u8, u8) {
+        let mut best = (255u8, 255u8, 255u8);
+        for y in (rect.y as u32)..((rect.y + rect.height) as u32).min(page.height()) {
+            for x in (rect.x as u32)..((rect.x + rect.width) as u32).min(page.width()) {
+                let px = pixel(x, y);
+                let sum = px.0 as u32 + px.1 as u32 + px.2 as u32;
+                if sum < best.0 as u32 + best.1 as u32 + best.2 as u32 {
+                    best = px;
+                }
+            }
+        }
+        best
+    };
+
+    let followed = ink(&links[0].rects[0]);
+    let fresh = ink(&links[1].rects[0]);
+    assert_ne!(
+        followed, fresh,
+        "both links drew the same colour, so the visited half never arrived"
+    );
+    // Purple is red and blue with little green between them; the unvisited
+    // link is the blue every browser has used, with almost no red.
+    assert!(
+        followed.0 > followed.1 && followed.2 > followed.1,
+        "the followed link is not purple: {followed:?}"
+    );
+    assert!(
+        fresh.2 > fresh.0 && fresh.2 > fresh.1,
+        "the unvisited link is not blue: {fresh:?}"
+    );
+}

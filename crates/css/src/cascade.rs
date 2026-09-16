@@ -190,6 +190,27 @@ pub fn cascade_as(
     zoom: f32,
     colours: Colours,
 ) -> StyleMap {
+    cascade_with(
+        doc,
+        author_sheets,
+        zoom,
+        colours,
+        &crate::selector::VisitedLinks::none(),
+    )
+}
+
+/// The whole of it, plus which links have been followed (#181).
+///
+/// Separate from [`cascade_as`] because almost nothing has a history to offer:
+/// a caller with no reader behind it means "nothing followed", and saying so by
+/// omission is better than making every test construct an empty set.
+pub fn cascade_with(
+    doc: &Document,
+    author_sheets: &[Stylesheet],
+    zoom: f32,
+    colours: Colours,
+    visited: &crate::selector::VisitedLinks,
+) -> StyleMap {
     let ua = Stylesheet::parse(crate::ua::UA_STYLESHEET);
     let mut map = StyleMap::default();
     // The root carries the zoomed default, so an element that says nothing
@@ -213,6 +234,7 @@ pub fn cascade_as(
         // and changes how values parse (ADR-0004).
         quirks: doc.is_quirks(),
         zoom,
+        visited,
         colours,
     };
     let mut counters = Counters::default();
@@ -316,6 +338,29 @@ struct Rules<'a> {
     zoom: f32,
     /// Whose colours win where the markup names one.
     colours: Colours,
+    /// Which of this page's links the reader has already followed (#181).
+    visited: &'a crate::selector::VisitedLinks,
+}
+
+/// Whether a `:visited` rule may set this property.
+///
+/// The list every engine settled on: the colours, and nothing that changes a
+/// box's size, its font, or what it has to fetch. `border-color` is here in
+/// both its shorthand and its four sides, because a page that cannot colour a
+/// visited link's underline differently from its neighbour's is not obviously
+/// safer and is visibly worse.
+fn is_a_colour_property(name: &str) -> bool {
+    matches!(
+        name,
+        "color"
+            | "background-color"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "outline-color"
+    )
 }
 
 /// Whether a property names a colour the reader's sheet should be choosing.
@@ -421,9 +466,9 @@ fn addresses(doc: &Document, node: NodeId, rules: &Rules, which: PseudoElement) 
         .chain(rules.sheets.iter())
         .flat_map(|sheet| sheet.rules.iter())
         .any(|rule| {
-            rule.selectors
-                .iter()
-                .any(|selector| selector.pseudo == Some(which) && selector.matches(doc, node))
+            rule.selectors.iter().any(|selector| {
+                selector.pseudo == Some(which) && selector.matches(doc, node, rules.visited)
+            })
         })
 }
 
@@ -443,7 +488,7 @@ fn compute(
         .chain(rules.sheets.iter().map(|s| (s, Origin::Author)))
     {
         for rule in &sheet.rules {
-            let best = rule
+            let matching: Vec<_> = rule
                 .selectors
                 .iter()
                 // A rule addressing `::before` styles that box and nothing
@@ -451,11 +496,25 @@ fn compute(
                 // element and not its generated boxes. `matches` answers for
                 // the originating element in both cases, so this is the only
                 // thing keeping them apart.
-                .filter(|selector| selector.pseudo == pseudo && selector.matches(doc, node))
-                .map(|selector| selector.specificity())
-                .max();
+                .filter(|selector| {
+                    selector.pseudo == pseudo && selector.matches(doc, node, rules.visited)
+                })
+                .collect();
+            let best = matching.iter().map(|selector| selector.specificity()).max();
+            // A rule that reached this element *only* through `:visited` may
+            // set colours and nothing else. Where a page can read its own
+            // rendering back, anything else — a width, a font, a background
+            // image it has to fetch — turns "has this reader been there?" into
+            // a question the page can ask about any URL it likes, one link at a
+            // time. This browser runs no script (ADR-0003), so that channel is
+            // already shut; the restriction is kept anyway because it costs one
+            // predicate and it is the difference between shut and shut twice.
+            let restricted = !matching.is_empty() && matching.iter().all(|s| s.is_visited());
             if let Some(specificity) = best {
                 for declaration in &rule.declarations {
+                    if restricted && !is_a_colour_property(&declaration.name) {
+                        continue;
+                    }
                     order += 1;
                     matched.push((
                         Precedence {
@@ -4585,5 +4644,86 @@ mod tests {
             .as_deref(),
             Some("7"),
         );
+    }
+
+    /// Styles the one link in `html`, told that it has been followed.
+    fn visited_link_style(html: &str, css: &str) -> ComputedStyle {
+        let doc = dom::parse(html);
+        let node = doc.find_element("a").expect("a link");
+        let visited: crate::selector::VisitedLinks = [node].into_iter().collect();
+        let sheets = [Stylesheet::parse(css)];
+        let map = cascade_with(&doc, &sheets, 1.0, Colours::Authors, &visited);
+        map.get(node).expect("the link is styled").clone()
+    }
+
+    #[test]
+    fn a_visited_rule_may_set_a_colour() {
+        let style = visited_link_style(
+            "<body><a href=\"/x\">x</a></body>",
+            "a:visited { color: #ff0000; background-color: #00ff00 }",
+        );
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
+        assert_eq!(style.background_color, Color::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn a_visited_rule_may_set_nothing_else() {
+        // The privacy rule (#181). Where a page can read its own rendering
+        // back, a width or a font behind `:visited` turns "has this reader been
+        // there?" into a question the page can ask about any URL it likes. This
+        // browser runs no script, so that channel is already shut; the
+        // restriction costs one predicate and shuts it twice.
+        let style = visited_link_style(
+            "<body><a href=\"/x\">x</a></body>",
+            "a:visited { color: #ff0000; width: 500px; font-size: 40px; \
+             display: block; margin-left: 30px }",
+        );
+        assert_eq!(style.color, Color::rgb(255, 0, 0), "the colour still wins");
+        assert_eq!(style.width, Length::Auto, "a width must not get through");
+        assert_eq!(style.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(style.display, Display::Inline);
+        assert_eq!(style.margin.left, Length::Px(0.0));
+    }
+
+    #[test]
+    fn a_rule_that_also_matches_without_visited_is_not_restricted() {
+        // `a, a:visited { … }` reaches this element both ways round. The
+        // restriction is about what `:visited` *reveals*, and a rule that
+        // applies to every link reveals nothing — holding it to colours would
+        // break ordinary pages for no gain.
+        let style = visited_link_style(
+            "<body><a href=\"/x\">x</a></body>",
+            "a, a:visited { width: 500px }",
+        );
+        assert_eq!(style.width, Length::Px(500.0));
+    }
+
+    #[test]
+    fn an_unvisited_link_takes_the_link_half() {
+        let doc = dom::parse("<body><a href=\"/x\">x</a></body>");
+        let node = doc.find_element("a").expect("a link");
+        let sheets = [Stylesheet::parse(
+            "a:link { color: #0000ff } a:visited { color: #ff0000 }",
+        )];
+        let nowhere = cascade_with(
+            &doc,
+            &sheets,
+            1.0,
+            Colours::Authors,
+            &crate::selector::VisitedLinks::none(),
+        );
+        assert_eq!(
+            nowhere.get(node).expect("styled").color,
+            Color::rgb(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn the_user_agent_sheet_makes_a_followed_link_purple() {
+        // The whole of what #181 asked for, with no author sheet at all.
+        let plain = style_of("<body><a href=\"/x\">x</a></body>", "", "a");
+        let followed = visited_link_style("<body><a href=\"/x\">x</a></body>", "");
+        assert_eq!(followed.color, Color::rgb(0x55, 0x1a, 0x8b));
+        assert_ne!(plain.color, followed.color);
     }
 }
