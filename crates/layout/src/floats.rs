@@ -107,8 +107,20 @@ impl FloatContext {
             top = next;
         }
 
+        // Below everything and still too wide to fit, so it overflows — and
+        // which edge it overflows past is the whole question. §9.5.1's rules 3
+        // and 7 pull opposite ways for a float wider than its containing block,
+        // and what browsers do is keep the edge the float was sent to and let
+        // the other one stick out: a right float keeps its right outer edge on
+        // the containing block's right edge and hangs off to the left.
+        //
+        // `.max(0.0)` used to pin it to the left edge instead, which is the
+        // right answer for a *left* float and the mirror image of the right one.
+        // The float then sat one whole overhang to the right of where it
+        // belonged (#164, `floats-147`), and it is not a rare shape: a 14em
+        // float in a 9em column is what the test is made of.
         let left = match side {
-            Float::Right => (self.width - width).max(0.0),
+            Float::Right => self.width - width,
             _ => 0.0,
         };
         self.floats.push(PlacedFloat {
@@ -301,6 +313,29 @@ mod tests {
         let mut context = FloatContext::new(500.0);
         context.place(Float::Left, 100.0, 20.0, 0.0);
         assert_eq!(context.clearance(Clear::Both, 100.0), 100.0);
+    }
+
+    #[test]
+    fn a_right_float_too_wide_to_fit_hangs_off_the_left() {
+        // §9.5.1's rules 3 and 7 pull opposite ways once a float is wider than
+        // its containing block, and what browsers do is keep the edge the float
+        // was sent to: a right float keeps its right outer edge on the
+        // containing block's right edge and sticks out to the left (#164).
+        let mut context = FloatContext::new(144.0);
+        assert_eq!(context.place(Float::Right, 224.0, 16.0, 0.0), (-80.0, 0.0));
+
+        // And again once it has to go below one, which is the path that was
+        // wrong: pinned to the left edge, the float sat a whole overhang — 80px
+        // here — to the right of where it belonged.
+        let (left, top) = context.place(Float::Right, 224.0, 16.0, 0.0);
+        assert_eq!(left, -80.0, "a second one lands on the same edge");
+        assert_eq!(top, 16.0, "below the first, which it cannot sit beside");
+
+        // A left float is the mirror image and keeps the left edge, which is
+        // what `0.0` always meant.
+        let mut context = FloatContext::new(144.0);
+        assert_eq!(context.place(Float::Left, 224.0, 16.0, 0.0), (0.0, 0.0));
+        assert_eq!(context.place(Float::Left, 224.0, 16.0, 0.0).0, 0.0);
     }
 
     #[test]
