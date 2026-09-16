@@ -44,6 +44,14 @@ pub const MAX_NODES: usize = 65_536;
 /// is 430 bytes.
 pub const MAX_STRING: usize = 4 * 1024;
 
+/// Widest or tallest a cell may say it spans.
+///
+/// The same number `layout::table` clamps the attribute to, and for the same
+/// reason: `colspan` is unbounded in the markup, and a mistyped one — or a
+/// deliberately hostile one — would otherwise describe a table with four
+/// billion columns to a screen reader.
+pub const MAX_SPAN: u32 = 1000;
+
 /// Most text in the whole tree, in bytes.
 ///
 /// Bounds the text independently of how it is divided into nodes, so 65 536
@@ -172,6 +180,13 @@ pub struct Node {
     pub level: u8,
     /// Whether a checkbox is ticked or a radio chosen.
     pub on: bool,
+    /// How many columns a cell covers, and how many rows. `(1, 1)` for
+    /// everything that is not a cell, and for a cell that spans nothing.
+    ///
+    /// Carried because a table read without them is a table read wrongly: a
+    /// row whose first cell spans two rows has one fewer cell than the row
+    /// above, and a reader told only the cells would hear the columns shift.
+    pub span: (u32, u32),
     /// How many of the entries after this one are its immediate children.
     pub children: u32,
 }
@@ -186,6 +201,7 @@ impl Node {
             rect,
             level: 0,
             on: false,
+            span: (1, 1),
             children: 0,
         }
     }
@@ -208,6 +224,8 @@ impl Node {
         writer.f32(self.rect.height);
         writer.tag(self.level);
         writer.some(self.on);
+        writer.u32(self.span.0);
+        writer.u32(self.span.1);
         writer.u32(self.children);
     }
 
@@ -223,6 +241,14 @@ impl Node {
         };
         let level = reader.tag()?;
         let on = reader.some()?;
+        // Bounded on the way in. A span is an attribute an author wrote, so a
+        // page can say `colspan="4000000000"` — and the parent turns these into
+        // a table's shape, which is not somewhere to discover a number nobody
+        // checked. The same ceiling the layout side uses for the same attribute.
+        let span = (
+            reader.u32()?.clamp(1, MAX_SPAN),
+            reader.u32()?.clamp(1, MAX_SPAN),
+        );
         let children = reader.u32()?;
         Ok(Self {
             role,
@@ -231,6 +257,7 @@ impl Node {
             rect,
             level,
             on,
+            span,
             children,
         })
     }

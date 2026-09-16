@@ -264,13 +264,26 @@ fn describe(
         // filename is not a description — reading one out is worse than
         // silence, because it sounds like information.
         Role::Image => element.attr("alt").unwrap_or_default().to_owned(),
+        // A control is named by whatever names it on the page, and on the
+        // era's forms that is almost always a `<label>` — the `name` attribute
+        // is what the *server* calls the field and is a last resort, since
+        // hearing "txtEmail1" is barely better than hearing nothing.
         Role::TextField | Role::CheckBox | Role::RadioButton | Role::ComboBox => element
             .attr("aria-label")
             .or_else(|| element.attr("title"))
-            .or_else(|| element.attr("name"))
-            .unwrap_or_default()
-            .to_owned(),
+            .map(str::to_owned)
+            .or_else(|| label_for(doc, node))
+            .or_else(|| element.attr("name").map(str::to_owned))
+            .unwrap_or_default(),
         Role::Separator => String::new(),
+        // `<input type="submit" value="Send">` is a button whose words are an
+        // attribute rather than its contents — it has no contents. Without
+        // this it reads as "button", which is a control a reader can find and
+        // not one they can decide whether to press.
+        Role::Button if element.local_name().eq_ignore_ascii_case("input") => element
+            .attr("value")
+            .map(str::to_owned)
+            .unwrap_or_else(|| default_button_label(element)),
         // A table is named by its caption, if it has one. Not by its contents:
         // a table whose name is every word in it is a page read twice, once as
         // the table's name and again as its cells.
@@ -301,6 +314,10 @@ fn describe(
         _ => None,
     };
     out.on = matches!(role, Role::CheckBox | Role::RadioButton) && doc.is_on(node);
+    out.span = match role {
+        Role::Cell | Role::HeaderCell => (span_of(element, "colspan"), span_of(element, "rowspan")),
+        _ => (1, 1),
+    };
     out.level = if role == Role::Heading {
         heading_level(element.local_name())
     } else {
@@ -312,6 +329,64 @@ fn describe(
         out.name.clear();
     }
     out
+}
+
+/// What a value-less `<input>` button is called.
+///
+/// A browser draws "Submit Query" on a bare `<input type="submit">` and "Reset"
+/// on a bare reset, so that is what it says — reading out a word that is not on
+/// the button would be describing a page that does not exist.
+fn default_button_label(element: &dom::ElementData) -> String {
+    let kind = element
+        .attr("type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "reset" => "Reset".to_owned(),
+        "submit" => "Submit Query".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// A cell's `colspan` or `rowspan`.
+///
+/// Clamped rather than trusted: the attribute is unbounded in the markup, and
+/// the same ceiling `layout::table` uses is applied here so that a table reads
+/// the way it draws. An unparseable value is one column, which is what a
+/// browser does with `colspan="banana"`.
+fn span_of(element: &dom::ElementData, name: &str) -> u32 {
+    element
+        .attr(name)
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, sandbox::access::MAX_SPAN)
+}
+
+/// The text of the `<label>` that names `node`, if one does.
+///
+/// Both spellings, because the era's forms use both: `<label for="id">` naming
+/// a control by its id, and a `<label>` with the control inside it. The first
+/// is searched for by id rather than walked to, since a label may sit anywhere
+/// in the document — in another table cell, most often.
+fn label_for(doc: &Document, node: NodeId) -> Option<String> {
+    let id = doc.element(node).and_then(|element| element.id());
+    let named = id.and_then(|id| {
+        (0..doc.len()).map(NodeId).find(|&at| {
+            doc.element(at).is_some_and(|element| {
+                element.local_name().eq_ignore_ascii_case("label")
+                    && element.attr("for").is_some_and(|for_| for_ == id)
+            })
+        })
+    });
+    let wrapping = || {
+        doc.ancestors(node).find(|&at| {
+            doc.element(at)
+                .is_some_and(|element| element.local_name().eq_ignore_ascii_case("label"))
+        })
+    };
+    let label = named.or_else(wrapping)?;
+    let text = collapse(&doc.text_content(label));
+    (!text.is_empty()).then_some(text)
 }
 
 /// Which option a `<select>` is on, by the same rule the renderer draws.
@@ -734,5 +809,97 @@ mod tests {
         let tree = tree_of(&doc, &out, (0.0, 0.0), Some(second));
         assert_eq!(tree.focus, Some(2), "the second link is the third node");
         assert_eq!(tree_of(&doc, &out, (0.0, 0.0), None).focus, None);
+    }
+
+    #[test]
+    fn a_label_names_the_control_it_belongs_to() {
+        // Both spellings, because the era's forms use both. `name` is what the
+        // *server* calls the field and is a last resort — hearing "txtEmail1"
+        // is barely better than hearing nothing.
+        let tree = tree(
+            "<body><form>\
+             <label for=\"a\">Your name</label><input id=\"a\" name=\"txtName1\">\
+             <label>Subscribe <input type=\"checkbox\" name=\"sub\"></label>\
+             <input name=\"txtOther\">\
+             </form></body>",
+        );
+        let named: Vec<(Role, String)> = tree
+            .nodes
+            .iter()
+            .filter(|node| node.role != Role::Document && node.role != Role::Text)
+            .map(|node| (node.role, node.name.clone()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (Role::TextField, "Your name".to_owned()),
+                (Role::CheckBox, "Subscribe".to_owned()),
+                (Role::TextField, "txtOther".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cell_says_how_far_it_spans() {
+        // A table read without spans is a table read wrongly: the row under a
+        // `rowspan` has one fewer cell than the row above, and a reader told
+        // only the cells would hear the columns shift.
+        let tree = tree(
+            "<body><table>\
+             <tr><td rowspan=\"2\">tall</td><td colspan=\"3\">wide</td></tr>\
+             <tr><td>plain</td></tr></table></body>",
+        );
+        let spans: Vec<(u32, u32)> = tree
+            .nodes
+            .iter()
+            .filter(|node| node.role == Role::Cell)
+            .map(|node| node.span)
+            .collect();
+        assert_eq!(spans, vec![(1, 2), (3, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn a_span_a_page_made_up_is_clamped_rather_than_believed() {
+        // `colspan` is unbounded in the markup, and the parent turns these into
+        // a table's shape — which is not somewhere to discover a number nobody
+        // checked.
+        let tree = tree("<body><table><tr><td colspan=\"4000000000\">x</td></tr></table></body>");
+        let cell = tree
+            .nodes
+            .iter()
+            .find(|node| node.role == Role::Cell)
+            .expect("a cell");
+        assert_eq!(cell.span, (sandbox::access::MAX_SPAN, 1));
+    }
+
+    #[test]
+    fn a_submit_button_is_named_by_its_value() {
+        // `<input type="submit">` is a button whose words are an attribute
+        // rather than its contents — it has no contents. Unnamed it reads as
+        // "button", which a reader can find and cannot decide whether to press.
+        // Found by the end-to-end test in `a11y`, not by this one.
+        let tree = tree(
+            "<body><form>\
+             <input type=\"submit\" value=\"Send\">\
+             <input type=\"submit\">\
+             <input type=\"reset\">\
+             </form></body>",
+        );
+        let buttons: Vec<String> = tree
+            .nodes
+            .iter()
+            .filter(|node| node.role == Role::Button)
+            .map(|node| node.name.clone())
+            .collect();
+        assert_eq!(
+            buttons,
+            vec![
+                "Send".to_owned(),
+                // What a browser draws on a bare one. Saying something else
+                // would describe a page that does not exist.
+                "Submit Query".to_owned(),
+                "Reset".to_owned(),
+            ],
+        );
     }
 }

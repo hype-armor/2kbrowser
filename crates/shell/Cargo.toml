@@ -21,6 +21,11 @@ slop = { path = "../slop" }
 softbuffer = "0.4"
 text = { path = "../text" }
 winit = "0.30"
+# ADR-0019, #178. One crate for UI Automation, NSAccessibility and AT-SPI —
+# which is the whole reason for taking it, since three platform integrations
+# written here is not a serious proposal (ADR-0007).
+accesskit = "0.25"
+accesskit_winit = "0.34"
 
 [dev-dependencies]
 tiny-skia = "0.11"

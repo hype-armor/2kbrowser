@@ -361,6 +361,20 @@ impl Viewport {
             .unwrap_or_else(|_| (Vec::new(), String::new()))
     }
 
+    /// The page as a screen reader would read it (ADR-0019, #178).
+    ///
+    /// Asked of the child, because the DOM and the box tree it is built from
+    /// never cross the boundary. Asked *only* when something is listening —
+    /// that is the caller's part of the bargain, and it is what keeps a page
+    /// costing nothing when nothing is.
+    ///
+    /// An empty tree where the child could not answer, which is what a window
+    /// hands to an assistive technology that attached before the first page
+    /// finished: "nothing here yet" rather than a failure.
+    pub fn accessibility(&mut self) -> sandbox::access::Tree {
+        self.session.accessibility().unwrap_or_default()
+    }
+
     /// Where `query` appears, asked of the child holding the page.
     pub fn find(&mut self, query: &str) -> Vec<Rect> {
         // Every match, wherever it is. These used to be filtered to the painted
