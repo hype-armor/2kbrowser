@@ -766,6 +766,20 @@ impl App {
         self.stage(Some(LAYING_OUT));
         match fetched {
             Ok(fetched) => {
+                // Somewhere the reader has now been, so the next page that
+                // links here draws that link purple (#181). Recorded on the
+                // fetch *landing* rather than on the click, because a link that
+                // refused to load is not a place you have been — and recorded
+                // from the fetched origin and path rather than the URL asked
+                // for, so a redirect records where it arrived.
+                // Resolved the same way `link_targets` resolves an href, so
+                // the two strings agree: what is recorded here is exactly what
+                // a link pointing back at this page will ask about.
+                self.renderer.record_visit(&net::resolve(
+                    &fetched.origin,
+                    &fetched.path,
+                    &fetched.path,
+                ));
                 self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
                     body: fetched.body,

@@ -9,7 +9,7 @@
 //! so: the pixels that come back across the pipe are byte-identical to the ones
 //! produced without one.
 
-use sandbox::child::{Fetched, Render};
+use sandbox::child::Render;
 use sandbox::message::{Link, Missing, Mode, Rendered};
 use sandbox::{Error, ToChild};
 use text::FontStore;
@@ -21,7 +21,7 @@ use text::FontStore;
 /// applies ADR-0006's policy — which is the improvement worth having: the rule
 /// is now enforced in a process a compromised renderer cannot reach.
 struct PipeLoader<'a> {
-    fetch: &'a mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
+    parent: &'a mut dyn sandbox::child::Parent,
 }
 
 impl crate::render::Loader for PipeLoader<'_> {
@@ -49,7 +49,8 @@ impl crate::render::Loader for PipeLoader<'_> {
         // it from the untrusted side would let a compromised renderer claim to
         // be an origin it is not, which is the whole policy defeated in one
         // field.
-        (self.fetch)(urls, kind)
+        self.parent
+            .fetch(urls, kind)
             .into_iter()
             .map(|resource| {
                 resource.map(|got| crate::render::Loaded {
@@ -58,6 +59,12 @@ impl crate::render::Loader for PipeLoader<'_> {
                 })
             })
             .collect()
+    }
+
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        // Straight across the pipe. The child never holds the history; it asks
+        // about the links it parsed and gets a yes or no for each (#181).
+        self.parent.visited(urls)
     }
 }
 
@@ -583,7 +590,7 @@ impl Render for PageRenderer {
     fn render(
         &mut self,
         request: &ToChild,
-        fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
+        parent: &mut dyn sandbox::child::Parent,
     ) -> Result<Rendered, String> {
         // Typing, focusing and choosing are re-renders of the page already
         // held, so they borrow the request it came from. Kept here rather than asked for
@@ -633,7 +640,7 @@ impl Render for PageRenderer {
 
         // Every subresource — images, stylesheets, `@import` chains, frames —
         // goes over the pipe. Nothing in this process opens a socket or a file.
-        let mut loader = PipeLoader { fetch };
+        let mut loader = PipeLoader { parent };
         let base = origin.as_ref().map(|origin| (origin, path.as_str()));
         // Both set is a request the parent never makes, and this side is where
         // messages from a stranger arrive — so it is decided rather than
@@ -860,6 +867,7 @@ fn render_until_the_parent_goes() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandbox::child::Fetched;
 
     fn request(body: &[u8], width: u32) -> ToChild {
         ToChild::Render {
@@ -903,8 +911,32 @@ mod tests {
         }
     }
 
-    fn no_fetch(urls: &[String], _: net::RequestKind) -> Vec<Fetched> {
-        vec![None; urls.len()]
+    /// A parent that supplies nothing and has been nowhere.
+    struct Nothing;
+
+    impl sandbox::child::Parent for Nothing {
+        fn fetch(&mut self, urls: &[String], _: net::RequestKind) -> Vec<Fetched> {
+            vec![None; urls.len()]
+        }
+
+        fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+            vec![false; urls.len()]
+        }
+    }
+
+    /// A parent that answers fetches from a closure and has been nowhere.
+    struct Supplying<F>(F);
+
+    impl<F: FnMut(&[String], net::RequestKind) -> Vec<Fetched>> sandbox::child::Parent
+        for Supplying<F>
+    {
+        fn fetch(&mut self, urls: &[String], kind: net::RequestKind) -> Vec<Fetched> {
+            (self.0)(urls, kind)
+        }
+
+        fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+            vec![false; urls.len()]
+        }
     }
 
     /// A real PNG, so a decode that succeeds means the bytes arrived intact.
@@ -930,7 +962,7 @@ mod tests {
 
         let mut renderer = PageRenderer::new();
         let crossed = renderer
-            .render(&request(html.as_bytes(), 300), &mut no_fetch)
+            .render(&request(html.as_bytes(), 300), &mut Nothing)
             .expect("renders");
 
         assert_eq!(crossed.width, direct.pixmap.width());
@@ -949,7 +981,7 @@ mod tests {
         let html = "<title>Named</title><body><p>x</p></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(html.as_bytes(), 200), &mut no_fetch)
+            .render(&request(html.as_bytes(), 200), &mut Nothing)
             .expect("renders");
         assert_eq!(page.title.as_deref(), Some("Named"));
         assert_eq!(page.mode, Mode::Authored);
@@ -964,7 +996,7 @@ mod tests {
                     <div style=\"display: grid\">a</div></div></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(html.as_bytes(), 200), &mut no_fetch)
+            .render(&request(html.as_bytes(), 200), &mut Nothing)
             .expect("renders");
         match page.mode {
             Mode::Document { unsupported_share } => {
@@ -985,7 +1017,7 @@ mod tests {
 
         let mut plain = PageRenderer::new();
         let ordinary = plain
-            .render(&request(html.as_bytes(), 300), &mut no_fetch)
+            .render(&request(html.as_bytes(), 300), &mut Nothing)
             .expect("renders");
         assert_eq!(
             ordinary.mode,
@@ -995,10 +1027,7 @@ mod tests {
 
         let mut forcing = PageRenderer::new();
         let forced = forcing
-            .render(
-                &overriding(html.as_bytes(), 300, false, true),
-                &mut no_fetch,
-            )
+            .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
         assert!(
             matches!(forced.mode, Mode::Document { .. }),
@@ -1025,10 +1054,7 @@ mod tests {
         let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
         let mut renderer = PageRenderer::new();
         renderer
-            .render(
-                &overriding(html.as_bytes(), 300, false, true),
-                &mut no_fetch,
-            )
+            .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
         let band = renderer.band(0, 200).expect("paints a band");
         assert!(
@@ -1047,10 +1073,7 @@ mod tests {
         let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
         let mut renderer = PageRenderer::new();
         let whole = renderer
-            .render(
-                &overriding(html.as_bytes(), 300, false, true),
-                &mut no_fetch,
-            )
+            .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
         let band = renderer.band(0, 200).expect("paints a band");
         assert_eq!(
@@ -1099,7 +1122,7 @@ mod tests {
                     force_document: true,
                     zoom: 1.0,
                 },
-                &mut fetch,
+                &mut Supplying(&mut fetch),
             )
             .expect("renders");
 
@@ -1124,7 +1147,7 @@ mod tests {
         let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&overriding(html.as_bytes(), 300, true, true), &mut no_fetch)
+            .render(&overriding(html.as_bytes(), 300, true, true), &mut Nothing)
             .expect("renders");
         assert_eq!(page.mode, Mode::Authored, "the author's layout lost");
         assert!(
@@ -1144,7 +1167,7 @@ mod tests {
 
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(&body, 200), &mut no_fetch)
+            .render(&request(&body, 200), &mut Nothing)
             .expect("renders");
         assert!(page.width > 0);
     }
@@ -1157,7 +1180,7 @@ mod tests {
         let html = "<body><a href=\"b.html\">there</a></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(html.as_bytes(), 200), &mut no_fetch)
+            .render(&request(html.as_bytes(), 200), &mut Nothing)
             .expect("renders");
         assert!(page.links.is_empty());
     }
@@ -1186,7 +1209,7 @@ mod tests {
                     force_document: false,
                     zoom: 1.0,
                 },
-                &mut no_fetch,
+                &mut Nothing,
             )
             .expect("renders");
 
@@ -1256,7 +1279,7 @@ mod tests {
                     force_document: false,
                     zoom: 1.0,
                 },
-                &mut fetch,
+                &mut Supplying(&mut fetch),
             )
             .expect("renders");
 
@@ -1315,7 +1338,7 @@ mod tests {
                     force_document: false,
                     zoom: 1.0,
                 },
-                &mut fetch,
+                &mut Supplying(&mut fetch),
             )
             .expect("renders anyway");
 
@@ -1345,7 +1368,7 @@ mod tests {
             .spawn(move || {
                 let mut renderer = PageRenderer::new();
                 renderer
-                    .render(&request(deep.as_bytes(), 300), &mut no_fetch)
+                    .render(&request(deep.as_bytes(), 300), &mut Nothing)
                     .map(|page| page.pixels.len())
             })
             .expect("a thread")
