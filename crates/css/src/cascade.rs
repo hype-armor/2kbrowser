@@ -1556,6 +1556,49 @@ impl Counters {
         }
     }
 
+    /// Drops a generated box's own reset where an enclosing instance remains.
+    ///
+    /// Blink's `RemoveCounterIfAncestorExists`, which it applies on leaving any
+    /// box that reset a counter: if the instance below this one on the stack
+    /// was created by an ancestor, this one can never be inherited by anything
+    /// that comes later — an ancestor's instance is always found first — so it
+    /// is dropped rather than left to shadow it.
+    ///
+    /// It is what tells these two apart, and nothing else does (#124):
+    ///
+    /// ```text
+    /// #a::before { counter-reset: c 7 }              a descendant of #a sees 7
+    /// #a { counter-reset: c 4 }
+    /// #a::before { counter-reset: c 9999 }           a descendant of #a sees 4
+    /// ```
+    ///
+    /// In the first the pseudo's instance is the only one, so it stays and is
+    /// what the element's content inherits. In the second `#a`'s own instance
+    /// is underneath it, so the pseudo's is dropped on the way out and the
+    /// content inherits `#a`'s. `counters-root-000` is the second shape, and
+    /// printed `19998.8` for a reference that says `4.8`.
+    ///
+    /// Only a *reset* creates an instance, so only a reset can leave one to
+    /// drop. An increment with no reset beside it acts on the enclosing
+    /// instance and is visible afterwards precisely because it never made one.
+    fn leave_generated(&mut self, style: &ComputedStyle, depth: usize) {
+        for (name, _) in &style.counter_reset {
+            let Some(at) = self
+                .instances
+                .iter()
+                .rposition(|instance| instance.name == *name && instance.depth == depth)
+            else {
+                continue;
+            };
+            let enclosed = self.instances[..at]
+                .iter()
+                .any(|instance| instance.name == *name && instance.depth < depth);
+            if enclosed {
+                self.instances.remove(at);
+            }
+        }
+    }
+
     /// Drops every instance whose scope ended when the walk left `depth`.
     fn leave(&mut self, depth: usize) {
         self.instances.retain(|instance| instance.depth <= depth);
@@ -1601,11 +1644,21 @@ impl Counters {
 /// is the style that is kept. Only a pseudo-element that declares one pays for
 /// it, which is nearly none of them.
 ///
-/// The operations are applied at the *element's* depth rather than a deeper
-/// one, because §12.4.1 scopes a reset to the box and its following siblings —
-/// and the following siblings of a `::before` box are the element's own
-/// content. A `div::before { counter-reset: n }` has to still be in scope for
-/// a `div div::before` inside it, which is what `counters()` prints as `0.0`.
+/// The operations are applied at the *pseudo-element's* depth — one deeper
+/// than the element it hangs off — because that is where its box actually is:
+/// a `::before` is the first child of its originating element, not a sibling
+/// of it. §12.4.1 scopes a reset to the box and its following siblings, and
+/// the following siblings of a `::before` box are the element's own content.
+/// So `div::before { counter-reset: n }` is still in scope for a
+/// `div div::before` inside it, which is what `counters()` prints as `0.0`,
+/// and is *not* in scope for a following sibling of the `div` — which it was
+/// when this ran at the element's own depth (#124).
+///
+/// Then [`Counters::leave_generated`] applies the other half of the rule. The
+/// two together are what Blink does, read out of `CountersAttachmentContext`
+/// rather than guessed at: it keeps one stack per counter name, pushes a
+/// pseudo-element's reset at the pseudo's own place in the layout tree, and
+/// pops it again on the way out when an enclosing instance remains.
 fn generated_box(
     doc: &Document,
     node: NodeId,
@@ -1626,8 +1679,11 @@ fn generated_box(
     {
         return generated.content.is_some().then_some(generated);
     }
-    step_counters(&generated, counters, depth);
+    step_counters(&generated, counters, depth + 1);
     let generated = compute(doc, node, parent_style, rules, counters, Some(which));
+    // After the content is resolved, not before: the pseudo's own `content`
+    // reads the counter it just set, which is §12.4's whole example.
+    counters.leave_generated(&generated, depth + 1);
     generated.content.is_some().then_some(generated)
 }
 
@@ -4395,5 +4451,139 @@ mod tests {
             "p",
         );
         assert_eq!(zero.outline.used_width(16.0), 0.0);
+    }
+
+    /// What a `.probe` element's `::before` prints, for the counter-scope
+    /// probes below.
+    fn probe(html: &str, css: &str) -> Option<String> {
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[Stylesheet::parse(css)]);
+        let node = (0..doc.len()).map(NodeId).find(|id| {
+            doc.element(*id)
+                .is_some_and(|element| element.classes().any(|c| c == "probe"))
+        })?;
+        map.pseudo(node, PseudoElement::Before)
+            .and_then(|style| style.content.clone())
+    }
+
+    /// The four probes #124 recorded against Chromium and could not reconcile.
+    ///
+    /// They are one model, and it is Blink's: a pseudo-element's counter
+    /// operations happen at the pseudo's own place in the tree — it is the
+    /// first child of its originating element, not a sibling of it — and on
+    /// leaving a box that reset a counter, the reset is dropped again if an
+    /// enclosing instance remains, because that one would always be inherited
+    /// first anyway.
+    #[test]
+    fn a_pseudo_elements_reset_is_in_scope_for_its_elements_content() {
+        assert_eq!(
+            probe(
+                "<div id=\"a\"><span class=\"probe\"></span></div>",
+                "#a::before { counter-reset: c 7; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("7"),
+            "the element's content is what follows the ::before box",
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_reset_does_not_reach_its_elements_siblings() {
+        // Unlike an element's own reset, which does. The pseudo's box is one
+        // level deeper, so the element's siblings are not its siblings — this
+        // is what running the operations at the element's depth got wrong.
+        assert_eq!(
+            probe(
+                "<div id=\"a\"></div><span class=\"probe\"></span>",
+                "#a::before { counter-reset: c 7; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("0"),
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_reset_gives_way_to_its_elements_own() {
+        // The case `counters-root-000` is built on, and the one that made this
+        // engine print `19998.8` where the reference says `4.8`. The pseudo's
+        // instance is dropped on the way out because the element's own is
+        // underneath it and would be inherited first regardless.
+        assert_eq!(
+            probe(
+                "<div id=\"a\"><span class=\"probe\"></span></div>",
+                "#a { counter-reset: c 4 } \
+                 #a::before { counter-reset: c 9999; counter-increment: c 1; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("4"),
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_increment_acts_on_the_instance_it_found() {
+        // And is visible afterwards, precisely because it never made an
+        // instance of its own for the rule above to drop.
+        assert_eq!(
+            probe(
+                "<div id=\"b\"><span class=\"probe\"></span></div>",
+                "#b { counter-reset: c 4 } \
+                 #b::before { counter-increment: c 1; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("5"),
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_reset_still_nests_for_counters() {
+        // The reading twenty-two `content-0NN` tests depend on: a
+        // `div::before` reset is still in scope for a `div div::before`
+        // inside it, and `counters()` prints both instances.
+        assert_eq!(
+            content_of(
+                "<div><div id=\"inner\">x</div></div>",
+                "div::before { counter-reset: n; content: counters(n, \".\") }",
+                "div",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("0"),
+        );
+        let doc = dom::parse("<div><div id=\"inner\">x</div></div>");
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "div::before { counter-reset: n; content: counters(n, \".\") }",
+            )],
+        );
+        let inner = (0..doc.len())
+            .map(NodeId)
+            .find(|id| doc.element(*id).is_some_and(|e| e.id() == Some("inner")))
+            .expect("the inner div");
+        assert_eq!(
+            map.pseudo(inner, PseudoElement::Before)
+                .and_then(|style| style.content.clone())
+                .as_deref(),
+            Some("0.0"),
+            "the outer pseudo's instance is still in scope for the inner one",
+        );
+    }
+
+    #[test]
+    fn an_elements_own_reset_still_reaches_its_following_siblings() {
+        // The half that must not change: §12.4.1 scopes an *element's* reset to
+        // the element, its following siblings, and their descendants.
+        assert_eq!(
+            probe(
+                "<div id=\"a\"></div><span class=\"probe\"></span>",
+                "#a { counter-reset: c 7 } .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("7"),
+        );
     }
 }
