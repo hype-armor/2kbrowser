@@ -62,6 +62,15 @@ pub trait Render {
     /// which never crosses the boundary.
     fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<layout::Rect>, String);
 
+    /// The page most recently rendered, as a screen reader would read it.
+    ///
+    /// Same reason as `find`: the semantic tree is the DOM plus the box tree,
+    /// and neither crosses the boundary. Asked for rather than produced with
+    /// every render, so a page costs nothing when nothing is listening — and,
+    /// more to the point, so the parsing surface ADR-0019 is mostly about is
+    /// not exercised at all in the common case.
+    fn accessibility(&mut self) -> crate::access::Tree;
+
     /// Paints a different band of the page most recently rendered.
     ///
     /// Never fetches: the document is already parsed and laid out, and a band
@@ -134,6 +143,10 @@ fn answer_until_the_parent_goes(
             ToChild::Find { query } => {
                 let rects = renderer.find(query);
                 write_frame(output, &ToParent::Matches { rects }.encode())?;
+            }
+            ToChild::Accessibility => {
+                let tree = renderer.accessibility();
+                write_frame(output, &ToParent::Accessible(Box::new(tree)).encode())?;
             }
             ToChild::Band { top, height } => {
                 let answer = match renderer.band(*top, *height) {
@@ -259,6 +272,10 @@ mod tests {
     }
 
     impl Render for Stub {
+        fn accessibility(&mut self) -> crate::access::Tree {
+            crate::access::Tree::default()
+        }
+
         fn render(
             &mut self,
             _: &ToChild,

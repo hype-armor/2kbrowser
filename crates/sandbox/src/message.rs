@@ -9,10 +9,20 @@
 //! because the document and the box tree stay on the far side of the boundary
 //! and are never sent. That is the point: the parent should not be parsing
 //! anything a stranger wrote.
+//!
+//! One message is no longer that shape, and it is worth saying so here rather
+//! than letting the sentence above quietly stop being true. ADR-0019 decided
+//! that the accessibility tree crosses as data, because the alternative is
+//! handing platform API handles to the sandboxed process. It is still not the
+//! document and still not the box tree — it is a flat list of roles, labels and
+//! rectangles, derived from both — but it is an arbitrary-depth structure with
+//! attacker-chosen text in it, which nothing else here is. [`crate::access`]
+//! holds it, and holds the four bounds that make it affordable.
 
 use layout::Rect;
 use net::{Origin, RequestKind, Scheme};
 
+use crate::access::Tree;
 use crate::wire::{Reader, WireError, Writer};
 
 /// How a page was rendered, as it crosses the boundary.
@@ -481,6 +491,18 @@ pub enum ToChild {
         /// Which of its options, in document order.
         index: u32,
     },
+    /// Asks for the page's accessibility tree (ADR-0019, #9).
+    ///
+    /// Asked rather than sent with every render, and that is a security
+    /// property as much as a saving: the tree is much the largest
+    /// attacker-chosen structure that crosses this boundary, so the parsing
+    /// surface it adds is not exercised at all until an assistive technology
+    /// has actually attached. A page costs nothing when nothing is using it.
+    ///
+    /// Answered from the page already held, like [`ToChild::Find`]. The
+    /// document and the box tree it is built from never cross, which is why
+    /// the only thing that can answer is the process holding them.
+    Accessibility,
 }
 
 impl ToChild {
@@ -527,6 +549,7 @@ impl ToChild {
                 writer.f32(at.0);
                 writer.f32(at.1);
             }
+            ToChild::Accessibility => writer.tag(9),
             ToChild::Choose { node, index } => {
                 writer.tag(8);
                 writer.u32(*node);
@@ -634,6 +657,7 @@ impl ToChild {
                 node: reader.u32()?,
                 index: reader.u32()?,
             },
+            9 => ToChild::Accessibility,
             4 => ToChild::Select {
                 from: (reader.f32()?, reader.f32()?),
                 to: (reader.f32()?, reader.f32()?),
@@ -680,6 +704,11 @@ pub enum ToParent {
         /// One rectangle per match, in document order.
         rects: Vec<Rect>,
     },
+    /// The page's accessibility tree (ADR-0019, #9).
+    ///
+    /// Boxed for the reason `Rendered` is: this is by far the largest variant,
+    /// and every other one would be as big as it in every message otherwise.
+    Accessible(Box<Tree>),
     /// What a [`ToChild::Select`] drag covers.
     Selected {
         /// One rectangle per line it touches, to draw the highlight with.
@@ -860,6 +889,10 @@ impl ToParent {
                     write_rect(&mut writer, rect);
                 }
             }
+            ToParent::Accessible(tree) => {
+                writer.tag(5);
+                tree.write(&mut writer);
+            }
             ToParent::Selected { rects, text } => {
                 writer.tag(4);
                 writer.u32(rects.len() as u32);
@@ -1035,6 +1068,7 @@ impl ToParent {
                     text: reader.str()?,
                 }
             }
+            5 => ToParent::Accessible(Box::new(Tree::read(&mut reader)?)),
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;
@@ -1248,8 +1282,12 @@ mod tests {
 
     #[test]
     fn an_unknown_tag_is_refused_rather_than_ignored() {
-        assert_eq!(ToChild::decode(&[9]), Err(WireError::Unknown));
-        assert_eq!(ToParent::decode(&[9]), Err(WireError::Unknown));
+        // Well past the tags either side uses, and deliberately not "one more
+        // than the last one": this test used tag 9 until #9's accessibility
+        // request became tag 9, at which point it was asserting that a message
+        // the wire knows is a message the wire does not.
+        assert_eq!(ToChild::decode(&[200]), Err(WireError::Unknown));
+        assert_eq!(ToParent::decode(&[200]), Err(WireError::Unknown));
         assert_eq!(ToParent::decode(&[]), Err(WireError::Truncated));
     }
 
@@ -1317,5 +1355,56 @@ mod tests {
             ToParent::decode(&writer.finish()),
             Err(WireError::BadLength)
         );
+    }
+
+    fn box_() -> Rect {
+        Rect {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+        }
+    }
+
+    #[test]
+    fn an_accessibility_request_and_its_answer_survive_the_wire() {
+        assert_eq!(
+            ToChild::decode(&ToChild::Accessibility.encode()),
+            Ok(ToChild::Accessibility),
+        );
+        let tree = crate::access::Tree {
+            nodes: vec![
+                crate::access::Node {
+                    name: "A page".to_owned(),
+                    children: 1,
+                    ..crate::access::Node::new(crate::access::Role::Document, box_())
+                },
+                crate::access::Node {
+                    name: "Next".to_owned(),
+                    value: Some("/next".to_owned()),
+                    ..crate::access::Node::new(crate::access::Role::Link, box_())
+                },
+            ],
+            focus: Some(1),
+        };
+        let message = ToParent::Accessible(Box::new(tree));
+        assert_eq!(ToParent::decode(&message.encode()), Ok(message));
+    }
+
+    #[test]
+    fn an_accessibility_frame_that_breaks_a_bound_is_refused() {
+        // The bounds are enforced where the bytes are read, not somewhere the
+        // caller has to remember to look — so this is the same `decode` every
+        // other message goes through, answering `Err` rather than handing back
+        // a tree with a hole in it.
+        let tree = crate::access::Tree {
+            nodes: vec![crate::access::Node {
+                name: "a".repeat(crate::access::MAX_STRING + 1),
+                ..crate::access::Node::new(crate::access::Role::Text, box_())
+            }],
+            focus: None,
+        };
+        let frame = ToParent::Accessible(Box::new(tree)).encode();
+        assert_eq!(ToParent::decode(&frame), Err(WireError::BadLength));
     }
 }
