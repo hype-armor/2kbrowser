@@ -57,6 +57,27 @@
   .mixed::after  { content: " Z"; color: #cc6600; }
   .mixed p { margin: 2px 0; }
 
+  /* A block-level generated box is a block child, not part of the line (#135).
+     The clearfix is the reason this matters: as an inline run its `clear`
+     applies to nothing at all, because a run is not a box that can clear.
+
+     The first group has no clearfix and so is one line tall with its float
+     hanging out of the bottom; the second is as tall as its float. Layout gets
+     the pair right — the second group's float sits beside the first's overhang
+     rather than under it, which is what an overhanging float in a shared
+     formatting context should do. What is wrong in the picture is paint order:
+     the second group's background covers the first's overhang, where Appendix
+     E puts floats (layer 4) above in-flow block backgrounds (layer 3). Filed
+     as #165; this fixture pins the behaviour so that fixing it shows
+     up here. */
+  .clearfix::after { content: ""; display: block; clear: both; }
+  .group { background: #eef3ff; border: 1px solid #99aadd; }
+  .group .side { float: left; width: 70px; height: 40px; background: #ffcc00; }
+  .blocked::before { content: "a block before"; display: block; color: #cc6600;
+                     background: #ffeedd; }
+  .blocked::after  { content: "a block after";  display: block; color: #cc6600;
+                     background: #ddffee; }
+
   /* A pseudo-element inherits, but does not take its originator's own rules. */
   .inherit { color: #006666; }
   .inherit::before { content: "inherits the colour "; }
@@ -89,6 +110,11 @@
 
 <h3>Mixed content: the brackets go outside, once</h3>
 <div class="mixed">first<p>a block in the middle</p>last</div>
+
+<h3>A block-level generated box is a block child</h3>
+<p class="blocked">between two blocks of its own</p>
+<div class="group"><div class="side"></div>without the clearfix the box stops here</div>
+<div class="group clearfix"><div class="side"></div>with it, the box encloses the float</div>
 
 <h3>Inheritance</h3>
 <p class="inherit">and the rest</p>
