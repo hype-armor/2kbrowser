@@ -140,10 +140,10 @@ pub const MAX_CONCURRENT_FETCHES: usize = 6;
 /// collapses repeats before they leave, since it knows which images a page
 /// names; this is about the renderer we might be sent, which is the one the
 /// boundary exists for.
-fn still_wanted<'a>(urls: &'a [String], allowed: &[bool], held: &Fetched) -> Vec<&'a str> {
+fn still_wanted<'a>(urls: &'a [String], allowed: &[bool], held: &[String]) -> Vec<&'a str> {
     let mut out: Vec<&str> = Vec::new();
     for (url, allowed) in urls.iter().zip(allowed) {
-        if *allowed && held.get(url).is_none() && !out.contains(&url.as_str()) {
+        if *allowed && !held.contains(url) && !out.contains(&url.as_str()) {
             out.push(url);
         }
     }
@@ -160,14 +160,21 @@ fn supplied(
     url: &str,
     document: Option<&Origin>,
     kind: RequestKind,
-) -> Supplied {
+) -> (Supplied, bool) {
     match fetcher.fetch_raw(url, document, kind) {
-        Ok(fetched) => Supplied {
-            body: fetched.body,
-            content_type: fetched.content_type,
-            ok: true,
-        },
-        Err(_) => Supplied::default(),
+        Ok(fetched) => (
+            Supplied {
+                body: fetched.body,
+                content_type: fetched.content_type,
+                ok: true,
+            },
+            fetched.storable,
+        ),
+        // A failure is remembered but never *stored* across pages. Within a
+        // page it stops a broken image being retried on every re-render; across
+        // them it would turn one bad minute on somebody's network into a page
+        // that stays broken for the rest of the run.
+        Err(_) => (Supplied::default(), false),
     }
 }
 
@@ -189,6 +196,11 @@ pub struct Renderer {
     /// machine will not accept, a policy that forbids it — and that is not
     /// discoverable until the first page.
     launch_failure: std::sync::OnceLock<String>,
+    /// Subresources kept across this run's pages (ADR-0018).
+    ///
+    /// Here rather than on the session because a session is one page: the whole
+    /// point is to outlive one.
+    cache: std::sync::Arc<std::sync::Mutex<Cache>>,
 }
 
 impl Renderer {
@@ -239,7 +251,23 @@ impl Renderer {
             confinement,
             failure,
             launch_failure: std::sync::OnceLock::new(),
+            cache: std::sync::Arc::default(),
         }
+    }
+
+    /// Forgets everything the cache holds for `site` (ADR-0018).
+    ///
+    /// What the reload control means. A reload that served the same cached
+    /// bytes back would leave the one control a reader has over staleness doing
+    /// nothing — and a stale page they cannot refresh is a page they have to
+    /// restart the browser to see.
+    ///
+    /// Only that site, because reloading one page says nothing about any other.
+    pub fn forget(&self, site: Option<&Origin>) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .forget(site);
     }
 
     /// What confines the renderers this spawns.
@@ -350,7 +378,12 @@ impl Renderer {
         force_document: bool,
         zoom: f32,
     ) -> Result<(Session, Rendered), Error> {
-        let mut session = Session::new(self.spawn()?, self.fetcher.clone(), self.timeout)?;
+        let mut session = Session::new(
+            self.spawn()?,
+            self.fetcher.clone(),
+            self.timeout,
+            std::sync::Arc::clone(&self.cache),
+        )?;
         let page = session.render(
             body,
             content_type,
@@ -541,7 +574,12 @@ pub struct Session {
 
 impl Session {
     /// Starts the worker for a freshly spawned child.
-    fn new(child: Spawned, fetcher: Fetcher, timeout: Duration) -> Result<Self, Error> {
+    fn new(
+        child: Spawned,
+        fetcher: Fetcher,
+        timeout: Duration,
+        cache: std::sync::Arc<std::sync::Mutex<Cache>>,
+    ) -> Result<Self, Error> {
         let child_id = child.id();
         let (jobs, work) = std::sync::mpsc::channel::<Job>();
         let (replies, answers) = std::sync::mpsc::channel::<Answer>();
@@ -556,7 +594,7 @@ impl Session {
                 let mut conversation = Conversation {
                     child,
                     fetcher,
-                    fetched: Fetched::default(),
+                    fetched: cache,
                     timeout,
                     document: None,
                     withheld: recorded,
@@ -837,64 +875,150 @@ impl Drop for Session {
     }
 }
 
-/// Most a page may keep fetched subresources for, in bytes.
+/// Most the cache may hold, in bytes.
 ///
 /// The era fixture peaks at around 27 MB across both processes against the
 /// budget harness's limit of 100, so this is sized to be a comfortable fraction
-/// of the room left rather than to hold everything: a page whose subresources
-/// exceed it goes on fetching, which is slow, where a page that could exhaust
-/// memory would be worse than slow.
+/// of the room left rather than to hold everything. It is the same number the
+/// per-page cache used, now spent once for the run instead of once per page —
+/// which is a smaller total, not a larger one.
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
-/// What has already been fetched for the page this conversation is holding.
+/// What a document is allowed to be served from the cache (ADR-0018).
 ///
-/// One page's worth, on the worker thread that does the fetching, dropped with
-/// the session — the same rule the child process follows, and for the same
-/// reason: a page's leftovers must not outlive the page.
+/// The pair, and not the URL alone. ADR-0006 already refuses third-party
+/// subresources by default, and ADR-0003 removes every way a page could time a
+/// load and report the answer — which is why this browser does not need cache
+/// partitioning for the reason Chrome and Firefox did. What it does need it for
+/// is ADR-0006's own exception: a host a reader has allowed becomes reachable
+/// from more than one site, and a cache keyed on the URL alone would make it a
+/// cross-site identifier — the exact shape the third-party rule exists to
+/// remove, rebuilt by consent.
 ///
-/// That scope is deliberately narrow. It makes re-rendering cheap, which is
-/// what a resize is and what most of the cost of one was, and it makes a page
-/// that uses the same spacer image forty times fetch it once. It does nothing
-/// for navigating back to a page you were just on.
-///
-/// That wants a cache which outlives a page, and the terms it would have to
-/// meet are now settled rather than open: ADR-0018 decides them — keyed on the
-/// pair of document site and full URL, consulted only behind the policy check,
-/// carrying `trust` with each entry, honouring `no-store` and `Pragma:
-/// no-cache`, bypassed by reload, and evicting least-recently-used against a
-/// byte cap. It *replaces* this rather than sitting beside it, so that one
-/// store holds the bytes rather than two.
-#[derive(Debug, Default)]
-struct Fetched {
-    /// Answers ready to send, by URL.
-    answers: std::collections::HashMap<String, Supplied>,
-    /// How many bytes of body they hold between them.
-    bytes: usize,
+/// The scheme stays in the URL half because `Origin::is_same_site` compares
+/// *host only*: `http://example.com` and `https://example.com` are one site to
+/// the policy. Normalising the scheme out of the key would let somebody on
+/// plain HTTP poison an entry a secure page then reads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Key {
+    /// The host of the document that asked. Empty for a document with no
+    /// origin, which cannot share with a named one because the strings differ.
+    site: String,
+    /// The full URL, scheme included.
+    url: String,
 }
 
-impl Fetched {
-    fn get(&self, url: &str) -> Option<Supplied> {
-        self.answers.get(url).cloned()
+/// One cached answer, and what it costs.
+#[derive(Debug, Clone)]
+struct Entry {
+    answer: Supplied,
+    /// Bytes of body, counted once so eviction does not re-measure.
+    bytes: usize,
+    /// The clock reading when this was last served, for eviction.
+    used: u64,
+}
+
+/// Subresources kept across the pages of one run (ADR-0018).
+///
+/// This is the single exception to a rule this codebase states repeatedly — *a
+/// page's leftovers never outlive the page* — and it is written down in
+/// ADR-0018 rather than discovered here. The child process is still torn down
+/// between pages; this is the parent's store, and it lives on `Renderer`, which
+/// outlives the `Conversation` that consults it.
+///
+/// In memory, for one run. On disk is a persistent record of what a person has
+/// read, against a README that says bookmarks are the only state this browser
+/// keeps between runs. That is a separate and much larger decision, and this
+/// does not license it.
+#[derive(Debug, Default)]
+pub struct Cache {
+    entries: std::collections::HashMap<Key, Entry>,
+    /// How many bytes of body they hold between them.
+    bytes: usize,
+    /// Ticks once per access, so the least recently used is the smallest.
+    clock: u64,
+}
+
+impl Cache {
+    fn key(site: Option<&Origin>, url: &str) -> Key {
+        Key {
+            site: site.map(|origin| origin.host.clone()).unwrap_or_default(),
+            url: url.to_owned(),
+        }
     }
 
-    /// Remembers an answer, if there is room.
+    /// The answer held for `url` on behalf of a document from `site`.
     ///
-    /// Full means stop rather than evict. Within one page's lifetime there is
-    /// no access pattern worth modelling and an eviction policy would be
-    /// machinery in service of a guess; stopping is predictable, and what it
-    /// costs is the speed this exists for rather than correctness.
-    fn put(&mut self, url: &str, answer: &Supplied) {
-        let size = answer.body.len();
-        if self.bytes.saturating_add(size) > MAX_CACHE_BYTES {
+    /// Never call this before the policy has been applied to `url`. Per page,
+    /// getting that ordering wrong cost one page; across pages it would be any
+    /// page served anything any earlier page fetched.
+    fn get(&mut self, site: Option<&Origin>, url: &str) -> Option<Supplied> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.get_mut(&Self::key(site, url))?;
+        entry.used = clock;
+        Some(entry.answer.clone())
+    }
+
+    /// Remembers an answer, evicting the least recently used to make room.
+    ///
+    /// A policy rather than stop-when-full, which was fine for one page's
+    /// lifetime and is not fine for something that outlives pages: a store that
+    /// fills once and then never changes stops being a cache of what is being
+    /// read and becomes a cache of whatever was read first.
+    fn put(&mut self, site: Option<&Origin>, url: &str, answer: &Supplied, storable: bool) {
+        if !storable {
             return;
         }
-        if self
-            .answers
-            .insert(url.to_owned(), answer.clone())
-            .is_none()
-        {
-            self.bytes += size;
+        let size = answer.body.len();
+        if size > MAX_CACHE_BYTES {
+            return;
         }
+        self.clock += 1;
+        let key = Self::key(site, url);
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes -= previous.bytes;
+        }
+        while self.bytes + size > MAX_CACHE_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.bytes -= evicted.bytes;
+            }
+        }
+        self.bytes += size;
+        self.entries.insert(
+            key,
+            Entry {
+                answer: answer.clone(),
+                bytes: size,
+                used: self.clock,
+            },
+        );
+    }
+
+    /// Forgets everything a given site was served.
+    ///
+    /// What reload means. Without it the one control a reader has over
+    /// staleness does nothing, which is worse than having no cache: a stale
+    /// page they cannot refresh is a page they have to restart the browser to
+    /// see. Only that site's entries, because reloading one page is not a
+    /// statement about any other.
+    pub fn forget(&mut self, site: Option<&Origin>) {
+        let site = site.map(|origin| origin.host.clone()).unwrap_or_default();
+        self.entries.retain(|key, entry| {
+            let keep = key.site != site;
+            if !keep {
+                self.bytes -= entry.bytes;
+            }
+            keep
+        });
     }
 }
 
@@ -902,8 +1026,12 @@ impl Fetched {
 struct Conversation {
     child: Spawned,
     fetcher: Fetcher,
-    /// Subresources already fetched for this page.
-    fetched: Fetched,
+    /// Subresources fetched for the pages of this run (ADR-0018).
+    ///
+    /// Shared with the `Renderer`, which outlives this conversation: the store
+    /// is what makes going back to a page you were just on cheap, and one that
+    /// died with the session could not.
+    fetched: std::sync::Arc<std::sync::Mutex<Cache>>,
     timeout: Duration,
     /// The origin the parent asked for a render of.
     ///
@@ -1085,7 +1213,19 @@ impl Conversation {
             })
             .collect();
 
-        let wanted = still_wanted(urls, &allowed, &self.fetched);
+        // The lock is taken to look up, released, the fetches made, and taken
+        // again to insert. Two concurrent misses on the same URL do the work
+        // twice, which is waste rather than error — where holding it across a
+        // fetch would serialise the concurrency below and cost the page the
+        // very thing that concurrency exists to give it.
+        let held: Vec<String> = {
+            let mut cache = self.fetched.lock().unwrap_or_else(|held| held.into_inner());
+            urls.iter()
+                .filter(|url| cache.get(self.document.as_ref(), url).is_some())
+                .cloned()
+                .collect()
+        };
+        let wanted = still_wanted(urls, &allowed, &held);
 
         // The concurrency this whole change exists for. A page waited for the
         // sum of its subresources' latencies rather than the longest of them,
@@ -1098,9 +1238,9 @@ impl Conversation {
         // would be a denial of service wearing a page's clothes.
         let fetcher = &self.fetcher;
         let document = self.document.as_ref();
-        let mut fresh: Vec<(String, Supplied)> = Vec::new();
+        let mut fresh: Vec<(String, (Supplied, bool))> = Vec::new();
         for chunk in wanted.chunks(MAX_CONCURRENT_FETCHES) {
-            let done: Vec<Supplied> = std::thread::scope(|scope| {
+            let done: Vec<(Supplied, bool)> = std::thread::scope(|scope| {
                 let handles: Vec<_> = chunk
                     .iter()
                     .map(|url| scope.spawn(move || supplied(fetcher, url, document, kind)))
@@ -1116,12 +1256,9 @@ impl Conversation {
             fresh.extend(chunk.iter().map(|url| (*url).to_owned()).zip(done));
         }
 
-        // Failures are remembered too. A page with a broken image would
-        // otherwise retry it on every re-render — the case the cache exists to
-        // make cheap — and a resize that quietly started succeeding would
-        // change what a page looks like halfway through reading it.
-        for (url, answer) in &fresh {
-            self.fetched.put(url, answer);
+        let mut cache = self.fetched.lock().unwrap_or_else(|held| held.into_inner());
+        for (url, (answer, storable)) in &fresh {
+            cache.put(self.document.as_ref(), url, answer, *storable);
         }
 
         let resources = urls
@@ -1131,14 +1268,16 @@ impl Conversation {
                 if !allowed {
                     return Supplied::default();
                 }
-                self.fetched
-                    .get(url)
-                    .or_else(|| {
-                        fresh
-                            .iter()
-                            .find(|(fetched, _)| fetched == url)
-                            .map(|(_, answer)| answer.clone())
-                    })
+                // What was just fetched first, because a response the server
+                // said not to store is in `fresh` and will never be in the
+                // cache — and this page asked for it and must still be given
+                // it. Only keeping it out of the *next* page is what `no-store`
+                // means here.
+                fresh
+                    .iter()
+                    .find(|(fetched, _)| fetched == url)
+                    .map(|(_, (answer, _))| answer.clone())
+                    .or_else(|| cache.get(self.document.as_ref(), url))
                     .unwrap_or_default()
             })
             .collect();
@@ -1210,21 +1349,18 @@ mod tests {
         // once the whole batch is done, so duplicates inside one would all miss
         // together and all go out together: a page turning one request into a
         // hundred against somebody else's server.
-        let held = Fetched::default();
         let urls: Vec<String> = ["a", "b", "a", "a", "b"]
             .iter()
             .map(|name| format!("https://example.com/{name}"))
             .collect();
         assert_eq!(
-            still_wanted(&urls, &[true; 5], &held),
+            still_wanted(&urls, &[true; 5], &[]),
             vec!["https://example.com/a", "https://example.com/b"]
         );
     }
 
     #[test]
     fn nothing_refused_or_already_held_is_fetched_again() {
-        let mut held = Fetched::default();
-        held.put("https://example.com/held", &resource(4));
         let urls: Vec<String> = [
             "https://example.com/held",
             "https://example.com/refused",
@@ -1234,34 +1370,126 @@ mod tests {
         .map(|url| (*url).to_owned())
         .collect();
         assert_eq!(
-            still_wanted(&urls, &[true, false, true], &held),
+            still_wanted(
+                &urls,
+                &[true, false, true],
+                &["https://example.com/held".to_owned()],
+            ),
             vec!["https://example.com/wanted"],
             "something already held, or refused by the policy, was fetched anyway"
         );
     }
 
-    #[test]
-    fn what_a_page_has_fetched_is_bounded() {
-        // The cache is filled by whatever the page asks for, and a page is a
-        // stranger's. Without a ceiling, a document referencing enough large
-        // resources would have the *parent* hold all of them — the process that
-        // is supposed to be the trustworthy one, and the one the memory budget
-        // is measured against.
-        let mut fetched = Fetched::default();
-        let half = MAX_CACHE_BYTES / 2 + 1;
-        fetched.put("https://example.com/a", &resource(half));
-        fetched.put("https://example.com/b", &resource(half));
+    fn site(host: &str) -> Origin {
+        Origin {
+            scheme: net::Scheme::Https,
+            host: host.to_owned(),
+            port: 443,
+        }
+    }
 
-        assert!(fetched.get("https://example.com/a").is_some());
+    #[test]
+    fn what_the_cache_holds_is_bounded() {
+        // It is filled by whatever pages ask for, and a page is a stranger's.
+        // Without a ceiling, documents referencing enough large resources would
+        // have the *parent* hold all of them — the process that is supposed to
+        // be the trustworthy one, and the one the memory budget is measured
+        // against.
+        let mut cache = Cache::default();
+        let a = site("example.com");
+        let half = MAX_CACHE_BYTES / 2 + 1;
+        cache.put(Some(&a), "https://example.com/a", &resource(half), true);
+        cache.put(Some(&a), "https://example.com/b", &resource(half), true);
+
         assert!(
-            fetched.get("https://example.com/b").is_none(),
-            "the second one did not fit and should not have been kept"
-        );
-        assert!(
-            fetched.bytes <= MAX_CACHE_BYTES,
+            cache.bytes <= MAX_CACHE_BYTES,
             "{} bytes held against a limit of {MAX_CACHE_BYTES}",
-            fetched.bytes
+            cache.bytes
         );
+    }
+
+    #[test]
+    fn the_least_recently_used_entry_is_the_one_evicted() {
+        // Not the first one in. A store that fills once and then never changes
+        // stops being a cache of what is being read and becomes a cache of
+        // whatever was read first, which is what stop-when-full gave — fine for
+        // one page's lifetime, not for something that outlives pages.
+        let mut cache = Cache::default();
+        let a = site("example.com");
+        let third = MAX_CACHE_BYTES / 3 + 1;
+        cache.put(Some(&a), "https://example.com/1", &resource(third), true);
+        cache.put(Some(&a), "https://example.com/2", &resource(third), true);
+        // Touching the first makes the second the oldest.
+        assert!(cache.get(Some(&a), "https://example.com/1").is_some());
+        cache.put(Some(&a), "https://example.com/3", &resource(third), true);
+
+        assert!(
+            cache.get(Some(&a), "https://example.com/1").is_some(),
+            "the one that was used again was thrown away",
+        );
+        assert!(
+            cache.get(Some(&a), "https://example.com/2").is_none(),
+            "the oldest survived and something else went instead",
+        );
+    }
+
+    #[test]
+    fn one_site_is_not_served_what_another_fetched() {
+        // ADR-0018's second term. ADR-0006's per-site exception lets a reader
+        // allow a host, which makes it reachable from more than one site — and
+        // a cache keyed on the URL alone would then be a cross-site identifier,
+        // the exact shape the third-party rule exists to remove.
+        let mut cache = Cache::default();
+        let url = "https://cdn.example.net/spacer.gif";
+        cache.put(Some(&site("one.example")), url, &resource(16), true);
+
+        assert!(cache.get(Some(&site("one.example")), url).is_some());
+        assert!(
+            cache.get(Some(&site("two.example")), url).is_none(),
+            "a second site was served the first site's bytes",
+        );
+    }
+
+    #[test]
+    fn the_scheme_stays_in_the_key() {
+        // `Origin::is_same_site` compares host only, so `http://example.com`
+        // and `https://example.com` are one site to the policy. If the scheme
+        // were normalised out of the URL half as well, somebody on plain HTTP
+        // could poison an entry a secure page then reads.
+        let mut cache = Cache::default();
+        let a = site("example.com");
+        cache.put(Some(&a), "http://example.com/x", &resource(16), true);
+
+        assert!(cache.get(Some(&a), "http://example.com/x").is_some());
+        assert!(
+            cache.get(Some(&a), "https://example.com/x").is_none(),
+            "the secure page was served the insecure entry",
+        );
+    }
+
+    #[test]
+    fn a_response_that_says_no_store_is_not_kept() {
+        let mut cache = Cache::default();
+        let a = site("example.com");
+        cache.put(Some(&a), "https://example.com/secret", &resource(16), false);
+        assert!(cache.get(Some(&a), "https://example.com/secret").is_none());
+    }
+
+    #[test]
+    fn reload_forgets_that_site_and_leaves_the_others() {
+        let mut cache = Cache::default();
+        let (one, two) = (site("one.example"), site("two.example"));
+        cache.put(Some(&one), "https://one.example/a", &resource(16), true);
+        cache.put(Some(&two), "https://two.example/a", &resource(16), true);
+
+        cache.forget(Some(&one));
+
+        assert!(cache.get(Some(&one), "https://one.example/a").is_none());
+        assert!(
+            cache.get(Some(&two), "https://two.example/a").is_some(),
+            "reloading one page threw away another site's bytes",
+        );
+        assert_eq!(cache.bytes, 16, "the byte count did not follow the entries");
     }
 
     #[test]
@@ -1269,12 +1497,61 @@ mod tests {
         // A page that asks for the same sheet forty times is the case this
         // exists for. Counting each answer again would have the cache believe
         // it was full long before it was.
-        let mut fetched = Fetched::default();
+        let mut cache = Cache::default();
+        let a = site("example.com");
         for _ in 0..40 {
-            fetched.put("https://example.com/spacer.gif", &resource(1024));
+            cache.put(
+                Some(&a),
+                "https://example.com/spacer.gif",
+                &resource(1024),
+                true,
+            );
         }
-        assert_eq!(fetched.bytes, 1024);
-        assert!(fetched.get("https://example.com/spacer.gif").is_some());
+        assert_eq!(cache.bytes, 1024);
+        assert!(
+            cache
+                .get(Some(&a), "https://example.com/spacer.gif")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_cache_is_behind_the_policy_and_not_in_front_of_it() {
+        // ADR-0018's third term, as a property of the pair rather than of the
+        // call order in `fetch_all`. A `file:` resource one document read must
+        // never reach a second, and the two rules that stop it are independent:
+        // the policy refuses the request outright, *and* the key does not match
+        // because the sites differ.
+        //
+        // The second document differs in **scheme** as well as origin on
+        // purpose. `Origin::is_same_site` compares host only, so an origin-only
+        // test would pass while a `file:` leak went straight through.
+        let mut cache = Cache::default();
+        let local = Origin {
+            scheme: net::Scheme::File,
+            host: String::new(),
+            port: 0,
+        };
+        let url = "file:///home/reader/notes.txt";
+        cache.put(Some(&local), url, &resource(32), true);
+
+        assert!(
+            cache.get(Some(&site("example.com")), url).is_none(),
+            "a web page was served bytes a local document read",
+        );
+        let policy = net::Policy::default();
+        let (origin, _) = net::parse_url(url).expect("a file url");
+        assert!(
+            matches!(
+                policy.check(
+                    Some(&site("example.com")),
+                    &origin,
+                    RequestKind::Subresource
+                ),
+                Err(net::Refusal::LocalFile),
+            ),
+            "and the policy refuses it before the cache is even asked",
+        );
     }
 
     #[test]
