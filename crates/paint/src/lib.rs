@@ -473,11 +473,22 @@ fn paint_box(
     order.extend(
         box_.children
             .iter()
-            .filter(|child| !child.style.position.is_positioned())
+            .filter(|child| {
+                !child.style.position.is_positioned()
+                    && child.style.float == css::style::Float::None
+            })
             .map(|child| Stacked { box_: child, x, y }),
     );
     if context {
         lift_positioned(box_, x, y, &mut order);
+    }
+    // Floats are lifted by whichever box `lift_floats` would have stopped at:
+    // a stacking context, a positioned box, or a float. Each of those paints
+    // its own subtree as a unit, so each has to gather the floats inside it or
+    // they are gathered by nobody and painted by nobody.
+    if context || box_.style.position.is_positioned() || box_.style.float != css::style::Float::None
+    {
+        lift_floats(box_, x, y, &mut order);
     }
     order.sort_by_key(|stacked| {
         let positioned = stacked.box_.style.position.is_positioned();
@@ -489,7 +500,17 @@ fn paint_box(
         } else {
             0
         };
-        (z, positioned)
+        // Appendix E's layers 3, 4 and 6, in that order: in-flow block boxes,
+        // then non-positioned floats, then positioned boxes. A float above the
+        // block boxes is what #165 is: a float that overhangs the bottom of its
+        // container was painted with that container and then covered by the
+        // next sibling's background.
+        let layer = match () {
+            () if positioned => 2,
+            () if stacked.box_.style.float != css::style::Float::None => 1,
+            () => 0,
+        };
+        (z, layer)
     });
     for stacked in order {
         let child = stacked.box_;
@@ -564,6 +585,40 @@ fn lift_positioned<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<Stacke
         }
         if !forms_a_stacking_context(child) {
             lift_positioned(child, x + child.rect.x, y + child.rect.y, out);
+        }
+    }
+}
+
+/// Collects the floats inside `box_` that belong to an ancestor's stacking
+/// context, in tree order.
+///
+/// The twin of [`lift_positioned`], and for the same reason one level down.
+/// Appendix E paints floats as their own layer of the stacking context — above
+/// in-flow block backgrounds, below positioned boxes — rather than with
+/// whichever box happens to contain them. Painting one in place is invisible
+/// while it fits inside its container and wrong the moment it does not: since
+/// #41 a container is as tall as its in-flow content and no taller, so a float
+/// routinely hangs out of the bottom of one, and the next sibling's background
+/// then paints over the part that hangs out.
+///
+/// The walk stops at a box that forms a context, whose floats are its own, and
+/// at a positioned box: Appendix E paints a `z-index: auto` positioned box as
+/// though it started a context, so what floats inside it stays inside it.
+///
+/// It does not descend into a float either. A float establishes a block
+/// formatting context, so a float within one is contained by it and has nothing
+/// to hang out of.
+fn lift_floats<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<Stacked<'a>>) {
+    for child in &box_.children {
+        if child.style.position.is_positioned() {
+            continue;
+        }
+        if child.style.float != css::style::Float::None {
+            out.push(Stacked { box_: child, x, y });
+            continue;
+        }
+        if !forms_a_stacking_context(child) {
+            lift_floats(child, x + child.rect.x, y + child.rect.y, out);
         }
     }
 }
@@ -3577,6 +3632,66 @@ mod stacking_context_tests {
             (Some(a), Some(b)) => a < b,
             _ => false,
         }
+    }
+
+    #[test]
+    fn a_float_paints_over_a_later_siblings_background() {
+        // #165, and Appendix E: floats are layer 4 and in-flow block
+        // backgrounds are layer 3. Since #41 a container is as tall as its
+        // in-flow content and no taller, so a float routinely hangs out of the
+        // bottom of one — and painting it with its container put it under
+        // whatever came next.
+        let order = painted(
+            "<body><div class=a><span class=f></span></div><div class=b></div></body>",
+            "body { margin: 0 }
+             .a { height: 10px }
+             .f { float: left; width: 50px; height: 60px; background: green }
+             .b { height: 60px; background: red }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the float went under the next block's background: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_float_inside_a_float_is_still_painted() {
+        // The float lift stops at a float, because a float establishes a block
+        // formatting context and contains its own. Stopping there without
+        // having that float gather them is how they stop being painted at all
+        // — 27 of the `margin-padding-clear` tests, which are built out of
+        // exactly this shape.
+        let order = painted(
+            "<body><div class=outer><div class=inner></div></div></body>",
+            "body { margin: 0 }
+             .outer { float: left; width: 80px; height: 80px; background: red }
+             .inner { float: left; width: 40px; height: 40px; background: green }",
+        );
+        assert!(
+            order.contains(&GREEN),
+            "the nested float vanished: {order:?}"
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "and it belongs over its container: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_float_still_paints_under_a_positioned_box() {
+        // Layer 4 is below layer 6. Lifting floats must not lift them past the
+        // positioned boxes that were already being lifted.
+        let order = painted(
+            "<body><span class=f></span><div class=p></div></body>",
+            "body { margin: 0 }
+             .f { float: left; width: 50px; height: 50px; background: red }
+             .p { position: absolute; top: 0; left: 0;
+                  width: 50px; height: 50px; background: green }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "a float painted over a positioned box: {order:?}",
+        );
     }
 
     #[test]
