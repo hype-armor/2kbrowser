@@ -2337,7 +2337,48 @@ fn subtree_widths(
         max = widest.1;
     }
 
-    for &child in content.unwrap_or_else(|| doc.children(node)) {
+    // §17.2.1's anonymous tables, worked out over the children being measured
+    // exactly as `layout_block` works them out over the ones it lays out. A run
+    // of orphan table-internal boxes is one table, and the box that starts the
+    // run stands it up; the rest are inside it and are not children here at all.
+    let children = content.unwrap_or_else(|| doc.children(node));
+    let steps = walk_order(doc, styles, children, true);
+    let anonymous = anonymous_tables(doc, styles, node, &steps);
+    let inside_anonymous: std::collections::HashSet<NodeId> = anonymous
+        .iter()
+        .flat_map(|(first, run)| run.iter().copied().filter(move |box_| box_ != first))
+        .collect();
+
+    for &child in children {
+        // The run's first box is measured as the whole table it stands up, and
+        // the others were measured with it. Ahead of the style lookup because
+        // what matters is the run, not what the box would have been alone.
+        if let Some(run) = anonymous.get(&child) {
+            // Anonymous, so it inherits the inherited properties and takes the
+            // initial value for the rest — the same style `layout_block` gives
+            // the box it builds here.
+            let table_style = ComputedStyle {
+                display: Display::Table,
+                ..ComputedStyle::inherit_from(style)
+            };
+            let (run_min, run_max) = anonymous_table_widths(
+                doc,
+                styles,
+                fonts,
+                node,
+                run,
+                &table_style,
+                intrinsic,
+                available,
+                depth + 1,
+            );
+            min = min.max(run_min);
+            max = max.max(run_max);
+            continue;
+        }
+        if inside_anonymous.contains(&child) {
+            continue;
+        }
         let Some(child_style) = styles.get(child) else {
             continue;
         };
@@ -2345,10 +2386,24 @@ fn subtree_widths(
         // atomic, so its own content decides how wide it wants to be. Taking
         // the widest rather than the sum understates a row of them, which
         // costs a column too little width and never too much.
+        // A table-internal box under a real table is measured through that
+        // table's grid, so measuring it again here would count it twice. One
+        // that is *not* under a table has no grid to be measured through: it is
+        // an orphan, and since it is not part of a run either — those were
+        // handled above — §17.2.1 inferred nothing around it and it is laid out
+        // as ordinary content. Measuring it as ordinary content is then the only
+        // answer that matches, and skipping it cost a column its widest row.
+        //
+        // The row group in `table-anonymous-objects-089` is the shape: it holds
+        // text and no rows, so the run it was in yielded no table and was left
+        // alone, and the column it sits in came out narrower than the other two
+        // by exactly the width of the text nobody measured.
+        let orphan_internal =
+            child_style.display.is_table_internal() && !inside_a_table(doc, styles, child);
         if child_style.display == Display::None
             || (is_inline_child(doc, styles, child, child_style)
                 && child_style.display != Display::InlineBlock)
-            || child_style.display.is_table_internal()
+            || (child_style.display.is_table_internal() && !orphan_internal)
             || child_style.position.is_out_of_flow()
         {
             continue;
@@ -2412,6 +2467,76 @@ fn table_widths(
             &owned_grid
         }
     };
+    let (min, max) = grid_widths(
+        doc,
+        styles,
+        fonts,
+        grid,
+        collapsed.as_ref(),
+        style,
+        intrinsic,
+        available,
+        depth,
+    );
+    let caption = caption_floor(doc, styles, fonts, node, intrinsic, available, depth + 1);
+    (min.max(caption), max.max(caption))
+}
+
+/// The intrinsic widths of §17.2.1's anonymous table around a run of orphans.
+///
+/// The measuring half of the anonymous table `layout_block` stands up, and it
+/// exists because without it that table is measured as nothing at all: the
+/// child walk in `subtree_widths` skips every table-internal box, on the
+/// reasoning that a real table's rows are measured through its grid rather than
+/// as children. An orphan row has no grid to be measured through until one is
+/// inferred, so it was skipped and never measured — and a column sized from
+/// that came out zero wide, which is #167.
+///
+/// Built from the same `build_grid_of` over the same run that `layout_table` is
+/// given, and never collapsed, because `layout_block` hands its anonymous
+/// tables `None` for the collapsed borders. Measuring one way and laying out
+/// the other is the bug this function is the fix for, in miniature.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn anonymous_table_widths(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    holder: NodeId,
+    run: &[NodeId],
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available: f32,
+    depth: usize,
+) -> (f32, f32) {
+    let grid = table::build_grid_of(doc, styles, holder, run);
+    grid_widths(
+        doc, styles, fonts, &grid, None, style, intrinsic, available, depth,
+    )
+}
+
+/// Intrinsic widths of a built grid, summed across its columns.
+///
+/// Shared by a real table and an inferred one so that the two cannot drift:
+/// they differ in where the grid came from and in nothing else that a width
+/// depends on.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout context, threaded explicitly for clarity"
+)]
+fn grid_widths(
+    doc: &Document,
+    styles: &StyleMap,
+    fonts: &mut FontStore,
+    grid: &table::Grid,
+    collapsed: Option<&table::Collapsed>,
+    style: &ComputedStyle,
+    intrinsic: &IntrinsicSizes,
+    available: f32,
+    depth: usize,
+) -> (f32, f32) {
     if grid.columns == 0 {
         return (0.0, 0.0);
     }
@@ -2433,7 +2558,7 @@ fn table_widths(
     let rows = grid.rows.len();
     for (index, row) in grid.rows.iter().enumerate() {
         for cell in &row.cells {
-            let cell_style = match &collapsed {
+            let cell_style = match collapsed {
                 Some(collapsed) => table::with_reserved_borders(
                     &cell.style,
                     collapsed.reserved(
@@ -2478,7 +2603,7 @@ fn table_widths(
     // each outermost grid line and nothing else — the table has no padding
     // there (§17.6.2), and its declared border was already spent on the
     // conflict the grid lines resolved.
-    let surround = match &collapsed {
+    let surround = match collapsed {
         Some(collapsed) => collapsed.half_vertical(0) + collapsed.half_vertical(grid.columns),
         None => {
             spacing * (grid.columns + 1) as f32
@@ -2488,10 +2613,9 @@ fn table_widths(
                 + style.border.right.used_width(style.font_size)
         }
     };
-    let caption = caption_floor(doc, styles, fonts, node, intrinsic, available, depth + 1);
     (
-        (mins.iter().sum::<f32>() + surround).max(caption),
-        (maxes.iter().sum::<f32>() + surround).max(caption),
+        mins.iter().sum::<f32>() + surround,
+        maxes.iter().sum::<f32>() + surround,
     )
 }
 
@@ -9043,6 +9167,87 @@ mod tests {
             "side by side: {} then {}",
             cells[0].rect.x,
             cells[1].rect.x
+        );
+    }
+
+    #[test]
+    fn a_row_inside_an_anonymous_cell_is_measured_as_the_table_it_becomes() {
+        // #167. The third cell holds a `table-row`, which §17.2.1 wraps in an
+        // anonymous table of its own. `layout_block` built that table; the
+        // measuring walk skipped it, because it skips every table-internal box
+        // on the reasoning that a real table's rows are measured through its
+        // grid. An orphan row has no grid until one is inferred, so the column
+        // was sized from nothing at all and came out zero wide.
+        let rendered = run(
+            "<body><div>\
+             <span class=r>\
+             <span>Row 1, </span><span>Col 1</span>\
+             <span class=d>Row 1, Col 2</span>\
+             <span class=r>Row 1, Col 3</span>\
+             </span></div></body>",
+            "body { margin: 0 } .r { display: table-row } \
+             .d { display: table-cell } span { padding: 0 }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        // Three columns of the outer table, plus the one inside the inferred
+        // table that the third column holds.
+        assert_eq!(cells.len(), 4);
+        let third = cells[2].rect.width;
+        assert!(
+            third > 0.0,
+            "the column holding the inferred table was sized from nothing"
+        );
+        // The three columns hold the same text at the same size, so they are
+        // the same width. Being equal is the point: a column that is merely
+        // non-zero can still be too narrow to line up with its neighbours.
+        assert!(
+            (cells[0].rect.width - third).abs() < 0.5 && (cells[1].rect.width - third).abs() < 0.5,
+            "columns disagree: {} {} {}",
+            cells[0].rect.width,
+            cells[1].rect.width,
+            third
+        );
+    }
+
+    #[test]
+    fn an_orphan_row_group_that_infers_no_table_is_still_measured() {
+        // The other half of #167, and the one that decided
+        // `table-anonymous-objects-089`. A `table-row-group` holding text and no
+        // rows yields no grid, so §17.2.1 infers no table around it and it is
+        // laid out as ordinary content — while the measuring walk went on
+        // skipping it for being table-internal. The column lost its widest row
+        // and came out narrower than its neighbours by exactly that text.
+        let rendered = run(
+            "<body><div>\
+             <span class=r><span class=d>short</span></span>\
+             <span class=r><span class=g>a much longer piece of text</span></span>\
+             </div></body>",
+            "body { margin: 0 } .r { display: table-row } \
+             .d { display: table-cell } .g { display: table-row-group } \
+             span { padding: 0 }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 2, "one column, two rows");
+        assert!(
+            (cells[0].rect.width - cells[1].rect.width).abs() < 0.5,
+            "the two rows of one column disagree: {} {}",
+            cells[0].rect.width,
+            cells[1].rect.width
+        );
+        // And wide enough for the longer row, which is the text that was not
+        // being measured.
+        assert!(
+            cells[0].rect.width > 100.0,
+            "the column was sized without the row group's text: {}",
+            cells[0].rect.width
         );
     }
 
