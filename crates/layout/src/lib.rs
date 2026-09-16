@@ -5582,13 +5582,27 @@ fn collapse_across_runs(runs: &mut [InlineRun]) {
     // trimming the edge would trim nothing. Replaced runs are deliberately not
     // skipped — the space after a leading image is real text between two
     // things, not the block's own leading whitespace.
-    if let Some(first) = runs.iter_mut().find(|run| run.edge.is_none()) {
+    //
+    // A `white-space: pre` run holding spaces or tabs is not trimmed: they are
+    // content, and dropping them is what made `generated-content/content-175`'s
+    // stripe two spaces short of its reference (#126).
+    //
+    // One holding only line breaks still is. A `<br>` reaches here as a `pre`
+    // run of exactly "\n", and a break at the very start or end of a block has
+    // nothing to break — trimming it is why a trailing `<br>` does not add an
+    // empty line, and keeping it costs `floats/float-no-content-beside-001`.
+    let trimmable = |run: &&mut InlineRun| {
+        run.edge.is_none()
+            && (run.style.white_space != css::style::WhiteSpace::Pre
+                || !run.text.contains([' ', '\t']))
+    };
+    if let Some(first) = runs.iter_mut().find(trimmable) {
         first.text = first
             .text
             .trim_start_matches(text::is_collapsible_space)
             .to_owned();
     }
-    if let Some(last) = runs.iter_mut().rev().find(|run| run.edge.is_none()) {
+    if let Some(last) = runs.iter_mut().rev().find(trimmable) {
         last.text = last
             .text
             .trim_end_matches(text::is_collapsible_space)
@@ -7753,6 +7767,64 @@ mod tests {
             })
             .collect();
         assert_eq!(widths[1] - widths[0], 10.0, "5px of border on each side");
+    }
+
+    /// Every line of the first box that laid text out.
+    fn all_lines(rendered: &Rendered) -> &[text::Line] {
+        content_boxes(rendered)
+            .into_iter()
+            .find_map(|b| b.text.as_ref())
+            .map(|text| text.lines.as_slice())
+            .expect("a line of text")
+    }
+
+    #[test]
+    fn a_break_with_only_box_sides_after_it_does_not_start_a_line() {
+        // §9.4.2, and #126's second navy stripe. The newline is the last thing
+        // inside the inline box, so what follows it is the box's own closing
+        // side: padding that draws a background but holds nothing. A line for
+        // it is a line box with no content, which does not exist.
+        let rendered = run(
+            "<body><p><span>text</span></p></body>",
+            "body { margin: 0 } p { font: 16px/16px serif }
+             span { display: inline; padding: 0 1em 0 0; background: navy }
+             span::after { content: \"  \\A\"; white-space: pre }",
+            600.0,
+        );
+        assert_eq!(
+            all_lines(&rendered).len(),
+            1,
+            "one line, so one stretch of background",
+        );
+    }
+
+    #[test]
+    fn a_blank_line_a_break_asked_for_keeps_its_height() {
+        // The other half of §9.4.2: a line box holding nothing is removed
+        // *unless* it ends with a preserved newline, which a `<br>` is. Two
+        // `<br>`s in a row are two blank lines an author asked for, and
+        // removing them would close up text the page meant to space out.
+        let rendered = run(
+            "<body><p>a<br><br>b</p></body>",
+            "body { margin: 0 } p { font: 16px/16px serif }",
+            600.0,
+        );
+        assert_eq!(all_lines(&rendered).len(), 3, "a, blank, b");
+    }
+
+    #[test]
+    fn a_trailing_break_is_still_trimmed_away() {
+        // A preserved run of nothing but line breaks is still the block's own
+        // trailing whitespace: a `<br>` at the very end of a paragraph has
+        // nothing to break, and keeping it adds a line the page did not ask
+        // for. Which is a different answer from the spaces above, and the
+        // reason the trim tests the run's text rather than its `white-space`.
+        let rendered = run(
+            "<body><p>text<br></p></body>",
+            "body { margin: 0 } p { font: 16px/16px serif }",
+            600.0,
+        );
+        assert_eq!(all_lines(&rendered).len(), 1);
     }
 
     /// The first line of the first box that laid text out.
