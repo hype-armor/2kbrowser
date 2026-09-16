@@ -36,6 +36,32 @@ use winit::window::{Window, WindowId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandReady;
 
+/// Anything that wakes the window from somewhere other than the reader.
+///
+/// Two sources now, which is why this is an enum rather than [`BandReady`]
+/// alone: a band finished on a renderer thread, and AccessKit reporting that an
+/// assistive technology has attached or gone away — which can happen on a
+/// platform thread of AccessKit's own (#178).
+#[derive(Debug)]
+pub enum Wake {
+    /// A band is painted and the window should redraw.
+    Band(BandReady),
+    /// AccessKit has something to say about who is listening.
+    Accessibility(accesskit_winit::Event),
+}
+
+impl From<BandReady> for Wake {
+    fn from(band: BandReady) -> Self {
+        Wake::Band(band)
+    }
+}
+
+impl From<accesskit_winit::Event> for Wake {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Wake::Accessibility(event)
+    }
+}
+
 /// How much taller than the window a painted band is.
 ///
 /// The reader sees one window's worth; painting three means scrolling roughly a
@@ -435,6 +461,27 @@ struct App {
     /// `None` until something is copied, and still `None` where there is no
     /// clipboard to be had.
     clipboard: Option<arboard::Clipboard>,
+    /// The bridge to the platform's accessibility API (ADR-0019, #178).
+    ///
+    /// `None` until the window exists, because AccessKit has to be given the
+    /// window before it is first shown. After that it is always present and
+    /// almost always idle: nothing is built, and the child is never asked, until
+    /// an assistive technology attaches and `update_if_active` starts calling
+    /// the closure it is handed.
+    adapter: Option<accesskit_winit::Adapter>,
+    /// The page's tree, once something has asked for it (#178).
+    ///
+    /// Kept so that a scroll does not cost a round trip to the child: the tree
+    /// is the same, and only the transform on its root moves. Cleared by
+    /// `forget_accessibility` when a render replaces the page it describes.
+    a11y_tree: Option<sandbox::access::Tree>,
+    /// Whether an assistive technology is attached right now.
+    ///
+    /// Kept beside the adapter rather than asked of it, because it is what
+    /// decides whether to go to the *child* for a tree — and that is a round
+    /// trip to another process, which is exactly the cost ADR-0019's third term
+    /// exists to avoid paying when nobody is listening.
+    listening: bool,
     /// Where a text selection drag started, in document coordinates.
     ///
     /// `None` when the pointer is not selecting. Set on press rather than on
@@ -459,7 +506,7 @@ struct App {
     ///
     /// `None` only in tests and before the loop starts, where nothing is
     /// waiting to be woken.
-    waker: Option<winit::event_loop::EventLoopProxy<BandReady>>,
+    waker: Option<winit::event_loop::EventLoopProxy<Wake>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
     /// The open site panel, if the padlock has been pressed (#118).
@@ -611,7 +658,7 @@ impl App {
                     // that is otherwise asleep.
                     if let Some(waker) = waker.clone() {
                         page.set_wake(Box::new(move || {
-                            let _ = waker.send_event(BandReady);
+                            let _ = waker.send_event(Wake::Band(BandReady));
                         }));
                     }
                     tab.page = Some(page);
@@ -672,6 +719,11 @@ impl App {
         // not there, the rows they are looking at have to be asked for.
         self.refresh_band();
         self.refresh_chrome();
+        // The tree described the page that has just been replaced (#178). Both
+        // calls, and in this order: forget what was, then send what is — and
+        // both do nothing at all unless something is listening.
+        self.forget_accessibility();
+        self.push_accessibility();
     }
 
     /// Fetches `url` and shows it, without touching history.
@@ -2013,6 +2065,90 @@ impl App {
         crate::chrome::total_height()
     }
 
+    /// What AccessKit is told about the window, so the page lands where it is
+    /// drawn (#178).
+    fn a11y_viewport(&self) -> crate::a11y::Viewport {
+        crate::a11y::Viewport {
+            chrome: self.chrome_height() as f32,
+            scroll: self.tab().scroll,
+        }
+    }
+
+    /// The window's title, which is also what a screen reader reads first.
+    fn window_title(&self) -> String {
+        let tab = self.tabs.active();
+        let mode = tab.page.as_ref().map(crate::viewport::Viewport::mode);
+        title_for(
+            tab.label(),
+            &mode.unwrap_or(layout::RenderMode::Authored),
+            tab.error.as_deref(),
+        )
+    }
+
+    /// AccessKit has something to say about who is listening (#178).
+    fn accessibility_event(&mut self, event: accesskit_winit::WindowEvent) {
+        match event {
+            // Somebody has attached. This is the only thing that turns the
+            // machinery on: until it arrives the child is never asked for a
+            // tree and none is built, which is ADR-0019's third term and the
+            // cheapest mitigation there is for the parsing surface it added.
+            accesskit_winit::WindowEvent::InitialTreeRequested => {
+                self.listening = true;
+                self.push_accessibility();
+            }
+            // And gone again. Back to costing nothing.
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => self.listening = false,
+            // A screen reader asking for something to be done — a button
+            // pressed, a node focused. Not offered yet: every action this
+            // browser has goes through the child, and routing one from here
+            // means deciding what a stranger's page may be made to do on a
+            // reader's behalf. Ignored rather than half-answered.
+            accesskit_winit::WindowEvent::ActionRequested(_) => {}
+        }
+    }
+
+    /// Sends the current page's tree, if anything is listening.
+    ///
+    /// Two guards, and they are not the same guard. `listening` says an
+    /// assistive technology has attached at all, and is what stops the *child*
+    /// being asked; `update_if_active` is AccessKit's own check that the tree
+    /// has been initialised. Without the first, every render would be a round
+    /// trip to another process for an answer nobody wanted.
+    ///
+    /// The tree is kept until the page changes, so this is cheap to call often.
+    /// Scrolling is the reason: it moves every node and changes none of them,
+    /// so it needs a new transform on the root and the same tree underneath —
+    /// which is the whole point of putting the transform there.
+    fn push_accessibility(&mut self) {
+        if !self.listening {
+            return;
+        }
+        if self.a11y_tree.is_none() {
+            self.a11y_tree = Some(match self.tabs.active_mut().page.as_mut() {
+                Some(page) => page.accessibility(),
+                // Attached before the first page finished. "Nothing here yet"
+                // is an answer; silence is a window an assistive technology
+                // decides is broken.
+                None => sandbox::access::Tree::default(),
+            });
+        }
+        let title = self.window_title();
+        let viewport = self.a11y_viewport();
+        let tree = self.a11y_tree.as_ref().expect("just filled");
+        if let Some(adapter) = &mut self.adapter {
+            adapter.update_if_active(|| crate::a11y::update(tree, &title, viewport));
+        }
+    }
+
+    /// Forgets the tree, because the page it described is gone.
+    ///
+    /// Called where a *render* happened rather than where the view moved. The
+    /// distinction is the saving: a new page has to be asked for across the
+    /// process boundary, and a scroll must not be.
+    fn forget_accessibility(&mut self) {
+        self.a11y_tree = None;
+    }
+
     /// Height of the page area, which is the window less the chrome.
     fn viewport_height(&self) -> f32 {
         (self.size.1.saturating_sub(self.chrome_height())) as f32
@@ -2036,6 +2172,11 @@ impl App {
             // speculatively: the rows ahead are usually painted by the time
             // they are scrolled to.
             self.refresh_band();
+            // Every node moved and none of them changed, so this is a new
+            // transform over the tree already held rather than a new tree
+            // (#178). No round trip to the child, which is what makes it
+            // affordable on every scroll step.
+            self.push_accessibility();
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -2566,7 +2707,7 @@ fn tint_rect(
     }
 }
 
-impl ApplicationHandler<BandReady> for App {
+impl ApplicationHandler<Wake> for App {
     /// Every event that had arrived has been handled, so the loop is about to
     /// sleep. The last thing to do before that is lay the page out for whatever
     /// size the window ended up.
@@ -2587,12 +2728,17 @@ impl ApplicationHandler<BandReady> for App {
         }
     }
 
-    /// A band painted on a renderer thread has arrived.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: BandReady) {
-        if self.accept_band()
-            && let Some(window) = &self.window
-        {
-            window.request_redraw();
+    /// Something other than the reader has woken the window.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Wake) {
+        match event {
+            Wake::Band(_) => {
+                if self.accept_band()
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
+            Wake::Accessibility(event) => self.accessibility_event(event.window_event),
         }
     }
 
@@ -2613,12 +2759,29 @@ impl ApplicationHandler<BandReady> for App {
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
             .with_window_icon(app_icon())
+            // Invisible until the accessibility adapter has been attached
+            // below: AccessKit must be given the window before it is first
+            // shown, and says so by panicking if it is not. Shown again a few
+            // lines down, before anything is rendered into it.
+            .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
             return;
         };
         let window = Rc::new(window);
+
+        // ADR-0019, #178. Costs nothing until something attaches: the handlers
+        // below only ever post an event, and no tree is built and no child is
+        // asked until one of them says an assistive technology is there.
+        if let Some(waker) = &self.waker {
+            self.adapter = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+                event_loop,
+                &window,
+                waker.clone(),
+            ));
+        }
+        window.set_visible(true);
 
         let context = match softbuffer::Context::new(window.clone()) {
             Ok(context) => context,
@@ -2642,6 +2805,12 @@ impl ApplicationHandler<BandReady> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // AccessKit sees every window event first, and needs to: it tracks
+        // focus and size to tell the platform where the window is. It consumes
+        // nothing, so the match below is unaffected.
+        if let (Some(adapter), Some(window)) = (&mut self.adapter, &self.window) {
+            adapter.process_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -3194,7 +3363,7 @@ pub fn open(
 
     // With a user event, so a band painted on a renderer thread can wake a
     // window that is otherwise asleep waiting for input.
-    let event_loop = EventLoop::<BandReady>::with_user_event()
+    let event_loop = EventLoop::<Wake>::with_user_event()
         .build()
         .map_err(|error| {
             format!("could not start the event loop ({error}); is a display available?")
@@ -3229,6 +3398,9 @@ pub fn open(
         loading: None,
         dragging: None,
         selecting: None,
+        adapter: None,
+        listening: false,
+        a11y_tree: None,
         menu: None,
         clipboard: None,
         theme: crate::chrome::Theme::LIGHT,
