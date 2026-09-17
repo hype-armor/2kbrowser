@@ -3789,6 +3789,7 @@ mod stacking_context_tests {
                 round: false,
                 chosen_rows: Vec::new(),
                 top_border_gap: None,
+                absolute_at: None,
             };
             forms_a_stacking_context(&box_)
         };
