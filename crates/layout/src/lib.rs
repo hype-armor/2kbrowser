@@ -102,6 +102,7 @@ impl ContainingBlock {
     /// no idea where the window is, so a `position: fixed` box inside one is
     /// measured against the probe instead. Rare enough to leave, and said here
     /// rather than discovered later.
+    ///
     fn independent(width: f32, height: f32) -> Self {
         Self {
             offset: (0.0, 0.0),
@@ -311,6 +312,10 @@ pub fn replaced_size(
     attr_width: Option<Length>,
     attr_height: Option<Length>,
     available_width: f32,
+    // The containing block's height, where it has a definite one. §10.5: a
+    // percentage height resolves against it only when it does not itself
+    // depend on the content, and computes to `auto` when it does.
+    definite_height: Option<f32>,
 ) -> (f32, f32) {
     let font_size = style.font_size;
     // CSS wins over the presentational attribute, which is only a fallback.
@@ -326,9 +331,17 @@ pub fn replaced_size(
         // width instead — the only basis to hand — would stretch an image to a
         // fraction of the page's *width*, which is not a small error.
         Length::Auto => attr_height.and_then(|length| match length {
-            Length::Percent(_) => None,
+            // Against the containing block's height where there is one, and
+            // `auto` where there is not. An absolutely positioned
+            // `<iframe height="50%">` in a box two inches tall is an inch
+            // tall; it used to be dropped along with the rest.
+            Length::Percent(percent) => definite_height.map(|basis| basis * percent / 100.0),
             length => Some(length.to_px(font_size, available_width)),
         }),
+        // A percentage in the *style* resolves the same way and for the same
+        // reason: the width is the only other basis to hand, and it is the
+        // wrong one.
+        Length::Percent(percent) => definite_height.map(|basis| basis * percent / 100.0),
         length => Some(length.to_px(font_size, available_width)),
     };
 
@@ -2349,6 +2362,8 @@ fn subtree_widths(
             size_attr(doc, node, "width"),
             size_attr(doc, node, "height"),
             available,
+            // An intrinsic *width* pass: there is no height to resolve against.
+            None,
         );
         return (width + surround, width + surround);
     }
@@ -3252,6 +3267,19 @@ fn layout_block(
             size_attr(doc, node, "width"),
             size_attr(doc, node, "height"),
             available_width,
+            // Only for an out-of-flow box, and the restraint is the point.
+            // §10.5 wants a basis that does not depend on the content, and an
+            // absolutely positioned box has one: its containing block was
+            // established with a size before it was laid out. An in-flow or
+            // floated box is measured through a probe that is handed its own
+            // *width* as a stand-in height, so taking that would resolve a
+            // percentage against the wrong axis — which is what it used to do
+            // before percentages here were dropped altogether.
+            style
+                .position
+                .is_out_of_flow()
+                .then_some(containing.definite_height)
+                .flatten(),
         );
         let mut box_ = LayoutBox {
             rect: Rect {
@@ -6504,6 +6532,11 @@ fn gather_one(
                 size_attr(doc, child, "width"),
                 size_attr(doc, child, "height"),
                 available_width,
+                // An inline replaced box is gathered without a containing block
+                // to hand, so a percentage height stays `auto` here. The common
+                // case is a block-level or absolutely positioned box, measured
+                // above with the basis it needs.
+                None,
             ),
         };
         // CSS `width` is the content width, so the box the line has to make
@@ -11014,13 +11047,21 @@ mod tests {
             max_width: Length::Px(300.0),
             ..ComputedStyle::default()
         };
-        let (width, height) =
-            replaced_size(&style, Some((1200.0, 400.0)), None, None, None, 1000.0);
+        let (width, height) = replaced_size(
+            &style,
+            Some((1200.0, 400.0)),
+            None,
+            None,
+            None,
+            1000.0,
+            None,
+        );
         assert_eq!(width, 300.0);
         assert_eq!(height, 100.0, "the 3:1 ratio should have been kept");
 
         // One already inside the bound is left exactly alone.
-        let (width, height) = replaced_size(&style, Some((120.0, 40.0)), None, None, None, 1000.0);
+        let (width, height) =
+            replaced_size(&style, Some((120.0, 40.0)), None, None, None, 1000.0, None);
         assert_eq!((width, height), (120.0, 40.0));
     }
 
@@ -11419,8 +11460,45 @@ mod tests {
     fn an_image_uses_its_intrinsic_size_when_nothing_is_declared() {
         let style = ComputedStyle::default();
         assert_eq!(
-            replaced_size(&style, Some((80.0, 40.0)), None, None, None, 500.0),
+            replaced_size(&style, Some((80.0, 40.0)), None, None, None, 500.0, None),
             (80.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn a_percentage_height_resolves_against_a_containing_block_that_has_one() {
+        // §10.5: a percentage height resolves against the containing block's
+        // height when that height does not itself depend on the content, and
+        // computes to `auto` when it does. Both arms matter, so both are here.
+        let style = ComputedStyle::default();
+        // Two inches of containing block, so `height="50%"` is one inch.
+        assert_eq!(
+            replaced_size(
+                &style,
+                None,
+                Some((300.0, 150.0)),
+                None,
+                Some(Length::Percent(50.0)),
+                500.0,
+                Some(192.0),
+            ),
+            (300.0, 96.0)
+        );
+        // With no definite height to measure against it stays `auto`, and the
+        // replaced box falls back to its default. Reading the percentage
+        // against the *width* — the only other number to hand — is the error
+        // this guards: it would make the box 250 tall rather than 150.
+        assert_eq!(
+            replaced_size(
+                &style,
+                None,
+                Some((300.0, 150.0)),
+                None,
+                Some(Length::Percent(50.0)),
+                500.0,
+                None,
+            ),
+            (300.0, 150.0)
         );
     }
 
@@ -11435,7 +11513,8 @@ mod tests {
                 None,
                 Some(Length::Px(200.0)),
                 None,
-                500.0
+                500.0,
+                None,
             ),
             (200.0, 100.0)
         );
@@ -11446,7 +11525,8 @@ mod tests {
                 None,
                 None,
                 Some(Length::Px(25.0)),
-                500.0
+                500.0,
+                None,
             ),
             (50.0, 25.0)
         );
@@ -11462,7 +11542,8 @@ mod tests {
                 None,
                 Some(Length::Px(30.0)),
                 Some(Length::Px(300.0)),
-                500.0
+                500.0,
+                None,
             ),
             (30.0, 300.0)
         );
@@ -11481,6 +11562,7 @@ mod tests {
             Some(Length::Px(999.0)),
             None,
             500.0,
+            None,
         );
         assert_eq!(width, 64.0);
     }
@@ -11496,12 +11578,13 @@ mod tests {
                 None,
                 Some(Length::Px(120.0)),
                 Some(Length::Px(60.0)),
-                500.0
+                500.0,
+                None,
             ),
             (120.0, 60.0)
         );
         assert_eq!(
-            replaced_size(&style, None, None, None, None, 500.0),
+            replaced_size(&style, None, None, None, None, 500.0, None),
             BROKEN_IMAGE_SIZE
         );
     }
@@ -11545,7 +11628,8 @@ mod tests {
                 None,
                 Some(Length::Percent(100.0)),
                 Some(Length::Px(50.0)),
-                500.0
+                500.0,
+                None,
             ),
             (500.0, 50.0)
         );
@@ -11556,7 +11640,8 @@ mod tests {
                 None,
                 Some(Length::Percent(50.0)),
                 None,
-                500.0
+                500.0,
+                None,
             ),
             (250.0, 250.0),
             "with no height, a square image keeps its ratio"
@@ -11578,7 +11663,8 @@ mod tests {
                 None,
                 None,
                 Some(Length::Percent(50.0)),
-                500.0
+                500.0,
+                None,
             ),
             (100.0, 50.0),
             "the image keeps its intrinsic size"
