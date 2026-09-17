@@ -76,6 +76,14 @@ pub trait Render {
     /// which never crosses the boundary.
     fn select(&mut self, from: (f32, f32), to: (f32, f32)) -> (Vec<layout::Rect>, String);
 
+    /// What is selected inside the focused control, for the clipboard.
+    ///
+    /// Empty when nothing has the keyboard, when what has it is not a text
+    /// control, or when nothing in it is selected. All three are "nothing to
+    /// copy", and none of them is worth a variant: the parent's next move is
+    /// the same for all of them, which is to put nothing on the clipboard.
+    fn copy_focused(&mut self) -> String;
+
     /// The page most recently rendered, as a screen reader would read it.
     ///
     /// Same reason as `find`: the semantic tree is the DOM plus the box tree,
@@ -153,6 +161,21 @@ fn answer_until_the_parent_goes(
             ToChild::Select { from, to } => {
                 let (rects, text) = renderer.select(*from, *to);
                 write_frame(output, &ToParent::Selected { rects, text }.encode())?;
+            }
+            ToChild::CopyFocused => {
+                // Answered with `Selected` and no rectangles, which is the
+                // honest shape: there is a selection and this is its text, and
+                // the highlight inside a control is drawn by this side rather
+                // than by the parent, so there is nothing to hand over.
+                let text = renderer.copy_focused();
+                write_frame(
+                    output,
+                    &ToParent::Selected {
+                        rects: Vec::new(),
+                        text,
+                    }
+                    .encode(),
+                )?;
             }
             ToChild::Find { query } => {
                 let rects = renderer.find(query);
@@ -387,6 +410,10 @@ mod tests {
                 }],
                 "selected".to_owned(),
             )
+        }
+
+        fn copy_focused(&mut self) -> String {
+            "in a field".to_owned()
         }
 
         fn find(&mut self, query: &str) -> Vec<layout::Rect> {

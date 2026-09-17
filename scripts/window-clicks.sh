@@ -862,6 +862,36 @@ done
 [ -n "$typed" ] || fail "five characters were typed into a focused field and \
 nothing appeared in it"
 
+# Cut and paste, in the control, through the real clipboard. Ink to clear to
+# ink: a cut that reached the child empties the field, and a paste that reached
+# it fills it again with what the cut took. Neither half can be seen from
+# `cargo test`, because what is in a control lives in the other process and only
+# crosses when a reader asks for it (ADR-0012).
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool key ctrl+x
+cut=""
+for _ in $(seq 1 25); do
+    sleep 0.2
+    if [ "$(inked_in_field)" = "clear" ]; then
+        cut=yes
+        break
+    fi
+done
+[ -n "$cut" ] || fail "Ctrl+X left the text in the field, so either the copy \
+never came back from the renderer or the deletion never reached it"
+
+DISPLAY=$display xdotool key ctrl+v
+pasted=""
+for _ in $(seq 1 25); do
+    sleep 0.2
+    if [ "$(inked_in_field)" = "ink" ]; then
+        pasted=yes
+        break
+    fi
+done
+[ -n "$pasted" ] || fail "Ctrl+V put nothing back in the field, so what the cut \
+took never reached the clipboard or never came back"
+
 # Escape gives the field up, which is what puts the keyboard back on the page.
 DISPLAY=$display xdotool key Escape
 released=""
@@ -874,7 +904,8 @@ for _ in $(seq 1 20); do
 done
 [ -n "$released" ] || fail "Escape left the field focused, so the page can no \
 longer be scrolled with the keyboard"
-echo "ok: a text field took a click, took five characters, and let go on Escape"
+echo "ok: a text field took a click, five characters, a cut and a paste, and \
+let go on Escape"
 stop
 
 # N. Pressing a submit button sends the form (#110).
@@ -1366,5 +1397,51 @@ stop
 unset XDG_CONFIG_HOME
 rm -rf "$looked"
 echo "ok: the source view and the page information both opened and were filled in"
+
+# N. Copy and paste in the address bar, through the real clipboard.
+#
+#    The round trip is the proof, and it needs no second tool to read the
+#    clipboard with: copy this page's address out of the bar, go somewhere else,
+#    paste it back and press Enter. Arriving where the copy came from means the
+#    text made it out of the field, onto the system clipboard, and back into the
+#    field — none of which `cargo test` can reach, because there is no clipboard
+#    in a headless test and no window to focus.
+start
+focus_window
+# Ctrl+L focuses the bar with the whole address selected, which is what makes
+# Ctrl+C here a copy of the address rather than of nothing.
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.5
+DISPLAY=$display xdotool key ctrl+c
+sleep 0.5
+DISPLAY=$display xdotool key Escape
+sleep 0.3
+
+# Somewhere else, so arriving back is a real navigation rather than a page that
+# never left.
+after=$(click_and_read "$click_x" "$click_y")
+case "$after" in
+    *Arrival*) ;;
+    *) fail "the link was not followed, so there is nowhere to come back from" ;;
+esac
+
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.5
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool key ctrl+v
+sleep 0.5
+DISPLAY=$display xdotool key Return
+returned=""
+for _ in $(seq 1 30); do
+    sleep 0.4
+    case "$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)" in
+        *Departure*) returned=yes; break ;;
+    esac
+done
+[ -n "$returned" ] || fail "pasting the copied address and pressing Enter did \
+not go back to where it was copied from, so the address bar's copy or its paste \
+did not happen"
+stop
+echo "ok: an address copied out of the bar pasted back into it and navigated"
 
 echo "all window click checks passed"

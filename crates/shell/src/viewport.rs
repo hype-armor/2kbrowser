@@ -361,6 +361,15 @@ impl Viewport {
             .unwrap_or_else(|_| (Vec::new(), String::new()))
     }
 
+    /// What is selected inside the focused control, for the clipboard.
+    ///
+    /// Empty when nothing has the keyboard, when what has it is not a text
+    /// control, or when the child could not answer — all of which mean the same
+    /// thing to the caller, which is that there is nothing to copy.
+    pub fn copy_focused(&mut self) -> String {
+        self.session.copy_focused().unwrap_or_default()
+    }
+
     /// The page as a screen reader would read it (ADR-0019, #178).
     ///
     /// Asked of the child, because the DOM and the box tree it is built from

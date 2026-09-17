@@ -108,6 +108,35 @@ fn stepped_zoom(now: f32, steps: i32) -> f32 {
     ZOOM_STEPS[to]
 }
 
+/// Flattens pasted text onto one line.
+///
+/// A one-line field cannot show a newline and nothing here would draw one, so
+/// text arriving from the clipboard with paragraphs in it would leave the
+/// field holding characters the reader can neither see nor delete by eye. Each
+/// break becomes a space, which is what pasting into a one-line field does
+/// everywhere — and a `<textarea>` gets the text untouched, because a decision
+/// about a one-line field is not a decision about the clipboard.
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut after_break = false;
+    for character in text.chars() {
+        match character {
+            '\n' | '\r' => after_break = true,
+            other => {
+                // Collapsed rather than one space per break: a paste of
+                // `a\r\n\r\nb` is two paragraphs, not four spaces' worth of
+                // gap in the middle of an address.
+                if after_break && !out.is_empty() {
+                    out.push(' ');
+                }
+                after_break = false;
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 /// Turns what someone typed into a URL.
 ///
 /// A bare host is the overwhelmingly common case and has to work: typing
@@ -1576,9 +1605,14 @@ impl App {
     /// out — an entry that cannot do anything is left out, which is shorter to
     /// read and cannot be clicked in hope.
     fn open_menu(&mut self) {
+        // Something is being typed in when a control on the page has the
+        // keyboard, or when the address bar does — a right-click on the page
+        // does not take the focus away from either.
+        let typing = self.page_focus_is_typing() || self.editing.is_some();
         let items = crate::menu::items_for(
             self.link_under_pointer(),
             !self.tab().selected.is_empty(),
+            typing,
             self.tab().history.can_go_back(),
             self.tab().history.can_go_forward(),
         );
@@ -1783,6 +1817,7 @@ impl App {
             Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
             Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
             Some(crate::menu::Item::CopySelection) => self.copy_selection(),
+            Some(crate::menu::Item::Paste) => self.paste_into_focus(),
             Some(crate::menu::Item::ViewSource) => self.open_source(),
             Some(crate::menu::Item::PageInformation) => self.open_page_information(),
             // A click outside the menu dismisses it and does nothing else.
@@ -1809,6 +1844,28 @@ impl App {
             },
         };
         let _ = clipboard.set_text(text);
+    }
+
+    /// Takes text off the system clipboard.
+    ///
+    /// The other half of [`App::copy`], and it keeps the same handle for the
+    /// same reason. `None` when there is no clipboard, when it holds something
+    /// that is not text, or when it is empty — all three are "nothing to
+    /// paste", and a reader who pressed Ctrl+V by accident should get nothing
+    /// rather than a complaint.
+    ///
+    /// Newlines survive. A one-line field turns them into spaces itself,
+    /// because that is a decision about the field rather than about the
+    /// clipboard: a `<textarea>` wants them kept.
+    fn paste(&mut self) -> Option<String> {
+        let clipboard = match &mut self.clipboard {
+            Some(clipboard) => clipboard,
+            None => match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard.insert(clipboard),
+                Err(_) => return None,
+            },
+        };
+        clipboard.get_text().ok().filter(|text| !text.is_empty())
     }
 
     /// Closes the menu if one is open. Whether there was one to close.
@@ -2152,9 +2209,35 @@ impl App {
             Key::Named(NamedKey::End) => field.end(shift),
             Key::Named(NamedKey::Space) => field.insert(" "),
             Key::Character(text) if ctrl => {
-                if text.as_str() == "a" {
-                    field.select_all();
-                    self.refresh_chrome();
+                // The same chords as the address bar, for the same reason: a
+                // search term is very often something you have just copied.
+                match text.as_str() {
+                    "a" => {
+                        field.select_all();
+                        self.refresh_chrome();
+                    }
+                    "c" => {
+                        let copied = field.selected_text().map(str::to_owned);
+                        if let Some(text) = copied {
+                            self.copy(text);
+                        }
+                    }
+                    "x" => {
+                        if let Some(text) = field.cut() {
+                            self.copy(text);
+                            self.refresh_matches();
+                        }
+                    }
+                    "v" => {
+                        if let Some(pasted) = self.paste() {
+                            let pasted = one_line(&pasted);
+                            if let Some(field) = &mut self.tab_mut().finding {
+                                field.insert(&pasted);
+                            }
+                            self.refresh_matches();
+                        }
+                    }
+                    _ => {}
                 }
                 return true;
             }
@@ -2202,10 +2285,41 @@ impl App {
             Key::Named(NamedKey::End) => field.end(shift),
             Key::Named(NamedKey::Space) => field.insert(" "),
             Key::Character(text) if ctrl => {
-                if text.as_str() == "a" {
-                    field.select_all();
-                } else {
-                    return true;
+                // The clipboard chords, which the address bar used to swallow
+                // along with every other Ctrl chord — so the one field in the
+                // browser you most often want to copy out of or paste into was
+                // the one field that could do neither.
+                match text.as_str() {
+                    "a" => field.select_all(),
+                    "c" => {
+                        let copied = field.selected_text().map(str::to_owned);
+                        if let Some(text) = copied {
+                            self.copy(text);
+                        }
+                        return true;
+                    }
+                    "x" => {
+                        if let Some(text) = field.cut() {
+                            self.copy(text);
+                            self.refresh_chrome();
+                        }
+                        return true;
+                    }
+                    "v" => {
+                        let Some(pasted) = self.paste() else {
+                            return true;
+                        };
+                        // An address is one line. A pasted paragraph becomes
+                        // one too rather than arriving as a field with
+                        // newlines in it that nothing here can show.
+                        let pasted = one_line(&pasted);
+                        if let Some(field) = &mut self.editing {
+                            field.insert(&pasted);
+                        }
+                        self.refresh_chrome();
+                        return true;
+                    }
+                    _ => return true,
                 }
             }
             Key::Character(text) => field.insert(text.as_str()),
@@ -2256,13 +2370,52 @@ impl App {
             // keeps the parent from having to model the page.
             Key::Named(NamedKey::Enter) => Typed::Insert("\n".to_owned()),
             Key::Named(NamedKey::Space) => Typed::Insert(" ".to_owned()),
-            Key::Character(text) if ctrl => {
-                if text.as_str() != "a" {
-                    // Every other Ctrl chord is the window's.
-                    return false;
+            Key::Character(text) if ctrl => match text.as_str() {
+                "a" => Typed::SelectAll,
+                // Copying out of a control is the one thing that needs the
+                // child to say what is in it, so it is asked rather than
+                // carried on every render (ADR-0012).
+                "c" => {
+                    let copied = self.copy_from_page();
+                    if copied.is_empty() {
+                        // Nothing selected in the control — and a checkbox has
+                        // the keyboard as readily as a field does, with nothing
+                        // in it to copy at all. So the chord is not the
+                        // control's, and it falls through to the page's own
+                        // selection rather than being swallowed.
+                        return false;
+                    }
+                    self.copy(copied);
+                    return true;
                 }
-                Typed::SelectAll
-            }
+                // A cut is that copy and then an insertion of nothing, which
+                // is what the child's field does to a selection anyway. Only
+                // when something was selected: a cut with no selection takes
+                // nothing rather than eating the next character.
+                "x" => {
+                    let copied = self.copy_from_page();
+                    if copied.is_empty() {
+                        return false;
+                    }
+                    self.copy(copied);
+                    self.type_into_page(Typed::Insert(String::new()));
+                    return true;
+                }
+                // And a paste is one insertion, whole. The child's field
+                // replaces its selection with it, the way typing over a
+                // selection already does — so `Insert` needed nothing added
+                // to it, and a `<textarea>` keeps the newlines a one-line
+                // field would have to flatten.
+                "v" => {
+                    let Some(pasted) = self.paste() else {
+                        return true;
+                    };
+                    self.type_into_page(Typed::Insert(pasted));
+                    return true;
+                }
+                // Every other Ctrl chord is the window's.
+                _ => return false,
+            },
             Key::Character(text) if alt => {
                 let _ = text;
                 return false;
@@ -2280,6 +2433,47 @@ impl App {
         };
         self.type_into_page(typed);
         true
+    }
+
+    /// Whether a text control on the page has the keyboard.
+    ///
+    /// Not the same as "a control has it": a checkbox takes keystrokes with
+    /// nothing to type, and pasting into one means nothing (#151).
+    fn page_focus_is_typing(&self) -> bool {
+        self.page_is_editing() && !self.page_focus_is_pressable()
+    }
+
+    /// Puts the clipboard into whatever is being typed in.
+    ///
+    /// The pointer's half of paste. The keyboard chords go to whichever field
+    /// has the focus because that field handles the key; this has to ask, since
+    /// the menu is not in either of them.
+    fn paste_into_focus(&mut self) {
+        let Some(pasted) = self.paste() else { return };
+        if self.editing.is_some() {
+            let flattened = one_line(&pasted);
+            if let Some(field) = &mut self.editing {
+                field.insert(&flattened);
+            }
+            self.refresh_chrome();
+            return;
+        }
+        if self.page_focus_is_typing() {
+            self.type_into_page(sandbox::message::Key::Insert(pasted));
+        }
+    }
+
+    /// What is selected inside the page's focused control.
+    ///
+    /// Empty when there is nothing to copy, which is what the caller does
+    /// nothing about: a copy chord pressed with nothing selected should leave
+    /// the clipboard alone rather than emptying it.
+    fn copy_from_page(&mut self) -> String {
+        self.tab_mut()
+            .page
+            .as_mut()
+            .map(crate::viewport::Viewport::copy_focused)
+            .unwrap_or_default()
     }
 
     /// The chrome control under the pointer, if any.
@@ -4766,5 +4960,50 @@ mod blank_tab_tests {
         let tab = Tab::blank();
         assert!(!tab.history.can_go_back());
         assert!(!tab.history.can_go_forward());
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    //! Flattening what arrives from the clipboard into a one-line field.
+
+    use super::one_line;
+
+    #[test]
+    fn a_pasted_address_is_unchanged() {
+        assert_eq!(
+            one_line("https://example.com/a?b=1&c=2"),
+            "https://example.com/a?b=1&c=2"
+        );
+    }
+
+    #[test]
+    fn a_pasted_paragraph_becomes_one_line() {
+        // A one-line field cannot show a newline and nothing here would draw
+        // one, so text with breaks in it would leave the field holding
+        // characters the reader can neither see nor delete by eye.
+        assert_eq!(one_line("one\ntwo\nthree"), "one two three");
+    }
+
+    #[test]
+    fn a_run_of_breaks_is_one_space() {
+        // `a\r\n\r\nb` is two paragraphs, not four spaces' worth of gap in the
+        // middle of an address.
+        assert_eq!(one_line("a\r\n\r\nb"), "a b");
+        assert_eq!(one_line("a\n\n\n\nb"), "a b");
+    }
+
+    #[test]
+    fn breaks_at_the_edges_add_nothing() {
+        // Copying a line out of a terminal very often takes the newline with
+        // it, and a leading space in an address bar is not what anybody meant.
+        assert_eq!(one_line("\nhttps://example.com/\n"), "https://example.com/");
+        assert_eq!(one_line("\r\n\r\n"), "");
+    }
+
+    #[test]
+    fn what_is_not_a_break_is_left_alone() {
+        // Tabs included: they are not line breaks, and a field can hold one.
+        assert_eq!(one_line("a\tb  c"), "a\tb  c");
     }
 }

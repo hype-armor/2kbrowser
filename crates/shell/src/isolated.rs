@@ -825,6 +825,17 @@ impl Render for PageRenderer {
             None => (Vec::new(), String::new()),
         }
     }
+
+    fn copy_focused(&mut self) -> String {
+        // Only a field is being typed in; a checkbox or a `<select>` has the
+        // keyboard without holding text, and there is nothing in one to copy.
+        match &self.focus {
+            Some(Focus::Typing { field, .. }) => {
+                field.selected_text().unwrap_or_default().to_owned()
+            }
+            _ => String::new(),
+        }
+    }
 }
 
 /// Runs this process as a renderer child, reading from stdin and writing to

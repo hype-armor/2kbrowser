@@ -16,6 +16,40 @@ record for everything earlier.
 
 ## Unreleased
 
+**Copy and paste, everywhere text is.** Copying a page selection has worked
+since selection did. Nothing else had: the address bar swallowed every Ctrl
+chord but Ctrl+A, so the one field you most often want to copy out of or paste
+into was the one that could do neither, and a form control on a page could be
+typed into but never pasted into.
+
+Ctrl+C, Ctrl+X and Ctrl+V now work in the address bar, in the find field, and in
+a text control on the page. The right-click menu gains **Paste**, offered only
+when something has the keyboard to put it in — a pointer could already copy from
+that menu and had no way to paste.
+
+Pasting into a one-line field flattens the text: a run of breaks becomes one
+space, and breaks at the edges add nothing, because copying a line out of a
+terminal usually takes the newline with it. A `<textarea>` keeps them, since
+that is a decision about a one-line field rather than about the clipboard.
+
+**Copying out of a page control needed the boundary crossed carefully.** What is
+in a control is the page's business (ADR-0012), and the three `Focused` states
+the child reports are deliberately nothing more than "something is being typed
+in". So the text is *asked for*, by a new `CopyFocused` message, only when a
+reader presses a copy chord — the same shape as a form submission, where the
+untrusted side proposes and the trusted side disposes. Nothing is carried on a
+render, and a page cannot make its own contents cross.
+
+A copy chord with nothing selected in the control falls through to the page's
+own selection rather than being swallowed, because a focused checkbox takes
+keystrokes while having nothing to copy.
+
+Both halves are checked in a real window against the real clipboard, which is
+where they live: `cargo test` has no clipboard and no focus. A field takes a
+cut and goes empty, takes a paste and fills again; and an address copied out of
+the bar, on another page, pasted back and entered, arrives where it was copied
+from.
+
 **Debugging tools: console, inspector, network, storage, and view source**
 (#198). All four of the asked-for tools, as one generated page rather than four
 panels — a page for the reason the saved list and the history are pages: the

@@ -45,6 +45,8 @@ pub enum Item {
     CopyLink(String),
     /// Put the selected text on the clipboard.
     CopySelection,
+    /// Put the clipboard into whatever is being typed in.
+    Paste,
     /// Show this page's markup, as a page (#198).
     ViewSource,
     /// Show what the browser knows about this page (#198).
@@ -61,6 +63,7 @@ impl Item {
             Item::OpenInNewTab(_) => "Open link in new tab",
             Item::CopyLink(_) => "Copy link address",
             Item::CopySelection => "Copy",
+            Item::Paste => "Paste",
             Item::ViewSource => "View page source",
             Item::PageInformation => "Page information",
         }
@@ -77,6 +80,7 @@ impl Item {
 pub fn items_for(
     link: Option<String>,
     selection: bool,
+    typing: bool,
     can_go_back: bool,
     can_go_forward: bool,
 ) -> Vec<Item> {
@@ -87,6 +91,14 @@ pub fn items_for(
     }
     if selection {
         items.push(Item::CopySelection);
+    }
+    // Only where there is somewhere for it to go. Paste is the one entry here
+    // that acts on something *other* than what the pointer is over — it needs a
+    // field with the keyboard — and offering it with nowhere to put the text
+    // would be an entry that does nothing, which is what the rule at the top of
+    // this function exists to prevent.
+    if typing {
+        items.push(Item::Paste);
     }
     if can_go_back {
         items.push(Item::Back);
@@ -230,7 +242,13 @@ mod tests {
 
     #[test]
     fn a_menu_on_a_link_offers_what_a_link_can_do() {
-        let items = items_for(Some("https://example.com/".to_owned()), false, true, false);
+        let items = items_for(
+            Some("https://example.com/".to_owned()),
+            false,
+            false,
+            true,
+            false,
+        );
 
         assert_eq!(
             items,
@@ -249,8 +267,8 @@ mod tests {
     fn a_menu_over_a_selection_offers_to_copy_it() {
         // The entry only exists when there is something to copy — the same
         // rule as back and forward, for the same reason.
-        assert!(!items_for(None, false, false, false).contains(&Item::CopySelection));
-        assert!(items_for(None, true, false, false).contains(&Item::CopySelection));
+        assert!(!items_for(None, false, false, false, false).contains(&Item::CopySelection));
+        assert!(items_for(None, true, false, false, false).contains(&Item::CopySelection));
     }
 
     #[test]
@@ -258,7 +276,13 @@ mod tests {
         // Nearest first: what the pointer is on, then what is on the page,
         // then what the tab can do. A menu that put "Reload" above "Copy link
         // address" would make the reader read the whole list every time.
-        let items = items_for(Some("https://example.com/".to_owned()), true, true, false);
+        let items = items_for(
+            Some("https://example.com/".to_owned()),
+            true,
+            false,
+            true,
+            false,
+        );
 
         assert_eq!(
             items,
@@ -277,7 +301,7 @@ mod tests {
     #[test]
     fn a_menu_on_bare_page_offers_only_what_the_page_can_do() {
         assert_eq!(
-            items_for(None, false, false, false),
+            items_for(None, false, false, false, false),
             vec![Item::Reload, Item::ViewSource, Item::PageInformation],
             "there is always a page to fetch again, to read the markup of, and \
              to ask about (#198)"
@@ -285,14 +309,24 @@ mod tests {
     }
 
     #[test]
+    fn paste_is_offered_only_where_there_is_somewhere_to_put_it() {
+        // The one entry here that acts on something other than what the pointer
+        // is over: it needs a field with the keyboard. Offering it otherwise
+        // would be an entry that does nothing, which is the thing this menu
+        // does not do.
+        assert!(!items_for(None, false, false, false, false).contains(&Item::Paste));
+        assert!(items_for(None, false, true, false, false).contains(&Item::Paste));
+    }
+
+    #[test]
     fn nothing_is_offered_that_would_do_nothing() {
         // Greyed-out entries are a list of things you cannot have. Leaving
         // them out is shorter to read and cannot be clicked in hope.
-        let fresh = items_for(None, false, false, false);
+        let fresh = items_for(None, false, false, false, false);
         assert!(!fresh.contains(&Item::Back), "{fresh:?}");
         assert!(!fresh.contains(&Item::Forward), "{fresh:?}");
 
-        let travelled = items_for(None, false, true, true);
+        let travelled = items_for(None, false, false, true, true);
         assert!(travelled.contains(&Item::Back));
         assert!(travelled.contains(&Item::Forward));
     }
