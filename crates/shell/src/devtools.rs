@@ -44,6 +44,8 @@ pub struct Report<'a> {
     pub content_type: Option<&'a str>,
     /// How many bytes of document arrived.
     pub bytes: usize,
+    /// What the server answered with (#203).
+    pub status: u16,
     /// Whether the certificate chain needed this computer's own roots
     /// (ADR-0015).
     pub local_root: bool,
@@ -177,6 +179,7 @@ fn network(html: &mut String, report: &Report<'_>) {
         "Served as",
         &escape(report.content_type.unwrap_or("nothing said")),
     );
+    row(html, "Status", &report.status.to_string());
     row(html, "Bytes", &report.bytes.to_string());
     row(
         html,
@@ -434,6 +437,7 @@ mod tests {
             url: "https://example.com/",
             content_type: Some("text/html"),
             bytes: 1234,
+            status: 200,
             local_root: false,
             mode: layout::RenderMode::Authored,
             explanation: None,

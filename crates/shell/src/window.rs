@@ -311,6 +311,12 @@ struct Tab {
     zoom: f32,
     /// Whether this page is in a layout decision the reader can change.
     can_toggle_layout: bool,
+    /// What the server answered this page with (#203).
+    ///
+    /// Kept because a page and its status are now two different things: a 404
+    /// with a body renders as the site wrote it, and nothing on screen would
+    /// otherwise say it was a 404 at all. The page information view reads it.
+    status: u16,
     /// Whether this page's certificate verified only against a local root.
     ///
     /// A property of the connection that fetched it, so it is remembered per
@@ -348,6 +354,9 @@ impl Tab {
             page: None,
             scroll: 0.0,
             error: None,
+            // Until something says otherwise. A tab that has not fetched
+            // anything has nothing to have gone wrong with it.
+            status: 200,
             forcing_authored: false,
             forcing_document: false,
             zoom: 1.0,
@@ -890,9 +899,21 @@ impl App {
                 // fills the name in.
                 self.record_visit(&landed_on, "");
                 self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
+                // A 4xx or a 5xx keeps whatever the server sent, because what
+                // it sent is the answer: a site's own "not found", a proxy's
+                // block notice. Only a status with *nothing* behind it gets a
+                // page of the browser's own — otherwise the reader is left with
+                // a blank window and a code in the chrome (#203).
+                let (body, content_type) = crate::status::substitute(
+                    fetched.status,
+                    fetched.body,
+                    fetched.content_type,
+                    &landed_on,
+                );
+                self.tab_mut().status = fetched.status;
                 self.tab_mut().loaded = Loaded {
-                    body: fetched.body,
-                    content_type: fetched.content_type,
+                    body,
+                    content_type,
                     origin: fetched.origin,
                     path: fetched.path,
                 };
@@ -2060,6 +2081,7 @@ impl App {
             url: self.tab().history.current(),
             content_type: self.tab().loaded.content_type.as_deref(),
             bytes: self.tab().loaded.body.len(),
+            status: self.tab().status,
             local_root: self.tab().local_root,
             explanation: mode.explanation(),
             mode,

@@ -19,6 +19,7 @@ pub mod render;
 pub mod scrollbar;
 pub mod site_panel;
 pub mod sites;
+pub mod status;
 pub mod tabs;
 pub mod viewport;
 pub mod visits;
