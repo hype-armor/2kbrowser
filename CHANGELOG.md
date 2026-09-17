@@ -16,6 +16,113 @@ record for everything earlier.
 
 ## Unreleased
 
+**Debugging tools: console, inspector, network, storage, and view source**
+(#198). All four of the asked-for tools, as one generated page rather than four
+panels — a page for the reason the saved list and the history are pages: the
+engine already knows how to show a document, and a devtools *window* would be a
+second piece of interface with its own scrolling and its own bugs. Ctrl+U shows
+the markup, Ctrl+Shift+I shows the rest, and both are in the right-click menu.
+
+Two of the four mean something different here, and saying so is most of the job.
+**The console has nothing to listen to** — ADR-0003 means no script runs, so
+nothing on the page can log anything. What it shows instead is the browser's own
+account of the page: why it was laid out the way it was, what was refused, what
+did not arrive. **Storage is empty by construction** — no `localStorage`
+without scripts, no cookies, and a cache that lives in memory for one run
+(ADR-0018). Rather than draw an empty table that reads as a missing feature, it
+says so and then names the three files the browser itself keeps.
+
+**The inspector is the accessibility tree**, which ADR-0019 already sends across
+the process boundary as data. That is not a stand-in for a DOM inspector so much
+as a better answer to the question usually being asked — *what did this page
+actually turn into?* — because it is the structure the page produced rather than
+the markup it was written in. The markup is one keystroke away, unchanged.
+
+View source shows the bytes the parent already holds, decoded the way the
+document itself was decoded. Nothing is fetched again: a source view that
+re-asked the server could show something the page on screen never was.
+
+**A preformatted line keeps the spaces it starts with.** Found while building
+the inspector below, which drew every level of the tree flush left. Spaces
+following a line break were folded into the segment that *carried* the break, so
+a `<pre>`'s indentation landed at the end of the line above, where nothing can
+see it. They are a segment of their own now, shaped, at the start of the line
+the break begins — so they take room, they are in the line's text for a search
+to find, and an inline box's background is drawn across them.
+
+Every line of every indented `<pre>` on the old web was affected, and so was
+view-source, which is a `<pre>` of somebody's markup. Conformance is unchanged
+at 901; this is a case the CSS 2.1 suite does not cover.
+
+**Where you have been survives the window** (#197, ADR-0021). ADR-0018 walked up
+to this and stopped: *"On disk is a persistent record of what a person has read
+… That is a separate and much larger decision, and this does not license it."*
+This is that decision. Ctrl+H shows the list, Ctrl+Shift+H forgets it, and
+`2kbrowser history` prints it with `--forget` to empty it.
+
+What keeps it honest is what the file is allowed to be. It is `history.tsv`
+beside the bookmarks and the site exceptions, in the same tab-separated format
+anybody can read, edit or delete. It is **bounded** at 500 addresses, because a
+bound is the thing a reader can check — a history with no ceiling becomes a life
+story by doing nothing at all. It holds **one line per address**, not one per
+visit, so it stays a list somebody can scan and so it says nothing about habits.
+And nothing sends it anywhere: there is no code here that could, and ADR-0021 is
+what stops one being written.
+
+That makes three files outliving a run rather than two, which is the real cost
+and is stated rather than absorbed — the README said two and has been corrected.
+
+**A new tab opens on nothing** (#196). It used to open on the page you were
+already looking at — and re-fetch it to get there. That was never neutral: it is
+a second copy of something nobody asked to duplicate. Nothing is the honest
+third option, and the address bar takes the focus so the tab is one keystroke
+from being useful. The strip calls it `New tab`, because a tab with no name is
+a gap in the strip.
+
+**The address bar takes a caret and a drag** (#199). It had exactly one
+behaviour — focus, and select everything — so the only way to reach one
+character of a long URL was the arrow keys. A press now puts the caret where the
+pointer is and a drag selects what it crosses. The first click into an unfocused
+bar still selects the whole address, which is what an address bar has always
+done and what the common next action wants.
+
+Both are checked by `window-clicks.sh`, because both are event-loop behaviour
+that `cargo test` cannot reach. The blank-tab check measures the *page* going
+blank rather than the address bar emptying: the bar's field is drawn on the
+chrome's grey, so "is this row white?" is answered no whether there is an
+address in it or not — the first version of that check passed without the
+feature, which is the one kind of check worth nothing.
+
+**A text box looks like one, and keeps its own alignment** (#195). An `inset`
+border darkens its top and left and leaves its bottom and right as given, which
+was written for the era's grey window background. On a white page the light
+edges vanish, so a field drew as a dark top-left corner and nothing else —
+which reads as a rendering fault rather than as a control. The border is
+`#999999` now: still sunken, still there on white.
+
+And a control's `text-align` is set rather than inherited, so a field inside a
+centred block no longer centres what is typed into it. An author rule on the
+control still wins, which is the whole of "unless otherwise styled": this only
+stops a control picking up an alignment meant for the prose around it.
+
+**An image opened by its own address renders as one** (#201). A JPEG is not a
+document, and decoding one as text produced a page of mojibake. A document is
+invented to hold it instead — `<img>` and nothing else — so a picture gets the
+same layout, the same scrollbar and the same `Load image` placeholder as one
+inside a page, rather than a second rendering path that could drift from the
+first.
+
+The `Content-Type` decides whenever there is one: a server saying `text/html` is
+believed even if the bytes open like a PNG, because sniffing *against* a
+declared type is how a browser gets talked into treating one thing as another.
+Sniffing only fills a silence — and the silence is not rare, since a `file:`
+URL has no headers at all, which is how most people open an image on their own
+disk.
+
+The picture already in hand is not asked for twice. The navigation downloaded
+it; the page invented to show it names it as its only subresource, and that
+request is answered from the bytes rather than from the network.
+
 **A page belongs to where the redirect left it.** Reported as Hacker News's
 comment pages answering "No such item." in this browser and rendering fine in
 Firefox. They do: `hackernews.com` is a redirect to `news.ycombinator.com`, and

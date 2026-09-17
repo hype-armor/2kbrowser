@@ -2275,6 +2275,44 @@ impl FontStore {
                     // paragraph gap was wanted.
                     let already_breaking =
                         out.last().is_some_and(|last| last.mandatory_break) && mandatory;
+                    // Preserved spaces that *follow* a break belong to the line
+                    // the break starts, not to the one it ends. Folded into the
+                    // segment carrying the break — which is what every other
+                    // whitespace piece does — they become trailing space at the
+                    // end of the line above, where nothing can see them. That
+                    // is why every line of an indented `<pre>` came out flush
+                    // left, and why view-source showed markup with no
+                    // indentation at all.
+                    //
+                    // A segment of its own, shaped, so the spaces are content:
+                    // they take room at the start of the new line, they are in
+                    // the line's text for a search to find, and an inline box's
+                    // background is drawn across them.
+                    let after_break = out.last().is_some_and(|last| last.mandatory_break);
+                    if preserve && after_break && !mandatory && !spacing.is_empty() {
+                        let shaped = self.shape_segment(&spacing, &run.style);
+                        out.push(Segment {
+                            shaped,
+                            trailing_space: 0.0,
+                            trailing_text: String::new(),
+                            space_is_content: false,
+                            mandatory_break: false,
+                            align: run.style.vertical_align,
+                            x: 0.0,
+                            level: bidi.at(run_start + piece_start),
+                            space_level: bidi.at(run_start + piece_start),
+                            replaced: None,
+                            source: run.source,
+                            decoration: run.style.text_decoration,
+                            font_size: run.style.font_size,
+                            color: span_color(&run.style),
+                            hidden: run.style.visibility == Visibility::Hidden,
+                            edge: None,
+                            boxes: run.boxes.clone(),
+                            content,
+                        });
+                        continue;
+                    }
                     if let Some(last) = out.last_mut()
                         && !already_breaking
                     {
@@ -3668,5 +3706,51 @@ mod break_tests {
         let mut store = FontStore::new();
         let layout = store.layout_runs(&[pre("a\n\nb")], &ComputedStyle::default(), 1000.0);
         assert_eq!(layout.lines.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod preserved_indent_tests {
+    //! Spaces at the start of a preserved line (#198's inspector found this).
+
+    use super::*;
+
+    /// Lays out one `white-space: pre` run and returns each line's text.
+    fn lines_of(text: &str) -> Vec<String> {
+        let mut fonts = FontStore::new();
+        let style = ComputedStyle {
+            white_space: WhiteSpace::Pre,
+            ..ComputedStyle::default()
+        };
+        let layout = fonts.layout(text, &style, 10_000.0);
+        layout.lines.iter().map(|line| line.text.clone()).collect()
+    }
+
+    #[test]
+    fn a_preserved_line_keeps_the_spaces_it_starts_with() {
+        // They used to be folded into the segment carrying the break, which put
+        // them at the end of the line *above* — invisible, and so every line of
+        // an indented `<pre>` came out flush left.
+        assert_eq!(
+            lines_of("a\n  b\n    c"),
+            vec!["a", "  b", "    c"],
+            "the indentation of a preformatted block is content"
+        );
+    }
+
+    #[test]
+    fn spaces_in_the_middle_of_a_preserved_line_are_still_kept() {
+        // The case #126 was about, which this must not disturb.
+        assert_eq!(lines_of("a  b"), vec!["a  b"]);
+    }
+
+    #[test]
+    fn a_blank_preserved_line_is_still_a_line() {
+        assert_eq!(lines_of("a\n\nb"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn a_line_of_nothing_but_spaces_survives() {
+        assert_eq!(lines_of("a\n   \nb"), vec!["a", "   ", "b"]);
     }
 }

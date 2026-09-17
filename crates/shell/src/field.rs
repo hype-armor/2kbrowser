@@ -53,6 +53,26 @@ impl Field {
         }
     }
 
+    /// Puts the cursor at a byte offset, extending the selection or not (#199).
+    ///
+    /// What a press and a drag in the field mean: the press places the cursor
+    /// and drops the anchor with it, and every movement after that extends from
+    /// the anchor. `extend` is the whole difference between the two.
+    ///
+    /// Clamped to a character boundary, because these are byte indices and
+    /// slicing one in half panics. An offset that came from measuring pixels is
+    /// exactly where that can happen.
+    pub fn place(&mut self, at: usize, extend: bool) {
+        let mut at = at.min(self.text.len());
+        while at > 0 && !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.cursor = at;
+        if !extend {
+            self.anchor = at;
+        }
+    }
+
     /// The current text.
     pub fn text(&self) -> &str {
         &self.text
@@ -184,14 +204,6 @@ impl Field {
     pub fn select_all(&mut self) {
         self.anchor = 0;
         self.cursor = self.text.len();
-    }
-
-    /// Places the cursor, extending the selection or collapsing it.
-    fn place(&mut self, to: usize, extend: bool) {
-        self.cursor = to;
-        if !extend {
-            self.anchor = to;
-        }
     }
 
     /// Removes the selection. Returns whether there was one.
@@ -415,5 +427,50 @@ mod tests {
         field.select_all();
         field.insert("new");
         assert_eq!(show(&field), "new|");
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    //! Placing the cursor with a pointer rather than with the keyboard (#199).
+
+    use super::Field;
+
+    #[test]
+    fn a_press_puts_the_cursor_where_it_landed_and_clears_the_selection() {
+        let mut field = Field::with_all_selected("https://example.com/");
+        assert!(field.selection().is_some(), "focusing selects everything");
+        field.place(8, false);
+        assert_eq!(field.cursor(), 8);
+        assert_eq!(field.selection(), None, "a press collapses the selection");
+    }
+
+    #[test]
+    fn a_drag_extends_from_where_the_press_landed() {
+        let mut field = Field::with_all_selected("https://example.com/");
+        field.place(8, false);
+        field.place(15, true);
+        assert_eq!(
+            field.selection(),
+            Some((8, 15)),
+            "the anchor should have stayed where the press put it"
+        );
+        // And dragging back past the anchor selects the other way.
+        field.place(4, true);
+        assert_eq!(field.selection(), Some((4, 8)));
+    }
+
+    #[test]
+    fn an_offset_from_pixels_never_splits_a_character() {
+        // The offset comes from measuring text, so it has no idea where a
+        // character begins. Slicing one in half is a panic, not mojibake.
+        let mut field = Field::with_cursor_at_end("é—x");
+        for at in 0..=field.text().len() + 4 {
+            field.place(at, false);
+            // The proof is that this does not panic.
+            assert!(field.text().is_char_boundary(field.cursor()));
+        }
+        field.place(usize::MAX, false);
+        assert_eq!(field.cursor(), field.text().len(), "clamped to the end");
     }
 }

@@ -496,7 +496,10 @@ the browser already knows how to show a document with links in it and a
 bookmarks *panel* would be a second piece of interface with its own scrolling
 and its own bugs. `2kbrowser bookmarks` prints the same list. It is stored as a
 tab-separated file under your config directory: a few kilobytes, editable in
-anything, and the only state this browser keeps between runs.
+anything. Ctrl+H shows where you have been, the same way and from the same kind
+of file, and Ctrl+Shift+H forgets it (ADR-0021). Those two and the site
+exceptions are the only state this browser keeps between runs — three files, all
+of them plain text, none of them sent anywhere.
 
 Hovering a link puts its address in the bottom-left corner. A link's text says
 whatever its author wanted it to say; only the address says where it goes, and

@@ -26,3 +26,4 @@ that ADRs are superseded rather than edited.
 | [0018](0018-cache-across-pages.md) | A cache that outlives a page, partitioned by site | accepted |
 | [0019](0019-accessibility-tree-crosses-as-data.md) | The accessibility tree crosses as data, and the parent builds the objects | accepted |
 | [0020](0020-the-site-is-the-third-party-boundary.md) | The third-party boundary is the site, not the host | accepted |
+| [0021](0021-history-kept-between-runs.md) | A history that outlives the run | accepted |

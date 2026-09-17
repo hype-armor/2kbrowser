@@ -245,6 +245,19 @@ type Loaded = crate::viewport::Document;
 ///
 /// Everything here describes a page. What is *not* here — the window, the
 /// fonts, the pointer — belongs to the browser rather than to any page in it.
+/// A press in the URL bar that has not been let go of yet (#199).
+#[derive(Debug, Clone, Copy)]
+struct UrlDrag {
+    /// Whether the bar already had the focus when the press landed.
+    ///
+    /// A first click focuses and selects everything; a second one places the
+    /// caret. Without this the bar could be focused or edited but never both.
+    was_focused: bool,
+    /// Whether the pointer moved while the button was down, which is what
+    /// makes a press a drag rather than a click.
+    moved: bool,
+}
+
 struct Tab {
     loaded: Loaded,
     history: crate::history::History,
@@ -356,8 +369,45 @@ impl Tab {
             .and_then(crate::viewport::Viewport::title)
         {
             Some(title) => title,
+            None if self.is_blank() => "New tab",
             None => self.history.current(),
         }
+    }
+
+    /// Whether this tab is the empty one a new tab starts as (#196).
+    ///
+    /// No address is the test, because no address is the thing: there is
+    /// nothing to reload, nothing to go back to and nothing to say about the
+    /// connection, and every one of those questions is asked of the URL.
+    fn is_blank(&self) -> bool {
+        self.history.current().is_empty()
+    }
+
+    /// A tab with nothing in it (#196).
+    ///
+    /// A new tab used to show the page you were on, for the reason the old
+    /// comment gave: there is no home page and no new-tab page of tiles to put
+    /// there. But copying the current page is not neutral either — it is a
+    /// second copy of something the reader did not ask to duplicate, and it
+    /// re-fetches it to get there. Nothing is the honest third option, and it
+    /// is what the address bar being ready to type into is for.
+    fn blank() -> Self {
+        Self::new(
+            Loaded {
+                body: Vec::new(),
+                content_type: None,
+                // No origin at all is the truthful answer, and an empty-hosted
+                // `file:` origin is how this browser already spells one: it is
+                // what every `file:` URL parses to.
+                origin: net::Origin {
+                    scheme: net::Scheme::File,
+                    host: String::new(),
+                    port: 0,
+                },
+                path: String::new(),
+            },
+            String::new(),
+        )
     }
 }
 
@@ -488,6 +538,11 @@ struct App {
     /// the first move, because the anchor is where the press was and by the
     /// time a move arrives the pointer is somewhere else.
     selecting: Option<(f32, f32)>,
+    /// A press in progress in the URL bar's text (#199).
+    ///
+    /// `None` when the pointer is not dragging through the address. What it
+    /// remembers is only what the release needs to tell a click from a drag.
+    url_drag: Option<UrlDrag>,
     /// Which colour scheme the chrome draws in.
     theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
@@ -509,6 +564,10 @@ struct App {
     waker: Option<winit::event_loop::EventLoopProxy<Wake>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
+    /// Where the reader has been, kept between runs (#197, ADR-0021).
+    visits: crate::visits::Visits,
+    /// Where that list is written back to.
+    visits_path: std::path::PathBuf,
     /// The open site panel, if the padlock has been pressed (#118).
     panel: Option<crate::site_panel::Panel>,
     /// The open dropdown, if a `<select>` on the page has been pressed.
@@ -678,6 +737,14 @@ impl App {
             tab.can_toggle_layout = page.can_toggle_layout();
             tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
         }
+        // The page now has a title, which is what the history list wants to
+        // call it (#197). The address was recorded when the navigation landed;
+        // this names it, once the borrow of the tab above is over.
+        let named = tab
+            .page
+            .as_ref()
+            .and_then(crate::viewport::Viewport::title)
+            .map(|title| (tab.history.current().to_owned(), title.to_owned()));
 
         // The old selection pointed at the old layout, and unlike a query there
         // is nothing to re-run it from: the two points it was dragged between
@@ -693,6 +760,9 @@ impl App {
                 None => Vec::new(),
             };
             tab.current_match = tab.current_match.min(tab.matches.len().saturating_sub(1));
+        }
+        if let Some((url, title)) = named {
+            self.record_visit(&url, &title);
         }
         // Same reason: the focused link is still the same link, but it is no
         // longer in the same place.
@@ -782,7 +852,14 @@ impl App {
                 // the padlock's site and every link on the page disagreeing
                 // about which site the reader is on — and Back would return to
                 // the address that only redirects again.
-                self.tab_mut().history.arrived_at(landed_on);
+                self.tab_mut().history.arrived_at(landed_on.clone());
+                // And the reader has been here (#197). Recorded on the landing
+                // rather than on the click, for the same reason the purple-link
+                // list is: a page that refused to load is not a place you have
+                // been. The title is not known yet — it arrives from the
+                // renderer — so this records the address and the render below
+                // fills the name in.
+                self.record_visit(&landed_on, "");
                 self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
                     body: fetched.body,
@@ -840,6 +917,11 @@ impl App {
     /// to do nothing.
     fn reload(&mut self) {
         let url = self.tab().history.current().to_owned();
+        // An empty tab has nothing to fetch again, and asking would answer
+        // with "malformed URL" — an error about a page nobody navigated to.
+        if url.is_empty() {
+            return;
+        }
         // ADR-0018's sixth term: reload bypasses the cache. Only this site's
         // entries go, because reloading one page says nothing about any other
         // — and a reload that served the same bytes back would leave the one
@@ -955,6 +1037,57 @@ impl App {
             self.tab().history.current(),
         ));
         self.refresh_chrome();
+    }
+
+    /// Starts a press in the URL bar's text (#199).
+    ///
+    /// The caret goes where the pointer is, which is the thing that was
+    /// missing: the bar could only ever be focused with everything selected,
+    /// so the only way to reach one character of a long URL was the arrow
+    /// keys. Whether this turns out to be a click or a drag is decided when
+    /// the button comes up.
+    fn press_url(&mut self) {
+        let was_focused = self.editing.is_some();
+        if !was_focused {
+            self.editing = Some(crate::field::Field::with_cursor_at_end(
+                self.tab().history.current(),
+            ));
+        }
+        self.drag_url_to(self.pointer.0, false);
+        self.url_drag = Some(UrlDrag {
+            was_focused,
+            moved: false,
+        });
+    }
+
+    /// Moves the caret in the URL bar to a window x (#199).
+    fn drag_url_to(&mut self, x: f32, extend: bool) {
+        let Some(field) = &self.editing else { return };
+        let at = crate::chrome::offset_in_url(&mut self.fonts, field.text(), x);
+        if let Some(field) = &mut self.editing {
+            field.place(at, extend);
+        }
+        self.refresh_chrome();
+    }
+
+    /// Ends a press in the URL bar (#199).
+    ///
+    /// A click that never moved, on a bar that was not already focused,
+    /// selects the whole URL — which is what focusing an address bar has
+    /// always done, and what the common next action wants: replace it. Once
+    /// the bar is focused the same click places the caret instead, and a drag
+    /// always selects what it crossed.
+    fn release_url(&mut self) {
+        let Some(drag) = self.url_drag.take() else {
+            return;
+        };
+        if !drag.moved
+            && !drag.was_focused
+            && let Some(field) = &mut self.editing
+        {
+            field.select_all();
+            self.refresh_chrome();
+        }
     }
 
     /// Tells the page a point on it was pressed (#110).
@@ -1202,6 +1335,17 @@ impl App {
         if self.editing.take().is_some() {
             self.refresh_chrome();
         }
+    }
+
+    /// Opens an empty tab beside the current one, ready to be typed into (#196).
+    ///
+    /// The URL bar takes the focus, because an empty tab with the focus
+    /// somewhere else is a page with nothing on it and nothing to do — the
+    /// address is the only thing a reader can possibly want next.
+    fn open_blank_tab(&mut self) {
+        self.tabs.open(Tab::blank());
+        self.editing = Some(crate::field::Field::with_all_selected(""));
+        self.rerender();
     }
 
     /// Opens a new tab showing `url`, beside the current one.
@@ -1639,6 +1783,8 @@ impl App {
             Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
             Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
             Some(crate::menu::Item::CopySelection) => self.copy_selection(),
+            Some(crate::menu::Item::ViewSource) => self.open_source(),
+            Some(crate::menu::Item::PageInformation) => self.open_page_information(),
             // A click outside the menu dismisses it and does nothing else.
             None => {}
         }
@@ -1726,6 +1872,173 @@ impl App {
             self.tab_mut().error = Some(format!("could not save bookmarks: {error}"));
         }
         self.refresh_chrome();
+    }
+
+    /// Records a page in the history, and writes the list out (#197).
+    ///
+    /// Written on every navigation rather than on the way out, for the reason
+    /// bookmarks gives: a browser that lost where you had been because it was
+    /// closed the wrong way would be worse than one that never remembered, and
+    /// the file is a few tens of kilobytes.
+    ///
+    /// A failed write is said once, in the place every other failure is said.
+    /// Silently not recording looks exactly like recording.
+    fn record_visit(&mut self, url: &str, title: &str) {
+        // Not the generated views of the browser's own lists. They are written
+        // fresh every time they are opened, so remembering them says only that
+        // you once pressed Ctrl+B — and it would put the history list in the
+        // history list.
+        if url.is_empty()
+            || url == net::file_url(&crate::bookmarks::page_path())
+            || url == net::file_url(&crate::visits::page_path())
+            || net::parse_url(url).ok().is_some_and(|(_, path)| {
+                crate::devtools::is_generated(std::path::Path::new(net::policy::to_file_path(
+                    &path,
+                )))
+            })
+        {
+            return;
+        }
+        self.visits.record(
+            url,
+            title,
+            crate::visits::stamp(std::time::SystemTime::now()),
+        );
+        if let Err(error) = self.visits.save(&self.visits_path) {
+            self.tab_mut().error = Some(format!("could not save the history: {error}"));
+        }
+    }
+
+    /// Opens the history, as a page, in a new tab (#197).
+    fn open_history(&mut self) {
+        let path = crate::visits::page_path();
+        let html = crate::visits::page(&self.visits);
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&net::file_url(&path)),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write the history: {error}"));
+                self.refresh_chrome();
+            }
+        }
+    }
+
+    /// Forgets every page in the history (#197).
+    ///
+    /// The whole list rather than a page of it, and one keystroke rather than a
+    /// confirmation. A reader who wants this gone usually wants it gone now,
+    /// and the alternative — a dialog — is a second piece of interface for a
+    /// thing that can be done again in a second if it was a mistake.
+    fn clear_history(&mut self) {
+        self.visits.clear();
+        if let Err(error) = self.visits.save(&self.visits_path) {
+            self.tab_mut().error = Some(format!("could not clear the history: {error}"));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Opens this page's markup, as a page (#198).
+    ///
+    /// The bytes the parent already holds, decoded the way the document itself
+    /// was decoded — so what is shown is what was *parsed*, not a second guess
+    /// at the encoding. Nothing is fetched again: a source view that re-asked
+    /// the server could show something the page on screen never was.
+    fn open_source(&mut self) {
+        let html = crate::devtools::source_page(
+            self.tab().history.current(),
+            &self.tab().loaded.body,
+            self.tab().loaded.content_type.as_deref(),
+        );
+        self.open_generated(crate::devtools::source_path(), html, "the source");
+    }
+
+    /// Opens what the browser knows about this page (#198).
+    fn open_page_information(&mut self) {
+        let stores = vec![
+            crate::devtools::Store::of(
+                "Bookmarks",
+                self.bookmarks_path.clone(),
+                self.bookmarks.len(),
+                "§1",
+            ),
+            crate::devtools::Store::of(
+                "Site exceptions",
+                self.sites_path.clone(),
+                self.renderer.policy().exceptions.len(),
+                "ADR-0006",
+            ),
+            crate::devtools::Store::of(
+                "History",
+                self.visits_path.clone(),
+                self.visits.len(),
+                "ADR-0021",
+            ),
+        ];
+        // Asked of the child, which is the only thing that has it: the tree is
+        // built from the box tree, and the box tree never crosses the boundary
+        // (ADR-0012, ADR-0019).
+        let tree = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .map(crate::viewport::Viewport::accessibility)
+            .unwrap_or_default();
+        let withheld = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
+        let mode = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::mode)
+            .unwrap_or(layout::RenderMode::Authored);
+        let html = crate::devtools::page(&crate::devtools::Report {
+            url: self.tab().history.current(),
+            content_type: self.tab().loaded.content_type.as_deref(),
+            bytes: self.tab().loaded.body.len(),
+            local_root: self.tab().local_root,
+            explanation: mode.explanation(),
+            mode,
+            error: self.tab().error.as_deref(),
+            images_loaded: self
+                .tab()
+                .page
+                .as_ref()
+                .map(crate::viewport::Viewport::images_loaded)
+                .unwrap_or(0),
+            withheld: withheld.urls().to_vec(),
+            withheld_hosts: withheld.hosts().to_vec(),
+            tree,
+            stores,
+        });
+        self.open_generated(crate::devtools::page_path(), html, "the page information");
+    }
+
+    /// Writes one of the browser's own pages out and opens it in a new tab.
+    ///
+    /// Written to disk and loaded like any other file so that back, forward,
+    /// find and the links on it all work without a second code path — which is
+    /// what the saved list and the history already do.
+    fn open_generated(&mut self, path: std::path::PathBuf, html: String, what: &str) {
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&net::file_url(&path)),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write {what}: {error}"));
+                self.refresh_chrome();
+            }
+        }
     }
 
     /// Opens the saved list, as a page, in a new tab.
@@ -2915,6 +3228,13 @@ impl ApplicationHandler<Wake> for App {
                     }
                     return;
                 }
+                if self.url_drag.is_some() {
+                    if let Some(drag) = &mut self.url_drag {
+                        drag.moved = true;
+                    }
+                    self.drag_url_to(self.pointer.0, true);
+                    return;
+                }
                 if self.selecting.is_some() {
                     self.extend_selection();
                     return;
@@ -2975,6 +3295,17 @@ impl ApplicationHandler<Wake> for App {
                 // Nothing to do rather than something careful: with an overlay
                 // up there is no press on the page or the scrollbar to be had.
                 if self.menu.is_some() || self.panel.is_some() || self.dropdown.is_some() {
+                    return;
+                }
+                // A press in the bar's text is where selecting a URL starts
+                // (#199). Above the bar is the tab strip and its controls are
+                // pressed on release, so neither is this.
+                if self.pointer.1 >= crate::chrome::TAB_HEIGHT as f32
+                    && self.pointer.1 < self.chrome_height() as f32
+                {
+                    if self.control_under_pointer().is_none() && self.tab().finding.is_none() {
+                        self.press_url();
+                    }
                     return;
                 }
                 match self.scrollbar_grab() {
@@ -3072,12 +3403,10 @@ impl ApplicationHandler<Wake> for App {
                             self.pointer.0,
                             self.pointer.1,
                         ) {
-                            // A new tab shows the page you are on, which is
-                            // what Ctrl+T does and the only thing this browser
-                            // could put there.
+                            // A new tab is empty, with the address bar ready
+                            // to be typed into (#196).
                             Some(crate::chrome::StripClick::NewTab) => {
-                                let url = self.tab().history.current().to_owned();
-                                self.open_tab(&url);
+                                self.open_blank_tab();
                             }
                             Some(crate::chrome::StripClick::Close(index)) => {
                                 self.close_tab(index);
@@ -3109,9 +3438,11 @@ impl ApplicationHandler<Wake> for App {
                                     window.request_redraw();
                                 }
                             }
-                            // Anywhere else in the bar is the URL, and clicking
-                            // a URL bar is how most people focus one.
-                            None => self.focus_url(),
+                            // Anywhere else in the bar is the URL. The press
+                            // already put the caret where the pointer was, so
+                            // all that is left is to decide whether it was a
+                            // click or a drag (#199).
+                            None => self.release_url(),
                         }
                     } else {
                         // A click on the page is a click on the page, even if
@@ -3192,12 +3523,10 @@ impl ApplicationHandler<Wake> for App {
                 }
                 if ctrl {
                     match &event.logical_key {
-                        // A new tab shows the page you are on, which is the
-                        // only thing this browser could put there: there is no
-                        // home page and no new-tab page to fill with tiles.
+                        // A new tab is empty, and the address bar takes the
+                        // focus so it can be typed into straight away (#196).
                         Key::Character(c) if c == "t" => {
-                            let url = self.tab().history.current().to_owned();
-                            self.open_tab(&url);
+                            self.open_blank_tab();
                             return;
                         }
                         Key::Character(c) if c == "w" => {
@@ -3234,6 +3563,30 @@ impl ApplicationHandler<Wake> for App {
                         }
                         Key::Character(c) if c == "b" => {
                             self.open_bookmarks();
+                            return;
+                        }
+                        // Ctrl+H shows where you have been, and Ctrl+Shift+H
+                        // forgets it — the destructive one behind a second
+                        // modifier, because "show me" and "throw it away" are
+                        // not two keystrokes that should be one slip apart
+                        // (#197).
+                        Key::Character(c) if c.eq_ignore_ascii_case("h") => {
+                            if shift {
+                                self.clear_history();
+                            } else {
+                                self.open_history();
+                            }
+                            return;
+                        }
+                        // Ctrl+U shows the markup, as it has everywhere since
+                        // Netscape, and Ctrl+Shift+I shows what the browser
+                        // knows about the page (#198).
+                        Key::Character(c) if c.eq_ignore_ascii_case("u") => {
+                            self.open_source();
+                            return;
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("i") && shift => {
+                            self.open_page_information();
                             return;
                         }
                         // Ctrl+R reloads, as it has everywhere since Netscape.
@@ -3441,6 +3794,7 @@ pub fn open(
         loading: None,
         dragging: None,
         selecting: None,
+        url_drag: None,
         adapter: None,
         listening: false,
         a11y_tree: None,
@@ -3453,6 +3807,8 @@ pub fn open(
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        visits: crate::visits::Visits::load(&crate::visits::default_path()),
+        visits_path: crate::visits::default_path(),
         panel: None,
         dropdown: None,
         sites_path: crate::sites::default_path(),
@@ -4372,5 +4728,43 @@ mod loading_tests {
         let mut buffer = vec![WHITE; (WIDTH * BAR) as usize];
         draw_loading(&mut buffer, Some(0.5), (WIDTH, BAR), BAR);
         assert!(buffer.iter().all(|pixel| *pixel == WHITE));
+    }
+}
+
+#[cfg(test)]
+mod blank_tab_tests {
+    //! The empty tab a new tab starts as (#196).
+
+    use super::Tab;
+
+    #[test]
+    fn a_new_tab_holds_nothing_and_says_so() {
+        let tab = Tab::blank();
+        assert!(tab.is_blank());
+        assert!(tab.loaded.body.is_empty(), "a blank tab has no document");
+        assert_eq!(tab.history.current(), "", "and no address");
+        assert_eq!(
+            tab.label(),
+            "New tab",
+            "an unnamed tab would be a nameless gap in the strip"
+        );
+    }
+
+    #[test]
+    fn a_tab_with_an_address_is_not_blank() {
+        let tab = Tab::blank();
+        let mut loaded = tab.loaded.clone();
+        loaded.path = "/index.html".to_owned();
+        let tab = Tab::new(loaded, "https://example.com/index.html".to_owned());
+        assert!(!tab.is_blank());
+        assert_eq!(tab.label(), "https://example.com/index.html");
+    }
+
+    #[test]
+    fn a_blank_tab_has_nowhere_to_go_back_to() {
+        // It is one entry like any other history, and that entry is nothing.
+        let tab = Tab::blank();
+        assert!(!tab.history.can_go_back());
+        assert!(!tab.history.can_go_forward());
     }
 }

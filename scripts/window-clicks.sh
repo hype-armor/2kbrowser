@@ -58,6 +58,10 @@ scrollbar=8
 button=40
 reload=58
 site_x=$((padding + button * 2 + reload + 13))
+# Where the URL bar's text begins, from `chrome::url_text_x`. Same caveat as
+# every other number here: pinned there, repeated because a pointer has to be
+# told one.
+url_x=$((padding * 2 + button * 2 + reload + 26))
 toggle_x=$((width - padding - bookmark - toggle / 2))
 # Down the middle of the URL bar, which is below the strip rather than at the
 # top of the window.
@@ -1200,5 +1204,167 @@ moved=$(DISPLAY=$display xwd -silent -id "$window" \
     | python3 "$here/scripts/xwd-ink.py" 0 $((width - 1)) $((chrome + 300)))
 echo "ok: a fixed box stayed where it was while the page scrolled under it"
 stop
+
+# N. The address bar can be selected with the pointer (#199).
+#
+#    `field.rs` pins what a press and a drag do to a cursor and an anchor. What
+#    it cannot pin is that a press in the bar reaches any of it: before this the
+#    bar had one behaviour, "focus and select everything", and the only way to
+#    reach one character of a long address was the arrow keys.
+start
+bar_selected() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-selection.py" "$strip" "$chrome"
+}
+quiet=$(bar_selected)
+# One click focuses the bar and selects the whole address, which is what an
+# address bar has always done and what this browser already did.
+DISPLAY=$display xdotool mousemove $((url_x + 60)) "$toggle_y"
+DISPLAY=$display xdotool click 1
+sleep 0.8
+everything=$(bar_selected)
+[ "$everything" -gt "$quiet" ] || fail "clicking the address bar selected \
+nothing ($everything tinted pixels against $quiet before), so the bar never \
+took the focus"
+
+# A second click puts the caret where the pointer is, which is the thing that
+# was missing. The selection has to go with it.
+DISPLAY=$display xdotool click 1
+sleep 0.8
+caret=$(bar_selected)
+[ "$caret" -lt "$everything" ] || fail "clicking an already-focused address bar \
+left the whole address selected ($caret tinted pixels against $everything), so \
+there is still no way to put the cursor anywhere with the pointer"
+
+# And a drag selects what it crossed: neither nothing nor everything.
+DISPLAY=$display xdotool mousemove $((url_x + 10)) "$toggle_y"
+DISPLAY=$display xdotool mousedown 1
+DISPLAY=$display xdotool mousemove $((url_x + 40)) "$toggle_y"
+sleep 0.3
+DISPLAY=$display xdotool mousemove $((url_x + 70)) "$toggle_y"
+sleep 0.5
+DISPLAY=$display xdotool mouseup 1
+sleep 0.5
+dragged=$(bar_selected)
+[ "$dragged" -gt "$caret" ] || fail "dragging across the address selected \
+nothing ($dragged tinted pixels against $caret for a bare caret)"
+[ "$dragged" -lt "$everything" ] || fail "dragging across part of the address \
+selected all of it ($dragged tinted pixels against $everything for select-all)"
+echo "ok: the address bar took a caret and a drag from the pointer"
+stop
+
+# N. A new tab opens on a blank page (#196).
+#
+#    A new tab used to show the page you were on — it re-fetched it and showed
+#    a second copy. Whether it now shows nothing is a question about the event
+#    loop, and there is nothing in `cargo test` that can be asked it.
+#
+#    Measured on the *page* rather than on the address bar. The bar's field is
+#    drawn on the chrome's grey, so "is this row white?" is answered no whether
+#    there is an address in it or not — a check that would have passed without
+#    the feature, which is the one kind of check worth nothing.
+start
+page_ink() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-ink.py" 0 $((width - 50)) $((chrome + 25))
+}
+[ "$(page_ink)" = "ink" ] || fail "the page was already blank before a new tab \
+was opened, so the check below would pass without anything happening"
+
+# Keys go to the window that has the focus, which under this window manager is
+# not automatic.
+focus_window
+DISPLAY=$display xdotool key ctrl+t
+emptied=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    if [ "$(page_ink)" = "clear" ]; then
+        emptied=yes
+        break
+    fi
+done
+[ -n "$emptied" ] || fail "a new tab still had a page in it, so it opened on \
+whatever the reader was already looking at"
+echo "ok: a new tab opened empty"
+stop
+
+# N. Where the reader has been outlives the window (#197, ADR-0021).
+#
+#    `visits.rs` pins the list and the file format. What it cannot pin is that a
+#    navigation reaches either — the recording happens in the event loop, on the
+#    landing rather than on the click, and it is named from a title that only
+#    exists once the renderer has answered.
+#
+#    A config directory of its own, so this neither reads nor writes the one
+#    belonging to whoever is running the tests. A harness that appended to a
+#    person's real history would be a worse bug than the one it is checking.
+recorded="$(mktemp -d)"
+export XDG_CONFIG_HOME="$recorded"
+start
+after=$(click_and_read "$click_x" "$click_y")
+case "$after" in
+    *Arrival*) ;;
+    *) fail "the link was not followed, so there is nothing for the history to \
+have recorded" ;;
+esac
+stop
+tsv="$recorded/2kbrowser/history.tsv"
+[ -f "$tsv" ] || fail "no history file was written at $tsv, so nothing about \
+this run outlived the window"
+grep -q "from.html" "$tsv" || fail "the page the browser opened on is not in \
+the history: $(cat "$tsv")"
+grep -q "to.html" "$tsv" || fail "the page the link went to is not in the \
+history: $(cat "$tsv")"
+# And the title is there, which is the half that arrives from the renderer
+# after the navigation rather than with it.
+grep -q "Arrival" "$tsv" || fail "the history recorded an address with no \
+title, so the name never came back from the renderer: $(cat "$tsv")"
+unset XDG_CONFIG_HOME
+rm -rf "$recorded"
+echo "ok: a navigation was recorded in the history and survived the window"
+
+# N. The debugging views are reachable and hold what they say (#198).
+#
+#    `devtools.rs` pins what the two pages say. What it cannot pin is that a
+#    keystroke reaches them, that the page they describe is the one on screen,
+#    or that the markup shown is the markup that was parsed rather than a second
+#    fetch of it.
+looked="$(mktemp -d)"
+export XDG_CONFIG_HOME="$looked"
+start
+focus_window
+DISPLAY=$display xdotool key ctrl+u
+source_html="$looked/2kbrowser/source.html"
+wrote=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    [ -f "$source_html" ] && { wrote=yes; break; }
+done
+[ -n "$wrote" ] || fail "Ctrl+U wrote no source view at $source_html"
+grep -q "go to the other page" "$source_html" || fail "the source view does not \
+hold the page's own markup: $(head -c 400 "$source_html")"
+grep -q "&lt;a href" "$source_html" || fail "the source view did not escape the \
+markup it is showing, so it rendered the page again instead of printing it"
+
+DISPLAY=$display xdotool key ctrl+shift+i
+info_html="$looked/2kbrowser/page-info.html"
+wrote=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    [ -f "$info_html" ] && { wrote=yes; break; }
+done
+[ -n "$wrote" ] || fail "Ctrl+Shift+I wrote no page information at $info_html"
+for section in Console Network Inspector Storage; do
+    grep -q "<h2>$section</h2>" "$info_html" || fail "the page information has \
+no $section section, so one of the four asked for does not exist"
+done
+# The inspector is built from the tree the child sends back, so an empty one
+# means the question never crossed the process boundary.
+grep -q "document" "$info_html" || fail "the inspector shows no document node, \
+so the accessibility tree never came back from the renderer"
+stop
+unset XDG_CONFIG_HOME
+rm -rf "$looked"
+echo "ok: the source view and the page information both opened and were filled in"
 
 echo "all window click checks passed"
