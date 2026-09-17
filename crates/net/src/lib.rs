@@ -6,12 +6,14 @@
 
 pub mod encoding;
 pub mod policy;
+pub mod site;
 pub mod tls;
 
 pub use policy::{
     Exception, LOCAL_SITE, Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path,
     parse_url, resolve,
 };
+pub use site::site;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

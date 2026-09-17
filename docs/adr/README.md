@@ -11,7 +11,7 @@ that ADRs are superseded rather than edited.
 | [0003](0003-no-javascript.md) | No JavaScript | accepted |
 | [0004](0004-css-21-scope-boundary.md) | CSS 2.1 is the scope boundary | accepted |
 | [0005](0005-deterministic-rendering.md) | CPU rasterisation and bundled fonts | accepted |
-| [0006](0006-network-policy-defaults.md) | Network policy defaults | accepted |
+| [0006](0006-network-policy-defaults.md) | Network policy defaults | accepted; third-party boundary superseded by [0020](0020-the-site-is-the-third-party-boundary.md) |
 | [0007](0007-dependency-posture.md) | Dependency posture | accepted |
 | [0008](0008-font-selection.md) | Font selection | accepted |
 | [0009](0009-automatic-document-fallback.md) | Re-render as a document when a page is too modern | accepted |
@@ -25,3 +25,4 @@ that ADRs are superseded rather than edited.
 | [0017](0017-one-unsafe-crate-for-macos.md) | One crate may write `unsafe`, so that macOS can be confined | accepted |
 | [0018](0018-cache-across-pages.md) | A cache that outlives a page, partitioned by site | accepted |
 | [0019](0019-accessibility-tree-crosses-as-data.md) | The accessibility tree crosses as data, and the parent builds the objects | accepted |
+| [0020](0020-the-site-is-the-third-party-boundary.md) | The third-party boundary is the site, not the host | accepted |
