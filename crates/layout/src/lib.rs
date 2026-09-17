@@ -430,6 +430,25 @@ pub struct Rect {
     pub height: f32,
 }
 
+/// Where an absolutely positioned box's explicit offsets put it, and what they
+/// were measured from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbsoluteAt {
+    /// The element whose padding box is the containing block (§10.1), or
+    /// `None` for the initial containing block.
+    ///
+    /// Taken from the *document* rather than from the box tree, because the two
+    /// do not always agree about ancestry: a table's caption is laid out beside
+    /// the table box rather than inside it, so an absolutely positioned box in
+    /// a caption has a positioned ancestor the box tree cannot reach.
+    pub containing: Option<NodeId>,
+    /// Where `left` or `right` put it, or `None` if both were `auto` and it
+    /// took the static position.
+    pub x: Option<f32>,
+    /// The same for `top` and `bottom`.
+    pub y: Option<f32>,
+}
+
 /// A laid-out box.
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
@@ -448,6 +467,22 @@ pub struct LayoutBox {
     pub content_width: f32,
     /// Child boxes.
     pub children: Vec<LayoutBox>,
+    /// Where an absolutely positioned box's *explicit* offsets put it, in its
+    /// containing block's coordinates.
+    ///
+    /// The two axes are kept apart because they mean different things. A static
+    /// position is where normal flow would have put the box, so it is relative
+    /// to the parent and *should* travel with it. An explicit `left` or `top`
+    /// resolves against the containing block, which is usually not the parent
+    /// and may be several boxes above it — and the parent's own final position
+    /// is not known while the parent is still being laid out, because its
+    /// margins are still collapsing and its ancestors have not been placed.
+    ///
+    /// So the offset is recorded here and settled once the tree is finished;
+    /// see `settle_absolutes`. Before that pass the box's rect is the layout's
+    /// best guess, which is right whenever the chain above it happens to be
+    /// flush.
+    pub absolute_at: Option<AbsoluteAt>,
     /// Set when this box is a replaced element, naming the node so paint can
     /// find its decoded image.
     pub replaced: Option<NodeId>,
@@ -1295,6 +1330,7 @@ pub fn layout(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     };
 
     // §9.7: a float shrinks to fit and is placed against an edge of its
@@ -1400,6 +1436,19 @@ pub fn layout(
     if propagated && let Some(box_) = find_box(&mut root, body) {
         box_.style.background_color = css::Color::TRANSPARENT;
     }
+
+    // §10.1's containing block, settled now that every box has been placed.
+    // Nothing below this point moves a box, so the positions this reads are
+    // final — which is the whole reason it happens here and not during layout.
+    // Two walks: the first reads where every positioned element ended up, and
+    // the second puts the boxes measured from them in place. One walk cannot do
+    // it, because a containing block can sit *below* its own absolutely
+    // positioned descendant in the tree — a table's caption is laid out beside
+    // the table box, so a box inside the caption is measured from a table the
+    // walk has not reached yet.
+    let mut corners = std::collections::HashMap::new();
+    positioned_corners(&root, (0.0, 0.0), &mut corners);
+    settle_absolutes(&mut root, &corners);
 
     // The image goes with the colour, for the reason given where `propagated`
     // is worked out.
@@ -1641,6 +1690,7 @@ fn marker_box(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     })
 }
 
@@ -1761,6 +1811,7 @@ fn layout_inline_block(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     };
     let consumed = layout_block(
         doc,
@@ -1913,6 +1964,7 @@ fn emit_replaced_boxes(
                 round,
                 chosen_rows,
                 top_border_gap: None,
+                absolute_at: None,
             });
         }
     }
@@ -2051,6 +2103,7 @@ fn control_parts(
             round,
             chosen_rows: Vec::new(),
             top_border_gap: None,
+            absolute_at: None,
         });
     }
     ControlParts {
@@ -2990,6 +3043,7 @@ fn flush_inline(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     };
     if let Some(laid_out) = &anonymous.text {
         let laid_out = laid_out.clone();
@@ -3174,6 +3228,7 @@ fn layout_block(
             round: parts.round,
             chosen_rows: parts.chosen_rows,
             top_border_gap: None,
+            absolute_at: None,
         };
         let consumed = Consumed {
             height: box_.rect.height,
@@ -3218,6 +3273,7 @@ fn layout_block(
             round: false,
             chosen_rows: Vec::new(),
             top_border_gap: None,
+            absolute_at: None,
         };
         let consumed = Consumed {
             height: box_.rect.height,
@@ -3252,6 +3308,7 @@ fn layout_block(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     };
 
     // Inline children become styled runs shaped as one paragraph, so a <b> or
@@ -3511,6 +3568,7 @@ fn layout_block(
                     round: false,
                     chosen_rows: Vec::new(),
                     top_border_gap: None,
+                    absolute_at: None,
                 };
                 let taken = layout_block(
                     doc,
@@ -3888,6 +3946,7 @@ fn layout_block(
                 round: false,
                 chosen_rows: Vec::new(),
                 top_border_gap: None,
+                absolute_at: None,
             };
             let (table_width, table_height) = layout_table(
                 doc,
@@ -4567,6 +4626,7 @@ fn place_absolutes(
             round: false,
             chosen_rows: Vec::new(),
             top_border_gap: None,
+            absolute_at: None,
         };
         // An absolutely positioned box with `width: auto` shrinks to fit its
         // content rather than filling its containing block — the difference
@@ -4662,12 +4722,112 @@ fn place_absolutes(
                 child_containing.offset.1 + static_y,
             ),
         );
-        // Convert from containing-block coordinates to this box's own.
+        // Convert from containing-block coordinates to this box's own. A best
+        // guess: it is right whenever the chain between this box and the
+        // containing block is flush, and `settle_absolutes` corrects it when it
+        // is not. It cannot be got right here, because this box's own final
+        // position is not known while it is still being laid out.
         child_box.rect.x = cb_x - child_containing.offset.0;
         child_box.rect.y = cb_y - child_containing.offset.1;
+        // Which axes an *explicit* offset decided. §10.3.7 and §10.6.4 resolve
+        // those against the containing block; an axis with both offsets `auto`
+        // took the static position instead, which is relative to this box and
+        // travels with it exactly as it should.
+        if child_style.position == Position::Absolute {
+            let explicit =
+                |start: Length, end: Length| !matches!((start, end), (Length::Auto, Length::Auto));
+            let offsets = child_style.offsets;
+            child_box.absolute_at = Some(AbsoluteAt {
+                // §10.1's nearest positioned ancestor, read from the document.
+                containing: doc.ancestors(child).find(|ancestor| {
+                    styles
+                        .get(*ancestor)
+                        .is_some_and(|style| style.position.is_positioned())
+                }),
+                x: explicit(offsets.left, offsets.right).then_some(cb_x),
+                y: explicit(offsets.top, offsets.bottom).then_some(cb_y),
+            });
+        }
         into.children
             .insert((at + reinserted).min(into.children.len()), child_box);
         reinserted += 1;
+    }
+}
+
+/// Puts every absolutely positioned box where its containing block says.
+///
+/// §10.1: an absolutely positioned box is laid out against the padding box of
+/// its nearest positioned ancestor, or against the initial containing block
+/// when it has none. Neither is usually its parent, and the difference is not
+/// knowable while the parent is still being laid out: the parent's own position
+/// is still moving, because its margins are collapsing and its ancestors have
+/// not been placed yet.
+///
+/// So `place_absolutes` records what the explicit offsets asked for, in the
+/// containing block's coordinates, and this walks the finished tree and makes
+/// it so. `page` is where this box's border box sits on the canvas, and
+/// `containing` where the current containing block's padding box does.
+///
+/// Only the axes an explicit offset decided. An axis that took the static
+/// position is relative to the parent and travels with it, which is exactly
+/// what a static position means.
+fn settle_absolutes(box_: &mut LayoutBox, corners: &std::collections::HashMap<NodeId, (f32, f32)>) {
+    fn walk(
+        box_: &mut LayoutBox,
+        page: (f32, f32),
+        corners: &std::collections::HashMap<NodeId, (f32, f32)>,
+    ) {
+        for child in &mut box_.children {
+            if let Some(at) = child.absolute_at {
+                // The initial containing block is the canvas corner; anything
+                // else is the padding box of the element §10.1 named. A named
+                // element that is somehow not in the tree falls back to the
+                // canvas, which is where it already was.
+                let containing = at
+                    .containing
+                    .and_then(|node| corners.get(&node).copied())
+                    .unwrap_or((0.0, 0.0));
+                // The box's rect is relative to this box; the offset was
+                // measured from the containing block. Both are on the canvas,
+                // so the conversion is a subtraction.
+                if let Some(x) = at.x {
+                    child.rect.x = containing.0 + x - page.0;
+                }
+                if let Some(y) = at.y {
+                    child.rect.y = containing.1 + y - page.1;
+                }
+            }
+            let at = (page.0 + child.rect.x, page.1 + child.rect.y);
+            walk(child, at, corners);
+        }
+    }
+    walk(box_, (0.0, 0.0), corners);
+}
+
+/// Every positioned element's padding-box corner, on the canvas.
+///
+/// §10.1 measures an absolutely positioned box from its containing block's
+/// *padding* box, so this is inside the border and outside the padding.
+fn positioned_corners(
+    box_: &LayoutBox,
+    page: (f32, f32),
+    out: &mut std::collections::HashMap<NodeId, (f32, f32)>,
+) {
+    for child in &box_.children {
+        let at = (page.0 + child.rect.x, page.1 + child.rect.y);
+        if child.style.position.is_positioned()
+            && let Some(node) = child.node
+        {
+            let font_size = child.style.font_size;
+            out.insert(
+                node,
+                (
+                    at.0 + child.style.border.left.used_width(font_size),
+                    at.1 + child.style.border.top.used_width(font_size),
+                ),
+            );
+        }
+        positioned_corners(child, at, out);
     }
 }
 
@@ -4929,6 +5089,7 @@ fn layout_table(
                 round: false,
                 chosen_rows: Vec::new(),
                 top_border_gap: None,
+                absolute_at: None,
             };
             // A cell establishes its own formatting context, so floats outside
             // the table do not reach into it.
@@ -5108,6 +5269,7 @@ fn layout_table(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     };
 
     /// The boxes one band's background needs.
@@ -5345,6 +5507,7 @@ fn emit_collapsed_borders(
             round: false,
             chosen_rows: Vec::new(),
             top_border_gap: None,
+            absolute_at: None,
         }
     };
 
@@ -5491,6 +5654,7 @@ fn place_float(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     };
     let float_height = layout_block(
         doc,
@@ -6152,6 +6316,7 @@ fn place_generated_block(
         round: false,
         chosen_rows: Vec::new(),
         top_border_gap: None,
+        absolute_at: None,
     });
     margin_top + height + margin_bottom
 }
@@ -6914,6 +7079,28 @@ mod tests {
             .and_then(|body| box_for(&rendered.layout.root, body))
             .expect("body box");
         boxes(body)
+    }
+
+    /// Where the box for `id` sits on the canvas, rather than within its
+    /// parent — which is what an absolutely positioned box is measured in.
+    fn page_of(rendered: &Rendered, id: &str, doc: &Document) -> (f32, f32) {
+        let wanted = (0..doc.len())
+            .map(NodeId)
+            .find(|node| {
+                doc.element(*node)
+                    .is_some_and(|element| element.id() == Some(id))
+            })
+            .expect("the fixture has that id");
+        fn walk(box_: &LayoutBox, at: (f32, f32), node: NodeId) -> Option<(f32, f32)> {
+            let here = (at.0 + box_.rect.x, at.1 + box_.rect.y);
+            if box_.node == Some(node) {
+                return Some(here);
+            }
+            box_.children
+                .iter()
+                .find_map(|child| walk(child, here, node))
+        }
+        walk(&rendered.layout.root, (0.0, 0.0), wanted).expect("it was laid out")
     }
 
     #[test]
@@ -8917,6 +9104,59 @@ mod tests {
             .map(|b| b.content_width)
             .fold(0.0f32, f32::max);
         assert!(widest > 100.0, "the inner column is {widest} wide");
+    }
+
+    #[test]
+    fn an_absolute_box_with_no_positioned_ancestor_measures_from_the_canvas() {
+        // §10.1: with nothing positioned above it the containing block is the
+        // *initial* containing block, so `left`/`top` are measured from the
+        // canvas corner and not from whatever box happens to hold the element.
+        //
+        // It cannot be settled during layout: the holding box is still moving
+        // while its own margins collapse and its ancestors are placed, and the
+        // absolute box was travelling with it. Here the body's 8px margin and
+        // the 24px the paragraph's margin pushes it down were both added to a
+        // box that should not have felt either.
+        let rendered = run(
+            "<body><div><div id=\"a\"></div></div><p>text</p></body>",
+            "body { margin: 8px } p { margin-top: 24px } \
+             #a { position: absolute; left: 328px; top: 8px; \
+                  width: 96px; height: 96px }",
+            800.0,
+        );
+        let doc = dom::parse("<body><div><div id=\"a\"></div></div><p>text</p></body>");
+        assert_eq!(page_of(&rendered, "a", &doc), (328.0, 8.0));
+    }
+
+    #[test]
+    fn a_positioned_ancestor_is_measured_from_even_across_a_caption() {
+        // The containing block is read from the *document*, because the box
+        // tree does not always agree about ancestry: a table's caption is laid
+        // out beside the table box rather than inside it, so an absolutely
+        // positioned box in a caption has a positioned ancestor no walk of the
+        // box tree can reach.
+        //
+        // This passes with the settling pass and without it, and is here
+        // anyway: the first version of that pass found the containing block by
+        // walking the box tree, which broke exactly this
+        // (`table-caption-passes-abspos-up-001`). It guards the choice rather
+        // than the pass.
+        let rendered = run(
+            "<body><table id=\"t\"><caption>\
+             <div id=\"a\"></div>\
+             </caption></table></body>",
+            "body { margin: 0 } #t { position: relative; margin-left: 40px } \
+             caption { height: 20px } \
+             #a { position: absolute; left: 50px; width: 10px; height: 10px }",
+            600.0,
+        );
+        let doc = dom::parse(
+            "<body><table id=\"t\"><caption>\
+             <div id=\"a\"></div>\
+             </caption></table></body>",
+        );
+        // 40 from the table's own margin, plus the 50 asked for.
+        assert_eq!(page_of(&rendered, "a", &doc).0, 90.0);
     }
 
     #[test]
