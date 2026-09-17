@@ -402,10 +402,16 @@ fn load_from(input: &str) -> Result<(shell::viewport::Document, String), String>
              something on this network can read it"
         );
     }
+    // A status with nothing behind it gets a page of the browser's own, the
+    // same as it would in a window (#203). Without this the command line
+    // rendered a 401 as a blank canvas, which says even less than the window's
+    // old one-line error did.
+    let (body, content_type) =
+        shell::status::substitute(fetched.status, fetched.body, fetched.content_type, &url);
     Ok((
         shell::viewport::Document {
-            body: fetched.body,
-            content_type: fetched.content_type,
+            body,
+            content_type,
             origin: fetched.origin,
             path: fetched.path,
         },

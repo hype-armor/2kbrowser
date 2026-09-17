@@ -60,7 +60,19 @@ fn serve(elsewhere: &str) -> (u16, Arc<AtomicUsize>) {
 
                 // The shape Hacker News's front door has: a redirect that keeps
                 // the path and throws the query away.
+                // A status with a page behind it, and one with nothing —
+                // the two halves of #203.
+                let refusal = |status: &str, body: &str| {
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
                 let response = match wanted.split('?').next().unwrap_or_default() {
+                    "/blocked" => refusal("403 Forbidden", "<h1>Blocked by your proxy</h1>"),
+                    "/bare" => refusal("401 Unauthorized", ""),
+                    "/gone.css" => refusal("404 Not Found", "<h1>no such file</h1>"),
                     "/start" => redirect("/deep/landed?id=42".to_owned()),
                     "/deep/landed" => page("<a href=\"item?id=7\">comments</a>"),
                     "/away" => redirect(elsewhere.clone()),
@@ -179,5 +191,61 @@ fn a_redirect_that_goes_in_circles_stops() {
         asked.load(Ordering::SeqCst) <= net::MAX_HOPS as usize + 1,
         "followed {} hops, past the bound",
         asked.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn a_status_with_a_page_behind_it_keeps_the_page() {
+    // #203, and #208 with it: a proxy's block notice is a 403 *with a body*,
+    // and throwing it away to show `server returned 403` tells the reader less
+    // than the server did.
+    let (port, _) = serve("");
+    let fetched = Fetcher::default()
+        .fetch_raw(
+            &format!("http://127.0.0.1:{port}/blocked"),
+            None,
+            RequestKind::Navigation,
+        )
+        .expect("a 403 with a body is a page, not an error");
+    assert_eq!(fetched.status, 403);
+    assert!(
+        String::from_utf8_lossy(&fetched.body).contains("Blocked by your proxy"),
+        "the server's own words should have survived"
+    );
+}
+
+#[test]
+fn a_status_with_nothing_behind_it_still_arrives() {
+    // The other half. The body is empty, so the shell puts its own page there
+    // — but the fetch has to hand back the status rather than an error, or
+    // there is nothing for it to put a page on.
+    let (port, _) = serve("");
+    let fetched = Fetcher::default()
+        .fetch_raw(
+            &format!("http://127.0.0.1:{port}/bare"),
+            None,
+            RequestKind::Navigation,
+        )
+        .expect("a 401 is an answer");
+    assert_eq!(fetched.status, 401);
+    assert!(fetched.body.is_empty());
+}
+
+#[test]
+fn a_subresource_that_answers_with_a_status_is_still_a_failure() {
+    // The half that must *not* change. A 404's HTML body is not a stylesheet,
+    // and handing it to the CSS parser because the status was ignored would
+    // apply a page of garbage rules to the document.
+    let (port, _) = serve("");
+    let document = origin_of(&format!("http://127.0.0.1:{port}/"));
+    let refusal = Fetcher::default().fetch_raw(
+        &format!("http://127.0.0.1:{port}/gone.css"),
+        Some(&document),
+        RequestKind::Subresource,
+    );
+    assert!(
+        matches!(refusal, Err(net::FetchError::Status { code: 404 })),
+        "got {:?}",
+        refusal.map(|fetched| fetched.status)
     );
 }

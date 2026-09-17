@@ -937,6 +937,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # A status with no body at all, which is what a great many servers
+        # answer a 401 with and what #203 is about.
+        if self.path == "/bare":
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.page(
             "<title>A form</title><body style='margin:0'>"
             "<form action='/submit' method='post'>"
@@ -980,13 +987,43 @@ for _ in $(seq 1 30); do
         Answered*) sent=yes; break ;;
     esac
 done
-kill "$form_server" 2>/dev/null || true
 [ -n "$sent" ] || fail "pressing the submit button did not navigate, so the \
 form never left the browser"
+
+# N. A status with nothing behind it gets a page rather than a blank window
+#    (#203). The same server, because it is already up and this needs one: a
+#    `file:` URL has no status to answer with.
+#
+#    Measured as *ink on the page*, not as the window title. The old behaviour
+#    put `server returned 401` in the title, so a title carrying `401` would
+#    have passed this check without the fix — which is a check worth nothing.
+#    What actually changed is that there is a page at all: before, the window
+#    below the chrome was blank.
+focus_window
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.4
+DISPLAY=$display xdotool type --delay 30 "http://127.0.0.1:$form_port/bare"
+DISPLAY=$display xdotool key Return
+explained=""
+for _ in $(seq 1 30); do
+    sleep 0.4
+    # The heading sits a little way down the page, clear of the top margin.
+    drawn=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-ink.py" 0 $((width - 50)) $((chrome + 60)))
+    title=$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)
+    case "$drawn:$title" in
+        # And the words, which the old one-line error never had: a title saying
+        # `401` proves nothing, one saying `Not authorised` proves the page.
+        ink:*"Not authorised"*) explained=yes; break ;;
+    esac
+done
+kill "$form_server" 2>/dev/null || true
+[ -n "$explained" ] || fail "a 401 with no body drew no page, so the reader got \
+a blank window and a code in the chrome"
 arrived=$(cat /tmp/2kbrowser-form-seen 2>/dev/null || true)
 [ "$arrived" = "q=tables&go=Send" ] || fail "the server was sent \
 \"$arrived\" rather than the form's own fields"
-echo "ok: pressing submit sent the form and the server got its fields"
+echo "ok: pressing submit sent the form, and a bare 401 got a page of its own"
 stop
 
 # N. A checkbox can be ticked and unticked, and a dropdown can be opened and

@@ -196,6 +196,8 @@ enum Landed {
     Elsewhere(String),
     /// A response with a body.
     Here {
+        /// What the server answered with.
+        status: u16,
         /// The bytes.
         bytes: Vec<u8>,
         /// Its `Content-Type`, when there was one.
@@ -216,6 +218,7 @@ enum Landed {
 struct Arrived {
     origin: Origin,
     path: String,
+    status: u16,
     bytes: Vec<u8>,
     content_type: Option<String>,
     trust: Trust,
@@ -268,6 +271,13 @@ pub struct Fetched {
     pub path: String,
     /// How its certificate chain was verified.
     pub trust: Trust,
+    /// What the server answered with.
+    ///
+    /// 200 for anything that had no status to have — a local file, a form's
+    /// answer. Carried because a navigation now *keeps* the body of a 4xx or a
+    /// 5xx (#203), and the reader has to be able to tell a site's own "not
+    /// found" from the page they asked for.
+    pub status: u16,
     /// Whether the response allows this to be kept once the page that asked
     /// for it is gone (ADR-0018).
     ///
@@ -344,6 +354,9 @@ impl Fetcher {
             return Ok(Arrived {
                 origin,
                 path,
+                // A file that opened is the file. There is no status to have,
+                // and 200 is the honest stand-in: the thing was served.
+                status: 200,
                 bytes,
                 content_type: None,
                 trust: Trust::NotEncrypted,
@@ -363,13 +376,32 @@ impl Fetcher {
             }
             let location = match landed {
                 Landed::Here {
+                    status,
                     bytes,
                     content_type,
                     storable,
                 } => {
+                    // A 4xx or a 5xx means opposite things to the two kinds of
+                    // request, so this is the one place the kind decides what a
+                    // status *is* (#203).
+                    //
+                    // For a navigation it is a page. The body is the site's own
+                    // "not found", or a proxy's block notice, or the sentence a
+                    // server wrote to explain itself, and throwing it away to
+                    // show `server returned 403` instead tells the reader less
+                    // than the server did.
+                    //
+                    // For a subresource it is a failure, exactly as before. A
+                    // 404's HTML body is not a stylesheet, and handing it to the
+                    // CSS parser because the status was ignored would apply a
+                    // page of garbage rules to the document.
+                    if status >= 400 && kind != RequestKind::Navigation {
+                        return Err(FetchError::Status { code: status });
+                    }
                     return Ok(Arrived {
                         origin,
                         path,
+                        status,
                         bytes,
                         content_type,
                         trust,
@@ -459,7 +491,7 @@ impl Fetcher {
             .check(None, &origin, RequestKind::Navigation)
             .map_err(FetchError::Refused)?;
 
-        let (bytes, content_type, trust, landed_on) = post_http(url, body)?;
+        let (bytes, content_type, trust, landed_on, status) = post_http(url, body)?;
         // Where the form's answer actually came from. A `post` is usually
         // answered by a redirect to the page to show, and that page's links
         // resolve against where it was served rather than against the address
@@ -471,6 +503,7 @@ impl Fetcher {
             origin,
             path,
             trust,
+            status,
             // A response to a form submission is a page, not a subresource, and
             // never reaches the cache. Saying so here rather than relying on
             // that: the answer to "may this be kept?" for a POST is no.
@@ -500,6 +533,7 @@ impl Fetcher {
             origin: arrived.origin,
             path: arrived.path,
             trust: arrived.trust,
+            status: arrived.status,
             storable: arrived.storable,
         })
     }
@@ -570,16 +604,18 @@ fn fetch_http(url: &str) -> Result<(Landed, Trust), FetchError> {
 fn post_http(
     url: &str,
     body: &str,
-) -> Result<(Vec<u8>, Option<String>, Trust, String), FetchError> {
+) -> Result<(Vec<u8>, Option<String>, Trust, String, u16), FetchError> {
     match send(tls::agent(), url, body) {
-        Ok((bytes, content_type, landed_on)) => Ok((bytes, content_type, Trust::Public, landed_on)),
+        Ok((bytes, content_type, landed_on, status)) => {
+            Ok((bytes, content_type, Trust::Public, landed_on, status))
+        }
         Err(error) => {
             if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
                 return Err(into_fetch_error(error));
             }
-            let (bytes, content_type, landed_on) =
+            let (bytes, content_type, landed_on, status) =
                 send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
-            Ok((bytes, content_type, Trust::LocalRoot, landed_on))
+            Ok((bytes, content_type, Trust::LocalRoot, landed_on, status))
         }
     }
 }
@@ -589,7 +625,7 @@ fn send(
     agent: &ureq::Agent,
     url: &str,
     body: &str,
-) -> Result<(Vec<u8>, Option<String>, String), ureq::Error> {
+) -> Result<(Vec<u8>, Option<String>, String, u16), ureq::Error> {
     use ureq::ResponseExt;
 
     let response = agent
@@ -610,12 +646,16 @@ fn send(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
+    // A form answered with a 4xx or a 5xx keeps its body for the same reason a
+    // navigation does: "your password was wrong" is a page, and the status
+    // alone does not say it (#203).
+    let status = response.status().as_u16();
     let bytes = response
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()?;
-    Ok((bytes, content_type, landed_on))
+    Ok((bytes, content_type, landed_on, status))
 }
 
 /// One request through a given agent, and one hop only.
@@ -652,12 +692,14 @@ fn get(agent: &ureq::Agent, url: &str) -> Result<Landed, ureq::Error> {
         header("pragma").as_deref(),
     );
 
+    let status = response.status().as_u16();
     let bytes = response
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()?;
     Ok(Landed::Here {
+        status,
         bytes,
         content_type,
         storable: keep,

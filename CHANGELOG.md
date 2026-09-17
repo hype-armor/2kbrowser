@@ -16,6 +16,35 @@ record for everything earlier.
 
 ## Unreleased
 
+**An error status is a page, not a one-line complaint** (#203, and #208 with
+it). A 4xx or a 5xx used to reach the reader as `server returned 401` in the
+chrome and a blank window. Two things were wrong with that, and they needed
+opposite fixes.
+
+**The server usually sent a page, and it was being thrown away.** A site's own
+"not found", a proxy's block notice, the sentence somebody wrote to explain a
+503 — `ureq` treats those statuses as errors by default and the body goes with
+them. It does not any more: a status is now a *page* for a navigation, and the
+site's own words are what the reader sees. That is #208 exactly — a proxy block
+notice is a 403 with a body, and showing `server returned 403` instead told the
+reader less than the proxy did.
+
+It is still a **failure** for a subresource, which is the opposite decision made
+on purpose. A 404's HTML body is not a stylesheet, and handing it to the CSS
+parser because the status was ignored would apply a page of garbage rules to the
+document.
+
+**And when the server sent nothing, the browser now says something.** A great
+many servers answer a 401 or a 403 with headers and no body at all. Those get a
+page of the browser's own, naming the status and saying which end the problem is
+at — because that decides whether trying again could possibly help. A 401 gets
+the answer that is specific to this browser: there is no HTTP authentication
+here, so the page cannot be reached at all, and advice to sign in would be
+advice nobody could take.
+
+The page information view shows the status, so a site's own 404 is still
+identifiable as one.
+
 **Copy and paste, everywhere text is.** Copying a page selection has worked
 since selection did. Nothing else had: the address bar swallowed every Ctrl
 chord but Ctrl+A, so the one field you most often want to copy out of or paste
