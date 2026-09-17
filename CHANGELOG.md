@@ -16,6 +16,18 @@ record for everything earlier.
 
 ## Unreleased
 
+**A preformatted line keeps the spaces it starts with.** Found while building
+the inspector below, which drew every level of the tree flush left. Spaces
+following a line break were folded into the segment that *carried* the break, so
+a `<pre>`'s indentation landed at the end of the line above, where nothing can
+see it. They are a segment of their own now, shaped, at the start of the line
+the break begins — so they take room, they are in the line's text for a search
+to find, and an inline box's background is drawn across them.
+
+Every line of every indented `<pre>` on the old web was affected, and so was
+view-source, which is a `<pre>` of somebody's markup. Conformance is unchanged
+at 901; this is a case the CSS 2.1 suite does not cover.
+
 **Where you have been survives the window** (#197, ADR-0021). ADR-0018 walked up
 to this and stopped: *"On disk is a persistent record of what a person has read
 … That is a separate and much larger decision, and this does not license it."*
