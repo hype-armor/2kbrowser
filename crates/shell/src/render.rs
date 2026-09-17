@@ -890,33 +890,6 @@ impl Loader for DirectLoader {
     }
 }
 
-/// How close the page's content may come to the edge of the window.
-///
-/// `body { margin: 0 }` is in nearly every modern stylesheet, and those pages
-/// were written for a window with a scrollbar down one side and browser chrome
-/// around the rest — not for a viewport that ends where the glass does. Taken
-/// literally, the declaration puts the first letter of every line hard against
-/// the window frame, which is unpleasant to read and looks like a bug.
-///
-/// So the page keeps a gutter whatever it asks for. Eight pixels, matching the
-/// UA sheet's own body margin: enough to read against, not enough to be a
-/// second opinion about the page's design.
-///
-/// Made of **padding**, not margin, and the difference is the whole reason this
-/// comment is longer than the constant. Padding is inside the background where
-/// margin is outside it: a `body { margin: 0; background: navy }` page topped up
-/// with margin is navy with a pale frame around it — which is exactly the
-/// "looks like a bug" this exists to avoid, one step further out. Topped up with
-/// padding it is navy to the glass with its text held off.
-///
-/// It also keeps §14.2 honest. The compensation for the frame used to be that
-/// the box holding the page carried the body's background out to the window,
-/// which is right when that background is the canvas's and wrong when the root
-/// has one of its own — `html { background: purple }` with a navy body came out
-/// navy to the window edge instead of navy in a purple field. With the gutter
-/// inside the background there is nothing to compensate for.
-const PAGE_GUTTER: f32 = 8.0;
-
 /// Renders HTML at a given viewport width.
 ///
 /// `max_height` bounds the canvas so that a pathological page cannot allocate
@@ -1284,12 +1257,6 @@ pub(crate) fn render_sized(
         }
     };
 
-    // Whatever the page asked for, it does not get to put its text against the
-    // glass. The body's own margin counts towards the gutter, so a page that
-    // left the UA default alone is unchanged and only `margin: 0` is topped up.
-    if let Some(body) = doc.find_element("body") {
-        styles.keep_off_the_edges(body, PAGE_GUTTER, width as f32);
-    }
     // Images are loaded whichever way the page is being rendered. They used to
     // be dropped on the document fallback, on the grounds that a rendering
     // which has discarded the author's layout should not spend requests on
@@ -2644,10 +2611,16 @@ mod tests {
                              it again because the first time nobody was watching.";
 
     #[test]
-    fn a_page_that_zeroes_its_body_margin_still_keeps_a_gutter() {
-        // `body { margin: 0 }` is in nearly every modern stylesheet, and taken
-        // literally it sets the first letter of every line against the window
-        // frame.
+    fn a_page_that_zeroes_its_body_margin_gets_zero() {
+        // There used to be a floor here: `body { margin: 0 }` is in nearly
+        // every modern stylesheet, and taken literally it sets the first letter
+        // of every line against the window frame — so the page was given eight
+        // pixels of padding whatever it asked for.
+        //
+        // The floor is gone. It was a reader-comfort decision the spec has no
+        // room for, and the suite measured the cost: sixty-nine reference tests
+        // compare a page that asks for a margin against one that asks for none,
+        // and every one of them disagreed by exactly those eight pixels.
         let mut fonts = FontStore::new();
         let page = render(
             &format!("<style>body {{ margin: 0 }}</style><body><p>{PARAGRAPH}</p></body>"),
@@ -2655,17 +2628,18 @@ mod tests {
             2000,
             &mut fonts,
         );
-        let (left, right) = ink_columns(&page);
-        assert!(left >= 8, "text starts at column {left}");
-        assert!(right <= 400 - 8, "text runs to column {right} of 400");
+        let (left, _) = ink_columns(&page);
+        assert_eq!(
+            left, 0,
+            "text starts at column {left}, not against the edge"
+        );
     }
 
     #[test]
-    fn the_gutter_is_a_floor_and_not_an_extra_margin() {
-        // The whole point of a floor: a page that already asked for room gets
-        // exactly the room it asked for. Adding the gutter on top would push
-        // every ordinary page inwards for no reason, and would keep pushing a
-        // generous one further in.
+    fn a_declared_body_margin_is_still_exactly_what_was_asked_for() {
+        // The other half, and the half that never changed: a page that asks for
+        // room gets the room it asked for, and the UA sheet's own 8px applies
+        // to a page that says nothing.
         let mut fonts = FontStore::new();
         let render_at = |css: &str, fonts: &mut FontStore| {
             ink_columns(&render(
@@ -2675,18 +2649,8 @@ mod tests {
                 fonts,
             ))
         };
-
-        // The UA sheet's own 8px, which is already the floor.
-        let default = render_at("", &mut fonts);
-        let zeroed = render_at("body { margin: 0 }", &mut fonts);
-        assert_eq!(
-            default, zeroed,
-            "the floor moved a page that had not asked for less than it"
-        );
-
-        // And a page asking for more keeps all of it, unchanged.
-        let generous = render_at("body { margin: 40px }", &mut fonts);
-        assert_eq!(generous.0, 40, "a 40px margin became {}", generous.0);
+        assert_eq!(render_at("", &mut fonts).0, 8, "the UA sheet's own margin");
+        assert_eq!(render_at("body { margin: 40px }", &mut fonts).0, 40);
     }
 
     #[test]

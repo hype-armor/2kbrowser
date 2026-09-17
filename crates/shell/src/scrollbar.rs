@@ -12,8 +12,11 @@
 
 /// How wide the bar is.
 ///
-/// Exactly the page gutter, so the bar sits in the margin the page already
-/// keeps clear rather than on top of the first column of text. An overlay bar
+/// Eight pixels, which is the UA sheet's own body margin — so on a page that
+/// leaves that margin alone the bar sits in space the page was not using. It
+/// used to be justified by a reader gutter that held *every* page's text back
+/// by this much, and that gutter is gone: a page asking for `body { margin: 0 }`
+/// now gets zero, and the bar overlays its first column of text. An overlay bar
 /// rather than a reserved column: whether a page needs one is not known until
 /// it has been laid out, and laying every page out for a bar it may not need
 /// would leave a dead strip down the side of every short one.
