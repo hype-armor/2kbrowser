@@ -2261,7 +2261,27 @@ fn subtree_widths(
     // A declared width settles it: the box wants exactly that much, whatever
     // is inside. This is how `<td width="150">` sizes its column, which is how
     // the era's layout tables were built.
-    if let Length::Px(width) = style.width {
+    //
+    // `em` counts as declared, and used not to. A length in `em` resolves
+    // against this box's own font size, which is a number already in hand — so
+    // it is every bit as settled as a pixel length, and reading only `Px` sent
+    // `width: 7em` down the content-measuring path to be sized from its text
+    // instead. A column then came out as wide as the words in it rather than as
+    // wide as the box was told to be, and the cells beside it were overlapped
+    // by content that no longer fitted.
+    //
+    // A *percentage* is deliberately not here. It resolves against the
+    // containing block's width, which during an intrinsic-width pass is the
+    // question being asked rather than an answer available to it — §17.5.2
+    // gives a percentage column its own rule, and guessing one from
+    // `available` would size the column against a width the table has not
+    // chosen yet.
+    let declared = match style.width {
+        Length::Px(width) => Some(width),
+        Length::Em(_) => Some(style.width.to_px(font_size, available)),
+        Length::Percent(_) | Length::Auto => None,
+    };
+    if let Some(width) = declared {
         return (width + surround, width + surround);
     }
     if depth >= MAX_INTRINSIC_DEPTH {
@@ -4757,8 +4777,12 @@ fn layout_table(
                 }
                 // A column whose cell declared a width has asked for exactly
                 // that, and must not be stretched when the table is widened.
-                if matches!(cell.style.width, Length::Px(_) | Length::Percent(_))
-                    && let Some(fixed) = declared.get_mut(cell.column)
+                // `em` is as declared as a pixel — it resolves against the
+                // cell's own font size, which is a number already in hand.
+                if matches!(
+                    cell.style.width,
+                    Length::Px(_) | Length::Em(_) | Length::Percent(_)
+                ) && let Some(fixed) = declared.get_mut(cell.column)
                 {
                     *fixed = true;
                 }
@@ -5489,12 +5513,16 @@ fn place_float(
     let font_size = child_style.font_size;
     let margin_x = child_style.margin.left.to_px(font_size, content_width)
         + child_style.margin.right.to_px(font_size, content_width);
-    let margin_y = child_style.margin.top.to_px(font_size, content_width)
-        + child_style.margin.bottom.to_px(font_size, content_width);
+    // `outer()` is already the margin box's height — `margin_top + height +
+    // margin_bottom` — where `float_width` is the border box and needs the
+    // margins added. The two are not symmetrical, and adding `margin_y` here as
+    // well reserved the float's margins twice: two rows of 96px squares with
+    // 10px margins sat 136px apart instead of 116, so the second row hung out
+    // of a container sized to hold both.
     let (left, top) = context.place(
         child_style.float,
         float_width + margin_x,
-        float_height.outer() + margin_y,
+        float_height.outer(),
         y,
     );
 
@@ -8889,6 +8917,97 @@ mod tests {
             .map(|b| b.content_width)
             .fold(0.0f32, f32::max);
         assert!(widest > 100.0, "the inner column is {widest} wide");
+    }
+
+    #[test]
+    fn a_floats_vertical_margins_are_reserved_once() {
+        // The float's reserved size is its *margin* box. `outer()` is already
+        // `margin_top + height + margin_bottom`, while the width handed in is
+        // the border box and needs its margins added — the two are not
+        // symmetrical, and adding the vertical margins again reserved them
+        // twice (`floats-014`).
+        //
+        // Four 96px squares with 10px margins in a 232px box: two per row, and
+        // the second row's border box at 10 + 96 + 10 + 10 = 126 from the
+        // content edge. Counted twice it was 146, and the second row hung out
+        // of a container sized to hold both.
+        let rendered = run(
+            "<body><div id=\"box\">\
+             <div class=f></div><div class=f></div>\
+             <div class=f></div><div class=f></div>\
+             </div></body>",
+            "body { margin: 0 } #box { width: 232px; height: 232px } \
+             .f { float: left; width: 96px; height: 96px; margin: 10px }",
+            600.0,
+        );
+        let floats: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.float == Float::Left)
+            .collect();
+        assert_eq!(floats.len(), 4);
+        assert_eq!(floats[0].rect.y, 10.0, "the first row sits at its margin");
+        assert_eq!(
+            floats[2].rect.y, 126.0,
+            "the second row reserved the first row's margins twice"
+        );
+        // And the rows are 116 apart, which is the margin box's height and not
+        // one margin more.
+        assert_eq!(floats[2].rect.y - floats[0].rect.y, 116.0);
+    }
+
+    #[test]
+    fn a_column_takes_a_width_declared_in_ems() {
+        // `em` is as declared as a pixel: it resolves against the box's own
+        // font size, which is a number already in hand when the column is
+        // measured. Reading only `Px` sent it down the content-measuring path,
+        // so the column came out as wide as the words in it and the cells
+        // beside it were overlapped by content that no longer fitted.
+        let rendered = run(
+            "<body><table><tr>\
+             <td><div id=\"wide\">hi</div></td><td>x</td>\
+             </tr></table></body>",
+            "body { margin: 0 } table { border-spacing: 0 } td { padding: 0 } \
+             #wide { width: 7em }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 2);
+        // 7em at the default 16px, and not the width of the word "hi".
+        assert!(
+            (cells[0].rect.width - 112.0).abs() < 0.5,
+            "the column was sized from its text: {}",
+            cells[0].rect.width
+        );
+    }
+
+    #[test]
+    fn a_percentage_width_does_not_settle_a_column() {
+        // Deliberately excluded: a percentage resolves against the containing
+        // block's width, which during an intrinsic-width pass is the question
+        // being asked rather than an answer. §17.5.2 gives it its own rule.
+        let rendered = run(
+            "<body><table><tr>\
+             <td><div id=\"pc\">hi</div></td>\
+             </tr></table></body>",
+            "body { margin: 0 } table { border-spacing: 0 } td { padding: 0 } \
+             #pc { width: 50% }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 1);
+        // Sized from the text, not from half of something the table has not
+        // chosen yet.
+        assert!(
+            cells[0].rect.width < 100.0,
+            "a percentage was treated as a declared width: {}",
+            cells[0].rect.width
+        );
     }
 
     #[test]
