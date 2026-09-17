@@ -1,9 +1,14 @@
 //! Request policy: what the browser is willing to fetch (ADR-0006).
 //!
 //! The policy is deliberately structural rather than list-based. Advertising
-//! and tracking require contacting a host other than the one in the address
+//! and tracking require contacting a site other than the one in the address
 //! bar, so refusing third-party requests removes the category without knowing a
 //! single ad domain's name — no filter lists, no subscription, no arms race.
+//!
+//! Where that boundary falls is [mod@crate::site]'s job: a subdomain is the same
+//! site as its parent (ADR-0020), which needs a small list to get right and is
+//! still not a filter list — it names suffixes, never ad servers, and it does
+//! not go stale in the direction that costs anything.
 
 /// How a resource is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,19 +46,29 @@ pub struct Origin {
 impl Origin {
     /// Whether two origins are the same for policy purposes.
     ///
-    /// Host equality only — not scheme or port. A page on `example.com` loading
-    /// an image from `example.com` is first-party whether or not the protocols
-    /// match, and treating a port change as third-party would break ordinary
-    /// sites while blocking nothing a tracker does.
+    /// The registrable domain, not the whole host and not the origin. A page on
+    /// `www.example.com` loading an image from `images.example.com` is one
+    /// publisher serving one site from two names (ADR-0020), and scheme and
+    /// port are ignored entirely: treating a protocol or port change as
+    /// third-party would break ordinary sites while blocking nothing a tracker
+    /// does.
+    ///
+    /// [mod@crate::site] is where the boundary is actually decided, including
+    /// what stops `alice.co.uk` and `bob.co.uk` from being read as one site.
     pub fn is_same_site(&self, other: &Origin) -> bool {
-        !self.host.is_empty() && self.host == other.host
+        // The emptiness check is on the *site* rather than on the host, so that
+        // a host which reduces to nothing cannot match a `file:` origin, whose
+        // host is empty. Nothing produces such a host today; the check costs a
+        // comparison and removes the question.
+        let site = crate::site::site(&self.host);
+        !site.is_empty() && site == crate::site::site(&other.host)
     }
 }
 
 /// Why a request was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// A subresource on a host other than the document's.
+    /// A subresource on a site other than the document's.
     ThirdParty {
         /// The host that was asked for.
         host: String,
@@ -138,11 +153,19 @@ impl Policy {
     ///
     /// `None` for an origin no exception can be written for — there is nothing
     /// to scope one to.
+    ///
+    /// The site rather than the host, which widens a grant made on
+    /// `www.example.com` to cover `shop.example.com` as well. That is not a
+    /// widening in substance: since ADR-0020 those two are already first-party
+    /// to each other, so either could fetch the allowed resource and hand it to
+    /// the other without asking anybody. Keying by host would only have made
+    /// the reader grant the same permission once per subdomain — and a prompt
+    /// asked often enough stops being a decision.
     pub fn site_of(document: &Origin) -> Option<&str> {
         match document.scheme {
             Scheme::File => Some(LOCAL_SITE),
             _ if document.host.is_empty() => None,
-            _ => Some(&document.host),
+            _ => Some(crate::site::site(&document.host)),
         }
     }
 
@@ -629,6 +652,58 @@ mod tests {
                 .check(Some(&document), &image, RequestKind::Subresource)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_subdomain_is_first_party_to_its_site() {
+        // ADR-0020. One publisher serving one site from two names is the
+        // ordinary shape of a site, and refusing it cost the reader the
+        // pictures while blocking nothing a tracker does.
+        let policy = Policy::default();
+        let document = origin("https://www.example.com/");
+        for image in [
+            "https://images.example.com/logo.png",
+            "https://example.com/logo.png",
+            "https://a.b.example.com/logo.png",
+        ] {
+            assert!(
+                policy
+                    .check(Some(&document), &origin(image), RequestKind::Subresource)
+                    .is_ok(),
+                "refused {image}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_neighbour_under_a_shared_suffix_is_still_third_party() {
+        // The reason the boundary needs a list rather than "the last two
+        // labels": `alice.co.uk` and `bob.co.uk` are two strangers, and so are
+        // two pages on a free host.
+        let policy = Policy::default();
+        for (document, target) in [
+            ("https://www.alice.co.uk/", "https://bob.co.uk/pixel.gif"),
+            (
+                "https://alice.github.io/",
+                "https://bob.github.io/pixel.gif",
+            ),
+            (
+                "https://en.wikipedia.org/",
+                "https://upload.wikimedia.org/x.png",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    policy.check(
+                        Some(&origin(document)),
+                        &origin(target),
+                        RequestKind::Subresource
+                    ),
+                    Err(Refusal::ThirdParty { .. })
+                ),
+                "{document} was allowed to reach {target}"
+            );
+        }
     }
 
     #[test]

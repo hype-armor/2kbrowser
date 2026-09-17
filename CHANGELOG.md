@@ -16,6 +16,86 @@ record for everything earlier.
 
 ## Unreleased
 
+**A page belongs to where the redirect left it.** Reported as Hacker News's
+comment pages answering "No such item." in this browser and rendering fine in
+Firefox. They do: `hackernews.com` is a redirect to `news.ycombinator.com`, and
+this browser resolved the front page's links against the address that was
+*asked for* rather than the one the page was *served from*. So `item?id=…` came
+out as `https://hackernews.com/item?id=…`, which redirects again — and that
+redirect keeps the path and throws the query away, so Hacker News was asked for
+`/item` with no item, and said so. Firefox resolves against the final URL and
+never goes near the redirect twice.
+
+The fix is that the fetcher now reports where the chain stopped, and everything
+downstream uses it: relative links, the third-party rule's idea of this page's
+site, the padlock, and the address bar — which used to name one site while the
+page belonged to another. Back and Forward get the corrected address too, since
+returning to a redirect's starting point only asks to be redirected again.
+
+**And the policy is applied at every hop, not just the first.** Chasing
+redirects had been left to `ureq`, which does it perfectly well and does it
+without asking anybody. That left a door in ADR-0006's headline rule: a
+subresource on the page's own site that answers `302 Location:
+https://tracker.example.net/pixel.gif` got the request *made*, and the rule
+never saw the host it was made to. The budget in `tests/budgets` says "no
+third-party request was ever made", and that has to be true of the second
+request as much as the first. Redirects are followed here now, bounded at eight,
+with the policy asked before each one — and a redirect to a `file:` URL is
+refused even on a navigation, which is exempt from the third-party rule and is
+still not allowed to reach the disk by bouncing off a server.
+
+Both halves have tests that fail without them, against a real socket: a
+redirect is the one thing about a fetch that cannot be posed to a file on disk.
+
+**A subdomain is the same site** (ADR-0020). ADR-0006 refuses third-party
+subresources, and "third party" has meant *a different host* since the rule was
+written. That is the strictest reading, and it is wrong about ordinary sites: a
+page at `www.example.com` whose images sit on `images.example.com` is one
+publisher serving one site under two names — which was as true in 1999 as it is
+now — and refusing it removed nothing a tracker does while costing the reader
+the pictures. The boundary is now the **registrable domain**, the thing somebody
+actually buys.
+
+Which needs a list, because "the last two labels" makes `alice.co.uk` and
+`bob.co.uk` one site and every `*.github.io` page one site. The complete answer
+is the Public Suffix List — several thousand entries, maintained elsewhere,
+stale the day it is vendored — and ADR-0006 exists partly to avoid subscribing
+to somebody else's list. So this is a small one plus a rule, and **it is allowed
+to be incomplete because of which way it fails**: every entry only ever makes a
+suffix *longer*, so a missing entry splits one site in two and costs a
+permission prompt. It can never join two sites and cost a request. A filter list
+that falls behind stops blocking things; this one cannot.
+
+Addresses are never split into labels, which is not a nicety: `10.0.0.1` and
+`20.0.0.1` would otherwise share a registrable domain of `0.1` and be read as
+one site — two unrelated machines joined by arithmetic that was never about
+them.
+
+Exceptions are keyed by the site now rather than by the host, so a grant made on
+`www.example.com` also holds on `shop.example.com`. Not a widening in substance:
+those two are already first-party to each other, so either could fetch the
+resource and hand it over. An existing `sites.tsv` is read through the same rule
+and keeps granting what it says it grants. The cross-page cache (ADR-0018) stays
+partitioned by *host*, which is now finer than it strictly needs to be — a
+partition too fine costs a cache miss, and one too coarse is the thing the key
+exists to prevent.
+
+Measured before merging, over the stylesheet, image and frame references of 18
+live pages — a thousand references between them. 159 changed side, and not one
+was an advertising or tracking host: they are `media.cnn.com`,
+`assets.science.nasa.gov`, `c.arstechnica.com`, `static.theguardian.com`. A
+publisher's own pictures, on a name the publisher owns. `doubleclick.net`,
+`googlesyndication.com`, `adnxs.com`, `scorecardresearch.com` and the rest of
+that list stayed exactly where they were. So did a publisher's *second domain* —
+`ichef.bbci.co.uk` on `bbc.co.uk`, `i.guim.co.uk` on `theguardian.com` — which
+is not a subdomain and which no rule short of knowing who owns what could join.
+
+Worth saying plainly, because it is the case that prompted this: it changes
+nothing on Wikipedia. Its stylesheets were always same-host, and its images come
+from `wikimedia.org`, which is a different registrable domain from
+`wikipedia.org` and still refused. What that page needs is flexbox, not network
+policy.
+
 **Forms submit** (#110). This is the first thing this browser sends *up* to a
 server, and it was held back to last for that reason rather than because it was
 hard. Press a submit button, or Enter in a one-line field, and the form goes:

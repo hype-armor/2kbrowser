@@ -952,10 +952,16 @@ const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// cross-site identifier — the exact shape the third-party rule exists to
 /// remove, rebuilt by consent.
 ///
-/// The scheme stays in the URL half because `Origin::is_same_site` compares
-/// *host only*: `http://example.com` and `https://example.com` are one site to
-/// the policy. Normalising the scheme out of the key would let somebody on
-/// plain HTTP poison an entry a secure page then reads.
+/// The scheme stays in the URL half because `Origin::is_same_site` ignores it:
+/// `http://example.com` and `https://example.com` are one site to the policy.
+/// Normalising the scheme out of the key would let somebody on plain HTTP
+/// poison an entry a secure page then reads.
+///
+/// The document half is its **host**, which since ADR-0020 is narrower than the
+/// site the policy decides by — `www.example.com` and `shop.example.com` are
+/// one site and two keys. Left that way deliberately: a partition finer than it
+/// needs to be costs a cache miss, and a partition coarser than it needs to be
+/// is the thing this key exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
     /// The host of the document that asked. Empty for a document with no
@@ -1530,7 +1536,7 @@ mod tests {
 
     #[test]
     fn the_scheme_stays_in_the_key() {
-        // `Origin::is_same_site` compares host only, so `http://example.com`
+        // `Origin::is_same_site` ignores the scheme, so `http://example.com`
         // and `https://example.com` are one site to the policy. If the scheme
         // were normalised out of the URL half as well, somebody on plain HTTP
         // could poison an entry a secure page then reads.
@@ -1602,7 +1608,7 @@ mod tests {
         // because the sites differ.
         //
         // The second document differs in **scheme** as well as origin on
-        // purpose. `Origin::is_same_site` compares host only, so an origin-only
+        // purpose. `Origin::is_same_site` ignores the scheme, so an origin-only
         // test would pass while a `file:` leak went straight through.
         let mut cache = Cache::default();
         let local = Origin {
