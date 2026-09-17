@@ -1288,4 +1288,39 @@ whatever the reader was already looking at"
 echo "ok: a new tab opened empty"
 stop
 
+# N. Where the reader has been outlives the window (#197, ADR-0021).
+#
+#    `visits.rs` pins the list and the file format. What it cannot pin is that a
+#    navigation reaches either — the recording happens in the event loop, on the
+#    landing rather than on the click, and it is named from a title that only
+#    exists once the renderer has answered.
+#
+#    A config directory of its own, so this neither reads nor writes the one
+#    belonging to whoever is running the tests. A harness that appended to a
+#    person's real history would be a worse bug than the one it is checking.
+recorded="$(mktemp -d)"
+export XDG_CONFIG_HOME="$recorded"
+start
+after=$(click_and_read "$click_x" "$click_y")
+case "$after" in
+    *Arrival*) ;;
+    *) fail "the link was not followed, so there is nothing for the history to \
+have recorded" ;;
+esac
+stop
+tsv="$recorded/2kbrowser/history.tsv"
+[ -f "$tsv" ] || fail "no history file was written at $tsv, so nothing about \
+this run outlived the window"
+grep -q "from.html" "$tsv" || fail "the page the browser opened on is not in \
+the history: $(cat "$tsv")"
+grep -q "to.html" "$tsv" || fail "the page the link went to is not in the \
+history: $(cat "$tsv")"
+# And the title is there, which is the half that arrives from the renderer
+# after the navigation rather than with it.
+grep -q "Arrival" "$tsv" || fail "the history recorded an address with no \
+title, so the name never came back from the renderer: $(cat "$tsv")"
+unset XDG_CONFIG_HOME
+rm -rf "$recorded"
+echo "ok: a navigation was recorded in the history and survived the window"
+
 echo "all window click checks passed"

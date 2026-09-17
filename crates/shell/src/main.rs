@@ -17,6 +17,7 @@ USAGE:
     2kbrowser render <url-or-file> [--out <file.png>] [--width <px>] [--height <px>]
     2kbrowser links  <url-or-file> [--width <px>]
     2kbrowser bookmarks
+    2kbrowser history [--forget]
 
 OPTIONS:
     --out <path>     Where to write the PNG (render only; default: page.png)
@@ -29,6 +30,10 @@ follow it — the same geometry the window uses, printed instead of drawn.
 `bookmarks` prints the saved list, and says where the file is. It is a plain
 tab-separated file: edit it in anything.
 
+`history` prints where the browser has been, newest first, and `--forget`
+empties it. That file is tab-separated too, and deleting it is the same as
+forgetting all of it (ADR-0021).
+
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
 
@@ -36,8 +41,9 @@ In a window: click a link to follow it, or Tab to it and press Enter — Shift+T
 goes back, Escape drops the focus. Alt+Left and Alt+Right, or Backspace,
 go back and forward. Ctrl+L focuses the URL bar and Ctrl+F searches the page;
 Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
-switches. Ctrl+D saves the page and Ctrl+B shows the saved list. Arrows and
-PageUp/PageDown scroll, Home/End jump, Esc or q quits.
+switches. Ctrl+D saves the page and Ctrl+B shows the saved list; Ctrl+H shows
+where you have been and Ctrl+Shift+H forgets it. Arrows and PageUp/PageDown
+scroll, Home/End jump, Esc or q quits.
 
 Ctrl and the wheel zooms, as do Ctrl+plus and Ctrl+minus; Ctrl+0 goes back to
 100%. The page is laid out again at the new size rather than magnified, so the
@@ -102,6 +108,7 @@ fn main() -> ExitCode {
         Some("links") => report(run_links(&args[1..])),
         Some("open") => report(run_open(&args[1..])),
         Some("bookmarks") => report(run_bookmarks()),
+        Some("history") => report(run_history(args.get(1).map(String::as_str))),
         Some("--help" | "-h" | "help") | None => say(USAGE),
         Some(other) => {
             eprintln!("error: unknown command `{other}`\n\n{USAGE}");
@@ -232,9 +239,9 @@ fn run_links(args: &[String]) -> Result<String, String> {
 
 /// Prints the saved list.
 ///
-/// The file is the only state this browser keeps between runs, so it is worth
-/// being able to see it without opening a window — and worth saying where it
-/// is, because it is a text file anyone can edit.
+/// One of the three files this browser keeps between runs, so it is worth being
+/// able to see it without opening a window — and worth saying where it is,
+/// because it is a text file anyone can edit.
 fn run_bookmarks() -> Result<String, String> {
     let path = shell::bookmarks::default_path();
     let marks = shell::bookmarks::Bookmarks::load(&path);
@@ -244,6 +251,40 @@ fn run_bookmarks() -> Result<String, String> {
     let mut message = format!("{} saved page(s) in {}:", marks.len(), path.display());
     for entry in marks.iter() {
         message.push_str("\n  ");
+        message.push_str(&entry.url);
+        if !entry.title.is_empty() {
+            message.push_str(&format!("\n      {}", entry.title));
+        }
+    }
+    Ok(message)
+}
+
+/// Prints where the browser has been, or forgets it (#197).
+fn run_history(flag: Option<&str>) -> Result<String, String> {
+    let path = shell::visits::default_path();
+    let mut visits = shell::visits::Visits::load(&path);
+    if let Some(flag) = flag {
+        if flag != "--forget" {
+            return Err(format!("unknown option `{flag}` for `history`"));
+        }
+        let had = visits.len();
+        visits.clear();
+        visits
+            .save(&path)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        return Ok(format!("forgot {had} address(es) ({})", path.display()));
+    }
+    if visits.is_empty() {
+        return Ok(format!("nothing here yet ({})", path.display()));
+    }
+    let mut message = format!("{} address(es) in {}:", visits.len(), path.display());
+    // Newest first, which is the order somebody looking for where they just
+    // were needs. The file is oldest first, because a file that is appended to
+    // grows downwards.
+    for entry in visits.iter().rev() {
+        message.push_str("\n  ");
+        message.push_str(&entry.when);
+        message.push_str("  ");
         message.push_str(&entry.url);
         if !entry.title.is_empty() {
             message.push_str(&format!("\n      {}", entry.title));

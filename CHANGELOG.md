@@ -16,6 +16,24 @@ record for everything earlier.
 
 ## Unreleased
 
+**Where you have been survives the window** (#197, ADR-0021). ADR-0018 walked up
+to this and stopped: *"On disk is a persistent record of what a person has read
+… That is a separate and much larger decision, and this does not license it."*
+This is that decision. Ctrl+H shows the list, Ctrl+Shift+H forgets it, and
+`2kbrowser history` prints it with `--forget` to empty it.
+
+What keeps it honest is what the file is allowed to be. It is `history.tsv`
+beside the bookmarks and the site exceptions, in the same tab-separated format
+anybody can read, edit or delete. It is **bounded** at 500 addresses, because a
+bound is the thing a reader can check — a history with no ceiling becomes a life
+story by doing nothing at all. It holds **one line per address**, not one per
+visit, so it stays a list somebody can scan and so it says nothing about habits.
+And nothing sends it anywhere: there is no code here that could, and ADR-0021 is
+what stops one being written.
+
+That makes three files outliving a run rather than two, which is the real cost
+and is stated rather than absorbed — the README said two and has been corrected.
+
 **A new tab opens on nothing** (#196). It used to open on the page you were
 already looking at — and re-fetch it to get there. That was never neutral: it is
 a second copy of something nobody asked to duplicate. Nothing is the honest

@@ -564,6 +564,10 @@ struct App {
     waker: Option<winit::event_loop::EventLoopProxy<Wake>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
+    /// Where the reader has been, kept between runs (#197, ADR-0021).
+    visits: crate::visits::Visits,
+    /// Where that list is written back to.
+    visits_path: std::path::PathBuf,
     /// The open site panel, if the padlock has been pressed (#118).
     panel: Option<crate::site_panel::Panel>,
     /// The open dropdown, if a `<select>` on the page has been pressed.
@@ -733,6 +737,14 @@ impl App {
             tab.can_toggle_layout = page.can_toggle_layout();
             tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
         }
+        // The page now has a title, which is what the history list wants to
+        // call it (#197). The address was recorded when the navigation landed;
+        // this names it, once the borrow of the tab above is over.
+        let named = tab
+            .page
+            .as_ref()
+            .and_then(crate::viewport::Viewport::title)
+            .map(|title| (tab.history.current().to_owned(), title.to_owned()));
 
         // The old selection pointed at the old layout, and unlike a query there
         // is nothing to re-run it from: the two points it was dragged between
@@ -748,6 +760,9 @@ impl App {
                 None => Vec::new(),
             };
             tab.current_match = tab.current_match.min(tab.matches.len().saturating_sub(1));
+        }
+        if let Some((url, title)) = named {
+            self.record_visit(&url, &title);
         }
         // Same reason: the focused link is still the same link, but it is no
         // longer in the same place.
@@ -837,7 +852,14 @@ impl App {
                 // the padlock's site and every link on the page disagreeing
                 // about which site the reader is on — and Back would return to
                 // the address that only redirects again.
-                self.tab_mut().history.arrived_at(landed_on);
+                self.tab_mut().history.arrived_at(landed_on.clone());
+                // And the reader has been here (#197). Recorded on the landing
+                // rather than on the click, for the same reason the purple-link
+                // list is: a page that refused to load is not a place you have
+                // been. The title is not known yet — it arrives from the
+                // renderer — so this records the address and the render below
+                // fills the name in.
+                self.record_visit(&landed_on, "");
                 self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
                     body: fetched.body,
@@ -1846,6 +1868,68 @@ impl App {
         // because silently not saving looks exactly like saving.
         if let Err(error) = self.bookmarks.save(&self.bookmarks_path) {
             self.tab_mut().error = Some(format!("could not save bookmarks: {error}"));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Records a page in the history, and writes the list out (#197).
+    ///
+    /// Written on every navigation rather than on the way out, for the reason
+    /// bookmarks gives: a browser that lost where you had been because it was
+    /// closed the wrong way would be worse than one that never remembered, and
+    /// the file is a few tens of kilobytes.
+    ///
+    /// A failed write is said once, in the place every other failure is said.
+    /// Silently not recording looks exactly like recording.
+    fn record_visit(&mut self, url: &str, title: &str) {
+        // Not the generated views of the browser's own lists. They are written
+        // fresh every time they are opened, so remembering them says only that
+        // you once pressed Ctrl+B — and it would put the history list in the
+        // history list.
+        if url.is_empty()
+            || url == net::file_url(&crate::bookmarks::page_path())
+            || url == net::file_url(&crate::visits::page_path())
+        {
+            return;
+        }
+        self.visits.record(
+            url,
+            title,
+            crate::visits::stamp(std::time::SystemTime::now()),
+        );
+        if let Err(error) = self.visits.save(&self.visits_path) {
+            self.tab_mut().error = Some(format!("could not save the history: {error}"));
+        }
+    }
+
+    /// Opens the history, as a page, in a new tab (#197).
+    fn open_history(&mut self) {
+        let path = crate::visits::page_path();
+        let html = crate::visits::page(&self.visits);
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&net::file_url(&path)),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write the history: {error}"));
+                self.refresh_chrome();
+            }
+        }
+    }
+
+    /// Forgets every page in the history (#197).
+    ///
+    /// The whole list rather than a page of it, and one keystroke rather than a
+    /// confirmation. A reader who wants this gone usually wants it gone now,
+    /// and the alternative — a dialog — is a second piece of interface for a
+    /// thing that can be done again in a second if it was a mistake.
+    fn clear_history(&mut self) {
+        self.visits.clear();
+        if let Err(error) = self.visits.save(&self.visits_path) {
+            self.tab_mut().error = Some(format!("could not clear the history: {error}"));
         }
         self.refresh_chrome();
     }
@@ -3374,6 +3458,19 @@ impl ApplicationHandler<Wake> for App {
                             self.open_bookmarks();
                             return;
                         }
+                        // Ctrl+H shows where you have been, and Ctrl+Shift+H
+                        // forgets it — the destructive one behind a second
+                        // modifier, because "show me" and "throw it away" are
+                        // not two keystrokes that should be one slip apart
+                        // (#197).
+                        Key::Character(c) if c.eq_ignore_ascii_case("h") => {
+                            if shift {
+                                self.clear_history();
+                            } else {
+                                self.open_history();
+                            }
+                            return;
+                        }
                         // Ctrl+R reloads, as it has everywhere since Netscape.
                         Key::Character(c) if c == "r" => {
                             self.reload();
@@ -3592,6 +3689,8 @@ pub fn open(
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        visits: crate::visits::Visits::load(&crate::visits::default_path()),
+        visits_path: crate::visits::default_path(),
         panel: None,
         dropdown: None,
         sites_path: crate::sites::default_path(),

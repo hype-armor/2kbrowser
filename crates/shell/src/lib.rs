@@ -20,4 +20,5 @@ pub mod site_panel;
 pub mod sites;
 pub mod tabs;
 pub mod viewport;
+pub mod visits;
 pub mod window;
