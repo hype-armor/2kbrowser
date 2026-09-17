@@ -16,6 +16,27 @@ record for everything earlier.
 
 ## Unreleased
 
+**A new tab opens on nothing** (#196). It used to open on the page you were
+already looking at — and re-fetch it to get there. That was never neutral: it is
+a second copy of something nobody asked to duplicate. Nothing is the honest
+third option, and the address bar takes the focus so the tab is one keystroke
+from being useful. The strip calls it `New tab`, because a tab with no name is
+a gap in the strip.
+
+**The address bar takes a caret and a drag** (#199). It had exactly one
+behaviour — focus, and select everything — so the only way to reach one
+character of a long URL was the arrow keys. A press now puts the caret where the
+pointer is and a drag selects what it crosses. The first click into an unfocused
+bar still selects the whole address, which is what an address bar has always
+done and what the common next action wants.
+
+Both are checked by `window-clicks.sh`, because both are event-loop behaviour
+that `cargo test` cannot reach. The blank-tab check measures the *page* going
+blank rather than the address bar emptying: the bar's field is drawn on the
+chrome's grey, so "is this row white?" is answered no whether there is an
+address in it or not — the first version of that check passed without the
+feature, which is the one kind of check worth nothing.
+
 **A text box looks like one, and keeps its own alignment** (#195). An `inset`
 border darkens its top and left and leaves its bottom and right as given, which
 was written for the era's grey window background. On a white page the light
