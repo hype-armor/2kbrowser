@@ -77,80 +77,13 @@ pub fn page(status: u16, url: &str) -> String {
 /// at opposite ends of the wire, and that is the first thing a reader wants to
 /// know because it decides whether trying again could possibly help.
 fn words(status: u16) -> (&'static str, &'static str) {
+    if let Some(named) = named(status) {
+        return named;
+    }
+    // The classes, for everything unnamed. Which end the problem is at is the
+    // first thing worth knowing, because it decides whether trying again could
+    // possibly help.
     match status {
-        400 => (
-            "Bad request",
-            "The server could not make sense of the request. That is usually a \
-             fault in the address rather than in the page it points at.",
-        ),
-        401 => (
-            "Not authorised",
-            "The server will not serve this page without a sign-in. This browser \
-             does not implement HTTP authentication, so there is no way to \
-             offer one — the page cannot be reached from here.",
-        ),
-        403 => (
-            "Forbidden",
-            "The server understood the request and refused it. Nothing is \
-             broken: this is the server declining, and no amount of reloading \
-             will change its mind. A proxy or a filter between here and the \
-             site can also answer this way.",
-        ),
-        404 => (
-            "Not found",
-            "The server has nothing at this address. Either it never did, or \
-             whatever was here has moved and nothing was left to say where.",
-        ),
-        405 => (
-            "Method not allowed",
-            "The server does not accept requests of this kind at this address — \
-             usually a form sent with `post` to somewhere that only answers a \
-             `get`.",
-        ),
-        408 => (
-            "Request timed out",
-            "The server gave up waiting for the request to arrive. Trying again \
-             is reasonable.",
-        ),
-        410 => (
-            "Gone",
-            "The server says this page used to exist and has been removed on \
-             purpose. Unlike a 404, that is a deliberate answer, so it is not \
-             worth looking for it again later.",
-        ),
-        429 => (
-            "Too many requests",
-            "The server is asking for less traffic — from this machine, or from \
-             everyone. Waiting is the only thing that helps.",
-        ),
-        500 => (
-            "Server error",
-            "Something went wrong at the server's end while it was making this \
-             page. Nothing here caused it and nothing here can fix it.",
-        ),
-        501 => (
-            "Not implemented",
-            "The server does not support what was asked of it.",
-        ),
-        502 => (
-            "Bad gateway",
-            "The server you reached could not get an answer from another one \
-             behind it. The problem is between two machines that are not this \
-             one.",
-        ),
-        503 => (
-            "Service unavailable",
-            "The server is up but not serving — too busy, or deliberately down \
-             for a while. It is the sort of thing that fixes itself.",
-        ),
-        504 => (
-            "Gateway timed out",
-            "The server you reached waited for another one behind it and gave \
-             up. Like a 502, the trouble is further in.",
-        ),
-        // The classes, for everything unnamed. Which end the problem is at is
-        // the first thing worth knowing, because it decides whether trying
-        // again could possibly help.
         400..=499 => (
             "Request refused",
             "The server refused the request. A status in this range puts the \
@@ -168,6 +101,87 @@ fn words(status: u16) -> (&'static str, &'static str) {
             "The server answered with a status this browser was not expecting \
              for a page.",
         ),
+    }
+}
+
+/// The statuses somebody actually meets, in words.
+///
+/// Separate from the classes above rather than arms in one match, so that `500`
+/// and `500..=599` are not two arms that overlap — which reads as a bug even
+/// when the first-match rule makes it correct.
+fn named(status: u16) -> Option<(&'static str, &'static str)> {
+    match status {
+        400 => Some((
+            "Bad request",
+            "The server could not make sense of the request. That is usually a \
+             fault in the address rather than in the page it points at.",
+        )),
+        401 => Some((
+            "Not authorised",
+            "The server will not serve this page without a sign-in. This browser \
+             does not implement HTTP authentication, so there is no way to \
+             offer one — the page cannot be reached from here.",
+        )),
+        403 => Some((
+            "Forbidden",
+            "The server understood the request and refused it. Nothing is \
+             broken: this is the server declining, and no amount of reloading \
+             will change its mind. A proxy or a filter between here and the \
+             site can also answer this way.",
+        )),
+        404 => Some((
+            "Not found",
+            "The server has nothing at this address. Either it never did, or \
+             whatever was here has moved and nothing was left to say where.",
+        )),
+        405 => Some((
+            "Method not allowed",
+            "The server does not accept requests of this kind at this address — \
+             usually a form sent with `post` to somewhere that only answers a \
+             `get`.",
+        )),
+        408 => Some((
+            "Request timed out",
+            "The server gave up waiting for the request to arrive. Trying again \
+             is reasonable.",
+        )),
+        410 => Some((
+            "Gone",
+            "The server says this page used to exist and has been removed on \
+             purpose. Unlike a 404, that is a deliberate answer, so it is not \
+             worth looking for it again later.",
+        )),
+        429 => Some((
+            "Too many requests",
+            "The server is asking for less traffic — from this machine, or from \
+             everyone. Waiting is the only thing that helps.",
+        )),
+        500 => Some((
+            "Server error",
+            "Something went wrong at the server's end while it was making this \
+             page. Nothing here caused it and nothing here can fix it.",
+        )),
+        501 => Some((
+            "Not implemented",
+            "The server does not support what was asked of it.",
+        )),
+        502 => Some((
+            "Bad gateway",
+            "The server you reached could not get an answer from another one \
+             behind it. The problem is between two machines that are not this \
+             one.",
+        )),
+        503 => Some((
+            "Service unavailable",
+            "The server is up but not serving — too busy, or deliberately down \
+             for a while. It is the sort of thing that fixes itself.",
+        )),
+        504 => Some((
+            "Gateway timed out",
+            "The server you reached waited for another one behind it and gave \
+             up. Like a 502, the trouble is further in.",
+        )),
+        _ => None,
     }
 }
 

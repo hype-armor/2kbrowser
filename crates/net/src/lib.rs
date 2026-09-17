@@ -491,19 +491,19 @@ impl Fetcher {
             .check(None, &origin, RequestKind::Navigation)
             .map_err(FetchError::Refused)?;
 
-        let (bytes, content_type, trust, landed_on, status) = post_http(url, body)?;
+        let (posted, trust) = post_http(url, body)?;
         // Where the form's answer actually came from. A `post` is usually
         // answered by a redirect to the page to show, and that page's links
         // resolve against where it was served rather than against the address
         // the form was sent to.
-        let (origin, path) = parse_url(&landed_on).unwrap_or((origin, path));
+        let (origin, path) = parse_url(&posted.landed_on).unwrap_or((origin, path));
         Ok(Fetched {
-            body: bytes,
-            content_type,
+            body: posted.bytes,
+            content_type: posted.content_type,
             origin,
             path,
             trust,
-            status,
+            status: posted.status,
             // A response to a form submission is a page, not a subresource, and
             // never reaches the cache. Saying so here rather than relying on
             // that: the answer to "may this be kept?" for a POST is no.
@@ -601,31 +601,38 @@ fn fetch_http(url: &str) -> Result<(Landed, Trust), FetchError> {
 /// one it was sent to whenever the server answers a `post` with a redirect —
 /// which is what a server that does not want the form re-sent on reload does,
 /// and therefore what most of them do.
-fn post_http(
-    url: &str,
-    body: &str,
-) -> Result<(Vec<u8>, Option<String>, Trust, String, u16), FetchError> {
+fn post_http(url: &str, body: &str) -> Result<(Posted, Trust), FetchError> {
     match send(tls::agent(), url, body) {
-        Ok((bytes, content_type, landed_on, status)) => {
-            Ok((bytes, content_type, Trust::Public, landed_on, status))
-        }
+        Ok(posted) => Ok((posted, Trust::Public)),
         Err(error) => {
             if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
                 return Err(into_fetch_error(error));
             }
-            let (bytes, content_type, landed_on, status) =
-                send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
-            Ok((bytes, content_type, Trust::LocalRoot, landed_on, status))
+            let posted = send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
+            Ok((posted, Trust::LocalRoot))
         }
     }
 }
 
+/// What a form's answer came back as.
+///
+/// A shape rather than a tuple, because the tuple had grown to five and a
+/// caller reading `(bytes, content_type, trust, landed_on, status)` positionally
+/// is one reordering away from a bug nothing would catch.
+struct Posted {
+    /// The answer's body.
+    bytes: Vec<u8>,
+    /// Its `Content-Type`, when there was one.
+    content_type: Option<String>,
+    /// Where the answer was finally served from, which is not where the form
+    /// was sent whenever the server answered with a redirect.
+    landed_on: String,
+    /// What the server answered with.
+    status: u16,
+}
+
 /// One form sent through a given agent.
-fn send(
-    agent: &ureq::Agent,
-    url: &str,
-    body: &str,
-) -> Result<(Vec<u8>, Option<String>, String, u16), ureq::Error> {
+fn send(agent: &ureq::Agent, url: &str, body: &str) -> Result<Posted, ureq::Error> {
     use ureq::ResponseExt;
 
     let response = agent
@@ -655,7 +662,12 @@ fn send(
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()?;
-    Ok((bytes, content_type, landed_on, status))
+    Ok(Posted {
+        bytes,
+        content_type,
+        landed_on,
+        status,
+    })
 }
 
 /// One request through a given agent, and one hop only.
