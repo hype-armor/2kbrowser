@@ -16,6 +16,24 @@ record for everything earlier.
 
 ## Unreleased
 
+**An image opened by its own address renders as one** (#201). A JPEG is not a
+document, and decoding one as text produced a page of mojibake. A document is
+invented to hold it instead — `<img>` and nothing else — so a picture gets the
+same layout, the same scrollbar and the same `Load image` placeholder as one
+inside a page, rather than a second rendering path that could drift from the
+first.
+
+The `Content-Type` decides whenever there is one: a server saying `text/html` is
+believed even if the bytes open like a PNG, because sniffing *against* a
+declared type is how a browser gets talked into treating one thing as another.
+Sniffing only fills a silence — and the silence is not rare, since a `file:`
+URL has no headers at all, which is how most people open an image on their own
+disk.
+
+The picture already in hand is not asked for twice. The navigation downloaded
+it; the page invented to show it names it as its only subresource, and that
+request is answered from the bytes rather than from the network.
+
 **A page belongs to where the redirect left it.** Reported as Hacker News's
 comment pages answering "No such item." in this browser and rendering fine in
 Firefox. They do: `hackernews.com` is a redirect to `news.ycombinator.com`, and

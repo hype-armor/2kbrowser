@@ -634,14 +634,48 @@ impl Render for PageRenderer {
             return Err("expected a render request".to_owned());
         };
 
+        let base = origin.as_ref().map(|origin| (origin, path.as_str()));
+        let own_url = base.map(|(origin, path)| net::resolve(origin, path, path));
+
+        // A picture opened by its own address is not a document, and decoding a
+        // JPEG as text produces a page of mojibake (#201). A document is
+        // invented to hold it instead, so it gets the same layout, scrollbar
+        // and placeholder as an image inside a page — decided here rather than
+        // by the parent, because deciding it needs the bytes, and the bytes
+        // stay on this side (ADR-0012).
+        let picture = crate::render::document_for_a_picture(
+            body,
+            content_type.as_deref(),
+            own_url.as_deref(),
+        );
         // Decoded here rather than by the parent, so the encoding sniffer stays
         // on the sandboxed side with every other parser.
-        let (html, ..) = net::encoding::decode_document(body, content_type.as_deref());
+        let html = match &picture {
+            Some(document) => document.clone(),
+            None => net::encoding::decode_document(body, content_type.as_deref()).0,
+        };
 
         // Every subresource — images, stylesheets, `@import` chains, frames —
         // goes over the pipe. Nothing in this process opens a socket or a file.
-        let mut loader = PipeLoader { parent };
-        let base = origin.as_ref().map(|origin| (origin, path.as_str()));
+        let mut pipe_loader = PipeLoader { parent };
+        // Except the picture above, which is already here: asking for it would
+        // fetch the same photograph a second time to put it in the page
+        // invented to show it.
+        let mut held;
+        let loader: &mut dyn crate::render::Loader = match (&picture, &own_url) {
+            (Some(_), Some(url)) => {
+                held = crate::render::Preloaded::new(
+                    url.clone(),
+                    crate::render::Loaded {
+                        bytes: body.clone(),
+                        content_type: content_type.clone(),
+                    },
+                    &mut pipe_loader,
+                );
+                &mut held
+            }
+            _ => &mut pipe_loader,
+        };
         // Both set is a request the parent never makes, and this side is where
         // messages from a stranger arrive — so it is decided rather than
         // assumed away. The author's layout wins, because it is the one that
@@ -668,7 +702,7 @@ impl Render for PageRenderer {
                 }),
             },
             &mut self.fonts,
-            &mut loader,
+            loader,
             base,
         );
 

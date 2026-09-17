@@ -871,6 +871,140 @@ impl Loaded {
     }
 }
 
+/// A loader that already holds one resource and passes everything else on.
+///
+/// For a response that *is* the thing being shown rather than a page
+/// describing one — an image opened by its own URL (#201). The document built
+/// around it names it as its only subresource, and this answers that one
+/// request from the bytes already in hand. Without it the same picture would
+/// be fetched twice: once as the navigation, once as the image inside the
+/// page invented to hold it.
+pub struct Preloaded<'a> {
+    /// The URL this can answer without asking anybody.
+    url: String,
+    /// The answer.
+    held: Loaded,
+    /// Where everything else comes from.
+    inner: &'a mut dyn Loader,
+}
+
+impl<'a> Preloaded<'a> {
+    /// Holds `held` for `url`, deferring to `inner` for the rest.
+    pub fn new(url: String, held: Loaded, inner: &'a mut dyn Loader) -> Self {
+        Self { url, held, inner }
+    }
+}
+
+impl Loader for Preloaded<'_> {
+    fn load(&mut self, url: &str, document: Option<&Origin>, kind: RequestKind) -> Option<Loaded> {
+        if url == self.url {
+            return Some(self.held.clone());
+        }
+        self.inner.load(url, document, kind)
+    }
+
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        self.inner.visited(urls)
+    }
+}
+
+/// The image formats this browser can draw, as `Content-Type` spells them.
+///
+/// `image/jpg` is not a registered type and servers send it anyway, which is
+/// the sort of thing a browser for the old web exists to cope with.
+const DRAWABLE_IMAGES: [&str; 5] = [
+    "image/png",
+    "image/x-png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+];
+
+/// Whether a response is a picture rather than a page (#201).
+///
+/// The header decides whenever there is one. A server saying `text/html` is
+/// believed even if the bytes open like a PNG, because sniffing *against* a
+/// declared type is how a browser gets talked into treating one thing as
+/// another. Sniffing only fills a silence — and the silence is not rare: a
+/// `file:` URL has no headers at all, which is how most people open an image
+/// on their own disk.
+fn is_a_picture(bytes: &[u8], content_type: Option<&str>) -> bool {
+    let declared = content_type
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|mime| !mime.is_empty());
+    match declared {
+        Some(mime) => DRAWABLE_IMAGES.contains(&mime.as_str()),
+        // The magic numbers of the three formats `paint` can decode. Each is
+        // unambiguous, and no HTML document begins with any of them.
+        None => {
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+                || bytes.starts_with(b"\xff\xd8\xff")
+                || bytes.starts_with(b"GIF87a")
+                || bytes.starts_with(b"GIF89a")
+        }
+    }
+}
+
+/// The document to show for a response that is an image (#201).
+///
+/// `None` for anything else, including an image with no address — there would
+/// be nothing to point the `img` at.
+///
+/// A page invented here rather than a second rendering path, so an image gets
+/// the same layout, the same scrollbar and the same `Load image` placeholder
+/// as one inside a document. The name is the last path segment: what a reader
+/// calls the file, and the only part of a URL full of tracking parameters
+/// worth putting in a title.
+pub fn document_for_a_picture(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    url: Option<&str>,
+) -> Option<String> {
+    let url = url?;
+    if !is_a_picture(bytes, content_type) {
+        return None;
+    }
+    let name = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(url);
+    Some(format!(
+        "<!doctype html>\n<html><head><title>{name}</title></head>\n\
+         <body><img src=\"{url}\" alt=\"{name}\"></body></html>",
+        name = escape_for_markup(name),
+        url = escape_for_markup(url),
+    ))
+}
+
+/// Escapes text for a document this browser writes itself.
+///
+/// The URL is the case that matters and it is not a corner one: the address in
+/// the issue carries `?utm_source=…&utm_campaign=…`, and an unescaped `&` in
+/// an attribute is an entity reference waiting to be misread.
+fn escape_for_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Loads subresources in this process, subject to the network policy.
 ///
 /// What the command line and the reference tests use. The browser itself does
@@ -3277,6 +3411,131 @@ mod title_tests {
         assert_eq!(
             title_of("<html><head><title>Node &amp; Nib &#8212; 1998</title></head></html>"),
             Some("Node & Nib — 1998".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    //! A response that is a picture rather than a page (#201).
+
+    use super::*;
+
+    /// The bytes a PNG, a JPEG and a GIF start with.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF";
+    const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00";
+
+    #[test]
+    fn an_image_served_as_one_becomes_a_document_around_it() {
+        let document = document_for_a_picture(
+            JPEG,
+            Some("image/jpeg"),
+            Some("https://example.com/photos/cat.jpg"),
+        )
+        .expect("an image document");
+        assert!(
+            document.contains(r#"<img src="https://example.com/photos/cat.jpg""#),
+            "{document}"
+        );
+        assert!(document.contains("<title>cat.jpg</title>"), "{document}");
+    }
+
+    #[test]
+    fn an_image_with_no_content_type_is_recognised_by_its_bytes() {
+        // The `file:` case, which is most of how somebody opens an image on
+        // their own disk: there are no headers at all to go on.
+        for bytes in [PNG, JPEG, GIF] {
+            assert!(
+                document_for_a_picture(bytes, None, Some("file:///home/reader/x")).is_some(),
+                "{:?} was not recognised",
+                &bytes[..4]
+            );
+        }
+        assert!(
+            document_for_a_picture(b"<html><body>hello", None, Some("file:///x.html")).is_none(),
+            "a document was treated as a picture"
+        );
+    }
+
+    #[test]
+    fn a_declared_type_beats_what_the_bytes_look_like() {
+        // Sniffing *against* a declared type is how a browser gets talked into
+        // treating one thing as another. The header is believed both ways.
+        assert!(
+            document_for_a_picture(PNG, Some("text/html"), Some("https://example.com/x")).is_none(),
+            "a server saying text/html was overruled by the bytes"
+        );
+        assert!(
+            document_for_a_picture(
+                b"not really a jpeg",
+                Some("image/jpeg; charset=binary"),
+                Some("https://example.com/x")
+            )
+            .is_some(),
+            "a server saying image/jpeg was not believed"
+        );
+    }
+
+    #[test]
+    fn the_address_is_escaped_into_the_document() {
+        // The URL in the issue carries `?utm_source=…&utm_campaign=…`, and an
+        // unescaped `&` in an attribute is an entity reference waiting to be
+        // misread.
+        let document = document_for_a_picture(
+            PNG,
+            Some("image/png"),
+            Some("https://example.com/a.png?one=1&two=2"),
+        )
+        .expect("an image document");
+        assert!(
+            document.contains(r#"src="https://example.com/a.png?one=1&amp;two=2""#),
+            "{document}"
+        );
+        // And the name is the file, not the tracking parameters.
+        assert!(document.contains("<title>a.png</title>"), "{document}");
+    }
+
+    #[test]
+    fn an_image_with_no_address_is_left_alone() {
+        // There would be nothing to point the `img` at.
+        assert!(document_for_a_picture(PNG, Some("image/png"), None).is_none());
+    }
+
+    #[test]
+    fn the_picture_in_hand_is_not_asked_for_again() {
+        // The point of `Preloaded`: the navigation already downloaded the
+        // photograph, and the page invented to show it must not download it a
+        // second time.
+        struct Counting(usize);
+        impl Loader for Counting {
+            fn load(&mut self, _: &str, _: Option<&Origin>, _: RequestKind) -> Option<Loaded> {
+                self.0 += 1;
+                None
+            }
+        }
+        let mut inner = Counting(0);
+        let held = Loaded {
+            bytes: PNG.to_vec(),
+            content_type: Some("image/png".to_owned()),
+        };
+        let mut loader = Preloaded::new("https://example.com/a.png".to_owned(), held, &mut inner);
+
+        let got = loader.load("https://example.com/a.png", None, RequestKind::Subresource);
+        assert_eq!(got.expect("the held bytes").bytes, PNG);
+        assert!(
+            loader
+                .load(
+                    "https://example.com/other.png",
+                    None,
+                    RequestKind::Subresource
+                )
+                .is_none(),
+            "anything else should go through to the real loader"
+        );
+        assert_eq!(
+            inner.0, 1,
+            "the held URL should not have reached the loader"
         );
     }
 }
