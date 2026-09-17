@@ -1323,4 +1323,48 @@ unset XDG_CONFIG_HOME
 rm -rf "$recorded"
 echo "ok: a navigation was recorded in the history and survived the window"
 
+# N. The debugging views are reachable and hold what they say (#198).
+#
+#    `devtools.rs` pins what the two pages say. What it cannot pin is that a
+#    keystroke reaches them, that the page they describe is the one on screen,
+#    or that the markup shown is the markup that was parsed rather than a second
+#    fetch of it.
+looked="$(mktemp -d)"
+export XDG_CONFIG_HOME="$looked"
+start
+focus_window
+DISPLAY=$display xdotool key ctrl+u
+source_html="$looked/2kbrowser/source.html"
+wrote=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    [ -f "$source_html" ] && { wrote=yes; break; }
+done
+[ -n "$wrote" ] || fail "Ctrl+U wrote no source view at $source_html"
+grep -q "go to the other page" "$source_html" || fail "the source view does not \
+hold the page's own markup: $(head -c 400 "$source_html")"
+grep -q "&lt;a href" "$source_html" || fail "the source view did not escape the \
+markup it is showing, so it rendered the page again instead of printing it"
+
+DISPLAY=$display xdotool key ctrl+shift+i
+info_html="$looked/2kbrowser/page-info.html"
+wrote=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    [ -f "$info_html" ] && { wrote=yes; break; }
+done
+[ -n "$wrote" ] || fail "Ctrl+Shift+I wrote no page information at $info_html"
+for section in Console Network Inspector Storage; do
+    grep -q "<h2>$section</h2>" "$info_html" || fail "the page information has \
+no $section section, so one of the four asked for does not exist"
+done
+# The inspector is built from the tree the child sends back, so an empty one
+# means the question never crossed the process boundary.
+grep -q "document" "$info_html" || fail "the inspector shows no document node, \
+so the accessibility tree never came back from the renderer"
+stop
+unset XDG_CONFIG_HOME
+rm -rf "$looked"
+echo "ok: the source view and the page information both opened and were filled in"
+
 echo "all window click checks passed"

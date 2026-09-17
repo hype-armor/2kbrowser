@@ -16,6 +16,32 @@ record for everything earlier.
 
 ## Unreleased
 
+**Debugging tools: console, inspector, network, storage, and view source**
+(#198). All four of the asked-for tools, as one generated page rather than four
+panels — a page for the reason the saved list and the history are pages: the
+engine already knows how to show a document, and a devtools *window* would be a
+second piece of interface with its own scrolling and its own bugs. Ctrl+U shows
+the markup, Ctrl+Shift+I shows the rest, and both are in the right-click menu.
+
+Two of the four mean something different here, and saying so is most of the job.
+**The console has nothing to listen to** — ADR-0003 means no script runs, so
+nothing on the page can log anything. What it shows instead is the browser's own
+account of the page: why it was laid out the way it was, what was refused, what
+did not arrive. **Storage is empty by construction** — no `localStorage`
+without scripts, no cookies, and a cache that lives in memory for one run
+(ADR-0018). Rather than draw an empty table that reads as a missing feature, it
+says so and then names the three files the browser itself keeps.
+
+**The inspector is the accessibility tree**, which ADR-0019 already sends across
+the process boundary as data. That is not a stand-in for a DOM inspector so much
+as a better answer to the question usually being asked — *what did this page
+actually turn into?* — because it is the structure the page produced rather than
+the markup it was written in. The markup is one keystroke away, unchanged.
+
+View source shows the bytes the parent already holds, decoded the way the
+document itself was decoded. Nothing is fetched again: a source view that
+re-asked the server could show something the page on screen never was.
+
 **A preformatted line keeps the spaces it starts with.** Found while building
 the inspector below, which drew every level of the tree flush left. Spaces
 following a line break were folded into the segment that *carried* the break, so

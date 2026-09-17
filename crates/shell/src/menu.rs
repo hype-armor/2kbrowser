@@ -45,6 +45,10 @@ pub enum Item {
     CopyLink(String),
     /// Put the selected text on the clipboard.
     CopySelection,
+    /// Show this page's markup, as a page (#198).
+    ViewSource,
+    /// Show what the browser knows about this page (#198).
+    PageInformation,
 }
 
 impl Item {
@@ -57,6 +61,8 @@ impl Item {
             Item::OpenInNewTab(_) => "Open link in new tab",
             Item::CopyLink(_) => "Copy link address",
             Item::CopySelection => "Copy",
+            Item::ViewSource => "View page source",
+            Item::PageInformation => "Page information",
         }
     }
 }
@@ -89,6 +95,11 @@ pub fn items_for(
         items.push(Item::Forward);
     }
     items.push(Item::Reload);
+    // Last, and always: these are about the page rather than about what the
+    // pointer is on, and a reader looking for them wants them in the same place
+    // every time (#198).
+    items.push(Item::ViewSource);
+    items.push(Item::PageInformation);
     items
 }
 
@@ -228,6 +239,8 @@ mod tests {
                 Item::CopyLink("https://example.com/".to_owned()),
                 Item::Back,
                 Item::Reload,
+                Item::ViewSource,
+                Item::PageInformation,
             ]
         );
     }
@@ -255,13 +268,20 @@ mod tests {
                 Item::CopySelection,
                 Item::Back,
                 Item::Reload,
+                Item::ViewSource,
+                Item::PageInformation,
             ]
         );
     }
 
     #[test]
     fn a_menu_on_bare_page_offers_only_what_the_page_can_do() {
-        assert_eq!(items_for(None, false, false, false), vec![Item::Reload]);
+        assert_eq!(
+            items_for(None, false, false, false),
+            vec![Item::Reload, Item::ViewSource, Item::PageInformation],
+            "there is always a page to fetch again, to read the markup of, and \
+             to ask about (#198)"
+        );
     }
 
     #[test]

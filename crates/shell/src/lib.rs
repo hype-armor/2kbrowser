@@ -7,6 +7,7 @@ pub mod a11y;
 pub mod access;
 pub mod bookmarks;
 pub mod chrome;
+pub mod devtools;
 pub mod dropdown;
 pub mod field;
 pub mod history;

@@ -1783,6 +1783,8 @@ impl App {
             Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
             Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
             Some(crate::menu::Item::CopySelection) => self.copy_selection(),
+            Some(crate::menu::Item::ViewSource) => self.open_source(),
+            Some(crate::menu::Item::PageInformation) => self.open_page_information(),
             // A click outside the menu dismisses it and does nothing else.
             None => {}
         }
@@ -1889,6 +1891,11 @@ impl App {
         if url.is_empty()
             || url == net::file_url(&crate::bookmarks::page_path())
             || url == net::file_url(&crate::visits::page_path())
+            || net::parse_url(url).ok().is_some_and(|(_, path)| {
+                crate::devtools::is_generated(std::path::Path::new(net::policy::to_file_path(
+                    &path,
+                )))
+            })
         {
             return;
         }
@@ -1932,6 +1939,106 @@ impl App {
             self.tab_mut().error = Some(format!("could not clear the history: {error}"));
         }
         self.refresh_chrome();
+    }
+
+    /// Opens this page's markup, as a page (#198).
+    ///
+    /// The bytes the parent already holds, decoded the way the document itself
+    /// was decoded — so what is shown is what was *parsed*, not a second guess
+    /// at the encoding. Nothing is fetched again: a source view that re-asked
+    /// the server could show something the page on screen never was.
+    fn open_source(&mut self) {
+        let html = crate::devtools::source_page(
+            self.tab().history.current(),
+            &self.tab().loaded.body,
+            self.tab().loaded.content_type.as_deref(),
+        );
+        self.open_generated(crate::devtools::source_path(), html, "the source");
+    }
+
+    /// Opens what the browser knows about this page (#198).
+    fn open_page_information(&mut self) {
+        let stores = vec![
+            crate::devtools::Store::of(
+                "Bookmarks",
+                self.bookmarks_path.clone(),
+                self.bookmarks.len(),
+                "§1",
+            ),
+            crate::devtools::Store::of(
+                "Site exceptions",
+                self.sites_path.clone(),
+                self.renderer.policy().exceptions.len(),
+                "ADR-0006",
+            ),
+            crate::devtools::Store::of(
+                "History",
+                self.visits_path.clone(),
+                self.visits.len(),
+                "ADR-0021",
+            ),
+        ];
+        // Asked of the child, which is the only thing that has it: the tree is
+        // built from the box tree, and the box tree never crosses the boundary
+        // (ADR-0012, ADR-0019).
+        let tree = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .map(crate::viewport::Viewport::accessibility)
+            .unwrap_or_default();
+        let withheld = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
+        let mode = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::mode)
+            .unwrap_or(layout::RenderMode::Authored);
+        let html = crate::devtools::page(&crate::devtools::Report {
+            url: self.tab().history.current(),
+            content_type: self.tab().loaded.content_type.as_deref(),
+            bytes: self.tab().loaded.body.len(),
+            local_root: self.tab().local_root,
+            explanation: mode.explanation(),
+            mode,
+            error: self.tab().error.as_deref(),
+            images_loaded: self
+                .tab()
+                .page
+                .as_ref()
+                .map(crate::viewport::Viewport::images_loaded)
+                .unwrap_or(0),
+            withheld: withheld.urls().to_vec(),
+            withheld_hosts: withheld.hosts().to_vec(),
+            tree,
+            stores,
+        });
+        self.open_generated(crate::devtools::page_path(), html, "the page information");
+    }
+
+    /// Writes one of the browser's own pages out and opens it in a new tab.
+    ///
+    /// Written to disk and loaded like any other file so that back, forward,
+    /// find and the links on it all work without a second code path — which is
+    /// what the saved list and the history already do.
+    fn open_generated(&mut self, path: std::path::PathBuf, html: String, what: &str) {
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&net::file_url(&path)),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write {what}: {error}"));
+                self.refresh_chrome();
+            }
+        }
     }
 
     /// Opens the saved list, as a page, in a new tab.
@@ -3469,6 +3576,17 @@ impl ApplicationHandler<Wake> for App {
                             } else {
                                 self.open_history();
                             }
+                            return;
+                        }
+                        // Ctrl+U shows the markup, as it has everywhere since
+                        // Netscape, and Ctrl+Shift+I shows what the browser
+                        // knows about the page (#198).
+                        Key::Character(c) if c.eq_ignore_ascii_case("u") => {
+                            self.open_source();
+                            return;
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("i") && shift => {
+                            self.open_page_information();
                             return;
                         }
                         // Ctrl+R reloads, as it has everywhere since Netscape.

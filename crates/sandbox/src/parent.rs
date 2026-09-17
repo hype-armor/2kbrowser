@@ -563,6 +563,16 @@ impl Withheld {
         &self.hosts
     }
 
+    /// The addresses themselves, in the order the page first asked.
+    ///
+    /// The hosts above are what the padlock offers, because that is the grain a
+    /// decision is made at. These are what the page information page lists
+    /// (#198), because "what did this page try to load?" is a different
+    /// question from "what may I allow?" and deserves the whole address.
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
     /// Whether anything was refused at all.
     pub fn is_empty(&self) -> bool {
         self.urls.is_empty()
