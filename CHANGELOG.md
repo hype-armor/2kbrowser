@@ -16,6 +16,18 @@ record for everything earlier.
 
 ## Unreleased
 
+**A text box looks like one, and keeps its own alignment** (#195). An `inset`
+border darkens its top and left and leaves its bottom and right as given, which
+was written for the era's grey window background. On a white page the light
+edges vanish, so a field drew as a dark top-left corner and nothing else —
+which reads as a rendering fault rather than as a control. The border is
+`#999999` now: still sunken, still there on white.
+
+And a control's `text-align` is set rather than inherited, so a field inside a
+centred block no longer centres what is typed into it. An author rule on the
+control still wins, which is the whole of "unless otherwise styled": this only
+stops a control picking up an alignment meant for the prose around it.
+
 **An image opened by its own address renders as one** (#201). A JPEG is not a
 document, and decoding one as text produced a page of mojibake. A document is
 invented to hold it instead — `<img>` and nothing else — so a picture gets the

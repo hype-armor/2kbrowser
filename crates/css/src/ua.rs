@@ -96,12 +96,25 @@ col { display: table-column; }
 
    `inset` and `outset` are the era's own borders, and the reason this browser
    implements them: a field is a hole in the page and a button stands proud of
-   it, which is exactly what those two styles say. */
+   it, which is exactly what those two styles say.
+
+   The border is `#999999` and not the `#cccccc` it used to be, because an
+   inset border darkens its top and left and leaves its bottom and right as
+   given — which was written for the era's grey window background and vanishes
+   against a white page (#195). A field drew as a dark top-left corner and
+   nothing else, which reads as a rendering fault rather than as a control.
+   `#999999` keeps the sunken look and is still there on white.
+
+   `text-align` is set rather than inherited, so a field inside a centred block
+   does not centre what is typed into it (#195). An author rule on the control
+   still wins, which is the whole of "unless otherwise styled in css": this
+   only stops a control picking up an alignment meant for prose around it. */
 input, textarea, select, button {
-  border: 2px inset #cccccc;
+  border: 2px inset #999999;
   background-color: #ffffff;
   padding: 1px 2px;
   color: #000000;
+  text-align: left;
 }
 input[type=submit], input[type=reset], input[type=button], button {
   border: 2px outset #cccccc;
