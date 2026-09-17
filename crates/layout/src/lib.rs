@@ -2213,12 +2213,27 @@ fn collect_floats(
 /// The check is "is there a table above me", not "is my parent a table",
 /// because `build_grid` descends through plain wrappers: a `<tr>` inside a
 /// `<div>` inside a `<table>` is collected, and is therefore not an orphan.
+///
+/// It stops at a box that has left the flow, though, because `build_grid` does
+/// too. §9.7 blockifies a floated or absolutely positioned box, and the
+/// cascade's own note on that rule says what follows: a floated `table-row` is
+/// no longer part of any table. So neither is anything inside it — a `<tr>`
+/// under an absolutely positioned wrapper is an orphan however many tables sit
+/// above the wrapper, and answering otherwise left it waiting for a grid that
+/// would never collect it. The box did not render wrongly; it did not render.
 fn inside_a_table(doc: &Document, styles: &StyleMap, node: NodeId) -> bool {
-    doc.ancestors(node).any(|ancestor| {
-        styles
-            .get(ancestor)
-            .is_some_and(|style| style.display == Display::Table)
-    })
+    for ancestor in doc.ancestors(node) {
+        let Some(style) = styles.get(ancestor) else {
+            continue;
+        };
+        if style.display == Display::Table {
+            return true;
+        }
+        if style.position.is_out_of_flow() || style.float != Float::None {
+            return false;
+        }
+    }
+    false
 }
 
 /// Whether an inline element has a block-level element inside it.
@@ -9540,6 +9555,32 @@ mod tests {
             "the element and the display value were spaced alike: {markup} against {styled}"
         );
         assert_eq!(markup - styled, 4.0, "two pixels on each side");
+    }
+
+    #[test]
+    fn an_out_of_flow_wrapper_takes_its_rows_out_of_the_table_above() {
+        // §9.7 blockifies an absolutely positioned box, and a row under one is
+        // no longer part of any table however many sit above it — `build_grid`
+        // does not reach through an out-of-flow box either. Answering otherwise
+        // left the row waiting for a grid that would never collect it, so the
+        // cell did not render wrongly: it did not render.
+        let rendered = run(
+            "<body><div id=\"table\"><div id=\"out\">\
+             <div class=row><div class=cell>x</div></div>\
+             </div></div></body>",
+            "body { margin: 0 } #table { display: table } \
+             #out { position: absolute; left: 0 } \
+             .row { display: table-row } \
+             .cell { display: table-cell; width: 40px; height: 20px }",
+            600.0,
+        );
+        let cells: Vec<_> = content_boxes(&rendered)
+            .into_iter()
+            .filter(|b| b.style.display == Display::TableCell)
+            .collect();
+        assert_eq!(cells.len(), 1, "the cell vanished");
+        assert!(cells[0].rect.width >= 40.0, "{}", cells[0].rect.width);
+        assert!(cells[0].rect.height >= 20.0, "{}", cells[0].rect.height);
     }
 
     #[test]
