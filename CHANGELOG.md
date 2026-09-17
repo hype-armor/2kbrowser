@@ -16,6 +16,37 @@ record for everything earlier.
 
 ## Unreleased
 
+**A page belongs to where the redirect left it.** Reported as Hacker News's
+comment pages answering "No such item." in this browser and rendering fine in
+Firefox. They do: `hackernews.com` is a redirect to `news.ycombinator.com`, and
+this browser resolved the front page's links against the address that was
+*asked for* rather than the one the page was *served from*. So `item?id=…` came
+out as `https://hackernews.com/item?id=…`, which redirects again — and that
+redirect keeps the path and throws the query away, so Hacker News was asked for
+`/item` with no item, and said so. Firefox resolves against the final URL and
+never goes near the redirect twice.
+
+The fix is that the fetcher now reports where the chain stopped, and everything
+downstream uses it: relative links, the third-party rule's idea of this page's
+site, the padlock, and the address bar — which used to name one site while the
+page belonged to another. Back and Forward get the corrected address too, since
+returning to a redirect's starting point only asks to be redirected again.
+
+**And the policy is applied at every hop, not just the first.** Chasing
+redirects had been left to `ureq`, which does it perfectly well and does it
+without asking anybody. That left a door in ADR-0006's headline rule: a
+subresource on the page's own site that answers `302 Location:
+https://tracker.example.net/pixel.gif` got the request *made*, and the rule
+never saw the host it was made to. The budget in `tests/budgets` says "no
+third-party request was ever made", and that has to be true of the second
+request as much as the first. Redirects are followed here now, bounded at eight,
+with the policy asked before each one — and a redirect to a `file:` URL is
+refused even on a navigation, which is exempt from the third-party rule and is
+still not allowed to reach the disk by bouncing off a server.
+
+Both halves have tests that fail without them, against a real socket: a
+redirect is the one thing about a fetch that cannot be posed to a file on disk.
+
 **A subdomain is the same site** (ADR-0020). ADR-0006 refuses third-party
 subresources, and "third party" has meant *a different host* since the rule was
 written. That is the strictest reading, and it is wrong about ordinary sites: a

@@ -775,11 +775,14 @@ impl App {
                 // Resolved the same way `link_targets` resolves an href, so
                 // the two strings agree: what is recorded here is exactly what
                 // a link pointing back at this page will ask about.
-                self.renderer.record_visit(&net::resolve(
-                    &fetched.origin,
-                    &fetched.path,
-                    &fetched.path,
-                ));
+                let landed_on = net::resolve(&fetched.origin, &fetched.path, &fetched.path);
+                self.renderer.record_visit(&landed_on);
+                // And the bar says where the page came from rather than where
+                // it was asked for. A redirect otherwise leaves the address,
+                // the padlock's site and every link on the page disagreeing
+                // about which site the reader is on — and Back would return to
+                // the address that only redirects again.
+                self.tab_mut().history.arrived_at(landed_on);
                 self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
                 self.tab_mut().loaded = Loaded {
                     body: fetched.body,
