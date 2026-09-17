@@ -451,6 +451,16 @@ pub enum ToChild {
         /// Where it is now.
         to: (f32, f32),
     },
+    /// Hand back whatever is selected inside the focused control, for the
+    /// clipboard.
+    ///
+    /// Asked only when the reader presses a copy chord, never on a render. What
+    /// is in a control is the page's business (ADR-0012) and the [`Focused`]
+    /// states are deliberately three bits of nothing; this is the one way text
+    /// leaves a control, and it leaves because a person asked for it — the same
+    /// shape as a form submission, where the untrusted side proposes and the
+    /// trusted side disposes.
+    CopyFocused,
     /// The answers to a [`ToParent::Fetch`], one per URL and in the same order.
     ///
     /// Order is the whole matching rule: the parent answers a batch with
@@ -569,6 +579,7 @@ impl ToChild {
                 writer.tag(7);
                 key.write(&mut writer);
             }
+            ToChild::CopyFocused => writer.tag(11),
             ToChild::Select { from, to } => {
                 writer.tag(4);
                 writer.f32(from.0);
@@ -683,6 +694,7 @@ impl ToChild {
                 }
                 ToChild::Followed { visited }
             }
+            11 => ToChild::CopyFocused,
             4 => ToChild::Select {
                 from: (reader.f32()?, reader.f32()?),
                 to: (reader.f32()?, reader.f32()?),

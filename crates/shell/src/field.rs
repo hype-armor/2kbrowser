@@ -200,6 +200,27 @@ impl Field {
         self.place(at, extend);
     }
 
+    /// The selected text, or `None` when nothing is selected.
+    ///
+    /// What a copy takes. Separate from [`Field::selection`] because a caller
+    /// wanting the text should not have to slice the string itself and get the
+    /// byte indices right — which is the one way to turn a copy into a panic.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|(start, end)| &self.text[start..end])
+    }
+
+    /// Removes the selection and returns what it held.
+    ///
+    /// What a cut is: the copy is the caller's, because only the caller has a
+    /// clipboard. `None`, and nothing removed, when there is no selection —
+    /// a cut with nothing selected takes nothing, rather than taking the
+    /// character a backspace would.
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.selected_text()?.to_owned();
+        self.delete_selection();
+        Some(text)
+    }
+
     /// Selects everything.
     pub fn select_all(&mut self) {
         self.anchor = 0;
@@ -472,5 +493,66 @@ mod pointer_tests {
         }
         field.place(usize::MAX, false);
         assert_eq!(field.cursor(), field.text().len(), "clamped to the end");
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    //! What a copy and a cut take out of a field.
+
+    use super::Field;
+
+    #[test]
+    fn a_copy_takes_the_selection_and_leaves_it_there() {
+        let mut field = Field::with_cursor_at_end("https://example.com/");
+        field.place(8, false);
+        field.place(15, true);
+        assert_eq!(field.selected_text(), Some("example"));
+        assert_eq!(
+            field.text(),
+            "https://example.com/",
+            "a copy changes nothing"
+        );
+        assert_eq!(field.selection(), Some((8, 15)), "and keeps the selection");
+    }
+
+    #[test]
+    fn nothing_selected_is_nothing_to_copy() {
+        // Not the empty string: "nothing was selected" and "the empty string
+        // was selected" would put the same thing on the clipboard, and only one
+        // of them should put anything there at all.
+        let field = Field::with_cursor_at_end("text");
+        assert_eq!(field.selected_text(), None);
+    }
+
+    #[test]
+    fn a_cut_takes_the_selection_out() {
+        let mut field = Field::with_cursor_at_end("one two three");
+        field.place(4, false);
+        field.place(8, true);
+        assert_eq!(field.cut().as_deref(), Some("two "));
+        assert_eq!(field.text(), "one three");
+        assert_eq!(field.cursor(), 4, "the cursor closes up where it was");
+        assert_eq!(field.selection(), None);
+    }
+
+    #[test]
+    fn a_cut_with_nothing_selected_takes_nothing() {
+        // And in particular does not take the character a backspace would: a
+        // cut that quietly deleted something would be a keystroke nobody could
+        // undo.
+        let mut field = Field::with_cursor_at_end("text");
+        assert_eq!(field.cut(), None);
+        assert_eq!(field.text(), "text");
+    }
+
+    #[test]
+    fn a_paste_replaces_what_was_selected() {
+        // `insert` is what a paste is, and this is the behaviour a paste needs
+        // from it: selecting a URL and pasting replaces it rather than
+        // appending to it.
+        let mut field = Field::with_all_selected("https://old.example/");
+        field.insert("https://new.example/");
+        assert_eq!(field.text(), "https://new.example/");
     }
 }

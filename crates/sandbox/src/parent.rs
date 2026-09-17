@@ -476,6 +476,7 @@ enum Job {
     Band { top: u32, height: u32 },
     Find(String),
     Select { from: (f32, f32), to: (f32, f32) },
+    CopyFocused,
     Focus { at: (f32, f32) },
     Type { key: crate::message::Key },
     Choose { node: u32, index: u32 },
@@ -887,6 +888,24 @@ impl Session {
         }
     }
 
+    /// What is selected inside the focused control, for the clipboard.
+    ///
+    /// Answered with `Selected` and no rectangles: a control draws its own
+    /// highlight on the far side of the boundary, so there is nothing for the
+    /// parent to draw and nothing to hand over but the text.
+    ///
+    /// Asked only when a reader presses a copy chord. What is in a control is
+    /// the page's business (ADR-0012), and this is the one way any of it comes
+    /// back — because a person asked for it.
+    pub fn copy_focused(&mut self) -> Result<String, Error> {
+        self.submit(Job::CopyFocused, Kind::Select)?;
+        match self.wait_for(Kind::Select)? {
+            Answer::Selected(_, text) => Ok(text),
+            Answer::Failed(error) => Err(error),
+            _ => Err(Error::Wire(crate::WireError::Unknown)),
+        }
+    }
+
     fn submit(&mut self, job: Job, kind: Kind) -> Result<(), Error> {
         let jobs = self.jobs.as_ref().ok_or(Error::Died)?;
         jobs.send(job).map_err(|_| Error::Died)?;
@@ -1147,6 +1166,7 @@ impl Conversation {
             Job::Find(query) => self.ask(&ToChild::Find { query }),
             Job::Accessibility => self.ask(&ToChild::Accessibility),
             Job::Select { from, to } => self.ask(&ToChild::Select { from, to }),
+            Job::CopyFocused => self.ask(&ToChild::CopyFocused),
             // Through `converse` rather than `ask`, because these re-render:
             // a field that grew a line can bring a new row of the page into
             // the band, and a new row can want an image.
