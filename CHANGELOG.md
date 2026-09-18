@@ -44,9 +44,31 @@ and a short list of recently-seen attribute sets — compared rather than hashed
 means even that is rare within a paragraph. The segment lookup takes a `&str`
 and allocates nothing.
 
-Layout of a 2,000-paragraph page went from 122 ms to 60 ms, and the profile went
-from one dominant cost to flat. The property that makes any of this safe is the
-one ADR-0005 already demands: identical input must produce identical output, so
+What that is worth, measured against the same binary with and without the change
+and with nothing else running — three runs each, and the band column carried as
+a control because painting a band does no layout at all:
+
+| page | operation | before | after | |
+|---|---|---|---|---|
+| long page | keystroke | 139 ms | 110 ms | −21% |
+| long page | open | 164 ms | 133 ms | −19% |
+| big table | keystroke | 121 ms | 108 ms | −11% |
+| big table | open | 179 ms | 155 ms | −13% |
+| either | band | 25 ms | 27 ms | unchanged, as it must be |
+
+A warm re-layout's instruction count fell from 442M to 266M and the profile went
+from one dominant cost to flat, which is the part that is exactly measurable.
+The wall-clock gain is smaller than that ratio because layout is about two
+thirds of a keystroke and the rest of the re-render — parse, cascade, display
+list, raster, and the pixels crossing the pipe — is untouched.
+
+An earlier draft of this entry quoted "122 ms to 60 ms" for layout. That was a
+real measurement of a *different and larger* fixture than the one the table
+above uses, and putting it beside the end-to-end numbers implied a halving that
+does not carry through. Layout on the long page went from about 85 ms to about
+56 ms, which is what the 29 ms off its keystroke accounts for.
+
+The property that makes any of this safe is the one ADR-0005 already demands: identical input must produce identical output, so
 a cache can change how long a page takes and cannot change how it looks — and
 the reference tests compare rendered pages against baselines byte for byte,
 which is what would catch a cache that returned the wrong glyphs.
