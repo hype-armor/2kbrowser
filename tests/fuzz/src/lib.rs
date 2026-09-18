@@ -969,6 +969,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
         }
         .encode(),
         sandbox::ToChild::Band {
+            left: 512,
             top: 4096,
             height: 300,
         }
@@ -1007,6 +1008,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             width: 4,
             height: 4,
             content_height: 64.0,
+            content_width: 96.0,
             mode: Mode::Document {
                 unsupported_share: 0.5,
             },
@@ -1031,6 +1033,15 @@ fn wire_seeds() -> Vec<Vec<u8>> {
                     height: 30.0,
                 },
                 url: "https://cdn.example.net/photo.jpg".to_owned(),
+            }],
+            pictures: vec![sandbox::Picture {
+                rect: layout::Rect {
+                    x: 7.0,
+                    y: 8.0,
+                    width: 60.0,
+                    height: 45.0,
+                },
+                url: "https://cdn.example.net/arrived.png".to_owned(),
             }],
             buttons: Vec::new(),
             pressables: vec![layout::Rect {
@@ -1060,6 +1071,7 @@ fn wire_seeds() -> Vec<Vec<u8>> {
             images_loaded: 2,
             background: 0x0011_2233,
             top: 0,
+            left: 16,
         }))
         .encode(),
     ];

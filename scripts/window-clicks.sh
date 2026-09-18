@@ -1481,4 +1481,195 @@ did not happen"
 stop
 echo "ok: an address copied out of the bar pasted back into it and navigated"
 
+# N. A page wider than the window scrolls sideways, and its bar drags (#204).
+#
+#    None of this is reachable from `cargo test`. The band arithmetic is pinned
+#    in `paint`, the bar's geometry in `scrollbar.rs`, and the blit's column
+#    offset in `window.rs` — but nothing there proves that a real window asks
+#    the child for a band at a new column, draws the answer where the reader is
+#    looking, and puts a bar along the bottom that a pointer can take hold of.
+#
+#    Measured by finding a red block that sits past 1700px in the fixture. Red
+#    rather than dark, because the page's own text is ink: a check that counted
+#    dark pixels would find the paragraph and pass without the page having moved
+#    an inch.
+wide="$here/tests/window/wide.html"
+bottom=$((height - scrollbar / 2))
+
+red() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-pixel.py" "$1" "$2" \
+        | awk '{ exit !($1 > 190 && $2 < 80 && $3 < 80) }'
+}
+
+# The first and last columns of the bottom row that are not the page's white,
+# which is where the horizontal thumb is.
+h_thumb_span() {
+    local first="" last="" column rgb
+    DISPLAY=$display xwd -silent -id "$window" > "$dump"
+    for column in $(seq 0 8 $((width - 4))); do
+        rgb=$(python3 "$here/scripts/xwd-pixel.py" "$column" "$bottom" < "$dump")
+        if [ "$rgb" != "255 255 255" ]; then
+            [ -z "$first" ] && first=$column
+            last=$column
+        fi
+    done
+    echo "$first $last"
+}
+
+start_on "$wide" "Wide"
+# Where the red block lands once the page is scrolled as far right as it goes.
+# The fixture is 2208 wide including the body margin, the window is 800, so the
+# furthest left edge is 1408 — and the block at 1708..2108 shows at window
+# 300..700. A column outside that range would be white at both ends of the
+# track and the check would fail whether or not anything worked.
+probe_x=500
+probe_y=$((chrome + 200))
+red "$probe_x" "$probe_y" && fail "the far side of the page is already on \
+screen, so this check would pass without anything being scrolled"
+
+span=$(h_thumb_span)
+[ "$span" != " " ] || fail "no horizontal scrollbar on a page far wider than \
+the window"
+span_left=${span% *}
+
+# Grab the thumb and pull it to the right-hand end of the track.
+DISPLAY=$display xdotool mousemove $((span_left + 4)) "$bottom"
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+for step in 200 400 600 780; do
+    DISPLAY=$display xdotool mousemove "$step" "$bottom"
+    sleep 0.2
+done
+DISPLAY=$display xdotool mouseup 1
+
+arrived=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    if red "$probe_x" "$probe_y"; then
+        arrived=yes
+        break
+    fi
+done
+[ -n "$arrived" ] || fail "dragging the horizontal thumb to the far right never \
+brought the right-hand side of the page onto the screen"
+echo "ok: a page wider than its window scrolls sideways by its own bar"
+
+# And Home comes back, which is the other half of being able to leave.
+focus_window
+DISPLAY=$display xdotool key Home
+returned=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    if ! red "$probe_x" "$probe_y"; then
+        returned=yes
+        break
+    fi
+done
+[ -n "$returned" ] || fail "Home did not bring the page back to its left edge"
+echo "ok: Home returns a sideways-scrolled page to its beginning"
+stop
+
+# N. The right-hand button over a picture saves it (#205).
+#
+#    The whole point of the feature is a file on the reader's disk, and nothing
+#    short of a real window can produce one: the menu has to open over the
+#    picture, the entry has to be where the menu drew it, choosing it has to
+#    fetch through the policy, and the bytes have to be written. The menu's
+#    contents are pinned by unit tests in `menu.rs` and the naming by
+#    `downloads.rs`; neither can see any of that.
+pictures=$(mktemp -d)
+saved="$pictures/saved"
+mkdir -p "$saved"
+python3 - "$pictures/green.png" <<'PNG'
+import struct, sys, zlib
+
+# A 60x60 solid green PNG, written by hand rather than pulled from a fixture
+# directory: the check needs a picture the browser can really decode, and four
+# lines of zlib is less to keep than a binary in the tree.
+width = height = 60
+raw = b"".join(b"\x00" + bytes([0x00, 0x80, 0x00] * width) for _ in range(height))
+
+
+def chunk(kind, body):
+    return (
+        struct.pack(">I", len(body))
+        + kind
+        + body
+        + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    )
+
+
+open(sys.argv[1], "wb").write(
+    b"\x89PNG\r\n\x1a\n"
+    + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(raw))
+    + chunk(b"IEND", b"")
+)
+PNG
+cat > "$pictures/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Picture</title>
+<body style="margin: 0">
+<img src="green.png">
+</body>
+FIXTURE
+
+# Where the browser will put it. Read by `downloads::default_directory`, and
+# set here so the check writes into a temporary directory rather than into
+# whoever is running it.
+export XDG_DOWNLOAD_DIR="$saved"
+start_on "$pictures/p.html" "Picture"
+
+# Make sure the picture really rendered before pointing at it: a menu opened
+# over a page that has not drawn its image would offer nothing about pictures,
+# and the failure would read like a broken menu.
+drawn=""
+for _ in $(seq 1 20); do
+    if [ "$(pixel 30 $((chrome + 30)))" = "0 128 0" ]; then
+        drawn=yes
+        break
+    fi
+    sleep 0.2
+done
+[ -n "$drawn" ] || fail "the picture never drew, so a menu over it would have \
+nothing to say about pictures"
+
+[ -z "$(ls -A "$saved")" ] || fail "something was already in the downloads \
+directory, so the check below would pass without anything being saved"
+
+# The right-hand button over the picture, then the first row of the menu it
+# opens. With no link, no selection, nowhere to paste and nowhere to go back
+# to, `items_for` puts "Save image as…" first — which `menu.rs` pins.
+menu_x=30
+menu_y=$((chrome + 30))
+DISPLAY=$display xdotool mousemove "$menu_x" "$menu_y"
+sleep 0.3
+DISPLAY=$display xdotool click 3
+sleep 0.8
+# Down the middle of the first row. ROW is 26 in `menu.rs`, and the menu's
+# top-left corner is the pointer.
+DISPLAY=$display xdotool mousemove $((menu_x + 40)) $((menu_y + 13))
+sleep 0.3
+DISPLAY=$display xdotool click 1
+
+written=""
+for _ in $(seq 1 25); do
+    sleep 0.3
+    if [ -s "$saved/green.png" ]; then
+        written=yes
+        break
+    fi
+done
+[ -n "$written" ] || fail "choosing \"Save image as…\" wrote no file — the \
+menu entry did nothing, or it saved somewhere nobody asked for. Downloads \
+directory holds: $(ls -A "$saved" | tr '\n' ' ')"
+
+cmp -s "$saved/green.png" "$pictures/green.png" \
+    || fail "the saved file is not the picture that was on the page"
+echo "ok: the right-hand button over a picture saved it to disk"
+stop
+unset XDG_DOWNLOAD_DIR
+rm -rf "$pictures"
+
 echo "all window click checks passed"

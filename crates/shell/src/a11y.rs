@@ -49,12 +49,22 @@ pub struct Viewport {
     pub chrome: f32,
     /// How far down the document the window is showing.
     pub scroll: f32,
+    /// How far across the document the window is showing (#204).
+    ///
+    /// Zero on nearly every page. It matters where it is not: a screen reader
+    /// draws its own focus rectangle at the coordinates given here, and one
+    /// that ignored the horizontal scroll would outline empty screen beside the
+    /// thing it was reading.
+    pub scroll_x: f32,
 }
 
 impl Viewport {
     /// The transform from canvas coordinates to window coordinates.
     fn transform(self) -> Affine {
-        Affine::translate((0.0, f64::from(self.chrome) - f64::from(self.scroll)))
+        Affine::translate((
+            -f64::from(self.scroll_x),
+            f64::from(self.chrome) - f64::from(self.scroll),
+        ))
     }
 }
 
@@ -108,6 +118,7 @@ pub fn nothing_yet(title: &str) -> TreeUpdate {
     let nowhere = Viewport {
         chrome: 0.0,
         scroll: 0.0,
+        scroll_x: 0.0,
     };
     update(&access::Tree::default(), title, nowhere)
 }
@@ -295,6 +306,7 @@ mod tests {
         Viewport {
             chrome: 46.0,
             scroll: 100.0,
+            scroll_x: 0.0,
         }
     }
 
@@ -357,6 +369,27 @@ mod tests {
         let bounds = at(&built, id_of(1)).bounds().expect("a heading has a box");
         assert_eq!((bounds.x0, bounds.y0), (10.0, 20.0));
         assert_eq!((bounds.x1, bounds.y1), (110.0, 40.0));
+    }
+
+    #[test]
+    fn the_page_is_moved_sideways_by_a_horizontal_scroll_too() {
+        // #204. A screen reader draws its focus rectangle from these
+        // coordinates, so a page pushed 300 to the left has to say so — or the
+        // rectangle sits 300 pixels away from the words being read.
+        let built = update(
+            &page(),
+            "t",
+            Viewport {
+                chrome: 46.0,
+                scroll: 100.0,
+                scroll_x: 300.0,
+            },
+        );
+        let moved = at(&built, WINDOW)
+            .transform()
+            .expect("the window carries the transform")
+            .as_coeffs();
+        assert_eq!([moved[4], moved[5]], [-300.0, -54.0]);
     }
 
     #[test]

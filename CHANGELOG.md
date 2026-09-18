@@ -16,6 +16,47 @@ record for everything earlier.
 
 ## Unreleased
 
+**A page wider than its window can be read** (#204). Scrolling had one axis.
+Anything that overflowed the viewport sideways — a scanned page, a large
+photograph opened by its own address, a block of fixed-width output, a table
+with more columns than its author expected — was simply cut off at the right
+edge, with no way to reach the rest of it.
+
+A band is a rectangle of the document, and there was never a reason beyond habit
+for its horizontal edge to be fixed at zero. So it is not: `rasterise_band` takes
+a left as well as a top, `position: fixed` items are exempt from both shifts for
+the reason they were always exempt from one, and the display list now also
+answers how far right the page reaches — from the items themselves, since that
+is the one place everything drawn passes through, and a glyph's advance is
+exactly the case (`<pre>` running past the box holding it) the feature is about.
+
+Above that the window grew the other half of everything it already had: a scroll
+offset, a scrollbar along the bottom that drags, the wheel and its Shift
+modifier, the arrow keys, Home, and the horizontal halves of hit-testing, the
+find highlights, the focus outline and the accessibility transform. A page that
+fits across its window is unchanged in every one of those — no bar, no offset,
+no extra work — which is nearly every page.
+
+One thing about it is deliberately not symmetric. A vertical band is painted
+three windows tall, so scrolling down usually costs nothing; a band is only ever
+as *wide* as the window, so there is nowhere to put a horizontal margin and
+scrolling sideways always asks the child for a repaint. What the reader sees
+while that arrives is the band they have, shifted, with the page's own canvas
+colour where it has no pixels — the same bargain the rows have always made, and
+better than a page that appears not to have moved at all.
+
+**Right-click a picture and keep it** (#205). The browser could fetch an image,
+decode it and draw it, and had nowhere to put one. The context menu now offers
+to save it, copy its address, or open it on its own, and there is a `downloads`
+module to write the file.
+
+Two things it is careful about. The bytes are fetched again rather than asked of
+the renderer: they are over there, and a process that is untrusted by
+construction (ADR-0012) should not be deciding what lands in the reader's files.
+And the filename is rebuilt character by character from the URL rather than
+trusted — a URL is written by whoever served the page, and a name that could
+carry a separator is a name that could leave the directory it was given.
+
 **An error status is a page, not a one-line complaint** (#203, and #208 with
 it). A 4xx or a 5xx used to reach the reader as `server returned 401` in the
 chrome and a blank window. Two things were wrong with that, and they needed

@@ -8,6 +8,7 @@ pub mod access;
 pub mod bookmarks;
 pub mod chrome;
 pub mod devtools;
+pub mod downloads;
 pub mod dropdown;
 pub mod field;
 pub mod history;

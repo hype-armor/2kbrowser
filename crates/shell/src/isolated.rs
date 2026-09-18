@@ -97,6 +97,14 @@ pub struct PageRenderer {
     /// go back to the parent for the document's bytes would be a keystroke that
     /// crossed the boundary twice.
     last: Option<ToChild>,
+    /// The document column the page is being shown from (#204).
+    ///
+    /// Kept beside `last` rather than in it, because the parent never asks for
+    /// a first render anywhere but the left edge — a page opens at its
+    /// beginning. Only a band moves sideways, and a *re-render* has to follow
+    /// it: typing into a form halfway across a wide page would otherwise answer
+    /// by painting the page's left edge, sliding it out from under the reader.
+    band_left: u32,
     /// What has been typed into this page's controls, by node.
     ///
     /// The document is re-parsed on every render and these are re-applied to
@@ -176,6 +184,7 @@ impl PageRenderer {
             zoom: 1.0,
             force_document: false,
             last: None,
+            band_left: 0,
             values: Vec::new(),
             chosen: Vec::new(),
             focus: None,
@@ -249,6 +258,14 @@ fn missing_of(page: &crate::render::Page) -> Vec<Missing> {
     page.missing_images()
         .into_iter()
         .map(|(rect, url)| Missing { rect, url })
+        .collect()
+}
+
+/// Every picture on the page, in the shape the wire wants (#205).
+fn pictures_of(page: &crate::render::Page) -> Vec<sandbox::Picture> {
+    page.pictures()
+        .into_iter()
+        .map(|(rect, url)| sandbox::Picture { rect, url })
         .collect()
 }
 
@@ -614,6 +631,10 @@ impl Render for PageRenderer {
                 held.as_ref().ok_or("nothing has been rendered yet")?
             }
             other => {
+                // A fresh render, which is a new page or the same one at a new
+                // size. Either way it opens at the left edge, the way a resize
+                // already returns to the top of the document.
+                self.band_left = 0;
                 self.last = Some(other.clone());
                 other
             }
@@ -684,6 +705,7 @@ impl Render for PageRenderer {
         let page = crate::render::render_sized(
             &html,
             *width,
+            self.band_left,
             *top,
             *height,
             crate::render::Settings {
@@ -714,11 +736,14 @@ impl Render for PageRenderer {
             width: page.pixmap.width(),
             height: page.pixmap.height(),
             top: page.band_top,
+            left: page.band_left,
             content_height: page.content_height,
+            content_width: page.content_width,
             mode: mode_of(&page),
             title: page.title.clone(),
             links: links_of(&page),
             missing: missing_of(&page),
+            pictures: pictures_of(&page),
             buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
             pressables: page
                 .pressables()
@@ -738,7 +763,7 @@ impl Render for PageRenderer {
         Ok(rendered)
     }
 
-    fn band(&mut self, top: u32, height: u32) -> Result<Rendered, String> {
+    fn band(&mut self, left: u32, top: u32, height: u32) -> Result<Rendered, String> {
         // Remembered so that a keystroke re-renders the rows the reader is
         // looking at (#110). Typing is a re-render of the whole page, built
         // from the request the page came from — and that request names the band
@@ -752,12 +777,14 @@ impl Render for PageRenderer {
         {
             (*at, *rows) = (top, height);
         }
+        // The same, for the axis the request carries and the message does not.
+        self.band_left = left;
         let Some(page) = &self.page else {
             return Err("no page to paint a band of".to_owned());
         };
         // A frameset has no display list to repaint from, and needs none: its
         // canvas is its viewport, so there are no rows below the ones it holds.
-        let Some(pixmap) = page.paint_band(&mut self.fonts, top, height) else {
+        let Some(pixmap) = page.paint_band(&mut self.fonts, left, top, height) else {
             return Err("this page cannot be repainted a band at a time".to_owned());
         };
         Ok(Rendered {
@@ -765,7 +792,9 @@ impl Render for PageRenderer {
             width: pixmap.width(),
             height: pixmap.height(),
             top,
+            left,
             content_height: page.content_height,
+            content_width: page.content_width,
             // Unchanged by moving down the page, and re-sent because the
             // message is one shape: the parent replaces what it holds rather
             // than merging, so a band that omitted these would blank the tab's
@@ -774,6 +803,7 @@ impl Render for PageRenderer {
             title: page.title.clone(),
             links: links_of(page),
             missing: missing_of(page),
+            pictures: pictures_of(page),
             buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
             pressables: page
                 .pressables()
@@ -1101,7 +1131,7 @@ mod tests {
         renderer
             .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
-        let band = renderer.band(0, 200).expect("paints a band");
+        let band = renderer.band(0, 0, 200).expect("paints a band");
         assert!(
             band.can_toggle_layout,
             "the band lost the reader's override"
@@ -1120,7 +1150,7 @@ mod tests {
         let whole = renderer
             .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
-        let band = renderer.band(0, 200).expect("paints a band");
+        let band = renderer.band(0, 0, 200).expect("paints a band");
         assert_eq!(
             band.background, whole.background,
             "the band reported a different canvas colour from its own page"

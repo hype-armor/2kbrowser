@@ -47,6 +47,12 @@ pub struct Page {
     pub mode: RenderMode,
     /// Full content height in CSS pixels, which may exceed the canvas.
     pub content_height: f32,
+    /// How far right the content reaches, which may exceed the canvas (#204).
+    ///
+    /// The counterpart of `content_height`, and needed for the same reason: a
+    /// canvas is the viewport, not the document, and the difference between the
+    /// two is exactly what there is to scroll.
+    pub content_width: f32,
     /// How many images were fetched and decoded.
     pub images_loaded: usize,
     /// The documents on this canvas, in paint order.
@@ -59,6 +65,8 @@ pub struct Page {
     pub title: Option<String>,
     /// The document row `pixmap` starts at.
     pub band_top: u32,
+    /// The document column `pixmap` starts at (#204).
+    pub band_left: u32,
     /// The colour the canvas was cleared to, opaque (CSS 2.1 §14.2).
     ///
     /// The window needs it for the rows it has no pixels for — below a page
@@ -92,7 +100,13 @@ impl Page {
     /// `None` when this page cannot repaint — a frameset — which is safe
     /// because a frameset's canvas is its viewport and never has rows beyond
     /// the ones it already holds.
-    pub fn paint_band(&self, fonts: &mut FontStore, top: u32, height: u32) -> Option<Pixmap> {
+    pub fn paint_band(
+        &self,
+        fonts: &mut FontStore,
+        left: u32,
+        top: u32,
+        height: u32,
+    ) -> Option<Pixmap> {
         let source = self.source.as_ref()?;
         // Clipped to what the document has below `top`, the same way a first
         // render is clipped to its content. A band running off the bottom
@@ -100,11 +114,17 @@ impl Page {
         // not rows of the document — they would scroll past the end.
         let content_rows = self.content_height.ceil().max(1.0) as u32;
         let height = height.min(content_rows.saturating_sub(top)).max(1);
+        // `left` gets no such clipping, and deliberately. Height decides how
+        // many rows are allocated, so a band asking past the end would waste
+        // the pixels; width is the viewport's either way, and a band asked for
+        // past the right edge comes back as canvas colour — which is what is
+        // actually there.
         paint::rasterise_band(
             &source.list,
             fonts,
             &source.images,
             self.pixmap.width(),
+            left as f32,
             top as f32,
             height,
         )
@@ -204,6 +224,40 @@ impl Page {
         for frame in &self.frames {
             for (node, url) in &frame.missing {
                 out.extend(frame.layout.rects_for(*node).into_iter().map(|mut rect| {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    (rect, url.clone())
+                }));
+            }
+        }
+        out
+    }
+
+    /// Every `<img>` on the canvas, with the address it came from (#205).
+    ///
+    /// Whether the picture arrived or not, which is what separates this from
+    /// [`Page::missing_images`]: that list is the placeholders, and exists so a
+    /// press on one can ask for the image again. This is every picture a reader
+    /// can point at, so that a right-click over one has something to offer.
+    ///
+    /// Computed rather than carried on the frame, because it is asked for once
+    /// per render and a fourth list threaded through the pipeline to save one
+    /// tree walk would cost more to read than it saves.
+    pub fn pictures(&self) -> Vec<(layout::Rect, String)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                let Some(element) = frame.doc.element(node) else {
+                    continue;
+                };
+                if element.local_name() != "img" {
+                    continue;
+                }
+                let Some(src) = element.attr("src") else {
+                    continue;
+                };
+                let url = net::resolve(&frame.origin, &frame.path, src);
+                out.extend(frame.layout.rects_for(node).into_iter().map(|mut rect| {
                     rect.x += frame.rect.x;
                     rect.y += frame.rect.y;
                     (rect, url.clone())
@@ -1070,6 +1124,7 @@ pub fn render_with_base_and_loader(
     render_sized(
         html,
         width,
+        0,
         band_top,
         band_height,
         Settings::default(),
@@ -1115,6 +1170,7 @@ fn render_in_viewport_with(
     render_sized(
         html,
         width,
+        0,
         0,
         height,
         Settings {
@@ -1167,6 +1223,7 @@ pub fn render_as_document_with(
     render_sized(
         html,
         width,
+        0,
         band_top,
         band_height,
         Settings {
@@ -1192,6 +1249,7 @@ pub fn render_as_authored_with(
     render_sized(
         html,
         width,
+        0,
         band_top,
         band_height,
         Settings {
@@ -1258,6 +1316,13 @@ impl Default for Settings {
     }
 }
 
+/// Renders a band of a document, at whatever corner of it the caller asks for.
+///
+/// `band_left` is zero for every caller but the one that repaints a page
+/// already open: a first render is a page opening, and a page opens at its
+/// beginning. It exists because a *re-render* need not — typing into a form
+/// halfway across a wide page re-renders it, and painting from the left edge
+/// would slide the page out from under the reader (#110, #204).
 #[expect(
     clippy::too_many_arguments,
     reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
@@ -1266,6 +1331,7 @@ impl Default for Settings {
 pub(crate) fn render_sized(
     html: &str,
     width: u32,
+    band_left: u32,
     band_top: u32,
     band_height: u32,
     settings: Settings,
@@ -1451,8 +1517,16 @@ pub(crate) fn render_sized(
             .min(content_rows.saturating_sub(band_top))
             .max(1)
     };
-    let pixmap = paint::rasterise_band(&list, fonts, &images, width, band_top as f32, height)
-        .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
+    let pixmap = paint::rasterise_band(
+        &list,
+        fonts,
+        &images,
+        width,
+        band_left as f32,
+        band_top as f32,
+        height,
+    )
+    .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
     // The whole canvas is one document. `base` is what a link inside it
     // resolves against; without one there is nothing to resolve against and
@@ -1484,10 +1558,12 @@ pub(crate) fn render_sized(
         pixmap,
         mode,
         content_height,
+        content_width: paint::content_width(&list),
         images_loaded: images.len(),
         title,
         frames,
         band_top,
+        band_left,
         background: list.canvas,
         source: Some(Box::new(BandSource { list, images })),
     }
@@ -1639,6 +1715,7 @@ fn render_frameset(
     Page {
         pixmap,
         band_top: 0,
+        band_left: 0,
         // A frameset's canvas is composited from its frames rather than built
         // from one display list, so there is nothing to repaint a band from —
         // and nothing needs one, because a frameset is its viewport and never
@@ -1650,6 +1727,11 @@ fn render_frameset(
         // frames, which is what `render_frameset` clears its canvas to.
         background: css::Color::rgb(0xff, 0xff, 0xff),
         content_height: height as f32,
+        // A frameset is its own viewport in both directions: its cells are
+        // shares of the width it was given, so there is never anything to its
+        // right either. Each frame's own document scrolls inside its cell in a
+        // browser that implements that, which this one does not.
+        content_width: width as f32,
         images_loaded: loaded,
         // The frameset document's own title, not any frame's: a frame is a
         // part of the page, and its title is not the page's.

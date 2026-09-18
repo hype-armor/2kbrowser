@@ -178,6 +178,21 @@ fn absolute_from_cwd(typed: &str) -> std::path::PathBuf {
     }
 }
 
+/// A scrollbar drag in progress.
+///
+/// `held` is how far along the thumb the pointer took hold, which is what stops
+/// the thumb jumping so its near edge is under the pointer the moment it is
+/// pressed — moving the page before the drag has begun.
+///
+/// `across` says which of the two bars it is. One field rather than two
+/// `Option`s, because a hand holds one thumb: a pair that must never both be
+/// set is a state the type should not be able to spell (#204).
+#[derive(Debug, Clone, Copy)]
+struct ThumbDrag {
+    across: bool,
+    held: f32,
+}
+
 /// Packs a rendered pixel for softbuffer.
 ///
 /// softbuffer wants 0RGB in a u32; tiny-skia stores premultiplied RGBA.
@@ -206,10 +221,18 @@ fn pack(pixel: &paint::PremultipliedColor) -> u32 {
 /// chrome's height is a constant, and when it changed from 34 to 46 the two
 /// sites were updated by hand and nothing would have said so if only one had
 /// been.
-fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Option<(f32, f32)> {
+fn document_point(
+    pointer: (f32, f32),
+    chrome_height: u32,
+    scroll: (f32, f32),
+) -> Option<(f32, f32)> {
     let y = pointer.1 - chrome_height as f32;
     // Above the page is the bar, which owns its own clicks.
-    (y >= 0.0).then_some((pointer.0, y + scroll))
+    //
+    // The horizontal offset needs no such guard. There is no chrome to the left
+    // of the page — the window's left edge is the page's — so a column is a
+    // column of the document wherever the pointer is (#204).
+    (y >= 0.0).then_some((pointer.0 + scroll.0, y + scroll.1))
 }
 
 /// Shrinks a requested window to something the screen can actually show.
@@ -294,6 +317,14 @@ struct Tab {
     /// navigation failed and there is nothing to show.
     page: Option<crate::viewport::Viewport>,
     scroll: f32,
+    /// How far the page has been scrolled sideways (#204).
+    ///
+    /// Almost always zero: a page laid out to the viewport's width has nothing
+    /// to the right of it, and the era's pages mostly were. It stops being zero
+    /// for the things that are wider than any window — a scanned page, a large
+    /// photograph opened by its own address, a `<pre>` block of fixed-width
+    /// output, a table with more columns than the author expected.
+    scroll_x: f32,
     /// What went wrong with the last navigation in this tab.
     error: Option<String>,
     /// Whether the reader has overruled the document fallback here (ADR-0009).
@@ -353,6 +384,7 @@ impl Tab {
             history: crate::history::History::new(url),
             page: None,
             scroll: 0.0,
+            scroll_x: 0.0,
             error: None,
             // Until something says otherwise. A tab that has not fetched
             // anything has nothing to have gone wrong with it.
@@ -497,6 +529,12 @@ impl PendingResize {
 struct App {
     tabs: crate::tabs::Tabs<Tab>,
     fetcher: net::Fetcher,
+    /// Where a saved picture goes (#205).
+    ///
+    /// Held rather than resolved at each save, so that a test can point it
+    /// somewhere else and so the answer cannot change under the reader
+    /// mid-session.
+    downloads: std::path::PathBuf,
     /// Spawns renderer children. One per page, killed when the page is
     /// replaced (ADR-0012).
     renderer: sandbox::Renderer,
@@ -535,13 +573,9 @@ struct App {
     /// through are known and unequal, and saying which one it is in is more
     /// use than saying that something is happening.
     loading: Option<f32>,
-    /// A scrollbar drag in progress, and how far down the thumb it was
-    /// started. `None` when the pointer is not holding the thumb.
-    ///
-    /// The offset is what stops the thumb jumping so its top is under the
-    /// pointer the moment it is pressed, which would move the page before the
-    /// drag had begun.
-    dragging: Option<f32>,
+    /// A scrollbar drag in progress. `None` when the pointer is not holding a
+    /// thumb.
+    dragging: Option<ThumbDrag>,
     /// The context menu, while one is open (#54).
     menu: Option<crate::menu::Menu>,
     /// The system clipboard, opened on the first copy and then kept.
@@ -650,6 +684,12 @@ impl App {
         let viewport = self.viewport_height();
         let span = self.band_span();
         let scroll = self.tab().scroll;
+        // The horizontal axis gets no margin, because there is nowhere to put
+        // one: a band is painted exactly as wide as the window, so the only
+        // column it can start at is the one the reader is looking at. Scrolling
+        // sideways therefore always costs a band, which is affordable because
+        // there is nothing to scroll sideways on almost every page (#204).
+        let left = self.tab().scroll_x as u32;
         let Some(page) = self.tab().page.as_ref() else {
             return;
         };
@@ -665,16 +705,19 @@ impl App {
         // document's own edge where there is no more page to have.
         let wanted_top = (scroll - viewport).max(0.0);
         let wanted_bottom = (scroll + viewport * 2.0).min(content);
-        if wanted_top >= band_top && wanted_bottom <= band_top + band_height {
+        if wanted_top >= band_top
+            && wanted_bottom <= band_top + band_height
+            && left == page.band_left()
+        {
             return;
         }
         let furthest = (content - span as f32).max(0.0);
         let desired = (scroll - viewport).clamp(0.0, furthest) as u32;
-        if desired == page.band_top() {
+        if desired == page.band_top() && left == page.band_left() {
             return;
         }
         if let Some(page) = self.tab_mut().page.as_mut() {
-            let _ = page.request_band(desired, span);
+            let _ = page.request_band(left, desired, span);
         }
     }
 
@@ -774,6 +817,7 @@ impl App {
         if let Some(page) = tab.page.as_ref() {
             tab.can_toggle_layout = page.can_toggle_layout();
             tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
+            tab.scroll_x = clamp_scroll(tab.scroll_x, page.scrollable_width(), width as f32);
         }
         // The page now has a title, which is what the history list wants to
         // call it (#197). The address was recorded when the navigation landed;
@@ -922,6 +966,7 @@ impl App {
                 self.tab_mut().page = None;
                 self.tab_mut().error = None;
                 self.tab_mut().scroll = 0.0;
+                self.tab_mut().scroll_x = 0.0;
                 // A decision about the previous page, not a setting. Both of
                 // them: a reader who asked one page for a plain view has not
                 // asked for one of every page they go on to visit.
@@ -1147,8 +1192,7 @@ impl App {
     /// (ADR-0012). All that comes back is a fresh render and one bit saying
     /// whether anything is now taking the typing.
     fn press_page(&mut self) {
-        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)
-        else {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.scroll()) else {
             return;
         };
         let was = self.page_is_editing();
@@ -1177,8 +1221,7 @@ impl App {
     /// has no box tree — so a control missing from those lists is one the
     /// cursor says nothing about, which is exactly as wrong as it is honest.
     fn control_on_page_under_pointer(&self) -> bool {
-        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)
-        else {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.scroll()) else {
             return false;
         };
         let Some(page) = &self.tab().page else {
@@ -1258,6 +1301,7 @@ impl App {
     fn open_dropdown(&mut self, asked: sandbox::message::Dropdown) {
         let top = self.chrome_height() as f32 - self.tab().scroll;
         let box_ = layout::Rect {
+            x: asked.rect.x - self.tab().scroll_x,
             y: asked.rect.y + top,
             ..asked.rect
         };
@@ -1496,6 +1540,7 @@ impl App {
         self.tab_mut().focused_link = Some(at);
         self.tab_mut().focused_rects = links[at].rects.clone();
         self.scroll_into_view(links[at].bounds());
+        self.scroll_into_view_across(links[at].bounds());
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -1594,6 +1639,7 @@ impl App {
         // will be. Back to the top, which is what a resize does and for the
         // same reason.
         self.tab_mut().scroll = 0.0;
+        self.tab_mut().scroll_x = 0.0;
         self.rerender();
     }
 
@@ -1605,7 +1651,7 @@ impl App {
     /// keystroke: the message is two points and the answer is a few rectangles.
     fn extend_selection(&mut self) {
         let Some(from) = self.selecting else { return };
-        let Some(to) = document_point(self.pointer, self.chrome_height(), self.tab().scroll) else {
+        let Some(to) = document_point(self.pointer, self.chrome_height(), self.scroll()) else {
             return;
         };
         let Some(page) = self.tabs.active_mut().page.as_mut() else {
@@ -1632,6 +1678,7 @@ impl App {
         let typing = self.page_focus_is_typing() || self.editing.is_some();
         let items = crate::menu::items_for(
             self.link_under_pointer(),
+            self.picture_under_pointer(),
             !self.tab().selected.is_empty(),
             typing,
             self.tab().history.can_go_back(),
@@ -1837,6 +1884,9 @@ impl App {
             Some(crate::menu::Item::Reload) => self.reload(),
             Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
             Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
+            Some(crate::menu::Item::CopyImageAddress(url)) => self.copy(url),
+            Some(crate::menu::Item::OpenImage(url)) => self.open_tab(&url),
+            Some(crate::menu::Item::SaveImage(url)) => self.save_image(&url),
             Some(crate::menu::Item::CopySelection) => self.copy_selection(),
             Some(crate::menu::Item::Paste) => self.paste_into_focus(),
             Some(crate::menu::Item::ViewSource) => self.open_source(),
@@ -1929,6 +1979,34 @@ impl App {
         self.refresh_band();
     }
 
+    /// The same, sideways (#204).
+    ///
+    /// Separate from [`Self::scroll_into_view`] and called beside it, because
+    /// the two answer independently: a match can be below the window and within
+    /// it across, and moving both axes when only one needed it is exactly the
+    /// disorientation the "only when it is off screen" rule exists to avoid.
+    fn scroll_into_view_across(&mut self, bounds: layout::Rect) {
+        let Some(content) = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::scrollable_width)
+        else {
+            return;
+        };
+        let window = self.size.0 as f32;
+        let (left, right) = (self.tab().scroll_x, self.tab().scroll_x + window);
+        if bounds.x >= left && bounds.x + bounds.width <= right {
+            return;
+        }
+        // A third of the way in, for the reason the vertical one lands a third
+        // of the way down: against the edge, there is nothing on one side of
+        // what the reader was looking for.
+        let target = bounds.x - window / 3.0;
+        self.tab_mut().scroll_x = clamp_scroll(target, content, window);
+        self.refresh_band();
+    }
+
     /// Saves the current page, or forgets it if it is already saved.
     ///
     /// Written through immediately rather than on exit: a browser that lost
@@ -1949,6 +2027,41 @@ impl App {
         if let Err(error) = self.bookmarks.save(&self.bookmarks_path) {
             self.tab_mut().error = Some(format!("could not save bookmarks: {error}"));
         }
+        self.refresh_chrome();
+    }
+
+    /// Writes a picture from the page to the reader's disk (#205).
+    ///
+    /// Fetched again rather than taken from the child. The bytes are over
+    /// there, and asking for them would be a new message whose answer is
+    /// whatever the renderer felt like sending — a process that is untrusted by
+    /// construction (ADR-0012) deciding what lands in the reader's files. The
+    /// second fetch goes through the same policy as the first and usually
+    /// through the cache that already holds the picture (ADR-0018).
+    ///
+    /// A `Subresource`, not a navigation: it is the same request the page made,
+    /// so it must answer to the same third-party rule (ADR-0006, ADR-0020). A
+    /// picture the page was not allowed to load is not one the menu can save
+    /// by asking a second time.
+    ///
+    /// Where it went is said in the place every other outcome is said, and so
+    /// is a failure — silently not saving looks exactly like saving.
+    fn save_image(&mut self, url: &str) {
+        self.stage(Some(FETCHING));
+        let fetched = self.fetcher.fetch_raw(
+            url,
+            Some(&self.tab().loaded.origin),
+            net::RequestKind::Subresource,
+        );
+        self.stage(None);
+        let outcome = match fetched {
+            Ok(fetched) => crate::downloads::save(&self.downloads, url, &fetched.body),
+            Err(error) => Err(error.to_string()),
+        };
+        self.tab_mut().error = Some(match outcome {
+            Ok(path) => format!("saved {}", path.display()),
+            Err(why) => format!("could not save the image: {why}"),
+        });
         self.refresh_chrome();
     }
 
@@ -2202,6 +2315,7 @@ impl App {
             return;
         };
         self.scroll_into_view(rect);
+        self.scroll_into_view_across(rect);
     }
 
     /// Handles a key while find is open.
@@ -2564,9 +2678,23 @@ impl App {
             return None;
         }
         let page = self.tab().page.as_ref()?;
-        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
-        page.target_at(x, y, self.tab().scroll)
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.scroll())?;
+        page.target_at(x, y, self.scroll())
             .map(|(url, jump_to)| (url.to_owned(), jump_to))
+    }
+
+    /// The picture under the pointer, whether or not it arrived (#205).
+    ///
+    /// Beside [`Self::missing_under_pointer`] rather than instead of it: that
+    /// one answers a *press* on a placeholder, and this answers what the
+    /// right-hand button has to offer over any `<img>` at all.
+    fn picture_under_pointer(&self) -> Option<String> {
+        if self.scrollbar_grab().is_some() {
+            return None;
+        }
+        let page = self.tab().page.as_ref()?;
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.scroll())?;
+        page.picture_at(x, y).map(str::to_owned)
     }
 
     /// The image the placeholder under the pointer was asking for (#118).
@@ -2575,35 +2703,81 @@ impl App {
             return None;
         }
         let page = self.tab().page.as_ref()?;
-        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.scroll())?;
         page.missing_at(x, y).map(str::to_owned)
     }
 
-    /// Where the pointer falls on the scrollbar, if it falls on one at all.
+    /// Where the pointer falls on a scrollbar, if it falls on one at all.
     ///
-    /// `None` when the page fits, since then no bar is drawn and the column it
-    /// would have occupied is ordinary page.
-    fn scrollbar_grab(&self) -> Option<crate::scrollbar::Grab> {
+    /// `None` when the page fits, since then no bar is drawn and the strip it
+    /// would have occupied is ordinary page. The vertical bar is asked first
+    /// where both are drawn: they overlap in the bottom-right corner, and the
+    /// one a reader means there is the one they have been using all along.
+    fn scrollbar_grab(&self) -> Option<(bool, crate::scrollbar::Grab)> {
         let page = self.tab().page.as_ref()?;
         let bar = self.chrome_height() as f32;
-        let left = self.size.0.saturating_sub(crate::scrollbar::WIDTH) as f32;
-        if self.pointer.1 < bar || self.pointer.0 < left {
+        if self.pointer.1 < bar {
             return None;
         }
-        crate::scrollbar::grab(
-            self.pointer.1 - bar,
-            self.tab().scroll,
-            page.scrollable_height(),
-            self.viewport_height(),
-        )
+        let left = self.size.0.saturating_sub(crate::scrollbar::WIDTH) as f32;
+        if self.pointer.0 >= left
+            && let Some(grab) = crate::scrollbar::grab(
+                self.pointer.1 - bar,
+                self.tab().scroll,
+                page.scrollable_height(),
+                self.viewport_height(),
+            )
+        {
+            return Some((false, grab));
+        }
+        let top = self.size.1.saturating_sub(crate::scrollbar::WIDTH) as f32;
+        if self.pointer.1 >= top.max(bar) {
+            return crate::scrollbar::grab(
+                self.pointer.0,
+                self.tab().scroll_x,
+                page.scrollable_width(),
+                self.size.0 as f32,
+            )
+            .map(|grab| (true, grab));
+        }
+        None
     }
 
-    /// Scrolls so the top of the thumb sits at `top` in the track.
-    fn drag_thumb_to(&mut self, top: f32) {
+    /// How long the thumb of one of the two bars is.
+    ///
+    /// What a press on the *track* needs: it puts the middle of the thumb under
+    /// the pointer, and the middle of a thumb cannot be found without its
+    /// length.
+    fn thumb_length(&self, across: bool) -> Option<f32> {
+        let page = self.tab().page.as_ref()?;
+        let (scroll, content, track) = if across {
+            (
+                self.tab().scroll_x,
+                page.scrollable_width(),
+                self.size.0 as f32,
+            )
+        } else {
+            (
+                self.tab().scroll,
+                page.scrollable_height(),
+                self.viewport_height(),
+            )
+        };
+        crate::scrollbar::thumb(scroll, content, track).map(|(_, length)| length)
+    }
+
+    /// Scrolls so the near edge of the thumb sits at `along` in its track.
+    fn drag_thumb_to(&mut self, across: bool, along: f32) {
         let Some(page) = &self.tab().page else { return };
-        let content = page.scrollable_height();
-        let to = crate::scrollbar::scroll_at(top, content, self.viewport_height());
-        self.scroll_by(to - self.tab().scroll);
+        if across {
+            let content = page.scrollable_width();
+            let to = crate::scrollbar::scroll_at(along, content, self.size.0 as f32);
+            self.scroll_x_by(to - self.tab().scroll_x);
+        } else {
+            let content = page.scrollable_height();
+            let to = crate::scrollbar::scroll_at(along, content, self.viewport_height());
+            self.scroll_by(to - self.tab().scroll);
+        }
     }
 
     /// Total chrome height: the URL bar and the tab strip above it.
@@ -2617,6 +2791,7 @@ impl App {
         crate::a11y::Viewport {
             chrome: self.chrome_height() as f32,
             scroll: self.tab().scroll,
+            scroll_x: self.tab().scroll_x,
         }
     }
 
@@ -2695,6 +2870,15 @@ impl App {
         self.a11y_tree = None;
     }
 
+    /// How far this tab has been scrolled, as `(across, down)`.
+    ///
+    /// The pair rather than the two fields, because everything that turns a
+    /// point on the screen into a point in the document needs both, and one of
+    /// them silently defaulting to zero is exactly the bug #204 was.
+    fn scroll(&self) -> (f32, f32) {
+        (self.tab().scroll_x, self.tab().scroll)
+    }
+
     /// Height of the page area, which is the window less the chrome.
     fn viewport_height(&self) -> f32 {
         (self.size.1.saturating_sub(self.chrome_height())) as f32
@@ -2714,18 +2898,43 @@ impl App {
             self.viewport_height(),
         );
         if self.tab().scroll != before {
-            // Before the reader gets there, which is the whole point of asking
-            // speculatively: the rows ahead are usually painted by the time
-            // they are scrolled to.
-            self.refresh_band();
-            // Every node moved and none of them changed, so this is a new
-            // transform over the tree already held rather than a new tree
-            // (#178). No round trip to the child, which is what makes it
-            // affordable on every scroll step.
-            self.push_accessibility();
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            self.after_scrolling();
+        }
+    }
+
+    /// The same, sideways (#204).
+    ///
+    /// Its own function rather than a second argument to [`Self::scroll_by`],
+    /// because every caller moves one axis: a wheel notch, an arrow key and a
+    /// scrollbar drag each belong to one direction, and a pair of deltas at
+    /// every call site would be a zero written out thirty times.
+    fn scroll_x_by(&mut self, delta: f32) {
+        self.close_dropdown();
+        let Some(page) = &self.tab().page else { return };
+        let before = self.tab().scroll_x;
+        self.tab_mut().scroll_x = clamp_scroll(
+            self.tab().scroll_x + delta,
+            page.scrollable_width(),
+            self.size.0 as f32,
+        );
+        if self.tab().scroll_x != before {
+            self.after_scrolling();
+        }
+    }
+
+    /// What follows a scroll on either axis.
+    fn after_scrolling(&mut self) {
+        // Before the reader gets there, which is the whole point of asking
+        // speculatively: the rows ahead are usually painted by the time
+        // they are scrolled to.
+        self.refresh_band();
+        // Every node moved and none of them changed, so this is a new
+        // transform over the tree already held rather than a new tree
+        // (#178). No round trip to the child, which is what makes it
+        // affordable on every scroll step.
+        self.push_accessibility();
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -2763,6 +2972,10 @@ impl App {
         };
 
         let offset = tab.scroll as u32;
+        // How far the window has moved right of the band's own left edge. A
+        // band that has caught up makes this zero, which is every page that
+        // does not scroll sideways and every moment after one that does has
+        // settled (#204).
         let viewport_width = width.get() as usize;
         let strip_height = crate::chrome::TAB_HEIGHT.min(height.get());
         let bar_height = (strip_height + crate::chrome::HEIGHT).min(height.get());
@@ -2801,6 +3014,7 @@ impl App {
                 // offset in document coordinates can be turned into a row of
                 // the band.
                 let band_top = page.band_top();
+                let shift = i64::from(tab.scroll_x as u32) - i64::from(page.band_left());
                 for row in bar_height..height.get() {
                     let document_row = row - bar_height + offset;
                     let start = row as usize * viewport_width;
@@ -2810,6 +3024,7 @@ impl App {
                         document_row
                             .checked_sub(band_top)
                             .filter(|it| *it < page_height),
+                        shift,
                         page_width,
                         blank,
                     );
@@ -2818,6 +3033,14 @@ impl App {
                     &mut buffer,
                     tab.scroll,
                     page.scrollable_height(),
+                    (width.get(), height.get()),
+                    bar_height,
+                    blank,
+                );
+                draw_horizontal_scrollbar(
+                    &mut buffer,
+                    tab.scroll_x,
+                    page.scrollable_width(),
                     (width.get(), height.get()),
                     bar_height,
                     blank,
@@ -2834,7 +3057,7 @@ impl App {
         highlight_selection(
             &mut buffer,
             &tab.selection,
-            tab.scroll,
+            (tab.scroll_x, tab.scroll),
             (width.get(), height.get()),
             bar_height,
         );
@@ -2842,14 +3065,14 @@ impl App {
             &mut buffer,
             &tab.matches,
             tab.current_match,
-            tab.scroll,
+            (tab.scroll_x, tab.scroll),
             (width.get(), height.get()),
             bar_height,
         );
         outline_focus(
             &mut buffer,
             &tab.focused_rects,
-            tab.scroll,
+            (tab.scroll_x, tab.scroll),
             (width.get(), height.get()),
             bar_height,
         );
@@ -3032,10 +3255,20 @@ fn blit_over(buffer: &mut [u32], pixmap: &paint::Pixmap, at: (u32, u32), size: (
 /// previous band's pixels, which would be showing the wrong part of the page
 /// under the right offset, and worse than showing none of it. The colour comes
 /// from the page because a white strip beside a dark rendering is a hole in it.
+///
+/// `shift` is the same idea along the other axis (#204): how many columns to
+/// the right of the band's own left edge the window starts. A band is painted
+/// exactly as wide as the window, so a page scrolled sideways is showing a band
+/// that has not caught up — and the columns it has no pixel for get `blank`, by
+/// exactly the rule the rows above it follow. The reader sees the page move at
+/// once with a strip of canvas at its edge, and the strip fills in when the
+/// band arrives. Showing the old columns instead would be a page that did not
+/// appear to move at all.
 fn compose_row(
     out: &mut [u32],
     pixels: &[u8],
     source_row: Option<u32>,
+    shift: i64,
     page_width: u32,
     blank: u32,
 ) {
@@ -3054,10 +3287,15 @@ fn compose_row(
         // there: it runs into the *next row*. Widening a window drew the page
         // twice, the second copy sheared one row up, because every row was
         // finished off with the beginning of the row below it.
-        let at = source_start + column * 4;
+        let source_column = column as i64 + shift;
+        let Ok(source_column) = usize::try_from(source_column) else {
+            *slot = blank;
+            continue;
+        };
+        let at = source_start + source_column * 4;
         *slot = match pixels
             .get(at..at + 3)
-            .filter(|_| column < page_width as usize)
+            .filter(|_| source_column < page_width as usize)
         {
             Some(rgb) => (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]),
             None => blank,
@@ -3101,6 +3339,45 @@ fn draw_scrollbar(
     }
 }
 
+/// Draws the page's horizontal scrollbar along the bottom of the page area.
+///
+/// The same bar turned on its side, and the same arithmetic: [`crate::scrollbar`]
+/// is written in terms of a scroll, a content length and a track, and none of
+/// those three words names an axis.
+///
+/// Nothing is drawn when the page fits across, which is nearly every page —
+/// so nearly every page is exactly as it was before #204, with no strip of
+/// furniture along the bottom saying there is nothing to the right.
+fn draw_horizontal_scrollbar(
+    buffer: &mut [u32],
+    scroll: f32,
+    content: f32,
+    size: (u32, u32),
+    bar_height: u32,
+    page_background: u32,
+) {
+    let (width, height) = size;
+    let track = width as f32;
+    let Some((left, thumb_width)) = crate::scrollbar::thumb(scroll, content, track) else {
+        return;
+    };
+    // The page area's own bottom edge, and never above the chrome: a very short
+    // window is all chrome, and a bar drawn into it would be a bar over the
+    // address field.
+    let thickness = crate::scrollbar::WIDTH.min(height.saturating_sub(bar_height));
+    if thickness == 0 {
+        return;
+    }
+    let first = left as usize;
+    let last = (first + thumb_width.round() as usize).min(width as usize);
+
+    let thumb_colour = contrasting(page_background);
+    for row in (height - thickness)..height {
+        let start = row as usize * width as usize;
+        buffer[start + first..start + last].fill(thumb_colour);
+    }
+}
+
 /// A colour that shows against `background` without shouting at it.
 ///
 /// Each channel moved 45% of the way towards whichever end of the scale is
@@ -3132,16 +3409,17 @@ const FOCUS_WIDTH: i64 = 2;
 fn outline_focus(
     buffer: &mut [u32],
     rects: &[layout::Rect],
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
     let (width, height) = size;
+    let (scroll_x, scroll) = scroll;
     for rect in rects {
         // A pixel or two of air, so the outline sits around the text rather
         // than on it.
-        let left = rect.x.round() as i64 - FOCUS_WIDTH;
-        let right = (rect.x + rect.width).round() as i64 + FOCUS_WIDTH;
+        let left = (rect.x - scroll_x).round() as i64 - FOCUS_WIDTH;
+        let right = (rect.x + rect.width - scroll_x).round() as i64 + FOCUS_WIDTH;
         let top = (rect.y - scroll + bar_height as f32).round() as i64 - FOCUS_WIDTH;
         let bottom =
             (rect.y + rect.height - scroll + bar_height as f32).round() as i64 + FOCUS_WIDTH;
@@ -3180,7 +3458,7 @@ fn highlight_matches(
     buffer: &mut [u32],
     matches: &[layout::Rect],
     current: usize,
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
@@ -3206,7 +3484,7 @@ fn highlight_matches(
 fn highlight_selection(
     buffer: &mut [u32],
     selection: &[layout::Rect],
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
@@ -3224,16 +3502,15 @@ fn tint_rect(
     buffer: &mut [u32],
     rect: layout::Rect,
     tint: (u32, u32, u32),
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
     let (width, height) = size;
+    let (scroll_x, scroll) = scroll;
     let top = rect.y - scroll + bar_height as f32;
-    let (x0, x1) = (
-        rect.x.max(0.0) as u32,
-        (rect.x + rect.width).max(0.0) as u32,
-    );
+    let left = rect.x - scroll_x;
+    let (x0, x1) = (left.max(0.0) as u32, (left + rect.width).max(0.0) as u32);
     let (y0, y1) = (
         top.max(bar_height as f32) as u32,
         (top + rect.height).max(0.0) as u32,
@@ -3372,9 +3649,16 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             WindowEvent::MouseWheel { delta, .. } => {
-                let pixels = match delta {
-                    MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE_HEIGHT,
-                    MouseScrollDelta::PixelDelta(position) => -position.y as f32,
+                // Both axes: a trackpad and a tilting wheel both report a
+                // sideways component, and until #204 it was dropped on the
+                // floor along with everywhere it could have scrolled to.
+                let (across, pixels) = match delta {
+                    MouseScrollDelta::LineDelta(columns, lines) => {
+                        (-columns * WHEEL_LINE_HEIGHT, -lines * WHEEL_LINE_HEIGHT)
+                    }
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (-position.x as f32, -position.y as f32)
+                    }
                 };
                 // Ctrl and the wheel is zoom everywhere else, and a reader
                 // who tries it and gets a scroll has been told the browser
@@ -3383,8 +3667,14 @@ impl ApplicationHandler<Wake> for App {
                     // Up the page is in, which is what every other browser and
                     // every trackpad has agreed on.
                     self.zoom_by(if pixels < 0.0 { 1 } else { -1 });
+                } else if self.modifiers.state().shift_key() {
+                    // Shift turns a plain wheel sideways, which is how a mouse
+                    // with one wheel has reached the right of a page since long
+                    // before there was a trackpad to tilt.
+                    self.scroll_x_by(pixels);
                 } else {
                     self.scroll_by(pixels);
+                    self.scroll_x_by(across);
                 }
             }
             // The pointer left the window without passing over anything that
@@ -3404,9 +3694,13 @@ impl ApplicationHandler<Wake> for App {
                 // check that the pointer is still over the bar: a hand dragging
                 // a thumb wanders off it constantly, and a bar that let go
                 // every time would be unusable.
-                if let Some(held) = self.dragging {
-                    let top = self.pointer.1 - self.chrome_height() as f32 - held;
-                    self.drag_thumb_to(top);
+                if let Some(ThumbDrag { across, held }) = self.dragging {
+                    let along = if across {
+                        self.pointer.0
+                    } else {
+                        self.pointer.1 - self.chrome_height() as f32
+                    };
+                    self.drag_thumb_to(across, along - held);
                     return;
                 }
                 // A menu takes the pointer while it is open: the row under it
@@ -3525,34 +3819,34 @@ impl ApplicationHandler<Wake> for App {
                     return;
                 }
                 match self.scrollbar_grab() {
-                    Some(crate::scrollbar::Grab::Thumb(held)) => self.dragging = Some(held),
+                    Some((across, crate::scrollbar::Grab::Thumb(held))) => {
+                        self.dragging = Some(ThumbDrag { across, held });
+                    }
                     // A press on the track puts the middle of the thumb where the
                     // pointer is — one movement to anywhere in the document — and
                     // then goes on holding it, so a press that turns into a drag
                     // carries on from there rather than needing a second grab.
-                    Some(crate::scrollbar::Grab::Track) => {
-                        let page = self
-                            .tab()
-                            .page
-                            .as_ref()
-                            .map(|page| page.scrollable_height());
-                        let Some(content) = page else { return };
-                        let track = self.viewport_height();
-                        let Some((_, height)) =
-                            crate::scrollbar::thumb(self.tab().scroll, content, track)
-                        else {
+                    Some((across, crate::scrollbar::Grab::Track)) => {
+                        let Some(length) = self.thumb_length(across) else {
                             return;
                         };
-                        let y = self.pointer.1 - self.chrome_height() as f32;
-                        self.dragging = Some(height / 2.0);
-                        self.drag_thumb_to(y - height / 2.0);
+                        let along = if across {
+                            self.pointer.0
+                        } else {
+                            self.pointer.1 - self.chrome_height() as f32
+                        };
+                        self.dragging = Some(ThumbDrag {
+                            across,
+                            held: length / 2.0,
+                        });
+                        self.drag_thumb_to(across, along - length / 2.0);
                     }
                     // Not on the bar: a press on the page is where a selection
                     // starts. Whether it turns out to be one is decided on
                     // release — a press that never moved is a click.
                     None => {
                         self.selecting =
-                            document_point(self.pointer, self.chrome_height(), self.tab().scroll);
+                            document_point(self.pointer, self.chrome_height(), self.scroll());
                         if self.selecting.is_some() {
                             self.clear_selection();
                         }
@@ -3920,11 +4214,25 @@ impl ApplicationHandler<Wake> for App {
                     }
                     Key::Named(NamedKey::ArrowDown) => self.scroll_by(SCROLL_STEP),
                     Key::Named(NamedKey::ArrowUp) => self.scroll_by(-SCROLL_STEP),
+                    // Without Alt, which is history and was matched above. A
+                    // page with nothing to its right ignores these, so the key
+                    // does nothing on nearly every page rather than doing
+                    // something surprising (#204).
+                    Key::Named(NamedKey::ArrowRight) => self.scroll_x_by(SCROLL_STEP),
+                    Key::Named(NamedKey::ArrowLeft) => self.scroll_x_by(-SCROLL_STEP),
                     Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
                         self.scroll_by(viewport * 0.9);
                     }
                     Key::Named(NamedKey::PageUp) => self.scroll_by(-viewport * 0.9),
-                    Key::Named(NamedKey::Home) => self.scroll_by(f32::NEG_INFINITY),
+                    // Home and End are the document's ends, and a reader who
+                    // has scrolled sideways to read the end of a long line
+                    // means both edges by "the beginning": arriving at the top
+                    // of the page still four screens to the right of its first
+                    // column is arriving nowhere in particular.
+                    Key::Named(NamedKey::Home) => {
+                        self.scroll_by(f32::NEG_INFINITY);
+                        self.scroll_x_by(f32::NEG_INFINITY);
+                    }
                     Key::Named(NamedKey::End) => self.scroll_by(f32::INFINITY),
                     Key::Character(ref c) if c == "q" => event_loop.exit(),
                     _ => {}
@@ -3995,6 +4303,7 @@ pub fn open(
             url,
         )),
         fetcher: net::Fetcher { policy: allowed },
+        downloads: crate::downloads::default_directory(),
         renderer,
         fonts: FontStore::new(),
         window: None,
@@ -4175,14 +4484,14 @@ mod tests {
     #[test]
     fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
         let chrome = crate::chrome::total_height();
-        assert_eq!(document_point((10.0, 0.0), chrome, 0.0), None);
+        assert_eq!(document_point((10.0, 0.0), chrome, (0.0, 0.0)), None);
         assert_eq!(
-            document_point((10.0, chrome as f32 - 1.0), chrome, 0.0),
+            document_point((10.0, chrome as f32 - 1.0), chrome, (0.0, 0.0)),
             None
         );
         // The first row of the page is the first row of the document.
         assert_eq!(
-            document_point((10.0, chrome as f32), chrome, 0.0),
+            document_point((10.0, chrome as f32), chrome, (0.0, 0.0)),
             Some((10.0, 0.0))
         );
     }
@@ -4190,15 +4499,35 @@ mod tests {
     #[test]
     fn scrolling_moves_the_document_under_the_pointer() {
         let chrome = crate::chrome::total_height();
-        let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, scroll);
+        let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, (0.0, scroll));
         assert_eq!(at(0.0), Some((0.0, 100.0)));
         assert_eq!(at(973.0), Some((0.0, 1073.0)));
-        // x is never touched: nothing is scrolled sideways.
+        // A page not scrolled sideways leaves x alone, which is every page that
+        // fits across its window.
         assert_eq!(
-            document_point((42.0, chrome as f32), chrome, 500.0)
+            document_point((42.0, chrome as f32), chrome, (0.0, 500.0))
                 .unwrap()
                 .0,
             42.0
+        );
+    }
+
+    #[test]
+    fn scrolling_sideways_moves_the_document_under_the_pointer_too() {
+        // #204: the pointer is over a column of the *window*, and the document
+        // column beneath it is however far the page has been pushed left. A
+        // browser that got this wrong would draw a link in one place and follow
+        // it from another, which is the same failure the row arithmetic below
+        // has a test for.
+        let chrome = crate::chrome::total_height();
+        let at = |scroll_x| document_point((30.0, chrome as f32), chrome, (scroll_x, 0.0));
+        assert_eq!(at(0.0), Some((30.0, 0.0)));
+        assert_eq!(at(400.0), Some((430.0, 0.0)));
+        // And the chrome still owns its own clicks whatever the page has done.
+        assert_eq!(
+            document_point((30.0, 0.0), chrome, (400.0, 0.0)),
+            None,
+            "a press on the bar is not a press on the page"
         );
     }
 
@@ -4215,7 +4544,7 @@ mod tests {
         for row in [bar, bar + 1, bar + 250, bar + 4000] {
             for scroll in [0_u32, 1, 973, 10_000] {
                 let drawn = row - bar + scroll;
-                let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
+                let (_, hit) = document_point((0.0, row as f32), chrome, (0.0, scroll as f32))
                     .expect("a row at or below the bar is on the page");
                 assert_eq!(
                     hit as u32, drawn,
@@ -4404,7 +4733,7 @@ mod highlight_tests {
                 height: 2.0,
             }],
             0,
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -4430,7 +4759,7 @@ mod highlight_tests {
             },
         ];
         let mut buffer = buffer();
-        highlight_matches(&mut buffer, &rects, 1, 0.0, (4, 4), 0);
+        highlight_matches(&mut buffer, &rects, 1, (0.0, 0.0), (4, 4), 0);
         assert_ne!(buffer[0], buffer[2]);
     }
 
@@ -4443,9 +4772,9 @@ mod highlight_tests {
             height: 1.0,
         };
         let mut at_top = buffer();
-        highlight_matches(&mut at_top, &[rect], 0, 0.0, (4, 4), 0);
+        highlight_matches(&mut at_top, &[rect], 0, (0.0, 0.0), (4, 4), 0);
         let mut scrolled = buffer();
-        highlight_matches(&mut scrolled, &[rect], 0, 2.0, (4, 4), 0);
+        highlight_matches(&mut scrolled, &[rect], 0, (0.0, 2.0), (4, 4), 0);
         assert_ne!(at_top, scrolled);
         assert_eq!(tinted(&scrolled), 4, "still one row, higher up");
     }
@@ -4463,7 +4792,7 @@ mod highlight_tests {
                 height: 4.0,
             }],
             0,
-            3.0,
+            (0.0, 3.0),
             (4, 4),
             2,
         );
@@ -4483,7 +4812,7 @@ mod highlight_tests {
                 height: 100.0,
             }],
             0,
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -4493,7 +4822,7 @@ mod highlight_tests {
     #[test]
     fn no_matches_leaves_the_buffer_alone() {
         let mut buffer = buffer();
-        highlight_matches(&mut buffer, &[], 0, 0.0, (4, 4), 0);
+        highlight_matches(&mut buffer, &[], 0, (0.0, 0.0), (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
     }
 
@@ -4516,7 +4845,7 @@ mod highlight_tests {
                     height: 1.0,
                 },
             ],
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -4538,7 +4867,7 @@ mod highlight_tests {
                 width: 1.0,
                 height: 1.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -4550,7 +4879,7 @@ mod highlight_tests {
     #[test]
     fn nothing_selected_leaves_the_buffer_alone() {
         let mut buffer = buffer();
-        highlight_selection(&mut buffer, &[], 0.0, (4, 4), 0);
+        highlight_selection(&mut buffer, &[], (0.0, 0.0), (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
     }
 }
@@ -4581,7 +4910,7 @@ mod focus_outline_tests {
                 width: 4.0,
                 height: 4.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (12, 12),
             0,
         );
@@ -4601,9 +4930,15 @@ mod focus_outline_tests {
             height: 1.0,
         };
         let mut one = buffer();
-        outline_focus(&mut one, &[piece(3.0)], 0.0, (12, 12), 0);
+        outline_focus(&mut one, &[piece(3.0)], (0.0, 0.0), (12, 12), 0);
         let mut both = buffer();
-        outline_focus(&mut both, &[piece(3.0), piece(8.0)], 0.0, (12, 12), 0);
+        outline_focus(
+            &mut both,
+            &[piece(3.0), piece(8.0)],
+            (0.0, 0.0),
+            (12, 12),
+            0,
+        );
         assert_ne!(one, both);
         assert!(
             both.iter().filter(|p| **p == FOCUS_OUTLINE).count()
@@ -4624,7 +4959,7 @@ mod focus_outline_tests {
                 width: 12.0,
                 height: 2.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (12, 12),
             5,
         );
@@ -4649,7 +4984,7 @@ mod focus_outline_tests {
                 width: 500.0,
                 height: 500.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (12, 12),
             0,
         );
@@ -4662,7 +4997,7 @@ mod focus_outline_tests {
     #[test]
     fn nothing_focused_leaves_the_buffer_alone() {
         let mut buffer = buffer();
-        outline_focus(&mut buffer, &[], 0.0, (12, 12), 0);
+        outline_focus(&mut buffer, &[], (0.0, 0.0), (12, 12), 0);
         assert!(buffer.iter().all(|p| *p == 0x00ff_ffff));
     }
 
@@ -4691,14 +5026,14 @@ mod focus_outline_tests {
         // painted. White here was invisible while every page was white and is a
         // lit strip beside the document rendering, which is dark.
         let mut out = [0u32; 2];
-        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), None, 2, DARK);
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), None, 0, 2, DARK);
         assert_eq!(out, [DARK, DARK]);
     }
 
     #[test]
     fn a_row_the_band_covers_comes_from_the_band() {
         let mut out = [0u32; 2];
-        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 0, 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233]);
     }
 
@@ -4707,7 +5042,7 @@ mod focus_outline_tests {
         // What a resize the child has not caught up with looks like: the band
         // is still the old width, and the columns past it have no pixel.
         let mut out = [0u32; 4];
-        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 0, 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
     }
 
@@ -4719,14 +5054,59 @@ mod focus_outline_tests {
         // is no row below.
         let page = page(&[(0x11, 0x22, 0x33), (0x44, 0x55, 0x66)]);
         let mut out = [0u32; 4];
-        compose_row(&mut out, &page, Some(0), 2, DARK);
+        compose_row(&mut out, &page, Some(0), 0, 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
+    }
+
+    /// A four-pixel row of four distinguishable colours.
+    fn striped() -> Vec<u8> {
+        [
+            (0x11, 0x11, 0x11),
+            (0x22, 0x22, 0x22),
+            (0x33, 0x33, 0x33),
+            (0x44, 0x44, 0x44),
+        ]
+        .iter()
+        .flat_map(|(r, g, b)| [*r, *g, *b, 0xff])
+        .collect()
+    }
+
+    #[test]
+    fn a_page_scrolled_sideways_shows_the_columns_it_has_and_blanks_the_rest() {
+        // #204, and the moment that matters: the reader has scrolled right and
+        // the band painted at the old left edge has not arrived yet. The
+        // columns it does hold are still the right ones for where they now are,
+        // and the rest is the page's own colour — the same bargain the rows
+        // above make, rather than a page that appears not to have moved.
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &striped(), Some(0), 2, 4, DARK);
+        assert_eq!(out, [0x0033_3333, 0x0044_4444, DARK, DARK]);
+    }
+
+    #[test]
+    fn a_band_ahead_of_the_window_fills_from_its_own_left() {
+        // The other direction: the band arrived for a scroll the reader has
+        // since undone, so it starts to the *right* of the window. Those
+        // columns are blank rather than read from a negative index — which as
+        // unsigned would wrap into some other row entirely.
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &striped(), Some(0), -2, 4, DARK);
+        assert_eq!(out, [DARK, DARK, 0x0011_1111, 0x0022_2222]);
+    }
+
+    #[test]
+    fn a_band_that_has_caught_up_is_drawn_exactly_as_it_was_before() {
+        // The overwhelmingly common case: nothing is scrolled sideways, so a
+        // shift of zero has to be the page byte for byte.
+        let mut before = [0u32; 4];
+        compose_row(&mut before, &striped(), Some(0), 0, 4, DARK);
+        assert_eq!(before, [0x0011_1111, 0x0022_2222, 0x0033_3333, 0x0044_4444]);
     }
 }
 
 #[cfg(test)]
 mod scrollbar_tests {
-    use super::{contrasting, draw_scrollbar};
+    use super::{contrasting, draw_horizontal_scrollbar, draw_scrollbar};
 
     const WHITE: u32 = 0x00ff_ffff;
     const DARK_PAGE: u32 = 0x001c_1b22;
@@ -4748,6 +5128,60 @@ mod scrollbar_tests {
         (BAR..HEIGHT)
             .filter(|row| at(buffer, WIDTH - 1, *row) != WHITE)
             .collect()
+    }
+
+    /// Columns of the bottom row that have been drawn on.
+    fn horizontal_thumb_columns(buffer: &[u32]) -> Vec<u32> {
+        (0..WIDTH)
+            .filter(|column| at(buffer, *column, HEIGHT - 1) != WHITE)
+            .collect()
+    }
+
+    #[test]
+    fn a_page_that_fits_across_gets_no_bar_along_the_bottom() {
+        // Which is nearly every page (#204). The horizontal bar has to be
+        // invisible on a page laid out to its window, or every page in the
+        // browser grows a strip of furniture saying there is nothing to the
+        // right of it.
+        let mut buffer = window();
+        draw_horizontal_scrollbar(&mut buffer, 0.0, WIDTH as f32, (WIDTH, HEIGHT), BAR, WHITE);
+        assert!(horizontal_thumb_columns(&buffer).is_empty());
+    }
+
+    #[test]
+    fn a_page_wider_than_its_window_gets_a_thumb_that_moves() {
+        let mut at_left = window();
+        draw_horizontal_scrollbar(&mut at_left, 0.0, 160.0, (WIDTH, HEIGHT), BAR, WHITE);
+        let left = horizontal_thumb_columns(&at_left);
+        assert!(!left.is_empty(), "a page four windows wide has a thumb");
+        assert_eq!(left.first(), Some(&0), "at the left it starts at the edge");
+
+        let mut at_right = window();
+        draw_horizontal_scrollbar(&mut at_right, 120.0, 160.0, (WIDTH, HEIGHT), BAR, WHITE);
+        let right = horizontal_thumb_columns(&at_right);
+        assert_eq!(
+            right.last(),
+            Some(&(WIDTH - 1)),
+            "at the far right the thumb reaches the end of the track"
+        );
+        assert_eq!(
+            left.len(),
+            right.len(),
+            "the thumb changed length by being moved"
+        );
+    }
+
+    #[test]
+    fn the_horizontal_bar_stays_out_of_the_chrome() {
+        // A window that is almost all chrome. The bar belongs to the page area,
+        // and one drawn into the rows above it would be drawn over the address.
+        let mut buffer = window();
+        draw_horizontal_scrollbar(&mut buffer, 0.0, 160.0, (WIDTH, HEIGHT), HEIGHT - 2, WHITE);
+        for row in 0..(HEIGHT - 2) {
+            for column in 0..WIDTH {
+                assert_eq!(at(&buffer, column, row), WHITE, "chrome row {row}");
+            }
+        }
     }
 
     #[test]

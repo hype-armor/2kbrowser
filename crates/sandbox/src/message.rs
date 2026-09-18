@@ -95,6 +95,21 @@ pub struct Missing {
     pub url: String,
 }
 
+/// A picture on the page, and the address it was fetched from (#205).
+///
+/// Travels outward with the page for the same reason the links do: the parent
+/// has no box tree — it is on the other side of the boundary — so a picture
+/// missing from this list is a picture the right-hand button has nothing to say
+/// about. The URL is already resolved, because resolving it needs the document
+/// that named it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    /// Where it is, in canvas coordinates.
+    pub rect: Rect,
+    /// The absolute URL it came from.
+    pub url: String,
+}
+
 /// A form the reader asked to send (#110).
 ///
 /// Assembled by the child, because the form is part of the document and the
@@ -435,6 +450,8 @@ pub enum ToChild {
     /// layout stay done, so moving down a long document costs only the pixels
     /// asked for. A band request never fetches anything.
     Band {
+        /// First document column to paint (#204).
+        left: u32,
         /// First document row to paint.
         top: u32,
         /// How many rows to paint.
@@ -587,8 +604,9 @@ impl ToChild {
                 writer.f32(to.0);
                 writer.f32(to.1);
             }
-            ToChild::Band { top, height } => {
+            ToChild::Band { left, top, height } => {
                 writer.tag(3);
+                writer.u32(*left);
                 writer.u32(*top);
                 writer.u32(*height);
             }
@@ -672,6 +690,7 @@ impl ToChild {
                 query: reader.str()?,
             },
             3 => ToChild::Band {
+                left: reader.u32()?,
                 top: reader.u32()?,
                 height: reader.u32()?,
             },
@@ -784,8 +803,12 @@ pub struct Rendered {
     pub height: u32,
     /// The document row `pixels` starts at.
     pub top: u32,
+    /// The document column `pixels` starts at (#204).
+    pub left: u32,
     /// Height of the content, which may exceed the canvas.
     pub content_height: f32,
+    /// Width of the content, which may exceed the canvas (#204).
+    pub content_width: f32,
     /// How it was rendered (ADR-0009).
     pub mode: Mode,
     /// The page's `<title>`, when it had one.
@@ -800,6 +823,13 @@ pub struct Rendered {
     /// side, so the placeholder these describe says `Load image` rather than
     /// naming a reason it does not have.
     pub missing: Vec<Missing>,
+    /// Every picture on the page, with the address it came from (#205).
+    ///
+    /// Whether it arrived or not, which is what makes this a different list
+    /// from `missing` rather than a longer one: that list is the placeholders a
+    /// press can retry, and this is every picture a reader can point at, so the
+    /// right-hand button has something to offer over one.
+    pub pictures: Vec<Picture>,
     /// Whether there is a fallback decision to overrule.
     pub can_toggle_layout: bool,
     /// Where this page's buttons are, in document order (#110).
@@ -874,7 +904,9 @@ impl ToParent {
                 writer.u32(page.width);
                 writer.u32(page.height);
                 writer.u32(page.top);
+                writer.u32(page.left);
                 writer.f32(page.content_height);
+                writer.f32(page.content_width);
                 page.mode.write(&mut writer);
                 writer.some(page.title.is_some());
                 if let Some(title) = &page.title {
@@ -895,6 +927,11 @@ impl ToParent {
                 for missing in &page.missing {
                     write_rect(&mut writer, &missing.rect);
                     writer.str(&missing.url);
+                }
+                writer.u32(page.pictures.len() as u32);
+                for picture in &page.pictures {
+                    write_rect(&mut writer, &picture.rect);
+                    writer.str(&picture.url);
                 }
                 writer.u32(page.buttons.len() as u32);
                 for rect in &page.buttons {
@@ -989,7 +1026,9 @@ impl ToParent {
                 let width = reader.u32()?;
                 let height = reader.u32()?;
                 let top = reader.u32()?;
+                let left = reader.u32()?;
                 let content_height = reader.f32()?;
+                let content_width = reader.f32()?;
                 let mode = Mode::read(&mut reader)?;
                 let title = if reader.some()? {
                     Some(reader.str()?)
@@ -1014,6 +1053,14 @@ impl ToParent {
                 let mut missing = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     missing.push(Missing {
+                        rect: read_rect(&mut reader)?,
+                        url: reader.str()?,
+                    });
+                }
+                let count = reader.count()?;
+                let mut pictures = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    pictures.push(Picture {
                         rect: read_rect(&mut reader)?,
                         url: reader.str()?,
                     });
@@ -1084,11 +1131,14 @@ impl ToParent {
                     width,
                     height,
                     top,
+                    left,
                     content_height,
+                    content_width,
                     mode,
                     title,
                     links,
                     missing,
+                    pictures,
                     buttons,
                     pressables,
                     submit,
@@ -1155,7 +1205,9 @@ mod tests {
             width,
             height,
             top: 0,
+            left: 0,
             content_height: 123.5,
+            content_width: 456.25,
             mode: Mode::Document {
                 unsupported_share: 0.42,
             },
@@ -1171,6 +1223,15 @@ mod tests {
                 group: 0,
                 jump_to: Some(920.0),
                 pinned: true,
+            }],
+            pictures: vec![Picture {
+                rect: Rect {
+                    x: 9.0,
+                    y: 10.0,
+                    width: 50.0,
+                    height: 50.0,
+                },
+                url: "https://example.com/arrived.png".to_owned(),
             }],
             missing: vec![Missing {
                 rect: Rect {
@@ -1410,15 +1471,24 @@ mod tests {
     #[test]
     fn a_link_count_larger_than_the_frame_is_refused() {
         // Hand-built: claim a billion links in a frame with room for none.
+        //
+        // The fields up to the count are written out one by one because they
+        // have to be *got past* — the reader is a stream, so a frame that does
+        // not spell them exactly runs out before it reaches the count and comes
+        // back `Truncated`, which is a different refusal from the one this is
+        // about. That makes this a mirror of the encoder above, and a field
+        // added there has to be added here too.
         let mut writer = Writer::new();
         writer.tag(1);
         writer.bytes(&[]);
-        writer.u32(0);
-        writer.u32(0);
-        writer.u32(0);
-        writer.f32(0.0);
-        writer.tag(0);
-        writer.some(false);
+        writer.u32(0); // width
+        writer.u32(0); // height
+        writer.u32(0); // top
+        writer.u32(0); // left
+        writer.f32(0.0); // content height
+        writer.f32(0.0); // content width
+        writer.tag(0); // mode
+        writer.some(false); // no title
         writer.u32(1_000_000_000);
         assert_eq!(
             ToParent::decode(&writer.finish()),
