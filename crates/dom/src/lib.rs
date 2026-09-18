@@ -8,6 +8,7 @@
 //! `RefCell` *during parsing only*. [`parse`] hands back a plain [`Document`]
 //! with no interior mutability left in it.
 
+mod depth;
 mod meta_charset;
 
 use std::cell::{Ref, RefCell};
@@ -656,7 +657,14 @@ pub fn parse(html: &str) -> Document {
     };
     let options = ParseOpts::default();
     let tree_builder = TreeBuilder::new(sink, options.tree_builder);
-    let tokenizer = Tokenizer::new(DefuseMetaCharset(tree_builder), options.tokenizer);
+    // Two wrappers between the tokenizer and the tree builder, and the order
+    // is not arbitrary: the depth cap is outermost, so a tag it refuses never
+    // reaches the charset workaround either. Both are working around the same
+    // library from the same side.
+    let tokenizer = Tokenizer::new(
+        depth::CapDepth::new(DefuseMetaCharset(tree_builder)),
+        options.tokenizer,
+    );
 
     let input = BufferQueue::default();
     input.push_back(StrTendril::from(html));
@@ -667,7 +675,7 @@ pub fn parse(html: &str) -> Document {
     }
     debug_assert!(input.is_empty(), "the parser stopped with input left");
     tokenizer.end();
-    tokenizer.sink.0.sink.finish()
+    tokenizer.sink.inner.0.sink.finish()
 }
 
 #[cfg(test)]

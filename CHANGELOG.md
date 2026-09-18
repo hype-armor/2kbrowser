@@ -16,6 +16,63 @@ record for everything earlier.
 
 ## Unreleased
 
+**A busy tab no longer hangs the window** (#207). Every request the browser
+made happened inside the event handler that asked for it: `show` called the
+fetcher and waited, and so did opening a tab, sending a form and saving a
+picture. A request is a DNS lookup, a connection, a handshake and however long
+the server takes — and for all of it the window drew nothing, answered nothing,
+and could not be scrolled. It was never the *tab* that was busy. It was the only
+thread there is.
+
+Requests now go to a small pool of workers and their answers arrive as a
+wake-up, exactly as a painted band already did. The page you are reading stays
+alive while the next one is on its way, in this tab or another; a tab opened
+from a link appears at once and fills in when its answer comes, rather than
+appearing only after the site replied.
+
+What that needs, and what is tested: an answer has to find the tab that asked
+after the reader has opened, closed and reordered tabs, so tabs carry an
+identity rather than being found by position. An answer nobody is waiting for is
+dropped rather than shown — a reader who types one address, waits, and types
+another gets the second, and a tab closed while it was loading gets nothing.
+Neither is an error and neither says anything. Four workers rather than one,
+because a slow site must not hold up a fast one queued behind it.
+
+The policy is unchanged and that is worth stating precisely: a `Fetcher` is its
+policy and nothing else, so ADR-0006 is enforced on the worker exactly as it was
+on the main thread. Saving a picture still goes out as a *subresource*, so one
+the page was not allowed to load cannot be had by asking again.
+
+**Parsing deeply nested markup is no longer quadratic** (#179). Doubling the
+nesting depth used to quadruple the time — 155 ms at 8,000 levels, 604 ms at
+16,000 — and a profile put **96% of every instruction** in html5ever's
+`in_scope_named::<button_scope>`. That is the spec doing what the spec says: a
+`<div>` start tag must first close any `p` in button scope, which means walking
+the stack of open elements to a boundary, and `div` is not a boundary. Every tag
+walked the whole stack. Upgrading does not help — 0.40 measures the same — it is
+the algorithm rather than a bug.
+
+So the stack is not allowed to get deep. `MAX_DEPTH` already said that nesting
+past 512 is flattened rather than represented faithfully (#176); that decision
+was made for the renderer's stack, and the parser's stack is the same problem
+one step earlier. A start tag that would open the 513th level is dropped before
+the tree builder sees it, and the end tag matching it is dropped with it so the
+token stream stays balanced.
+
+A 100,000-level document now parses in 33 ms. What is *inside* the nesting is
+untouched — text still arrives and is still inserted — so what disappears is
+surplus nesting, which the old cap had already collapsed into a row of empty
+boxes. Nothing real is near this: the era fixture here is 14 deep and the
+deepest document in the CSS 2.1 suite is 13.
+
+**Opening with no address shows a home page**. `2kbrowser open` used to answer
+"no input given" and exit, which is correct and useless. It now starts on a page
+built out of what the browser already knows — the pages you saved and the pages
+you went to — because that is the most likely place you want to go and it costs
+no request to find out. Nothing is fetched and nothing is configurable: a home
+page that phoned somewhere on startup would be at odds with ADR-0006, which
+refuses third-party requests on a page you *asked* for.
+
 **Half of layout was hashing a cache key** (#207). The report said "lots of
 hanging ui issues" and named nothing, which is the most honest form a
 performance report takes and the least actionable — so the first thing built for

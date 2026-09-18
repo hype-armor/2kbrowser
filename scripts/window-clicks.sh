@@ -1688,4 +1688,91 @@ stop
 unset XDG_DOWNLOAD_DIR
 rm -rf "$pictures"
 
+# N. A tab waiting on a slow server does not freeze the window (#207).
+#
+#    The report was "if one tab is busy, it hangs the whole UI", and it was
+#    exactly right: every fetch used to happen inside the event handler that
+#    asked for it, so the one thread there is sat in a socket read for as long
+#    as the server took. Nothing drew, nothing scrolled, nothing answered.
+#
+#    Nothing short of a real window can show this. The fetch being off-thread is
+#    unit-tested, and that proves the worker answers — not that the *window*
+#    stayed alive while it did. So: point a tab at a server that takes its time,
+#    and while it is waiting, scroll the page that is already on screen and
+#    check the pixels moved.
+slow_port=8741
+python3 - "$slow_port" >/dev/null 2>&1 <<'SLOW' &
+import http.server, socketserver, sys, time
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        # Long enough that a browser which waited for it would be visibly dead
+        # for the whole of the check below, and short enough that the harness
+        # is not held up if something goes wrong.
+        time.sleep(6)
+        body = b"<title>Eventually</title><body><p>here at last</p></body>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as server:
+    server.serve_forever()
+SLOW
+slow_server=$!
+for _ in $(seq 1 40); do
+    (echo > "/dev/tcp/127.0.0.1/$slow_port") >/dev/null 2>&1 && break
+    sleep 0.25
+done
+
+# A page tall enough to scroll, so there is something to prove still works.
+start_on "$long" "Long"
+focus_window
+scroll_probe_x=$((width / 2))
+scroll_probe_y=$((chrome + 120))
+before=$(pixel "$scroll_probe_x" "$scroll_probe_y")
+
+# Send this tab somewhere slow. The address bar rather than a link, because
+# what is being tested is the navigation and not the click.
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.4
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool type --delay 12 "http://127.0.0.1:$slow_port/slow"
+DISPLAY=$display xdotool key Return
+sleep 0.6
+
+# While that is in flight, scroll. A frozen window ignores this entirely.
+moved=""
+for _ in $(seq 1 12); do
+    DISPLAY=$display xdotool key Page_Down
+    sleep 0.2
+    if [ "$(pixel "$scroll_probe_x" "$scroll_probe_y")" != "$before" ]; then
+        moved=yes
+        break
+    fi
+done
+[ -n "$moved" ] || fail "the page did not scroll while a tab was waiting on a \
+slow server — the window is still blocking on the fetch"
+echo "ok: the window kept scrolling while a tab waited on a slow server"
+
+# And the slow page does eventually arrive, so this did not pass by the
+# navigation quietly never happening.
+arrived=""
+for _ in $(seq 1 40); do
+    sleep 0.5
+    case "$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)" in
+        *Eventually*) arrived=yes; break ;;
+    esac
+done
+[ -n "$arrived" ] || fail "the slow page never arrived, so the check above \
+proved only that nothing was ever fetched"
+echo "ok: and the slow page arrived once the server answered"
+stop
+kill "$slow_server" 2>/dev/null || true
+
 echo "all window click checks passed"
