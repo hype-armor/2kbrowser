@@ -330,6 +330,17 @@ struct Tab {
     /// opened, closed or reordered tabs has to be able to find the one that
     /// asked.
     id: crate::fetches::TabId,
+    /// Keystrokes typed while this tab's page was being re-rendered (#207).
+    ///
+    /// A keystroke costs the child a whole re-render — parse, cascade, layout,
+    /// paint — and a person types faster than that. Waiting for each one froze
+    /// the window for the length of a word, against the reader's own keys.
+    ///
+    /// So a key goes out at once when nothing is in flight, and otherwise waits
+    /// here for the render already running to finish. A burst then costs two
+    /// renders rather than one per letter, and the letters nobody could see yet
+    /// never got a render of their own.
+    typing: Vec<sandbox::message::Key>,
     /// The request this tab is waiting for, if it is waiting for one.
     ///
     /// A reader who types an address, waits, and types another has two in
@@ -406,6 +417,7 @@ impl Tab {
     fn new(id: crate::fetches::TabId, loaded: Loaded, url: String) -> Self {
         Self {
             id,
+            typing: Vec::new(),
             pending: None,
             loaded,
             history: crate::history::History::new(url),
@@ -1556,15 +1568,52 @@ impl App {
             .is_some_and(crate::viewport::Viewport::editing)
     }
 
-    /// Hands one keystroke to the page's focused control.
+    /// Hands one keystroke to the page's focused control (#207).
+    ///
+    /// Sent and not waited for. The page changes when the child answers, which
+    /// is a wake-up like a painted band — so the window keeps drawing, and a
+    /// reader typing quickly is never typing into a frozen one.
     fn type_into_page(&mut self, key: sandbox::message::Key) {
+        self.tab_mut().typing.push(key);
+        self.flush_typing();
+    }
+
+    /// Sends whatever has been typed, if the child is free to take it.
+    ///
+    /// One render in flight at a time per tab. A second would be answered after
+    /// the first and immediately replace it — a page nobody saw, laid out and
+    /// painted for nothing, which is exactly the cost this is removing.
+    fn flush_typing(&mut self) {
+        let free = self
+            .tab()
+            .page
+            .as_ref()
+            .is_some_and(|page| !page.typing_outstanding());
+        if !free || self.tab().typing.is_empty() {
+            return;
+        }
+        let keys = std::mem::take(&mut self.tab_mut().typing);
         if let Some(page) = self.tab_mut().page.as_mut() {
-            page.type_key(key);
+            page.request_type(keys);
         }
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    }
+
+    /// Shows a page that typing changed, and sends whatever was typed since.
+    ///
+    /// Returns whether anything changed, which is what decides a redraw.
+    fn accept_typed(&mut self) -> bool {
+        let changed = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .is_some_and(crate::viewport::Viewport::accept_typed);
+        if changed {
+            // Everything typed while that render was running goes now, as one
+            // run. This is the second of the two renders a burst costs.
+            self.flush_typing();
+            self.act_on_page();
         }
-        self.act_on_page();
+        changed
     }
 
     /// Gives up editing without navigating.
@@ -1637,6 +1686,10 @@ impl App {
         if index == self.tabs.active_index() {
             return;
         }
+        // Anything typed into the tab being left goes out before it stops
+        // being the one `flush_typing` acts on. Those keys were typed into
+        // *that* page and belong to it (#207).
+        self.flush_typing();
         self.tabs.select(index);
         self.editing = None;
         // The new tab may never have been rendered, or was rendered at another
@@ -3698,7 +3751,13 @@ impl ApplicationHandler<Wake> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Wake) {
         match event {
             Wake::Band(_) => {
-                if self.accept_band()
+                // A band and a typed page arrive through the same wake,
+                // because the child answers both on the same thread and the
+                // window has no way to tell which woke it. Asking for both
+                // costs two `try_recv`s and removes the question.
+                let band = self.accept_band();
+                let typed = self.accept_typed();
+                if (band || typed)
                     && let Some(window) = &self.window
                 {
                     window.request_redraw();
@@ -5536,6 +5595,104 @@ mod loading_tests {
         let mut buffer = vec![WHITE; (WIDTH * BAR) as usize];
         draw_loading(&mut buffer, Some(0.5), (WIDTH, BAR), BAR);
         assert!(buffer.iter().all(|pixel| *pixel == WHITE));
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    //! Coalescing keystrokes (#207).
+    //!
+    //! A keystroke costs the child a whole re-render, and a person types faster
+    //! than that. The rules for what is sent and what waits are small, and
+    //! getting one wrong loses a letter — which is the kind of bug a reader
+    //! notices immediately and cannot reproduce on purpose.
+    //!
+    //! So they are here as arithmetic, without a child process to run them
+    //! against. `flush_typing` is the same two questions: is the child free,
+    //! and is there anything to send.
+
+    use sandbox::message::Key;
+
+    /// What `flush_typing` does, without a window.
+    ///
+    /// Returns what goes out now, leaving behind what waits.
+    fn flush(buffer: &mut Vec<Key>, child_free: bool) -> Vec<Key> {
+        if !child_free || buffer.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(buffer)
+    }
+
+    fn letter(which: &str) -> Key {
+        Key::Insert(which.to_owned())
+    }
+
+    #[test]
+    fn the_first_keystroke_goes_out_at_once() {
+        // Nothing is gained by making the first letter wait: the child is idle,
+        // and a reader who types one character wants to see it.
+        let mut buffer = vec![letter("h")];
+        assert_eq!(flush(&mut buffer, true), vec![letter("h")]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn keys_typed_during_a_render_wait_rather_than_queueing_renders() {
+        // The whole point. Four letters typed while the first is rendering must
+        // not become four more renders — each would be laid out and painted for
+        // a page the next letter immediately invalidates.
+        let mut buffer = Vec::new();
+        for which in ["e", "l", "l", "o"] {
+            buffer.push(letter(which));
+            assert!(
+                flush(&mut buffer, false).is_empty(),
+                "a keystroke was sent while the child was busy"
+            );
+        }
+        assert_eq!(buffer.len(), 4, "a keystroke was lost while waiting");
+    }
+
+    #[test]
+    fn everything_that_waited_goes_out_together() {
+        // And in order, because "hello" typed as h-e-l-l-o is not the same
+        // string as any other arrangement of those letters.
+        let mut buffer: Vec<Key> = ["e", "l", "l", "o"].iter().map(|it| letter(it)).collect();
+        let sent = flush(&mut buffer, true);
+        assert_eq!(
+            sent,
+            vec![letter("e"), letter("l"), letter("l"), letter("o")]
+        );
+        assert!(buffer.is_empty(), "something was left behind");
+    }
+
+    #[test]
+    fn a_burst_costs_two_renders_rather_than_one_per_letter() {
+        // Counted rather than asserted in prose. The first letter goes at once;
+        // the rest wait for that render and then go as one.
+        let mut buffer = Vec::new();
+        let mut renders = 0;
+        let mut busy = false;
+        for which in ["h", "e", "l", "l", "o"] {
+            buffer.push(letter(which));
+            if !flush(&mut buffer, !busy).is_empty() {
+                renders += 1;
+                busy = true;
+            }
+        }
+        // The first render finishes; whatever waited goes now.
+        busy = false;
+        if !flush(&mut buffer, !busy).is_empty() {
+            renders += 1;
+        }
+        assert_eq!(renders, 2, "five letters cost {renders} renders");
+    }
+
+    #[test]
+    fn nothing_typed_sends_nothing() {
+        // Called on every wake, including wakes that were about a band. An
+        // empty run would be a render asked for with nothing to render.
+        let mut buffer: Vec<Key> = Vec::new();
+        assert!(flush(&mut buffer, true).is_empty());
     }
 }
 

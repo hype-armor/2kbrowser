@@ -16,6 +16,42 @@ record for everything earlier.
 
 ## Unreleased
 
+**Typing no longer freezes the window, and a word costs one render** (#207). A
+keystroke costs the child a whole re-render — parse, cascade, layout, paint —
+about 110 ms on a long page. A person types faster than that, so the old
+arrangement was the worst available: every key blocked the window for a render,
+a five-letter word meant five of them and about half a second of frozen window,
+and each of those renders was invalidated by the next letter before anybody
+could see it.
+
+Two changes, both following the pattern bands set. Typing is now **sent rather
+than waited for** — `request_type` and `take_typed` mirror `request_band` and
+`take_band`, with a slot of their own so a keystroke's answer is never mistaken
+for a scroll's. And keystrokes **coalesce**: the first goes out at once, and
+anything typed while that render runs waits and goes as one run, which the child
+applies in order before rendering once.
+
+Measured, five letters against one:
+
+| page | one keystroke | a five-letter burst |
+| --- | --- | --- |
+| era page | 16 ms | 24 ms |
+| long page | 108 ms | 100 ms |
+| big table | 140 ms | 165 ms |
+
+A burst now costs about what a single keystroke does, because it *is* a single
+render. It used to cost five, by construction — one per letter — and the
+end-to-end test asserts exactly that: a run of three letters comes back as one
+answer, not three.
+
+What could go wrong here is a lost or reordered letter, so that is what the
+tests are aimed at. The coalescing rules are checked as arithmetic, including
+counting that a burst costs two renders rather than one per letter; and a live
+child is sent a run and its pixels compared against the same letters sent one at
+a time, which catches any reordering. The window harness now also types with no
+delay at all — the old check typed at 60 ms intervals, which never exercised any
+of this — and measures how far right the ink reaches, so a dropped letter shows.
+
 **A busy tab no longer hangs the window** (#207). Every request the browser
 made happened inside the event handler that asked for it: `show` called the
 fetcher and waited, and so did opening a tab, sending a form and saving a

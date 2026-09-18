@@ -2074,6 +2074,60 @@ fn form_page(width: u32) -> shell::viewport::Viewport {
 }
 
 #[test]
+fn a_burst_of_typing_is_one_render_and_arrives_in_order() {
+    // #207, end to end through a real child. A person types faster than a page
+    // re-renders, and every keystroke used to cost a whole one — so a word cost
+    // as many renders as it had letters, each of them invalidated by the next.
+    //
+    // Sent as a run and asked for without waiting. What this proves is the part
+    // that could go wrong silently: that the letters are applied in the order
+    // they were typed, and that one run is one answer rather than five.
+    let mut page = form_page(400);
+    assert!(
+        page.focus_at(20.0, 10.0),
+        "pressing the field focused nothing"
+    );
+
+    let before = look(&page);
+    let word = ["z", "y", "x"];
+    page.request_type(
+        word.iter()
+            .map(|letter| sandbox::message::Key::Insert((*letter).to_owned()))
+            .collect(),
+    );
+    assert!(
+        page.typing_outstanding(),
+        "the run was not sent, or was waited for after all"
+    );
+
+    let mut answers = 0;
+    while page.typing_outstanding() {
+        if page.accept_typed() {
+            answers += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(answers, 1, "three letters came back as {answers} renders");
+    assert_ne!(look(&page), before, "the typing never reached the page");
+
+    // In order. The field started as `Ada`, so a run applied backwards or out
+    // of sequence draws something different from one applied as typed — and
+    // the only way to tell from out here is the pixels.
+    let run = look(&page);
+    let mut separately = form_page(400);
+    assert!(separately.focus_at(20.0, 10.0));
+    for letter in word {
+        separately.type_key(sandbox::message::Key::Insert(letter.to_owned()));
+    }
+    assert_eq!(
+        run,
+        look(&separately),
+        "a run of keystrokes drew something different from the same keystrokes \
+         sent one at a time, so the batching changed what was typed"
+    );
+}
+
+#[test]
 fn a_text_field_can_be_focused_and_typed_into() {
     // #110, end to end through a real renderer child. The whole path is here:
     // the parent knows where the pointer was and nothing else, the child works

@@ -620,8 +620,14 @@ impl Render for PageRenderer {
                 held = self.last.clone();
                 held.as_ref().ok_or("nothing has been rendered yet")?
             }
-            ToChild::Type { key } => {
-                self.apply(key);
+            ToChild::Type { keys } => {
+                // Every key, then one render. The run arrived together because
+                // the reader typed faster than the page renders, and rendering
+                // once per letter would be work each following letter
+                // immediately invalidated (#207).
+                for key in keys {
+                    self.apply(key);
+                }
                 held = self.last.clone();
                 held.as_ref().ok_or("nothing has been rendered yet")?
             }

@@ -509,10 +509,17 @@ pub enum ToChild {
         /// Where, in canvas coordinates.
         at: (f32, f32),
     },
-    /// A keystroke for whatever control is focused.
+    /// Keystrokes for whatever control is focused.
+    ///
+    /// A run of them rather than one, because a person types faster than a
+    /// page re-renders (#207). Every keystroke costs the child a whole
+    /// re-render — parse, cascade, layout, paint — so sending them one at a
+    /// time made a word cost as many renders as it had letters, and each of
+    /// those renders was work the next keystroke immediately invalidated.
+    /// Applied in order, then rendered once.
     Type {
-        /// What was pressed.
-        key: Key,
+        /// What was pressed, oldest first. Never empty.
+        keys: Vec<Key>,
     },
     /// The reader picked a row out of a dropdown the child opened.
     ///
@@ -592,9 +599,12 @@ impl ToChild {
                 writer.u32(*node);
                 writer.u32(*index);
             }
-            ToChild::Type { key } => {
+            ToChild::Type { keys } => {
                 writer.tag(7);
-                key.write(&mut writer);
+                writer.u32(keys.len() as u32);
+                for key in keys {
+                    key.write(&mut writer);
+                }
             }
             ToChild::CopyFocused => writer.tag(11),
             ToChild::Select { from, to } => {
@@ -697,9 +707,17 @@ impl ToChild {
             6 => ToChild::Focus {
                 at: (reader.f32()?, reader.f32()?),
             },
-            7 => ToChild::Type {
-                key: Key::read(&mut reader)?,
-            },
+            7 => {
+                // A count, not a plain `u32`: bounded by the bytes left, so a
+                // claim of four billion keystrokes cannot reserve for four
+                // billion keystrokes.
+                let count = reader.count()?;
+                let mut keys = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    keys.push(Key::read(&mut reader)?);
+                }
+                ToChild::Type { keys }
+            }
             8 => ToChild::Choose {
                 node: reader.u32()?,
                 index: reader.u32()?,
