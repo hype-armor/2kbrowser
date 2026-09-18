@@ -884,9 +884,14 @@ nothing appeared in it"
 #
 # Measured as how far right the ink reaches: ten characters have to reach
 # further than the five already there, and a run that dropped letters would not.
+# Bounded to the field's own columns. The fixture has a submit button beside
+# the field on the same rows, so a box taken across the whole width answers
+# about the *button* — which never moves however much is typed, and made the
+# first version of this check one that could not pass.
 ink_right() {
     DISPLAY=$display xwd -silent -id "$window" \
         | python3 "$here/scripts/xwd-box.py" $((text_y - 6)) $((text_y + 6)) \
+            "$field_left" "$field_right" \
         | awk '{ print $3 }'
 }
 slow_right=$(ink_right)
@@ -906,8 +911,10 @@ for _ in $(seq 1 30); do
     fi
 done
 [ -n "$grew" ] || fail "typing five more characters as fast as the keyboard \
-could send them did not widen the text in the field — keystrokes were lost \
-while a render was in flight"
+could send them did not widen the text in the field: it reached $slow_right \
+before and $(ink_right) after, within the field's columns \
+$field_left..$field_right. Either keystrokes were lost while a render was in \
+flight, or this is measuring something that does not move."
 echo "ok: a burst typed at full speed lost no keystrokes"
 
 # Back to what the checks below expect: the field holds one known run again.

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Finds the box of everything drawn in a band of an `xwd` dump.
 
-    xwd -silent -id "$window" | xwd-box.py Y0 Y1
+    xwd -silent -id "$window" | xwd-box.py Y0 Y1 [X0 X1]
 
 Prints `left top right bottom` of the non-white pixels between rows `Y0` and
-`Y1`, or nothing when that band is blank. `window-clicks.sh` asks this to find
+`Y1`, or nothing when that band is blank. `X0` and `X1` narrow it to a range of
+columns, which matters whenever something else is drawn on the same rows: the
+form fixture has a submit button beside its text field, so a box taken across
+the whole width answers about the *button* however much is typed into the
+field. `window-clicks.sh` asks this to find
 out where a form control actually landed, on a fixture that has nothing else on
 it — the same rule the link coordinates follow, which is that a coordinate comes
 from the browser rather than from a number typed into the harness.
@@ -26,10 +30,11 @@ import sys
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("usage: xwd-box.py Y0 Y1", file=sys.stderr)
+    if len(sys.argv) not in (3, 5):
+        print("usage: xwd-box.py Y0 Y1 [X0 X1]", file=sys.stderr)
         return 2
     y0, y1 = int(sys.argv[1]), int(sys.argv[2])
+    x0, x1 = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) == 5 else (0, None)
 
     data = sys.stdin.buffer.read()
     if len(data) < 100:
@@ -62,9 +67,10 @@ def main() -> int:
         return (value & mask) >> shift if span >= 255 else ((value & mask) >> shift) * 255 // span
 
     left, top, right, bottom = width, height, -1, -1
+    last = width if x1 is None else min(x1 + 1, width)
     for y in range(max(y0, 0), min(y1 + 1, height)):
         row = pixels_at + y * bytes_per_line
-        for x in range(width):
+        for x in range(max(x0, 0), last):
             at = row + x * stride
             raw = data[at : at + stride]
             if len(raw) != stride:
