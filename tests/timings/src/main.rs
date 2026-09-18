@@ -53,13 +53,15 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     };
 
+    // Each page with a word it really contains, so the find column measures
+    // finding something rather than failing to.
     let mut pages = vec![
-        ("an era page", era_page()),
-        ("a long page", generated(&long_page(), "long.html")),
-        ("a big table", generated(&big_table(), "table.html")),
-        ("deep nesting", generated(&deep_page(), "deep.html")),
+        ("an era page", era_page(), "the"),
+        ("a long page", generated(&long_page(), "long.html"), "line"),
+        ("a big table", generated(&big_table(), "table.html"), "r7c3"),
+        ("deep nesting", generated(&deep_page(), "deep.html"), "text"),
     ];
-    pages.retain(|(name, source)| {
+    pages.retain(|(name, source, _)| {
         let kept = source.is_some();
         if !kept {
             eprintln!("skipping {name}: its fixture could not be written");
@@ -73,9 +75,9 @@ fn main() -> std::process::ExitCode {
     );
     println!("{}", "-".repeat(76));
 
-    for (name, source) in &pages {
+    for (name, source, present) in &pages {
         let Some(source) = source else { continue };
-        match measure(&browser, source) {
+        match measure(&browser, source, present) {
             Some(row) => println!(
                 "{:<16}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
                 name,
@@ -108,8 +110,13 @@ struct Row {
     accessibility: Duration,
 }
 
-/// Runs every measurement against one page.
-fn measure(browser: &Path, source: &Path) -> Option<Row> {
+/// A word every fixture contains, so find has something to find.
+///
+/// Passed in rather than fixed. The first version searched for one word against
+/// every page and two of them did not contain it — so two columns reported a
+/// fast zero, which is what a *failure* looks like and not what a speed looks
+/// like. The warning below caught it, which is the point of the warning.
+fn measure(browser: &Path, source: &Path, present: &str) -> Option<Row> {
     let body = std::fs::read(source).ok()?;
     let url = net::file_url(source);
     let (origin, path) = net::parse_url(&url).ok()?;
@@ -189,11 +196,15 @@ fn measure(browser: &Path, source: &Path) -> Option<Row> {
     let mut found = 0usize;
     let find = worst(|| {
         let started = Instant::now();
-        found = page.find("a").len();
+        found = page.find(present).len();
         started.elapsed()
     });
     if found == 0 {
-        eprintln!("warning: nothing was found, so the find column is a failure and not a speed");
+        eprintln!(
+            "warning: {}: `{present}` was not found, so its find column is a failure and not a \
+             speed",
+            source.display()
+        );
     }
 
     // The accessibility tree, which crosses as data (ADR-0019) and is rebuilt
@@ -205,7 +216,10 @@ fn measure(browser: &Path, source: &Path) -> Option<Row> {
         started.elapsed()
     });
     if nodes == 0 {
-        eprintln!("warning: the accessibility tree came back empty, so its column is a failure");
+        eprintln!(
+            "warning: {}: the accessibility tree came back empty, so its column is a failure",
+            source.display()
+        );
     }
 
     Some(Row {
