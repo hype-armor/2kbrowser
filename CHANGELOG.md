@@ -16,6 +16,110 @@ record for everything earlier.
 
 ## Unreleased
 
+**Half of layout was hashing a cache key** (#207). The report said "lots of
+hanging ui issues" and named nothing, which is the most honest form a
+performance report takes and the least actionable — so the first thing built for
+it was not a fix but a way to find out: `tests/timings` measures every operation
+the event loop performs *synchronously*, because the window is a single thread
+and anything it waits for is a frame it does not draw. What an operation costs
+there is how long the browser is frozen for when a reader asks for it.
+
+The answer was that a keystroke on a long page cost 138 ms. Typing into a form
+re-renders the whole page in the child — parse, cascade, layout, paint — and of
+that, layout was 85 ms and everything else together was 30. Inside layout, text
+was all of it: the same page with its text removed laid out in 1.4 ms.
+
+That pointed at the shaping cache, which turned out to be working perfectly and
+to be the problem anyway. It was keyed on `(AttrsOwned, String)` — a dozen-field
+struct and an owned copy of the word — so every word of the page allocated a
+`String` to look itself up and hashed the whole struct to do it, twice, since
+the face metrics are keyed the same way. A profile of a warm re-layout put
+**38% of every instruction in SipHash's `write`** and another 10% in building,
+hashing and comparing the struct around it. Sixty thousand words of prose was
+sixty thousand hashes of the same handful of styles.
+
+So the attributes are interned. The struct is hashed once per *style* rather
+than once per word, the per-word caches are keyed on the number that comes back,
+and a short list of recently-seen attribute sets — compared rather than hashed —
+means even that is rare within a paragraph. The segment lookup takes a `&str`
+and allocates nothing.
+
+What that is worth, measured against the same binary with and without the change
+and with nothing else running — three runs each, and the band column carried as
+a control because painting a band does no layout at all:
+
+| page | operation | before | after | |
+|---|---|---|---|---|
+| long page | keystroke | 139 ms | 110 ms | −21% |
+| long page | open | 164 ms | 133 ms | −19% |
+| big table | keystroke | 121 ms | 108 ms | −11% |
+| big table | open | 179 ms | 155 ms | −13% |
+| either | band | 25 ms | 27 ms | unchanged, as it must be |
+
+A warm re-layout's instruction count fell from 442M to 266M and the profile went
+from one dominant cost to flat, which is the part that is exactly measurable.
+The wall-clock gain is smaller than that ratio because layout is about two
+thirds of a keystroke and the rest of the re-render — parse, cascade, display
+list, raster, and the pixels crossing the pipe — is untouched.
+
+An earlier draft of this entry quoted "122 ms to 60 ms" for layout. That was a
+real measurement of a *different and larger* fixture than the one the table
+above uses, and putting it beside the end-to-end numbers implied a halving that
+does not carry through. Layout on the long page went from about 85 ms to about
+56 ms, which is what the 29 ms off its keystroke accounts for.
+
+The property that makes any of this safe is the one ADR-0005 already demands: identical input must produce identical output, so
+a cache can change how long a page takes and cannot change how it looks — and
+the reference tests compare rendered pages against baselines byte for byte,
+which is what would catch a cache that returned the wrong glyphs.
+
+What is *not* fixed is the shape of the thing: a keystroke still re-lays-out the
+whole document, which is O(page) however fast each word is. And the harness
+surfaced something larger that this change does not touch — a navigation runs
+its network fetch on the event-loop thread, so clicking a link freezes the
+window for the whole round trip. Both are recorded in #207 rather than claimed.
+
+**A page wider than its window can be read** (#204). Scrolling had one axis.
+Anything that overflowed the viewport sideways — a scanned page, a large
+photograph opened by its own address, a block of fixed-width output, a table
+with more columns than its author expected — was simply cut off at the right
+edge, with no way to reach the rest of it.
+
+A band is a rectangle of the document, and there was never a reason beyond habit
+for its horizontal edge to be fixed at zero. So it is not: `rasterise_band` takes
+a left as well as a top, `position: fixed` items are exempt from both shifts for
+the reason they were always exempt from one, and the display list now also
+answers how far right the page reaches — from the items themselves, since that
+is the one place everything drawn passes through, and a glyph's advance is
+exactly the case (`<pre>` running past the box holding it) the feature is about.
+
+Above that the window grew the other half of everything it already had: a scroll
+offset, a scrollbar along the bottom that drags, the wheel and its Shift
+modifier, the arrow keys, Home, and the horizontal halves of hit-testing, the
+find highlights, the focus outline and the accessibility transform. A page that
+fits across its window is unchanged in every one of those — no bar, no offset,
+no extra work — which is nearly every page.
+
+One thing about it is deliberately not symmetric. A vertical band is painted
+three windows tall, so scrolling down usually costs nothing; a band is only ever
+as *wide* as the window, so there is nowhere to put a horizontal margin and
+scrolling sideways always asks the child for a repaint. What the reader sees
+while that arrives is the band they have, shifted, with the page's own canvas
+colour where it has no pixels — the same bargain the rows have always made, and
+better than a page that appears not to have moved at all.
+
+**Right-click a picture and keep it** (#205). The browser could fetch an image,
+decode it and draw it, and had nowhere to put one. The context menu now offers
+to save it, copy its address, or open it on its own, and there is a `downloads`
+module to write the file.
+
+Two things it is careful about. The bytes are fetched again rather than asked of
+the renderer: they are over there, and a process that is untrusted by
+construction (ADR-0012) should not be deciding what lands in the reader's files.
+And the filename is rebuilt character by character from the URL rather than
+trusted — a URL is written by whoever served the page, and a name that could
+carry a separator is a name that could leave the directory it was given.
+
 **An error status is a page, not a one-line complaint** (#203, and #208 with
 it). A 4xx or a 5xx used to reach the reader as `server returned 401` in the
 chrome and a blank window. Two things were wrong with that, and they needed

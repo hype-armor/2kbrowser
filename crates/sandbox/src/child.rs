@@ -99,7 +99,7 @@ pub trait Render {
     /// is only pixels. That is the whole reason a long page is affordable, and
     /// it is why this is not simply another `render` — a render can talk to the
     /// parent and this cannot.
-    fn band(&mut self, top: u32, height: u32) -> Result<Rendered, String>;
+    fn band(&mut self, left: u32, top: u32, height: u32) -> Result<Rendered, String>;
 }
 
 /// Runs the child's side of the conversation until the parent goes away.
@@ -185,8 +185,8 @@ fn answer_until_the_parent_goes(
                 let tree = renderer.accessibility();
                 write_frame(output, &ToParent::Accessible(Box::new(tree)).encode())?;
             }
-            ToChild::Band { top, height } => {
-                let answer = match renderer.band(*top, *height) {
+            ToChild::Band { left, top, height } => {
+                let answer = match renderer.band(*left, *top, *height) {
                     Ok(page) => ToParent::Rendered(Box::new(page)),
                     Err(message) => ToParent::Failed { message },
                 };
@@ -384,6 +384,7 @@ mod tests {
                 title: None,
                 links: Vec::new(),
                 missing: Vec::new(),
+                pictures: Vec::new(),
                 buttons: Vec::new(),
                 submit: None,
                 can_toggle_layout: false,
@@ -393,10 +394,12 @@ mod tests {
                 images_loaded: 0,
                 background: 0x00ff_ffff,
                 top: 0,
+                left: 0,
+                content_width: 1.0,
             })
         }
 
-        fn band(&mut self, _top: u32, _height: u32) -> Result<Rendered, String> {
+        fn band(&mut self, _left: u32, _top: u32, _height: u32) -> Result<Rendered, String> {
             Err("the stub renderer paints no bands".to_owned())
         }
 

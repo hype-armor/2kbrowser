@@ -473,7 +473,7 @@ impl Renderer {
 /// What the worker is asked to do.
 enum Job {
     Render(Box<RenderJob>),
-    Band { top: u32, height: u32 },
+    Band { left: u32, top: u32, height: u32 },
     Find(String),
     Select { from: (f32, f32), to: (f32, f32) },
     CopyFocused,
@@ -805,8 +805,8 @@ impl Session {
     /// so this costs the pixels and the pipe. That is what makes scrolling a
     /// long page affordable, and it is why it is not a `render` — a render can
     /// ask the parent for resources and this deliberately cannot.
-    pub fn band(&mut self, top: u32, height: u32) -> Result<Rendered, Error> {
-        self.request_band(top, height)?;
+    pub fn band(&mut self, left: u32, top: u32, height: u32) -> Result<Rendered, Error> {
+        self.request_band(left, top, height)?;
         match self.wait_for(Kind::Band)? {
             Answer::Rendered(page) => Ok(*page),
             Answer::Failed(error) => Err(error),
@@ -821,8 +821,8 @@ impl Session {
     /// while the window carries on drawing the rows it has. Collect it with
     /// [`Session::take_band`], or be told by the callback given to
     /// [`Session::set_wake`].
-    pub fn request_band(&mut self, top: u32, height: u32) -> Result<(), Error> {
-        self.submit(Job::Band { top, height }, Kind::Band)
+    pub fn request_band(&mut self, left: u32, top: u32, height: u32) -> Result<(), Error> {
+        self.submit(Job::Band { left, top, height }, Kind::Band)
     }
 
     /// Whether a band has been asked for and not yet collected.
@@ -1160,8 +1160,8 @@ impl Conversation {
                 })
                 .map(|page| Answer::Rendered(Box::new(page)))
             }
-            Job::Band { top, height } => self
-                .converse(ToChild::Band { top, height })
+            Job::Band { left, top, height } => self
+                .converse(ToChild::Band { left, top, height })
                 .map(|page| Answer::Rendered(Box::new(page))),
             Job::Find(query) => self.ask(&ToChild::Find { query }),
             Job::Accessibility => self.ask(&ToChild::Accessibility),

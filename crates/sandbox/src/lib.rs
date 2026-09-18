@@ -38,7 +38,7 @@ use std::io::{Read, Write};
 
 pub use access::{Node, Role, Tree};
 pub use confine::Confinement;
-pub use message::{Link, Missing, Mode, Rendered, Submission, ToChild, ToParent};
+pub use message::{Link, Missing, Mode, Picture, Rendered, Submission, ToChild, ToParent};
 pub use parent::{MAX_RESOURCES, Renderer, Session, Withheld};
 pub use wire::{MAX_FRAME, WireError};
 

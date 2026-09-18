@@ -157,9 +157,19 @@ impl Viewport {
         self.page.content_height
     }
 
+    /// Width of the content, which may exceed the canvas (#204).
+    pub fn content_width(&self) -> f32 {
+        self.page.content_width
+    }
+
     /// The document row the painted band starts at.
     pub fn band_top(&self) -> u32 {
         self.page.top
+    }
+
+    /// The document column the painted band starts at (#204).
+    pub fn band_left(&self) -> u32 {
+        self.page.left
     }
 
     /// How far the page can be scrolled, in document pixels.
@@ -175,12 +185,22 @@ impl Viewport {
         self.page.content_height.max(self.page.height as f32)
     }
 
+    /// How far the page can be scrolled sideways, in document pixels (#204).
+    ///
+    /// The counterpart of [`Viewport::scrollable_height`], and the same rule:
+    /// the content, or the canvas where the content is narrower than it. A page
+    /// that fits has nothing to the right of the window, and the `max` is what
+    /// says so rather than reporting a width smaller than the window itself.
+    pub fn scrollable_width(&self) -> f32 {
+        self.page.content_width.max(self.page.width as f32)
+    }
+
     /// Asks for the rows around `top` without waiting for them.
     ///
     /// The speculative half of scrolling a long page: the rows ahead of the
     /// reader are painted while the window carries on drawing the rows it has.
-    pub fn request_band(&mut self, top: u32, height: u32) -> Result<(), Error> {
-        self.session.request_band(top, height)
+    pub fn request_band(&mut self, left: u32, top: u32, height: u32) -> Result<(), Error> {
+        self.session.request_band(left, top, height)
     }
 
     /// Whether a band has been asked for and not yet arrived.
@@ -301,14 +321,14 @@ impl Viewport {
     /// This runs on every pointer move, and a round trip per mouse motion would
     /// be absurd — but it is also all the parent *can* do, since the box tree it
     /// would hit-test against is on the other side.
-    pub fn link_at(&self, x: f32, y: f32, scroll: f32) -> Option<&str> {
+    pub fn link_at(&self, x: f32, y: f32, scroll: (f32, f32)) -> Option<&str> {
         self.wire_link_at(x, y, scroll)
             .map(|link| link.url.as_str())
     }
 
     /// The same, with where on this page the link goes if it does not leave
     /// it — so a caller can tell a page to fetch from a place to scroll to.
-    pub fn target_at(&self, x: f32, y: f32, scroll: f32) -> Option<(&str, Option<f32>)> {
+    pub fn target_at(&self, x: f32, y: f32, scroll: (f32, f32)) -> Option<(&str, Option<f32>)> {
         self.wire_link_at(x, y, scroll)
             .map(|link| (link.url.as_str(), link.jump_to))
     }
@@ -332,6 +352,27 @@ impl Viewport {
             .map(|missing| missing.url.as_str())
     }
 
+    /// The picture at this point, and where it came from (#205).
+    ///
+    /// Every `<img>`, whether or not its picture arrived — a placeholder is
+    /// still something a reader can ask to save, and refusing to offer would be
+    /// the browser deciding on their behalf that a failed fetch cannot be
+    /// retried by other means.
+    ///
+    /// Topmost first, which is paint order: a picture drawn over another is the
+    /// one the pointer is on.
+    pub fn picture_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.page
+            .pictures
+            .iter()
+            .rev()
+            .find(|picture| {
+                let rect = picture.rect;
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|picture| picture.url.as_str())
+    }
+
     /// `y` is a document coordinate and `scroll` is how far the page has been
     /// scrolled, which is what turns it back into a window one for a link that
     /// does not move with the page.
@@ -340,11 +381,19 @@ impl Viewport {
     /// the box stays put, so adding the scroll to find it misses by however
     /// far the reader has come down the page. That is the difference between a
     /// fixed navigation bar and a fixed navigation bar you can click.
-    fn wire_link_at(&self, x: f32, y: f32, scroll: f32) -> Option<&sandbox::message::Link> {
+    fn wire_link_at(&self, x: f32, y: f32, scroll: (f32, f32)) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
         self.page.links.iter().rev().find(|link| {
             let rect = link.rect;
-            let y = if link.pinned { y - scroll } else { y };
+            // Both axes for a pinned link, because its rectangle is in window
+            // coordinates along both: a fixed sidebar on a page scrolled
+            // sideways stays where it is on screen, so a click on it arrives
+            // carrying a horizontal scroll the rectangle never had (#204).
+            let (x, y) = if link.pinned {
+                (x - scroll.0, y - scroll.1)
+            } else {
+                (x, y)
+            };
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
         })
     }
@@ -639,6 +688,51 @@ mod tests {
         // and therefore document order.
         assert_eq!(grouped[0].url, "https://example.com/third");
         assert_eq!(grouped[1].url, "https://example.com/first");
+    }
+
+    /// The pinned-link hit test alone, without a child process: a link's
+    /// rectangle, the scroll, and whether the point lands on it.
+    fn hits(link: &WireLink, x: f32, y: f32, scroll: (f32, f32)) -> bool {
+        let rect = link.rect;
+        let (x, y) = if link.pinned {
+            (x - scroll.0, y - scroll.1)
+        } else {
+            (x, y)
+        };
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    }
+
+    #[test]
+    fn a_fixed_link_is_found_at_the_same_place_however_the_page_has_scrolled() {
+        // #108 along both axes (#204). A pinned link's rectangle is in window
+        // coordinates, and a point arrives in the document's — so both offsets
+        // have to come back off it, or a fixed sidebar on a page scrolled
+        // sideways stays on screen and stops being clickable.
+        let mut link = wire(0, "https://example.com/", 0.0);
+        link.pinned = true;
+        link.rect = rect(10.0, 10.0, 40.0, 20.0);
+
+        // Nothing scrolled: the point is where it is drawn.
+        assert!(hits(&link, 20.0, 20.0, (0.0, 0.0)));
+        // Scrolled 500 across and 300 down, the pointer is over the same screen
+        // pixel — which is 500 and 300 further into the document.
+        assert!(hits(&link, 520.0, 320.0, (500.0, 300.0)));
+        // And the document coordinates it was at before are now somewhere else
+        // on the screen, so they are not a hit any more.
+        assert!(!hits(&link, 20.0, 20.0, (500.0, 300.0)));
+    }
+
+    #[test]
+    fn an_ordinary_link_ignores_the_scroll_because_the_point_already_carries_it() {
+        let link = {
+            let mut link = wire(0, "https://example.com/", 0.0);
+            link.rect = rect(600.0, 400.0, 40.0, 20.0);
+            link
+        };
+        // The caller turned the pointer into a document point before asking, so
+        // the scroll must not be subtracted a second time.
+        assert!(hits(&link, 610.0, 410.0, (500.0, 300.0)));
+        assert!(!hits(&link, 110.0, 110.0, (500.0, 300.0)));
     }
 
     #[test]

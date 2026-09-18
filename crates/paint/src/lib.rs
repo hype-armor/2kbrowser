@@ -1133,24 +1133,31 @@ pub fn rasterise(
     width: u32,
     height: u32,
 ) -> Option<Pixmap> {
-    rasterise_band(list, fonts, images, width, 0.0, height)
+    rasterise_band(list, fonts, images, width, 0.0, 0.0, height)
 }
 
-/// Rasterises the rows `[top, top + height)` of a document.
+/// Rasterises the rows `[top, top + height)` of a document, starting `left`
+/// pixels in from its left edge.
 ///
 /// The display list is in document coordinates and does not change between
 /// bands — it is built once from the layout, and drawing a band is a matter of
 /// where the rows are taken from. That is what makes a band cheap: no parse, no
 /// cascade, no layout, just paint.
 ///
-/// Items are shifted by `top` as they are drawn rather than the list being
-/// rewritten, so nothing is allocated per band and the drawable-range check
-/// still sees the coordinate that actually reaches the rasteriser.
+/// Items are shifted by `left` and `top` as they are drawn rather than the list
+/// being rewritten, so nothing is allocated per band and the drawable-range
+/// check still sees the coordinate that actually reaches the rasteriser.
+///
+/// `left` is how a page wider than its window is read (#204). The two axes are
+/// the same operation and deliberately share one: a band is a rectangle of the
+/// document, and there was never a reason beyond habit for its horizontal edge
+/// to be fixed at zero.
 pub fn rasterise_band(
     list: &DisplayList,
     fonts: &mut FontStore,
     images: &ImageStore,
     width: u32,
+    left: f32,
     top: f32,
     height: u32,
 ) -> Option<Pixmap> {
@@ -1173,18 +1180,18 @@ pub fn rasterise_band(
         let full = Rect {
             x: 0.0,
             y: 0.0,
-            width: pixmap.width() as f32,
+            width: left + pixmap.width() as f32,
             height: top + pixmap.height() as f32,
         };
         let anchor = anchor_of(&area, position, image);
         if let Some(slice) = banded(&full, top, pixmap.height() as f32) {
-            let slice = shifted(&slice, top);
+            let slice = shifted(&slice, left, top);
             if drawable(&slice) {
                 tile_image(
                     &mut pixmap,
                     image,
                     &slice,
-                    (anchor.0, anchor.1 - top),
+                    (anchor.0 - left, anchor.1 - top),
                     repeat,
                 );
             }
@@ -1195,19 +1202,28 @@ pub fn rasterise_band(
     // their coordinates are already the window's, which is the whole of what
     // `position: fixed` means once the containing block is the viewport (#108).
     for (at, item) in list.items.iter().enumerate() {
-        let shift = if list.is_pinned(at) { 0.0 } else { top };
+        // A pinned item is not shifted along *either* axis. Its coordinates are
+        // the window's, and a fixed sidebar that slid away when the reader
+        // scrolled sideways would be no more fixed than one that slid away when
+        // they scrolled down (#108, #204).
+        let (dx, dy) = if list.is_pinned(at) {
+            (0.0, 0.0)
+        } else {
+            (left, top)
+        };
         draw_items(
             &mut pixmap,
             fonts,
             images,
             std::slice::from_ref(item),
-            shift,
+            dx,
+            dy,
         );
     }
     Some(pixmap)
 }
 
-/// Draws a run of display items into a band, shifting them up by `top`.
+/// Draws a run of display items into a band, shifting them by `left` and `top`.
 ///
 /// Called twice: once for the page's own items, and once for the pinned ones
 /// with a shift of zero. That second call is the whole of `position: fixed`'s
@@ -1218,6 +1234,7 @@ fn draw_items(
     fonts: &mut FontStore,
     images: &ImageStore,
     items: &[DisplayItem],
+    left: f32,
     top: f32,
 ) {
     for item in items {
@@ -1226,13 +1243,13 @@ fn draw_items(
         // place the check has to be.
         match item {
             DisplayItem::Rect { rect, color } => {
-                let rect = shifted(rect, top);
+                let rect = shifted(rect, left, top);
                 if drawable(&rect) {
                     fill_rect(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Ellipse { rect, color } => {
-                let rect = shifted(rect, top);
+                let rect = shifted(rect, left, top);
                 if drawable(&rect) {
                     fill_ellipse(pixmap, &rect, *color);
                 }
@@ -1242,7 +1259,7 @@ fn draw_items(
                 rect,
                 placeholder,
             } => {
-                let rect = shifted(rect, top);
+                let rect = shifted(rect, left, top);
                 if drawable(&rect) {
                     match images.get(&ImageKey::content(*node)) {
                         Some(image) => draw_image(pixmap, image, &rect),
@@ -1264,9 +1281,15 @@ fn draw_items(
                     // coordinates and is then shifted with everything else, so
                     // a band draws the tiles a whole-page render would have.
                     let anchor = anchor_of(rect, *position, image);
-                    let slice = shifted(&slice, top);
+                    let slice = shifted(&slice, left, top);
                     if drawable(&slice) {
-                        tile_image(pixmap, image, &slice, (anchor.0, anchor.1 - top), *repeat);
+                        tile_image(
+                            pixmap,
+                            image,
+                            &slice,
+                            (anchor.0 - left, anchor.1 - top),
+                            *repeat,
+                        );
                     }
                 }
             }
@@ -1276,9 +1299,10 @@ fn draw_items(
                 origin_y,
                 color,
             } => {
+                let origin_x = *origin_x - left;
                 let origin_y = *origin_y - top;
-                if in_range(*origin_x) && in_range(origin_y) {
-                    draw_glyph(pixmap, fonts, glyph, *origin_x, origin_y, *color);
+                if in_range(origin_x) && in_range(origin_y) {
+                    draw_glyph(pixmap, fonts, glyph, origin_x, origin_y, *color);
                 }
             }
         }
@@ -1286,11 +1310,55 @@ fn draw_items(
 }
 
 /// The same rectangle, moved into a band's coordinates.
-fn shifted(rect: &Rect, top: f32) -> Rect {
+fn shifted(rect: &Rect, left: f32, top: f32) -> Rect {
     Rect {
+        x: rect.x - left,
         y: rect.y - top,
         ..*rect
     }
+}
+
+/// How far to the right the document's painted content reaches.
+///
+/// The scrollable width, answered from the display list because that is the one
+/// place every drawn thing passes through — a box, a picture, a tile and a
+/// glyph all end up here, and anything that does not is by definition not on
+/// the screen to be scrolled to.
+///
+/// Pinned items are left out. Their coordinates are the window's rather than
+/// the document's (#108), so a `position: fixed` bar the width of the viewport
+/// would otherwise claim to be content sitting at whatever the reader had
+/// already scrolled to.
+///
+/// Clamped to the drawable range: a page can name a coordinate far outside it,
+/// and `draw_items` already declines to draw one. A scroll range that ran to
+/// 10^9 would be a scrollbar with no thumb and a document that never ends.
+pub fn content_width(list: &DisplayList) -> f32 {
+    let mut widest: f32 = 0.0;
+    for (at, item) in list.items.iter().enumerate() {
+        if list.is_pinned(at) {
+            continue;
+        }
+        let right = match item {
+            DisplayItem::Rect { rect, .. }
+            | DisplayItem::Ellipse { rect, .. }
+            | DisplayItem::Image { rect, .. }
+            | DisplayItem::Tile { rect, .. } => rect.x + rect.width,
+            // A glyph is positioned within its run and then advances, and
+            // neither offset is in the run's rectangle: a line of `<pre>` runs
+            // past the box holding it, which is exactly the case #204 is about.
+            DisplayItem::Glyph {
+                glyph, origin_x, ..
+            } => origin_x + glyph.x + glyph.advance,
+        };
+        // `>` rather than `max`: a NaN coordinate fails the comparison and is
+        // skipped, where `max` would carry it out of here and into a scroll
+        // range nothing could clamp.
+        if right > widest {
+            widest = right;
+        }
+    }
+    widest.clamp(0.0, MAX_COORD)
 }
 
 /// The rows of a rectangle a band can see, still in document coordinates.
@@ -2205,9 +2273,16 @@ mod tests {
         for band_height in [7u32, 16, 23] {
             let mut top = 0u32;
             while top < height {
-                let band =
-                    rasterise_band(&list, &mut fonts, &images, width, top as f32, band_height)
-                        .expect("band");
+                let band = rasterise_band(
+                    &list,
+                    &mut fonts,
+                    &images,
+                    width,
+                    0.0,
+                    top as f32,
+                    band_height,
+                )
+                .expect("band");
                 for row in 0..band_height {
                     let document_row = top + row;
                     if document_row >= height {
@@ -2226,6 +2301,122 @@ mod tests {
                 top += band_height;
             }
         }
+    }
+
+    #[test]
+    fn a_band_is_exactly_the_columns_it_names_from_the_whole_page() {
+        // The same property, sideways (#204). It is the one horizontal
+        // scrolling rests on: the reader moving right must see the columns they
+        // would have seen from a canvas wide enough to hold the whole page, or
+        // scrolling is a rendering change in disguise.
+        //
+        // Checked against a *wide* canvas rather than the window-sized one,
+        // because the whole point is that the page is wider than the window —
+        // there is no other way to have the right answer to compare with.
+        let html = "<body><div class=wide><p>one two three four five six seven</p>\
+             <pre>a line of fixed width output that runs well past any window</pre>\
+             <p>eight nine ten</p></div></body>";
+        let css_text = "body { background: #eef; margin: 0 }
+             .wide { width: 700px; border: 3px solid #333; padding: 7px }
+             pre { margin: 0 }";
+        let window = 120;
+        let whole_width = 760;
+
+        // Laid out once, at the window's width — which is what actually
+        // happens: the page overflows the viewport rather than being laid out
+        // for a wider one.
+        let (list, mut fonts, height) = scene(html, css_text, window);
+        assert!(
+            content_width(&list) > window as f32 * 2.0,
+            "the fixture does not overflow its window: {}",
+            content_width(&list)
+        );
+        let images = ImageStore::new();
+        let whole =
+            rasterise_band(&list, &mut fonts, &images, whole_width, 0.0, 0.0, height).expect("all");
+
+        for left in [0u32, 1, 60, 119, 300, 640] {
+            let band = rasterise_band(&list, &mut fonts, &images, window, left as f32, 0.0, height)
+                .expect("band");
+            for row in 0..height {
+                for column in 0..window {
+                    let document_column = left + column;
+                    if document_column >= whole_width {
+                        break;
+                    }
+                    let from_band = band.pixels()[(row * window + column) as usize];
+                    let from_whole = whole.pixels()[(row * whole_width + document_column) as usize];
+                    assert_eq!(
+                        from_band, from_whole,
+                        "band at {left}: row {row} column {column} is not document column \
+                         {document_column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_content_width_reaches_the_furthest_thing_drawn() {
+        let list = DisplayList {
+            canvas: Color::rgb(0xff, 0xff, 0xff),
+            canvas_image: None,
+            items: vec![
+                DisplayItem::Rect {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 10.0,
+                    },
+                    color: Color::rgb(0, 0, 0),
+                },
+                DisplayItem::Rect {
+                    rect: Rect {
+                        x: 400.0,
+                        y: 0.0,
+                        width: 250.0,
+                        height: 10.0,
+                    },
+                    color: Color::rgb(0, 0, 0),
+                },
+            ],
+            pinned: Vec::new(),
+        };
+        assert_eq!(content_width(&list), 650.0);
+    }
+
+    #[test]
+    fn a_fixed_box_is_not_something_to_scroll_to() {
+        // A `position: fixed` item's coordinates are the window's, not the
+        // document's (#108). Counting one as content would give every page with
+        // a fixed bar a scroll range it does not have — and the range would
+        // move as the reader scrolled, which is not a thing a document does.
+        let bar = DisplayItem::Rect {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 900.0,
+                height: 10.0,
+            },
+            color: Color::rgb(0, 0, 0),
+        };
+        let text = DisplayItem::Rect {
+            rect: Rect {
+                x: 0.0,
+                y: 20.0,
+                width: 300.0,
+                height: 10.0,
+            },
+            color: Color::rgb(0, 0, 0),
+        };
+        let list = DisplayList {
+            canvas: Color::rgb(0xff, 0xff, 0xff),
+            canvas_image: None,
+            items: vec![bar, text],
+            pinned: vec![(0, 1)],
+        };
+        assert_eq!(content_width(&list), 300.0, "the fixed bar was counted");
     }
 
     fn count_non_white(pixmap: &Pixmap) -> usize {
@@ -3053,7 +3244,7 @@ mod tile_tests {
             tile_image(
                 &mut band,
                 &tile,
-                &shifted(&slice, top),
+                &shifted(&slice, 0.0, top),
                 (anchor.0, anchor.1 - top),
                 BackgroundRepeat::Repeat,
             );

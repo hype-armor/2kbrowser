@@ -413,18 +413,22 @@ fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
     let links = page.links();
     let rect = links[0].rects[0];
 
-    let hit = page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0, 0.0);
+    let hit = page.link_at(
+        rect.x + rect.width / 2.0,
+        rect.y + rect.height / 2.0,
+        (0.0, 0.0),
+    );
     assert!(
         hit.is_some_and(|url| url.ends_with("/there.html")),
         "{hit:?}"
     );
 
     assert_eq!(
-        page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0, 0.0),
+        page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0, (0.0, 0.0)),
         None
     );
     assert_eq!(
-        page.link_at(rect.x, rect.y + rect.height + 200.0, 0.0),
+        page.link_at(rect.x, rect.y + rect.height + 200.0, (0.0, 0.0)),
         None
     );
 }
@@ -1322,7 +1326,7 @@ fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
 
     // And the last rows of the document are reachable.
     let last = page.content_height() as u32 - 100;
-    page.request_band(last, 300).expect("asks");
+    page.request_band(0, last, 300).expect("asks");
     let arrived = loop {
         if page.accept_band() {
             break true;
@@ -1505,7 +1509,9 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
         (400, 250),
         (whole.height - 30, 90),
     ] {
-        let band = session.band(top, height).expect("the child paints a band");
+        let band = session
+            .band(0, top, height)
+            .expect("the child paints a band");
         assert_eq!(band.top, top);
         assert_eq!(band.width, whole.width);
         // Clipped to what the document has below `top`, exactly as a first
@@ -1528,7 +1534,7 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
     // A band is pixels, not a re-render: what the parent knows about the page
     // must survive one. A band that blanked the title or the links would empty
     // the tab strip and every keyboard target on the page.
-    let band = session.band(0, 100).expect("paints");
+    let band = session.band(0, 0, 100).expect("paints");
     assert_eq!(band.links.len(), whole.links.len());
     assert_eq!(band.title, whole.title);
     assert_eq!(band.can_toggle_layout, whole.can_toggle_layout);
@@ -1564,6 +1570,101 @@ fn tall_session(lines: usize, width: u32) -> (sandbox::Session, sandbox::Rendere
         .expect("the renderer opens the page")
 }
 
+/// A page wider than any window, in a live session (#204).
+fn wide_session(width: u32) -> (sandbox::Session, sandbox::Rendered) {
+    // A fixed-size box four times the viewport, with something drawn at its far
+    // end so that a band over there has ink in it rather than canvas.
+    let html = "<body bgcolor=\"#eef\"><div style=\"width: 1200px\">\
+         <div style=\"width: 200px; height: 40px; background: #f00; \
+         margin-left: 980px\"></div>\
+         <p>left edge</p></div></body>"
+        .to_owned();
+    let dir = std::env::temp_dir().join("2kbrowser-band-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("wide.html");
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")))
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            width,
+            0,
+            8000,
+            Some(origin),
+            at,
+            false,
+            false,
+            1.0,
+        )
+        .expect("the renderer opens the page")
+}
+
+#[test]
+fn a_page_wider_than_the_window_says_so_and_can_be_painted_from_the_right() {
+    // #204 end to end, across the real process boundary: the child has to
+    // report a width beyond its canvas, and answer a band asked for at a
+    // column other than zero.
+    let window = 300;
+    let (mut session, whole) = wide_session(window);
+    assert_eq!(whole.left, 0, "a page opens at its left edge");
+    assert_eq!(
+        whole.width, window,
+        "the canvas is still the window's width"
+    );
+    assert!(
+        whole.content_width > window as f32 * 3.0,
+        "a 1200px box in a {window}px window reported {} of content",
+        whole.content_width
+    );
+
+    // The fixture puts a red box at 980..1180, which no part of the window's
+    // first 300 columns can show. Counting its ink is what says the band came
+    // from where it was asked for — comparing two bands for mere inequality
+    // would pass on their lengths differing and prove nothing. Red rather than
+    // a dark grey because the page's own text is ink too, and counting that
+    // would have found a hundred and fifty pixels of "left edge".
+    let red = |band: &sandbox::Rendered| {
+        band.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[0] > 0xc0 && pixel[1] < 0x50 && pixel[2] < 0x50)
+            .count()
+    };
+
+    let near = session
+        .band(0, 0, 120)
+        .expect("paints the left of the page");
+    assert_eq!(red(&near), 0, "the red box is not in the first window");
+
+    let far = session
+        .band(900, 0, 120)
+        .expect("the child paints a band from the right of the page");
+    assert_eq!(far.left, 900);
+    assert_eq!(
+        far.width, window,
+        "a band is the window's width wherever it is"
+    );
+    assert_eq!(
+        far.content_width, whole.content_width,
+        "moving across the page changed how wide it is"
+    );
+    // 200 wide and 40 tall, of which columns 980..1180 fall inside the window
+    // at 900..1200 — all 200 of them.
+    assert!(
+        red(&far) > 200 * 30,
+        "a band at 900 found {} red pixels, so it painted the wrong columns",
+        red(&far)
+    );
+
+    // And going back is the page as it was. The display list does not change
+    // between bands, so this must be exact rather than merely similar.
+    let back = session.band(0, 0, 120).expect("paints");
+    assert_eq!(back.pixels, near.pixels);
+}
+
 #[test]
 fn a_band_asked_for_speculatively_arrives_without_being_waited_on() {
     // The point of putting the conversation on a thread. A reader approaching
@@ -1578,7 +1679,7 @@ fn a_band_asked_for_speculatively_arrives_without_being_waited_on() {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
 
-    session.request_band(200, 150).expect("asks");
+    session.request_band(0, 200, 150).expect("asks");
     assert!(session.band_outstanding(), "the band should be in flight");
 
     let band = loop {
@@ -1615,7 +1716,7 @@ fn a_blocking_question_does_not_swallow_a_band_in_flight() {
     // which is not a rare combination.
     let (mut session, _) = tall_session(120, 300);
 
-    session.request_band(300, 120).expect("asks for a band");
+    session.request_band(0, 300, 120).expect("asks for a band");
     let matches = session.find("line 7").expect("the child answers");
     assert!(!matches.is_empty(), "the fixture should contain the query");
 
@@ -1879,6 +1980,74 @@ fn an_image_that_loaded_leaves_no_placeholder() {
     );
 }
 
+#[test]
+fn a_picture_that_loaded_can_still_be_pointed_at() {
+    // #205, end to end. The window has no box tree — it is on the other side of
+    // the boundary — so a picture missing from the list the child sends is a
+    // picture the right-hand button has nothing to say about. The placeholder
+    // list is no help here by design: this picture arrived, so it is not in it.
+    let dir = std::env::temp_dir().join("2kbrowser-picture-menu");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("dot.png"), solid_png(40, 40, (0, 0x80, 0))).expect("write");
+    let path = dir.join("page.html");
+    let html = "<body style=\"margin: 0\"><img src=\"dot.png\"></body>";
+    std::fs::write(&path, html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+    let expected = net::file_url(&dir.join("dot.png"));
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        400,
+        400,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens");
+
+    assert_eq!(page.images_loaded(), 1, "the image was never fetched");
+    assert_eq!(
+        page.missing_at(20.0, 20.0),
+        None,
+        "a picture that arrived is not a placeholder"
+    );
+    assert_eq!(
+        page.picture_at(20.0, 20.0),
+        Some(expected.as_str()),
+        "a picture that arrived could not be pointed at, so the menu has \
+         nothing to offer over it"
+    );
+    assert_eq!(
+        page.picture_at(1000.0, 1000.0),
+        None,
+        "a point nowhere near the picture answered anyway"
+    );
+}
+
+#[test]
+fn a_picture_that_was_refused_can_be_pointed_at_too() {
+    // A placeholder is still something a reader can ask to save. Refusing to
+    // offer would be the browser deciding on their behalf that a fetch the
+    // policy stopped cannot be asked for by other means (ADR-0006).
+    let page = viewport(
+        "<body><img src=\"https://cdn.example.net/photo.jpg\" width=\"240\" \
+         height=\"160\"></body>",
+        400,
+    );
+    assert_eq!(
+        page.picture_at(20.0, 20.0),
+        Some("https://cdn.example.net/photo.jpg")
+    );
+}
+
 /// A cheap digest of a page's pixels.
 ///
 /// Compared instead of the buffers themselves because a failed comparison of
@@ -2041,7 +2210,7 @@ fn typing_repaints_the_rows_the_reader_is_looking_at() {
     assert_eq!(page.band_top(), 0);
 
     // Down the page, the way scrolling does it.
-    page.request_band(800, 400).expect("asks for a band");
+    page.request_band(0, 800, 400).expect("asks for a band");
     while !page.accept_band() {
         std::thread::yield_now();
     }
