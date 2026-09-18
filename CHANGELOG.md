@@ -16,6 +16,47 @@ record for everything earlier.
 
 ## Unreleased
 
+**Half of layout was hashing a cache key** (#207). The report said "lots of
+hanging ui issues" and named nothing, which is the most honest form a
+performance report takes and the least actionable — so the first thing built for
+it was not a fix but a way to find out: `tests/timings` measures every operation
+the event loop performs *synchronously*, because the window is a single thread
+and anything it waits for is a frame it does not draw. What an operation costs
+there is how long the browser is frozen for when a reader asks for it.
+
+The answer was that a keystroke on a long page cost 138 ms. Typing into a form
+re-renders the whole page in the child — parse, cascade, layout, paint — and of
+that, layout was 85 ms and everything else together was 30. Inside layout, text
+was all of it: the same page with its text removed laid out in 1.4 ms.
+
+That pointed at the shaping cache, which turned out to be working perfectly and
+to be the problem anyway. It was keyed on `(AttrsOwned, String)` — a dozen-field
+struct and an owned copy of the word — so every word of the page allocated a
+`String` to look itself up and hashed the whole struct to do it, twice, since
+the face metrics are keyed the same way. A profile of a warm re-layout put
+**38% of every instruction in SipHash's `write`** and another 10% in building,
+hashing and comparing the struct around it. Sixty thousand words of prose was
+sixty thousand hashes of the same handful of styles.
+
+So the attributes are interned. The struct is hashed once per *style* rather
+than once per word, the per-word caches are keyed on the number that comes back,
+and a short list of recently-seen attribute sets — compared rather than hashed —
+means even that is rare within a paragraph. The segment lookup takes a `&str`
+and allocates nothing.
+
+Layout of a 2,000-paragraph page went from 122 ms to 60 ms, and the profile went
+from one dominant cost to flat. The property that makes any of this safe is the
+one ADR-0005 already demands: identical input must produce identical output, so
+a cache can change how long a page takes and cannot change how it looks — and
+the reference tests compare rendered pages against baselines byte for byte,
+which is what would catch a cache that returned the wrong glyphs.
+
+What is *not* fixed is the shape of the thing: a keystroke still re-lays-out the
+whole document, which is O(page) however fast each word is. And the harness
+surfaced something larger that this change does not touch — a navigation runs
+its network fetch on the event-loop thread, so clicking a link freezes the
+window for the whole round trip. Both are recorded in #207 rather than claimed.
+
 **A page wider than its window can be read** (#204). Scrolling had one axis.
 Anything that overflowed the viewport sideways — a scanned page, a large
 photograph opened by its own address, a block of fixed-width output, a table

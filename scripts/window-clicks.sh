@@ -72,6 +72,20 @@ fail() {
     exit 1
 }
 
+# Why the script died, when it died without being asked to.
+#
+# `set -e` kills this script the moment any unchecked command returns non-zero,
+# and it does so in total silence: the step goes red, the last thing printed is
+# whichever check passed before it, and there is nothing at all to say what
+# happened next. That has now cost two debugging sessions — once on #202, where
+# it was written off as a flake, and once on #205, where a check that passed
+# locally died on CI between two known-good points with no message.
+#
+# One line, so a silent death names the line and the command. It does not
+# replace `fail`: a check that *decides* something is wrong still says so in its
+# own words, and this is only for the commands nobody thought could fail.
+trap 'status=$?; echo "FAIL: line $LINENO: \`$BASH_COMMAND\` exited $status" >&2' ERR
+
 [ -x "$browser" ] || fail "build it first: cargo build --release"
 for tool in Xvfb xdotool xwd python3; do
     command -v "$tool" >/dev/null || fail "$tool is not installed"
@@ -1607,6 +1621,8 @@ open(sys.argv[1], "wb").write(
     + chunk(b"IEND", b"")
 )
 PNG
+[ -s "$pictures/green.png" ] || fail "the fixture picture was not written, so \
+there is nothing on the page to point at"
 cat > "$pictures/p.html" <<'FIXTURE'
 <!doctype html>
 <title>Picture</title>

@@ -831,14 +831,59 @@ pub struct FontStore {
     /// looks. The reference tests are what hold that — they compare rendered
     /// pages against baselines byte for byte, so a cache that returned the
     /// wrong glyphs would fail them rather than pass quietly.
-    shaped: std::collections::HashMap<(AttrsOwned, String), Shaped>,
+    /// Indexed by the attribute slot the segment was shaped under; see
+    /// [`FontStore::slot_for`].
+    shaped: Vec<std::collections::HashMap<String, Shaped>>,
     /// What `line-height: normal` comes to for a set of attributes, per em.
     ///
     /// Asked once per line of every page and answered from a face's metrics,
-    /// which means finding the face — so it is cached by the attributes rather
-    /// than by the size, and multiplied by the size on the way out.
-    face_metrics: std::collections::HashMap<AttrsOwned, FaceMetrics>,
+    /// which means finding the face — so it is kept by the attributes rather
+    /// than by the size, and multiplied by the size on the way out. Indexed by
+    /// the same slots the shaping cache is.
+    face_metrics: Vec<Option<FaceMetrics>>,
+    /// The attribute sets this page has used, and what each interned to.
+    ///
+    /// Hashing the attributes was half of layout (#207). `AttrsOwned` is a
+    /// dozen fields wide and was being hashed once per *word* — twice, since
+    /// the metrics above are keyed the same way — and a profile of a warm
+    /// re-layout put 38% of every instruction in SipHash's `write` and another
+    /// 10% in building, hashing and comparing the struct around it. Sixty
+    /// thousand words of prose is sixty thousand hashes of the same handful of
+    /// styles.
+    ///
+    /// So the struct is hashed once per style rather than once per word, and
+    /// what the per-word caches are keyed on is a number. `recent` below is
+    /// what makes even that rare.
+    slots: std::collections::HashMap<AttrsOwned, usize>,
+    /// The last few attribute sets asked for, found by comparing rather than
+    /// by hashing.
+    ///
+    /// A run of words in a paragraph shares one style, and the two callers
+    /// interleave — a line asks for its face metrics at the font size and its
+    /// segments at the line height, which are two different sets — so a single
+    /// memo would thrash between them and a handful does not. Scanned linearly,
+    /// because comparing four structs is still far less work than hashing one.
+    ///
+    /// Not reordered on a hit. Keeping the most recent one first sounds free
+    /// and is not: `AttrsOwned` is a wide struct, and moving one to the front
+    /// of this cost 3.5% of layout in a profile — more than scanning past it
+    /// three times ever saves.
+    recent: Vec<(AttrsOwned, usize)>,
+    /// How many segments are held across every slot.
+    ///
+    /// Counted rather than asked of the maps, because the ceiling below is
+    /// about the memory one store holds and the slots divide that up rather
+    /// than each getting their own allowance. A page with twenty styles must
+    /// not be allowed twenty times the cache.
+    shaped_total: usize,
 }
+
+/// How many attribute sets [`FontStore::recent`] remembers.
+///
+/// Small on purpose: it is scanned linearly, and a page that really uses more
+/// styles than this still gets the interning map behind it. Four covers the two
+/// callers at two styles, which is a paragraph with a bold word in it.
+const RECENT_ATTRS: usize = 4;
 
 impl Default for FontStore {
     fn default() -> Self {
@@ -874,8 +919,11 @@ impl FontStore {
         Self {
             system,
             cache: SwashCache::new(),
-            shaped: std::collections::HashMap::new(),
-            face_metrics: std::collections::HashMap::new(),
+            shaped: Vec::new(),
+            face_metrics: Vec::new(),
+            slots: std::collections::HashMap::new(),
+            recent: Vec::new(),
+            shaped_total: 0,
         }
     }
 
@@ -901,6 +949,71 @@ impl FontStore {
     /// make the render target dramatically slower to no purpose.
     pub fn forget_page(&mut self) {
         self.shaped.clear();
+        self.face_metrics.clear();
+        self.slots.clear();
+        self.recent.clear();
+        self.shaped_total = 0;
+    }
+
+    /// How many segments are remembered, across every attribute slot.
+    ///
+    /// For the tests that hold the cache's two properties — that it is used,
+    /// and that it is bounded — which used to read the map's length directly
+    /// and cannot now that there is a map per style.
+    #[cfg(test)]
+    fn remembered(&self) -> usize {
+        self.shaped_total
+    }
+
+    /// Replaces what is remembered for `text`, wherever it is kept.
+    ///
+    /// Only for the test that proves the lookup happens at all: a correct cache
+    /// is invisible in its output, so the only way to see it is to put
+    /// something the shaper could never have produced where the answer lives.
+    #[cfg(test)]
+    fn poison(&mut self, text: &str, with: Shaped) -> bool {
+        self.shaped
+            .iter_mut()
+            .find(|slot| slot.contains_key(text))
+            .map(|slot| slot.insert(text.to_owned(), with))
+            .is_some()
+    }
+
+    /// The slot a set of attributes interns to, creating one if it is new.
+    ///
+    /// The whole of #207's first fix. Everything per-word is keyed on the
+    /// number this returns rather than on the attributes themselves, and this
+    /// is reached by comparison rather than by hashing for as long as the text
+    /// keeps the same style — which, within a paragraph, it does.
+    ///
+    /// Interned on `AttrsOwned` and not on a list of the properties that
+    /// matter, for the reason the key always was: `AttrsOwned` carries exactly
+    /// what `Attrs` carries, so a property added to `attrs_for` is in the key
+    /// by construction rather than by somebody remembering.
+    fn slot_for(&mut self, attrs: &Attrs<'_>) -> usize {
+        if let Some((_, slot)) = self
+            .recent
+            .iter()
+            .find(|(known, _)| known.as_attrs() == *attrs)
+        {
+            return *slot;
+        }
+        let owned = AttrsOwned::new(attrs);
+        let next = self.slots.len();
+        let slot = *self.slots.entry(owned.clone()).or_insert(next);
+        if slot == self.shaped.len() {
+            self.shaped.push(std::collections::HashMap::new());
+            self.face_metrics.push(None);
+        }
+        // Oldest out. A page that cycles through more styles than this fits
+        // still gets the right answer from the map above; it just pays the hash
+        // for it, which is what this exists to avoid and not what it exists to
+        // guarantee.
+        if self.recent.len() == RECENT_ATTRS {
+            self.recent.remove(0);
+        }
+        self.recent.push((owned, slot));
+        slot
     }
 
     /// Number of loaded faces. Twelve for the M1 bundle.
@@ -1000,12 +1113,12 @@ impl FontStore {
         if !(style.font_size.is_finite() && style.font_size > 0.0) {
             return FaceMetrics::FALLBACK;
         }
-        let key = AttrsOwned::new(&Self::attrs_for(style, style.font_size));
-        if let Some(found) = self.face_metrics.get(&key) {
-            return *found;
+        let slot = self.slot_for(&Self::attrs_for(style, style.font_size));
+        if let Some(found) = self.face_metrics[slot] {
+            return found;
         }
         let measured = self.measure_face(style).unwrap_or(FaceMetrics::FALLBACK);
-        self.face_metrics.insert(key, measured);
+        self.face_metrics[slot] = Some(measured);
         measured
     }
 
@@ -1258,8 +1371,11 @@ impl FontStore {
         // for one, so a zero size and a nearly-zero one share a key and mean
         // different things. Only shaped text is ever stored or looked up here,
         // and the zero-size path never reaches this.
-        let key = (AttrsOwned::new(&attrs), text.to_owned());
-        if let Some(shaped) = self.shaped.get(&key) {
+        let slot = self.slot_for(&attrs);
+        // Looked up by `&str` rather than by an owned key, which is the other
+        // half of #207: the old key allocated a `String` on every lookup, hit
+        // or miss, once per word of the page.
+        if let Some(shaped) = self.shaped[slot].get(text) {
             return shaped.clone();
         }
 
@@ -1303,8 +1419,12 @@ impl FontStore {
         // Full means stop rather than evict, as elsewhere: within one page's
         // life there is no access pattern worth modelling, and what stopping
         // costs is the speed this exists for rather than correctness.
-        if self.shaped.len() < MAX_SHAPED {
-            self.shaped.insert(key, shaped.clone());
+        if self.shaped_total < MAX_SHAPED
+            && self.shaped[slot]
+                .insert(text.to_owned(), shaped.clone())
+                .is_none()
+        {
+            self.shaped_total += 1;
         }
         shaped
     }
@@ -2888,17 +3008,108 @@ mod tests {
             let _ = store.shape_segment(&format!("segment number {n}"), &style(16.0));
         }
         // Saturated: a segment never seen before cannot get in.
-        assert_eq!(store.shaped.len(), MAX_SHAPED);
+        assert_eq!(store.remembered(), MAX_SHAPED);
         let _ = store.shape_segment("a stranger", &style(16.0));
-        assert_eq!(store.shaped.len(), MAX_SHAPED, "it evicted after all");
+        assert_eq!(store.remembered(), MAX_SHAPED, "it evicted after all");
 
         store.forget_page();
-        assert!(
-            store.shaped.is_empty(),
-            "the cache survived being forgotten"
-        );
+        assert_eq!(store.remembered(), 0, "the cache survived being forgotten");
         let _ = store.shape_segment("a stranger", &style(16.0));
-        assert_eq!(store.shaped.len(), 1, "it still cannot cache anything");
+        assert_eq!(store.remembered(), 1, "it still cannot cache anything");
+    }
+
+    #[test]
+    fn two_styles_never_share_a_slot() {
+        // The property the whole of #207's fix rests on. Segments are now kept
+        // per attribute *slot*, and a slot is found by comparing `Attrs` rather
+        // than by hashing `AttrsOwned` — so if that comparison were blind to
+        // any property, two styles would share a cache and a page would be
+        // drawn with another style's glyphs. That is a failure no output
+        // comparison would catch on a page that only uses one of them.
+        //
+        // Every property `attrs_for` puts into the key gets a row. A property
+        // added there without one here is the gap this is guarding.
+        let plain = style(16.0);
+        let mut differing = Vec::new();
+
+        let mut size = plain.clone();
+        size.font_size = 24.0;
+        differing.push(("font size", size));
+
+        let mut spacing = plain.clone();
+        spacing.letter_spacing = 3.0;
+        differing.push(("letter spacing", spacing));
+
+        let mut weight = plain.clone();
+        weight.font_weight = 700;
+        differing.push(("weight", weight));
+
+        let mut slant = plain.clone();
+        slant.font_style = FontStyle::Italic;
+        differing.push(("slant", slant));
+
+        let mut colour = plain.clone();
+        colour.color = css::Color::rgb(0xff, 0, 0);
+        differing.push(("colour", colour));
+
+        let mut height = plain.clone();
+        height.line_height = LineHeight::Px(40.0);
+        differing.push(("line height", height));
+
+        let mut family = plain.clone();
+        family.font_family.families = vec!["courier".to_owned()];
+        differing.push(("family", family));
+
+        for (what, other) in differing {
+            let mut fonts = FontStore::new();
+            let first = fonts.shape_segment("sample", &plain);
+            let second = fonts.shape_segment("sample", &other);
+            assert_eq!(
+                fonts.remembered(),
+                2,
+                "a difference of {what} was answered from the other style's cache"
+            );
+            // Everything a reader could tell apart, not just the measurements:
+            // a colour changes the glyphs and not the width, and comparing
+            // widths alone would have made that row prove nothing.
+            assert_ne!(
+                visible(&first),
+                visible(&second),
+                "a difference of {what} shaped identically, so this row proves \
+                 nothing — pick a value that actually changes the shaping"
+            );
+        }
+    }
+
+    #[test]
+    fn a_style_seen_again_after_others_still_finds_its_own_segments() {
+        // The recent-attrs memo holds a few sets and drops the oldest. A style
+        // pushed out of it must still find what it shaped — the memo is a way
+        // to skip a hash, not the record itself, and a page that cycles through
+        // more styles than it holds would otherwise re-shape everything.
+        let mut fonts = FontStore::new();
+        let mut styles: Vec<ComputedStyle> = (0..RECENT_ATTRS + 2)
+            .map(|n| {
+                let mut one = style(16.0);
+                one.font_size = 12.0 + n as f32;
+                one
+            })
+            .collect();
+        for one in &styles {
+            let _ = fonts.shape_segment("sample", one);
+        }
+        let remembered = fonts.remembered();
+        assert_eq!(remembered, styles.len(), "each style shaped its own copy");
+
+        // The first one again, long since dropped from the memo.
+        let first = styles.remove(0);
+        let _ = fonts.shape_segment("sample", &first);
+        assert_eq!(
+            fonts.remembered(),
+            remembered,
+            "a style dropped from the memo shaped a second copy of the same \
+             segment, so it lost its cache rather than just its shortcut"
+        );
     }
 
     #[test]
@@ -2916,21 +3127,18 @@ mod tests {
             !real.glyphs.is_empty(),
             "the fixture has to shape to glyphs"
         );
-        assert_eq!(fonts.shaped.len(), 1, "shaping remembered nothing");
+        assert_eq!(fonts.remembered(), 1, "shaping remembered nothing");
 
-        let key = fonts
-            .shaped
-            .keys()
-            .next()
-            .cloned()
-            .expect("something was remembered");
-        fonts.shaped.insert(
-            key,
-            Shaped {
-                text: "hello".to_owned(),
-                width: 1234.0,
-                ..Shaped::default()
-            },
+        assert!(
+            fonts.poison(
+                "hello",
+                Shaped {
+                    text: "hello".to_owned(),
+                    width: 1234.0,
+                    ..Shaped::default()
+                },
+            ),
+            "nothing was remembered under the text that was shaped"
         );
         let again = fonts.shape_segment("hello", &ordinary);
         assert_eq!(
@@ -2939,7 +3147,7 @@ mod tests {
         );
 
         // And asking a second time did not remember a second copy of it.
-        assert_eq!(fonts.shaped.len(), 1);
+        assert_eq!(fonts.remembered(), 1);
     }
 
     #[test]
@@ -2954,9 +3162,9 @@ mod tests {
             let _ = fonts.shape_segment(&format!("w{word}"), &ordinary);
         }
         assert!(
-            fonts.shaped.len() <= MAX_SHAPED,
+            fonts.remembered() <= MAX_SHAPED,
             "{} remembered against a limit of {MAX_SHAPED}",
-            fonts.shaped.len()
+            fonts.remembered()
         );
     }
 
