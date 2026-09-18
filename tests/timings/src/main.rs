@@ -70,20 +70,21 @@ fn main() -> std::process::ExitCode {
     });
 
     println!(
-        "{:<16}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
-        "page", "open", "band", "keypress", "select", "find", "a11y"
+        "{:<16}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
+        "page", "open", "band", "keypress", "burst", "select", "find", "a11y"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(86));
 
     for (name, source, present) in &pages {
         let Some(source) = source else { continue };
         match measure(&browser, source, present) {
             Some(row) => println!(
-                "{:<16}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
+                "{:<16}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
                 name,
                 ms(row.open),
                 ms(row.band),
                 ms(row.keypress),
+                ms(row.burst),
                 ms(row.select),
                 ms(row.find),
                 ms(row.accessibility),
@@ -105,6 +106,7 @@ struct Row {
     open: Duration,
     band: Duration,
     keypress: Duration,
+    burst: Duration,
     select: Duration,
     find: Duration,
     accessibility: Duration,
@@ -173,6 +175,24 @@ fn measure(browser: &Path, source: &Path, present: &str) -> Option<Row> {
         started.elapsed()
     });
 
+    // A word, typed the way a person types one: faster than the page can
+    // re-render. This is the number that matters — a keystroke measured alone
+    // is a keystroke nobody was in a hurry about, and the complaint was never
+    // about pressing one key.
+    let burst = worst(|| {
+        let word = ["h", "e", "l", "l", "o"];
+        let started = Instant::now();
+        page.request_type(
+            word.iter()
+                .map(|letter| sandbox::message::Key::Insert((*letter).to_owned()))
+                .collect(),
+        );
+        while page.typing_outstanding() && !page.accept_typed() {
+            std::hint::spin_loop();
+        }
+        started.elapsed()
+    });
+
     // A selection drag sends one of these *per pointer move*, so this number is
     // charged many times a second while a reader drags across a paragraph.
     //
@@ -226,6 +246,7 @@ fn measure(browser: &Path, source: &Path, present: &str) -> Option<Row> {
         open,
         band,
         keypress,
+        burst,
         select,
         find,
         accessibility,

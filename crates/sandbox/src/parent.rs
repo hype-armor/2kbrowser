@@ -478,7 +478,7 @@ enum Job {
     Select { from: (f32, f32), to: (f32, f32) },
     CopyFocused,
     Focus { at: (f32, f32) },
-    Type { key: crate::message::Key },
+    Type { keys: Vec<crate::message::Key> },
     Choose { node: u32, index: u32 },
     Accessibility,
 }
@@ -506,6 +506,8 @@ struct RenderJob {
 enum Kind {
     Page,
     Band,
+    /// A re-render caused by typing, asked for without waiting (#207).
+    Typed,
     Find,
     Select,
     Accessibility,
@@ -611,6 +613,13 @@ pub struct Session {
     outstanding: std::collections::VecDeque<Kind>,
     /// A band that arrived while something else was being waited for.
     band: Option<Result<Rendered, Error>>,
+    /// A page re-rendered after typing, waiting to be collected (#207).
+    ///
+    /// Its own slot rather than sharing the band's, because the two mean
+    /// different things to the window: a band is the same page painted
+    /// elsewhere, and this is the page *changed*. Mixing them would have a
+    /// keystroke's answer taken for a scroll's.
+    typed: Option<Result<Rendered, Error>>,
     child_id: u32,
     wake: std::sync::Arc<std::sync::OnceLock<Wake>>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -666,6 +675,7 @@ impl Session {
             answers,
             outstanding: std::collections::VecDeque::new(),
             band: None,
+            typed: None,
             child_id,
             wake,
             worker: Some(worker),
@@ -762,12 +772,51 @@ impl Session {
 
     /// Sends a keystroke to whatever the child has focused.
     pub fn type_key(&mut self, key: crate::message::Key) -> Result<Rendered, Error> {
-        self.submit(Job::Type { key }, Kind::Page)?;
+        self.submit(Job::Type { keys: vec![key] }, Kind::Page)?;
         match self.wait_for(Kind::Page)? {
             Answer::Rendered(page) => Ok(*page),
             Answer::Failed(error) => Err(error),
             _ => Err(Error::Wire(crate::WireError::Unknown)),
         }
+    }
+
+    /// Sends a run of keystrokes without waiting for the page they change.
+    ///
+    /// The typing half of what bands did for scrolling (#207). A keystroke
+    /// costs the child a whole re-render, and a person types faster than a page
+    /// renders — so waiting for each one froze the window for the length of a
+    /// word, and the reader's own keys were what it was frozen against.
+    ///
+    /// A run rather than one, because everything typed while a render was
+    /// running is applied together when it finishes: a burst costs two renders
+    /// rather than one per letter, and the letters the reader could not see yet
+    /// were never worth a render of their own.
+    ///
+    /// Collect it with [`Session::take_typed`], or be told by the callback
+    /// given to [`Session::set_wake`].
+    pub fn request_type(&mut self, keys: Vec<crate::message::Key>) -> Result<(), Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // The same job as the blocking version; the `Kind` is what says
+        // whether anybody is waiting for its answer.
+        self.submit(Job::Type { keys }, Kind::Typed)
+    }
+
+    /// Whether typing has been sent and not yet answered.
+    pub fn typing_outstanding(&self) -> bool {
+        self.typed.is_none() && self.outstanding.contains(&Kind::Typed)
+    }
+
+    /// Takes a page that typing changed, if one has arrived. Never blocks.
+    pub fn take_typed(&mut self) -> Option<Result<Rendered, Error>> {
+        while self.typed.is_none() {
+            match self.answers.try_recv() {
+                Ok(answer) => self.stash(answer),
+                Err(_) => break,
+            }
+        }
+        self.typed.take()
     }
 
     /// Tells the child which row of the dropdown it opened was chosen.
@@ -920,6 +969,15 @@ impl Session {
             // asked for on purpose and the window still wants it.
             Some(Kind::Band) => {
                 self.band = Some(match answer {
+                    Answer::Rendered(page) => Ok(*page),
+                    Answer::Failed(error) => Err(error),
+                    _ => Err(Error::Wire(crate::WireError::Unknown)),
+                });
+            }
+            // And typing, for the same reason: it was asked for on purpose and
+            // the window still wants the page it changed.
+            Some(Kind::Typed) => {
+                self.typed = Some(match answer {
                     Answer::Rendered(page) => Ok(*page),
                     Answer::Failed(error) => Err(error),
                     _ => Err(Error::Wire(crate::WireError::Unknown)),
@@ -1173,8 +1231,8 @@ impl Conversation {
             Job::Focus { at } => self
                 .converse(ToChild::Focus { at })
                 .map(|page| Answer::Rendered(Box::new(page))),
-            Job::Type { key } => self
-                .converse(ToChild::Type { key })
+            Job::Type { keys } => self
+                .converse(ToChild::Type { keys })
                 .map(|page| Answer::Rendered(Box::new(page))),
             Job::Choose { node, index } => self
                 .converse(ToChild::Choose { node, index })

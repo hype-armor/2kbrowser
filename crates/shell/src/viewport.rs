@@ -467,6 +467,41 @@ impl Viewport {
         }
     }
 
+    /// Sends a run of keystrokes without waiting for the page (#207).
+    ///
+    /// What the window uses. A keystroke costs the child a whole re-render, and
+    /// a person types faster than a page renders — so waiting for each one
+    /// froze the window for the length of a word. The blocking version above is
+    /// kept for callers with nothing else to do while they wait, which is the
+    /// tests and the timings harness.
+    pub fn request_type(&mut self, keys: Vec<sandbox::message::Key>) {
+        // A failure here is a child that has gone. The page on screen stays as
+        // it was, which is what every other failed question of it does.
+        let _ = self.session.request_type(keys);
+    }
+
+    /// Whether typing has been sent and its page not yet collected.
+    pub fn typing_outstanding(&self) -> bool {
+        self.session.typing_outstanding()
+    }
+
+    /// Shows the page typing changed, if it has arrived. Never blocks.
+    ///
+    /// Returns whether anything changed, which is what decides a redraw.
+    pub fn accept_typed(&mut self) -> bool {
+        match self.session.take_typed() {
+            // A re-render that failed leaves the page on screen alone, the same
+            // way a band that failed to paint does: what the reader is looking
+            // at is still the page, and blanking it to report a keystroke would
+            // be far worse than the keystroke not showing.
+            Some(Ok(page)) => {
+                self.page = page;
+                true
+            }
+            Some(Err(_)) | None => false,
+        }
+    }
+
     /// Where this page's buttons are, in document order (#110).
     ///
     /// Asked of the child at render time and carried with the page, for the

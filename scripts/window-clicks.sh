@@ -876,6 +876,72 @@ done
 [ -n "$typed" ] || fail "five characters were typed into a focused field and \
 nothing appeared in it"
 
+# And again as fast as the keyboard can send them (#207). A keystroke costs the
+# child a whole re-render, so keys typed faster than that now wait for the
+# render already running and go as one run — and the way that goes wrong is a
+# lost letter, which nothing above would notice because it only asks whether
+# *any* ink appeared.
+#
+# Measured as how far right the ink reaches: ten characters have to reach
+# further than the five already there, and a run that dropped letters would not.
+#
+# Bounded off the submit button, which sits beside the field on the same rows.
+# A box taken across those rows answers about the *button's* far edge, which
+# never moves however much is typed — so the first two versions of this check
+# could not pass whatever the browser did. Bounding by `field_right` did not
+# help either: that comes from a box of everything below the chrome, so it *is*
+# the button's edge. Nor does the field's own border, because the two controls
+# sit flush and their border rows merge into a single run.
+#
+# What does separate them is the blank gap between them: on the text row the
+# button is the last run of ink, and the typed text grows in the columns before
+# it. Read once, before anything is typed, since the button is the one thing
+# here that stays put.
+runs=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-runs.py" "$text_y")
+button_left=$(printf '%s\n' "$runs" | awk '{ split($NF, edges, "-"); print edges[1] }')
+[ "$(printf '%s\n' "$runs" | awk '{ print NF }')" -ge 2 ] \
+    || fail "the text row holds one run of ink ($runs), so the field's text and \
+the submit button beside it cannot be told apart and the check below would \
+measure the button"
+text_limit=$((button_left - 4))
+[ "$text_limit" -gt $((field_left + 12)) ] || fail "the submit button starts at \
+$button_left, which leaves no room to measure text growing from $field_left"
+ink_right() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((text_y - 6)) $((text_y + 6)) \
+            "$field_left" "$text_limit" \
+        | awk '{ print $3 }'
+}
+slow_right=$(ink_right)
+[ -n "$slow_right" ] || fail "no ink in the field to measure, so the fast-typing \
+check below would prove nothing"
+
+focus_window
+# No delay at all: this is the burst the coalescing is for.
+DISPLAY=$display xdotool type --delay 0 "wwwww"
+grew=""
+for _ in $(seq 1 30); do
+    sleep 0.2
+    now=$(ink_right)
+    if [ -n "$now" ] && [ "$now" -gt "$slow_right" ]; then
+        grew=yes
+        break
+    fi
+done
+[ -n "$grew" ] || fail "typing five more characters as fast as the keyboard \
+could send them did not widen the text in the field: it reached $slow_right \
+before and $(ink_right) after, in columns $field_left..$text_limit — the \
+field's text, stopping short of the submit button at $button_left. Either \
+keystrokes were lost while a render was in flight, or this is measuring \
+something that does not move."
+echo "ok: a burst typed at full speed lost no keystrokes"
+
+# Back to what the checks below expect: the field holds one known run again.
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool type --delay 40 "hello"
+sleep 0.6
+
 # Cut and paste, in the control, through the real clipboard. Ink to clear to
 # ink: a cut that reached the child empties the field, and a paste that reached
 # it fills it again with what the cut took. Neither half can be seen from
