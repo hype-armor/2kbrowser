@@ -13,7 +13,7 @@ const USAGE: &str = "\
 2kbrowser — a web browser without the slop
 
 USAGE:
-    2kbrowser open   <url-or-file> [--width <px>] [--height <px>]
+    2kbrowser open   [url-or-file] [--width <px>] [--height <px>]
     2kbrowser render <url-or-file> [--out <file.png>] [--width <px>] [--height <px>]
     2kbrowser links  <url-or-file> [--width <px>]
     2kbrowser bookmarks
@@ -23,6 +23,9 @@ OPTIONS:
     --out <path>     Where to write the PNG (render only; default: page.png)
     --width <px>     Viewport width (default: 800)
     --height <px>    Window height, or maximum canvas height for render
+
+`open` with no address starts on a page of what you saved and where you have
+been, built from this machine and fetched from nowhere.
 
 `links` lists every link on the page with the rectangle you would click to
 follow it — the same geometry the window uses, printed instead of drawn.
@@ -132,7 +135,13 @@ fn report(outcome: Result<String, String>) -> ExitCode {
 /// Opens a window. See the caveat in `window.rs`: this path is unverified.
 fn run_open(args: &[String]) -> Result<String, String> {
     let options = Options::parse(args)?;
-    let input = options.input.ok_or("no input given")?;
+    // No address is not a mistake to report. A browser opened with no argument
+    // is one somebody wants to use, and the one thing it should not do is
+    // refuse — so it opens on a page built from what it already knows.
+    let input = match options.input {
+        Some(input) => input,
+        None => home_page()?,
+    };
     let (document, url) = load_from(&input)?;
     window::open(
         document.body,
@@ -153,6 +162,27 @@ fn run_open(args: &[String]) -> Result<String, String> {
         },
     )?;
     Ok(String::new())
+}
+
+/// Writes the home page and hands back its address.
+///
+/// Written to disk rather than passed in memory because the whole browser loads
+/// *a document from a URL* — that is the one path the engine has, and inventing
+/// a second one so this page could skip the disk would be a second path to keep
+/// working. It is rewritten on every start, since what it lists changes.
+fn home_page() -> Result<String, String> {
+    let path = shell::home::path();
+    let html = shell::home::page(
+        &shell::bookmarks::Bookmarks::load(&shell::bookmarks::default_path()),
+        &shell::visits::Visits::load(&shell::visits::default_path()),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+    }
+    std::fs::write(&path, html)
+        .map_err(|error| format!("could not write the home page: {error}"))?;
+    Ok(net::file_url(&path))
 }
 
 /// Height of a window that nobody asked to be a particular size.

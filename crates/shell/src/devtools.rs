@@ -406,7 +406,7 @@ pub fn source_path() -> std::path::PathBuf {
 /// Asked so that opening one does not record it in the history, and so that
 /// asking for information *about* the information page says something useful.
 pub fn is_generated(path: &Path) -> bool {
-    path == page_path() || path == source_path()
+    path == page_path() || path == source_path() || path == crate::home::path()
 }
 
 #[cfg(test)]
