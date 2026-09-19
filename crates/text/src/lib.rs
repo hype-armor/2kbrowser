@@ -2612,10 +2612,18 @@ impl FontStore {
     /// Rasterises a glyph, returning its coverage bitmap and placement.
     ///
     /// The bitmap is 8-bit alpha; colour comes from the paint stage.
+    ///
+    /// Borrowed from the cache rather than copied out of it. The cache already
+    /// holds this bitmap and hands back the same one for every repeat of a
+    /// letter, so copying it was an allocation and a memcpy per glyph *drawn*
+    /// — a quarter of a million of them on a long page, for bytes that were
+    /// already sitting there. The borrow holds this store for as long as the
+    /// caller keeps the coverage, which is what stops the cache being changed
+    /// underneath a bitmap someone is still reading (#207).
     pub fn rasterise(
         &mut self,
         glyph: &PositionedGlyph,
-    ) -> Option<(Vec<u8>, i32, i32, usize, usize)> {
+    ) -> Option<(&[u8], i32, i32, usize, usize)> {
         // A glyph this large is a resource attack rather than typography: the
         // outline rasteriser allocates a bitmap proportional to the em square,
         // so `font-size: 99999px` asks for something on the order of ten
@@ -2642,7 +2650,7 @@ impl FontStore {
             return None;
         }
         Some((
-            image.data.clone(),
+            &image.data,
             image.placement.left,
             image.placement.top,
             width,

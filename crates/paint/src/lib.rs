@@ -1785,6 +1785,76 @@ fn draw_tofu(pixmap: &mut Pixmap, glyph: &text::PositionedGlyph, x: f32, y: f32,
     }
 }
 
+/// How far from its baseline a glyph's outline is allowed to reach, in ems,
+/// for the purpose of deciding it cannot be on screen.
+///
+/// Deliberately far looser than any real outline. Typography puts ascenders
+/// and descenders inside about 1.2em of the baseline; four is chosen so that
+/// the question this answers — "is this glyph nowhere near the canvas?" — is
+/// never a close call. The glyphs it lets through are cropped exactly a few
+/// lines further down, so the cost of being generous is a handful of extra
+/// cache lookups at the edges of a band, and the cost of being too tight
+/// would be text missing from the page.
+const GLYPH_REACH: f32 = 4.0;
+
+/// Whether a glyph could possibly put a pixel on the canvas.
+///
+/// Conservative on purpose: a `true` here means "rasterise it and find out",
+/// and only a `false` skips anything. See `GLYPH_REACH`.
+///
+/// A non-finite size or position makes every comparison below false, so the
+/// glyph is skipped — which is what happens to it further down anyway, where
+/// `rasterise` refuses a size that is not finite.
+fn reaches_canvas(
+    glyph: &text::PositionedGlyph,
+    x: f32,
+    y: f32,
+    canvas_width: f32,
+    canvas_height: f32,
+) -> bool {
+    let reach = glyph.font_size * GLYPH_REACH + 1.0;
+    y + reach > 0.0
+        && y - reach < canvas_height
+        && x + glyph.advance + reach > 0.0
+        && x - reach < canvas_width
+}
+
+/// Whether a glyph would have put a pixel on the canvas, worked out the exact
+/// way — by rasterising it and cropping it as the drawing path does.
+///
+/// Only for the `debug_assert` that holds [`GLYPH_REACH`] honest, which is why
+/// it costs exactly what the fast path exists to avoid.
+#[cfg(debug_assertions)]
+fn would_have_drawn(
+    pixmap: &Pixmap,
+    fonts: &mut FontStore,
+    glyph: &text::PositionedGlyph,
+    x: f32,
+    y: f32,
+) -> bool {
+    if glyph.glyph_id == NOTDEF {
+        // Tofu is drawn from the glyph's own advance and size rather than from
+        // an outline, and crops itself.
+        return false;
+    }
+    let Some((_, left, top, width, height)) = fonts.rasterise(glyph) else {
+        return false;
+    };
+    let (Some(x), Some(y)) = (
+        (x.floor() as i32).checked_add(left),
+        (y.floor() as i32).checked_sub(top),
+    ) else {
+        return false;
+    };
+    let (glyph_width, glyph_height) = (width as i32, height as i32);
+    let (canvas_width, canvas_height) = (pixmap.width() as i32, pixmap.height() as i32);
+    let from_x = (-x).max(0);
+    let from_y = (-y).max(0);
+    let to_x = (canvas_width - x).min(glyph_width);
+    let to_y = (canvas_height - y).min(glyph_height);
+    to_x > from_x && to_y > from_y
+}
+
 fn draw_glyph(
     pixmap: &mut Pixmap,
     fonts: &mut FontStore,
@@ -1801,6 +1871,40 @@ fn draw_glyph(
     // same family as the `margin: 1e40px` bug, one layer further in.
     let (x, y) = (origin_x + glyph.x, origin_y + glyph.y);
     if !in_range(x) || !in_range(y) {
+        return;
+    }
+
+    // Nowhere near the canvas, decided without touching the glyph cache.
+    //
+    // A display list is the whole document (that is what lets a band be a
+    // shift rather than a re-render), so painting one band walks every glyph
+    // on the page. A long article is a quarter of a million of them, and each
+    // one was being rasterised — a cache lookup and, until recently, a copy of
+    // the bitmap — before the crop below noticed it was a thousand rows off
+    // screen. Two thousand glyphs were drawn; the other 99% were looked up and
+    // thrown away.
+    //
+    // The crop below is exact because it has the rasterised bitmap's placement
+    // to work from. This runs before there is one, so it asks the looser
+    // question: could a glyph of this size, with its baseline here, reach the
+    // canvas at all? `GLYPH_REACH` ems either side of the baseline is far more
+    // than any outline in the bundled faces uses, and those are the only faces
+    // this browser has (ADR-0010) — so the margin is a bound on the fonts that
+    // exist rather than a guess about fonts in general. The `debug_assert`
+    // holds it to that: whatever this skips is rasterised anyway when
+    // assertions are on, and checked to have really been off the canvas.
+    let (canvas_width, canvas_height) = (pixmap.width() as f32, pixmap.height() as f32);
+    if !reaches_canvas(glyph, x, y, canvas_width, canvas_height) {
+        #[cfg(debug_assertions)]
+        {
+            let skipped = would_have_drawn(pixmap, fonts, glyph, x, y);
+            debug_assert!(
+                !skipped,
+                "a glyph {}px at ({x}, {y}) was skipped as off-canvas on a \
+                 {canvas_width}x{canvas_height} band, and would have drawn",
+                glyph.font_size
+            );
+        }
         return;
     }
 
