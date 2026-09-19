@@ -12,6 +12,8 @@
 
 pub mod first_letter;
 
+use std::rc::Rc;
+
 use cosmic_text::{
     Attrs, AttrsOwned, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, SwashCache,
     Weight,
@@ -744,7 +746,16 @@ struct Shaped {
 /// A segment placed on a line.
 #[derive(Debug, Clone)]
 struct Segment {
-    shaped: Shaped,
+    /// The shaping this segment shows, shared with the cache it came from.
+    ///
+    /// Shared rather than owned because a page repeats its words: the shaping
+    /// of "the" is looked up thousands of times, and copying its glyph vector
+    /// and its text out of the cache each time was the largest single cost of
+    /// laying out a long page — 104,000 copies for 2,027 distinct shapings
+    /// (#207). A handle costs a count instead. Nothing writes through it
+    /// except `shape_directed`, which mirrors an RTL segment and takes its own
+    /// copy to do so.
+    shaped: Rc<Shaped>,
     /// Set when this segment is an atomic inline box rather than text.
     replaced: Option<ReplacedInline>,
     /// The element this segment's text came from.
@@ -856,7 +867,7 @@ pub struct FontStore {
     /// wrong glyphs would fail them rather than pass quietly.
     /// Indexed by the attribute slot the segment was shaped under; see
     /// [`FontStore::slot_for`].
-    shaped: Vec<std::collections::HashMap<String, Shaped>>,
+    shaped: Vec<std::collections::HashMap<String, Rc<Shaped>>>,
     /// What `line-height: normal` comes to for a set of attributes, per em.
     ///
     /// Asked once per line of every page and answered from a face's metrics,
@@ -998,7 +1009,7 @@ impl FontStore {
         self.shaped
             .iter_mut()
             .find(|slot| slot.contains_key(text))
-            .map(|slot| slot.insert(text.to_owned(), with))
+            .map(|slot| slot.insert(text.to_owned(), Rc::new(with)))
             .is_some()
     }
 
@@ -1266,15 +1277,21 @@ impl FontStore {
     /// plan says to leave alone — the levels still come from `unicode-bidi` —
     /// and there is nowhere else to put it: no shaper will reverse letters it
     /// has been given no reason to reverse.
-    fn shape_directed(&mut self, text: &str, style: &ComputedStyle, level: Level) -> Shaped {
+    fn shape_directed(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        level: Level,
+        line_height: f32,
+    ) -> Rc<Shaped> {
         // The controls have done their work in `analyse_bidi` and are not
         // content. Left in, they shape as blank boxes that take real width.
         let bare = without_bidi_controls(text);
         if bare.is_empty() {
-            return Shaped::default();
+            return Rc::new(Shaped::default());
         }
         if level.is_ltr() || bare.chars().any(is_strongly_rtl) {
-            return self.shape_segment(&bare, style);
+            return self.shape_segment_at(&bare, style, line_height);
         }
         // Rule L4 as well as L2: a bracket in right-to-left text is drawn as
         // the bracket that faces the other way, so that `(x)` reads as `(x)`
@@ -1282,16 +1299,47 @@ impl FontStore {
         // shaping the mirrored characters rather than by substituting glyphs,
         // which leaves the shaper to find them — it is the one that knows what
         // is in the face.
-        let mut shaped = self.shape_segment(&mirrored(&bare), style);
-        mirror(&mut shaped);
+        let mut shaped = self.shape_segment_at(&mirrored(&bare), style, line_height);
+        // The one place anything writes through a shared shaping, so it takes
+        // its own copy first. Right-to-left text pays for that copy; the rest
+        // of the web does not.
+        let owned = Rc::make_mut(&mut shaped);
+        mirror(owned);
         // The offsets index the text the author wrote, and mirroring is
         // character for character, so they still line up.
-        shaped.text = bare;
+        owned.text = bare;
         shaped
     }
 
-    fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Shaped {
+    /// Shapes a segment, working out the line height for itself.
+    ///
+    /// Only the tests below reach this now. Everything that shapes a page
+    /// knows the line height already — a run's segments all share one — and
+    /// asking for it per segment is the cost `shape_segment_at` exists to
+    /// avoid. Kept because a test measuring one piece of text in isolation has
+    /// no run to hoist it out of, and should not have to resolve `normal`
+    /// itself to say what it means.
+    #[cfg(test)]
+    fn shape_segment(&mut self, text: &str, style: &ComputedStyle) -> Rc<Shaped> {
         let line_height = self.used_line_height(style);
+        self.shape_segment_at(text, style, line_height)
+    }
+
+    /// The same, for a caller that already knows the line height.
+    ///
+    /// Worth passing rather than asking for, because asking is not free:
+    /// `used_line_height` resolves `normal` against the face, and doing that
+    /// means shaping a probe glyph. Called once per segment, it doubled the
+    /// shaping lookups of a page — 106,000 for the 53,000 segments that
+    /// actually wanted one. A line height belongs to a style, and every
+    /// segment of a run shares one, so `segment` works it out once per run
+    /// alongside the content box it already hoists (#207).
+    fn shape_segment_at(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+    ) -> Rc<Shaped> {
         if style.font_variant == FontVariant::SmallCaps {
             return self.shape_small_caps(text, style, line_height);
         }
@@ -1309,7 +1357,12 @@ impl FontStore {
     /// pieces. A word that happens to be all lowercase would otherwise sit on a
     /// shorter line than the word beside it, and a paragraph of small caps
     /// would read as a paragraph somebody set in a smaller font.
-    fn shape_small_caps(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Shaped {
+    fn shape_small_caps(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+    ) -> Rc<Shaped> {
         let mut plain = style.clone();
         plain.font_variant = FontVariant::Normal;
         let mut small = plain.clone();
@@ -1359,26 +1412,26 @@ impl FontStore {
             }
             out.width += shaped.width;
         }
-        out
+        Rc::new(out)
     }
 
     /// The same, at a line height already resolved.
     ///
     /// Split out so that measuring what `normal` means can shape its probe
     /// without asking what `normal` means.
-    fn shape_with(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Shaped {
+    fn shape_with(&mut self, text: &str, style: &ComputedStyle, line_height: f32) -> Rc<Shaped> {
         if text.is_empty() {
-            return Shaped::default();
+            return Rc::new(Shaped::default());
         }
         // Text at zero size occupies nothing. Shaping it would be work whose
         // every result is multiplied by zero, and the glyphs would be invisible
         // either way — so it is skipped rather than floored, which is also what
         // keeps `font-size: 0` from quietly rendering at the floor size.
         if !(style.font_size.is_finite() && style.font_size > 0.0) {
-            return Shaped {
+            return Rc::new(Shaped {
                 text: text.to_owned(),
                 ..Shaped::default()
-            };
+            });
         }
         let attrs = Self::attrs_for(style, line_height);
         // Keyed on the attributes themselves rather than on a list of the style
@@ -1398,8 +1451,9 @@ impl FontStore {
         // Looked up by `&str` rather than by an owned key, which is the other
         // half of #207: the old key allocated a `String` on every lookup, hit
         // or miss, once per word of the page.
+        // A count rather than a copy: see `Segment::shaped`.
         if let Some(shaped) = self.shaped[slot].get(text) {
-            return shaped.clone();
+            return Rc::clone(shaped);
         }
 
         let mut buffer = Buffer::new(&mut self.system, Self::metrics_for(style, line_height));
@@ -1442,9 +1496,10 @@ impl FontStore {
         // Full means stop rather than evict, as elsewhere: within one page's
         // life there is no access pattern worth modelling, and what stopping
         // costs is the speed this exists for rather than correctness.
+        let shaped = Rc::new(shaped);
         if self.shaped_total < MAX_SHAPED
             && self.shaped[slot]
-                .insert(text.to_owned(), shaped.clone())
+                .insert(text.to_owned(), Rc::clone(&shaped))
                 .is_none()
         {
             self.shaped_total += 1;
@@ -2269,6 +2324,9 @@ impl FontStore {
             // Measured once per run rather than once per segment: a paragraph
             // is one run and dozens of segments, all in the same face.
             let content = self.content_box(&run.style);
+            // For the same reason, and it is the larger of the two: see
+            // `shape_segment_at`.
+            let line_height = self.used_line_height(&run.style);
             // An atomic inline box is one unbreakable segment of its own size,
             // aligned on the baseline it declares. For an image that is its
             // bottom edge, which is what `vertical-align: baseline` means for a
@@ -2276,13 +2334,13 @@ impl FontStore {
             // baseline rather than centred on it.
             if let Some(box_) = run.replaced {
                 out.push(Segment {
-                    shaped: Shaped {
+                    shaped: Rc::new(Shaped {
                         glyphs: Vec::new(),
                         text: String::new(),
                         width: box_.width,
                         ascent: box_.baseline,
                         height: box_.height,
-                    },
+                    }),
                     trailing_space: 0.0,
                     trailing_text: String::new(),
                     space_is_content: false,
@@ -2315,17 +2373,18 @@ impl FontStore {
                 // this line, so an empty `<span>` with a border draws the same
                 // height as one holding a word. A space is shaped for its
                 // metrics alone and its width thrown away.
-                let metrics = self.shape_segment(" ", &run.style);
+                let metrics = self.shape_segment_at(" ", &run.style, line_height);
                 out.push(Segment {
-                    shaped: Shaped {
+                    shaped: Rc::new(Shaped {
                         // The ascent and height only. The space's glyphs and
                         // its text would otherwise be drawn and searched: an
                         // edge is room on the line, not a character on it.
                         glyphs: Vec::new(),
                         text: String::new(),
                         width: edge.width,
-                        ..metrics
-                    },
+                        ascent: metrics.ascent,
+                        height: metrics.height,
+                    }),
                     trailing_space: 0.0,
                     trailing_text: String::new(),
                     space_is_content: false,
@@ -2399,11 +2458,13 @@ impl FontStore {
                 } else if preserve {
                     // §16.4: `word-spacing` is added to *each* space, and a
                     // preformatted run can hold a row of them.
-                    self.shape_segment(&spacing, &run.style).width
+                    self.shape_segment_at(&spacing, &run.style, line_height)
+                        .width
                         + run.style.word_spacing * spacing.chars().count() as f32
                 } else {
                     // Collapsed runs already hold at most one space.
-                    self.shape_segment(" ", &run.style).width + run.style.word_spacing
+                    self.shape_segment_at(" ", &run.style, line_height).width
+                        + run.style.word_spacing
                 };
 
                 if trimmed.is_empty() {
@@ -2433,7 +2494,7 @@ impl FontStore {
                     // background is drawn across them.
                     let after_break = out.last().is_some_and(|last| last.mandatory_break);
                     if preserve && after_break && !mandatory && !spacing.is_empty() {
-                        let shaped = self.shape_segment(&spacing, &run.style);
+                        let shaped = self.shape_segment_at(&spacing, &run.style, line_height);
                         out.push(Segment {
                             shaped,
                             trailing_space: 0.0,
@@ -2465,13 +2526,13 @@ impl FontStore {
                         last.space_level = bidi.at(run_start + piece_start);
                         last.mandatory_break |= mandatory;
                     } else if mandatory {
-                        let height = self.used_line_height(&run.style);
+                        let height = line_height;
                         out.push(Segment {
-                            shaped: Shaped {
+                            shaped: Rc::new(Shaped {
                                 height,
                                 ascent: run.style.font_size * 0.8,
                                 ..Shaped::default()
-                            },
+                            }),
                             trailing_space: space_width,
                             trailing_text: trailing_text.clone(),
                             space_is_content: preserve && !spacing.is_empty(),
@@ -2504,7 +2565,7 @@ impl FontStore {
                 let last_piece = pieces.len() - 1;
                 for (at, (level, part)) in pieces.into_iter().enumerate() {
                     let tail = at == last_piece;
-                    let shaped = self.shape_directed(part, &run.style, level);
+                    let shaped = self.shape_directed(part, &run.style, level, line_height);
                     out.push(Segment {
                         shaped,
                         // Only the last piece of a word carries what follows
@@ -2734,8 +2795,8 @@ mod tests {
     fn an_override_turns_latin_round() {
         let mut fonts = FontStore::new();
         let style = ComputedStyle::default();
-        let plain = fonts.shape_directed("abc", &style, Level::ltr());
-        let forced = fonts.shape_directed("abc", &style, Level::rtl());
+        let plain = fonts.shape_directed("abc", &style, Level::ltr(), style.font_size);
+        let forced = fonts.shape_directed("abc", &style, Level::rtl(), style.font_size);
 
         assert_eq!(plain.width, forced.width, "reversing must not resize");
         let ids = |shaped: &Shaped| {
@@ -2757,7 +2818,12 @@ mod tests {
         let mut fonts = FontStore::new();
         let style = ComputedStyle::default();
         let natural = fonts.shape_segment("\u{5d0}\u{5d1}\u{5d2}", &style);
-        let directed = fonts.shape_directed("\u{5d0}\u{5d1}\u{5d2}", &style, Level::rtl());
+        let directed = fonts.shape_directed(
+            "\u{5d0}\u{5d1}\u{5d2}",
+            &style,
+            Level::rtl(),
+            style.font_size,
+        );
 
         let xs = |shaped: &Shaped| shaped.glyphs.iter().map(|g| g.x).collect::<Vec<_>>();
         assert_eq!(xs(&natural), xs(&directed));
