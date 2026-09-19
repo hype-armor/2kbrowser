@@ -108,6 +108,29 @@ pub fn is_collapsible_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
 }
 
+/// The pieces of a run that a line break may not fall inside.
+///
+/// What counts as one unbreakable piece depends on where the run is allowed to
+/// break at all. Neither `pre` nor `nowrap` breaks at a space, so their
+/// narrowest piece is a whole line rather than a word — which is what makes a
+/// `white-space: nowrap` caption widen the table under it instead of being
+/// measured by its longest word and then overflowing.
+///
+/// One function rather than two copies, because `intrinsic_widths` both
+/// measures these and asks whether a run is a single one of them. Written
+/// twice, the question and the measurement could answer differently, and the
+/// symptom would be a column sized for a word the cell does not contain.
+fn unbreakable_pieces(run: &InlineRun) -> Vec<&str> {
+    match run.style.white_space {
+        WhiteSpace::Normal => run
+            .text
+            .split(is_collapsible_space)
+            .filter(|piece| !piece.is_empty())
+            .collect(),
+        WhiteSpace::Pre | WhiteSpace::NoWrap => run.text.split('\n').collect(),
+    }
+}
+
 /// One shaped, positioned glyph.
 #[derive(Debug, Clone, Copy)]
 pub struct PositionedGlyph {
@@ -2532,31 +2555,52 @@ impl FontStore {
     ) -> (f32, f32) {
         let max = self.layout_runs(runs, default_style, f32::MAX).width;
 
-        // The minimum is the widest word, measured in the style of the run it
-        // came from — measuring everything in the default style would
-        // under-report a bold or larger span and let its column collapse.
+        // A run that is already one unbreakable piece is its own minimum, and
+        // the measurement below would be the one just taken: same text, same
+        // style, same everything a width depends on. Most cells of most tables
+        // of the era are this — one word in one run — and measuring each of
+        // them twice was the larger half of what sizing their columns cost.
+        //
+        // `source` and `boxes` are what the rebuilt run below would drop, and
+        // neither reaches a width. `source` is carried for hit testing alone,
+        // and `boxes` is read only beside an `edge`, which a run taking this
+        // path does not have. The `debug_assert` holds them to that: every
+        // page the test suite renders measures both ways and compares.
+        if let [only] = runs
+            && only.replaced.is_none()
+            && only.edge.is_none()
+            && let [whole] = unbreakable_pieces(only).as_slice()
+            && *whole == only.text
+        {
+            #[cfg(debug_assertions)]
+            {
+                let measured = self.minimum_width(runs, default_style);
+                debug_assert!(
+                    measured.to_bits() == max.to_bits() || (measured.is_nan() && max.is_nan()),
+                    "a run of one piece measured {measured} on its own and {max} in place"
+                );
+            }
+            return (max, max);
+        }
+
+        let min = self.minimum_width(runs, default_style);
+        (min, max.max(min))
+    }
+
+    /// The widest single unbreakable piece across a set of runs.
+    ///
+    /// Each piece is measured in the style of the run it came from — measuring
+    /// everything in the default style would under-report a bold or larger
+    /// span and let its column collapse.
+    fn minimum_width(&mut self, runs: &[InlineRun], default_style: &ComputedStyle) -> f32 {
         let mut min: f32 = 0.0;
         for run in runs {
-            // What counts as one unbreakable piece depends on where the run is
-            // allowed to break at all. Neither `pre` nor `nowrap` breaks at a
-            // space, so their narrowest piece is a whole line rather than a
-            // word — which is what makes a `white-space: nowrap` caption widen
-            // the table under it instead of being measured by its longest word
-            // and then overflowing.
-            let pieces: Vec<&str> = match run.style.white_space {
-                WhiteSpace::Normal => run
-                    .text
-                    .split(is_collapsible_space)
-                    .filter(|piece| !piece.is_empty())
-                    .collect(),
-                WhiteSpace::Pre | WhiteSpace::NoWrap => run.text.split('\n').collect(),
-            };
-            for piece in pieces {
+            for piece in unbreakable_pieces(run) {
                 let single = [InlineRun::text(piece, run.style.clone())];
                 min = min.max(self.layout_runs(&single, default_style, f32::MAX).width);
             }
         }
-        (min, max.max(min))
+        min
     }
 
     /// Measures text without keeping the glyphs.
