@@ -41,6 +41,36 @@ const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// How many times each interaction is repeated, with the worst one reported.
 const LATENCY_REPEATS: usize = 5;
 
+/// What [`machine_work`] costs on the machine the latency limits were chosen
+/// on, in milliseconds.
+///
+/// The limits below are thresholds of human perception, which makes them claims
+/// about the computer in front of the reader and not about this code alone. CI
+/// runs this harness on three desktop-class runners and on a Raspberry Pi, and
+/// asking a Pi to open a page inside the hundred milliseconds a person notices
+/// is asking it to be a different computer. A budget that fails for that reason
+/// is one everybody learns to ignore.
+///
+/// So the limits are scaled by how much slower this machine is than that one.
+/// The alternative — skipping the check where it cannot be met — risks a
+/// harness that reports PENDING everywhere and therefore enforces nothing,
+/// which this file's own header calls worse than having no harness at all.
+/// Scaling always enforces something: a machine four times slower gets four
+/// times the limit and still catches a regression that doubles the cost.
+const REFERENCE_WORK_MS: f64 = 5.0;
+
+/// How much slower than the reference a machine may be and still be held to
+/// these limits at all.
+///
+/// Scaling without a ceiling degrades into a budget that passes anything: a
+/// machine measuring thirty times slower would be allowed three seconds to open
+/// a page, which is not a limit anybody would notice being broken. Past this,
+/// the honest report is that the measurement does not mean anything here, which
+/// is what PENDING is for. Eight is well beyond the Raspberry Pi this is
+/// actually about and well below the factor an unoptimised build shows (around
+/// thirty, which is how this ceiling came to be written).
+const MAX_MACHINE_FACTOR: f64 = 8.0;
+
 /// The viewport the interaction budgets are measured at.
 const LATENCY_WIDTH: u32 = 1000;
 const LATENCY_HEIGHT: u32 = 800;
@@ -614,17 +644,20 @@ fn interaction_latency() -> Vec<Check> {
     // the whole of that hundred milliseconds.
     const OPEN_LIMIT_MS: u128 = 100;
 
+    // Measured before anything else, so the limits are known even for the
+    // reports that never get as far as rendering a page.
+    let factor = machine_factor();
     let names = [
-        ("opening a page", OPEN_LIMIT_MS),
-        ("scrolling a band", BAND_LIMIT_MS),
-        ("a keystroke", KEYSTROKE_LIMIT_MS),
+        ("opening a page", scaled_limit(OPEN_LIMIT_MS, factor)),
+        ("scrolling a band", scaled_limit(BAND_LIMIT_MS, factor)),
+        ("a keystroke", scaled_limit(KEYSTROKE_LIMIT_MS, factor)),
     ];
     let pending = |blocked_on: &'static str| {
         names
             .iter()
-            .map(|(name, limit)| Check {
+            .map(|(name, (_, shown))| Check {
                 name,
-                limit: format!("<= {limit} ms"),
+                limit: shown.clone(),
                 outcome: Outcome::Pending { blocked_on },
             })
             .collect::<Vec<_>>()
@@ -632,9 +665,9 @@ fn interaction_latency() -> Vec<Check> {
     let failed = |reason: String| {
         names
             .iter()
-            .map(|(name, limit)| Check {
+            .map(|(name, (_, shown))| Check {
                 name,
-                limit: format!("<= {limit} ms"),
+                limit: shown.clone(),
                 outcome: Outcome::Fail {
                     measured: "-".to_owned(),
                     reason: reason.clone(),
@@ -643,6 +676,12 @@ fn interaction_latency() -> Vec<Check> {
             .collect::<Vec<_>>()
     };
 
+    if factor > MAX_MACHINE_FACTOR {
+        return pending(
+            "a machine too far slower than the one these thresholds describe for them to \
+             mean anything here",
+        );
+    }
     let Some(browser) = browser_beside_us() else {
         return pending("a release build of the browser beside this harness");
     };
@@ -721,10 +760,65 @@ fn interaction_latency() -> Vec<Check> {
     }
 
     vec![
-        latency_check(names[0], opening),
-        latency_check(names[1], band),
-        latency_check(names[2], keystroke),
+        latency_check(&names[0], opening),
+        latency_check(&names[1], band),
+        latency_check(&names[2], keystroke),
     ]
+}
+
+/// A fixed amount of work, for finding out how fast this machine is.
+///
+/// Four mebibytes written and read sixteen times over, which is the shape of
+/// what rendering actually does — a canvas is a few megabytes and painting
+/// walks it. A pure arithmetic loop would measure a part of the machine that
+/// painting a page does not lean on.
+///
+/// Deterministic, so the only thing that varies between runs is the machine.
+fn machine_work() -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let mut buffer = vec![0u32; 1 << 20];
+    for round in 0..16u32 {
+        for (at, slot) in buffer.iter_mut().enumerate() {
+            *slot = slot.wrapping_add((at as u32) ^ round);
+        }
+    }
+    let total = buffer
+        .iter()
+        .fold(0u32, |sum, slot| sum.wrapping_add(*slot));
+    // Kept, so that the optimiser cannot delete the loop that was being timed.
+    std::hint::black_box(total);
+    started.elapsed()
+}
+
+/// How much slower this machine is than the one the limits were chosen on.
+///
+/// The best of several runs rather than the worst or the mean: the thing being
+/// estimated is how fast the machine *can* go, and every source of noise here —
+/// another job on the runner, a migration between cores — makes a run slower
+/// and none makes it faster. The worst run would measure the neighbours.
+///
+/// Never below one. A machine faster than the reference does not get a limit
+/// tighter than the threshold a person notices, because there is no such thing
+/// as responding better than imperceptibly.
+fn machine_factor() -> f64 {
+    // Nine rather than a handful. The same container measured 1.0 on one run and
+    // 1.9 on the next because something else was running on it, and the factor
+    // only has to be roughly right — but a limit that halves between runs is one
+    // nobody can reason about. More samples cost about forty milliseconds and
+    // make the minimum steadier.
+    let best = (0..9).map(|_| machine_work()).min().unwrap_or_default();
+    (best.as_secs_f64() * 1e3 / REFERENCE_WORK_MS).max(1.0)
+}
+
+/// A perception threshold, scaled for the machine measuring it.
+fn scaled_limit(perception_ms: u128, factor: f64) -> (u128, String) {
+    let scaled = (perception_ms as f64 * factor).round() as u128;
+    let shown = if scaled == perception_ms {
+        format!("<= {perception_ms} ms")
+    } else {
+        format!("<= {scaled} ms ({perception_ms} x {factor:.1})")
+    };
+    (scaled, shown)
 }
 
 /// One interaction measured against its limit.
@@ -733,12 +827,15 @@ fn interaction_latency() -> Vec<Check> {
 /// window, a page and a renderer; deciding whether a number is over a limit
 /// needs none of those, and it is the half that would fail silently — a budget
 /// that cannot report FAIL is decoration.
-fn latency_check((name, limit): (&'static str, u128), taken: std::time::Duration) -> Check {
+fn latency_check(
+    (name, (limit, shown)): &(&'static str, (u128, String)),
+    taken: std::time::Duration,
+) -> Check {
     let measured = format!("{} ms", taken.as_millis());
     Check {
         name,
-        limit: format!("<= {limit} ms"),
-        outcome: if taken.as_millis() <= limit {
+        limit: shown.clone(),
+        outcome: if taken.as_millis() <= *limit {
             Outcome::Pass { measured }
         } else {
             Outcome::Fail {
@@ -813,19 +910,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_slower_machine_gets_a_looser_limit_and_a_faster_one_does_not() {
+        // The scaling is what keeps these budgets enforceable on a Raspberry Pi
+        // without making them meaningless on a desktop, so both ends matter.
+        let (limit, shown) = scaled_limit(100, 4.0);
+        assert_eq!(
+            limit, 400,
+            "a machine four times slower gets four times the limit"
+        );
+        assert!(
+            shown.contains("100 x 4.0"),
+            "the report has to say why the limit moved, or it reads as a changed budget: {shown}"
+        );
+
+        // A fast machine is held to the threshold a person notices and no
+        // tighter: there is no responding better than imperceptibly, and a
+        // limit that chased the hardware down would fail on the quiet runs.
+        let (limit, shown) = scaled_limit(100, 1.0);
+        assert_eq!(limit, 100);
+        assert_eq!(
+            shown, "<= 100 ms",
+            "an unscaled limit should read as the plain number"
+        );
+        // One call, not two compared against each other. This is a
+        // measurement, and two of them differ by whatever the machine was
+        // doing in between — the first version of this line compared two and
+        // failed, which it deserved to.
+        let factor = machine_factor();
+        assert!(factor >= 1.0, "the factor is never below one: {factor}");
+    }
+
+    #[test]
     fn an_interaction_over_its_limit_fails_the_budget() {
         // The half of the latency budgets that has no window in it, and the
         // half that would otherwise be taken on trust. A budget whose
         // comparison is wrong reports PASS for a browser that freezes, which is
         // worse than having no budget at all.
-        let over = latency_check(("scrolling a band", 32), Duration::from_millis(33));
+        let band = ("scrolling a band", scaled_limit(32, 1.0));
+        let over = latency_check(&band, Duration::from_millis(33));
         assert!(
             matches!(over.outcome, Outcome::Fail { .. }),
             "33ms against a 32ms limit must fail"
         );
         // The limit itself is allowed: `<= 32 ms` is what the report prints, so
         // 32 passing is what it must mean.
-        let at = latency_check(("scrolling a band", 32), Duration::from_millis(32));
+        let at = latency_check(&band, Duration::from_millis(32));
         assert!(
             matches!(at.outcome, Outcome::Pass { .. }),
             "32ms against a 32ms limit must pass"
@@ -833,7 +962,10 @@ mod tests {
         // Milliseconds, not nanoseconds: a measurement is reported in whole
         // milliseconds, so a limit compared against the wrong unit would pass
         // everything.
-        let far_over = latency_check(("opening a page", 100), Duration::from_secs(4));
+        let far_over = latency_check(
+            &("opening a page", scaled_limit(100, 1.0)),
+            Duration::from_secs(4),
+        );
         assert!(
             matches!(far_over.outcome, Outcome::Fail { .. }),
             "4s must fail"
