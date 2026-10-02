@@ -1622,13 +1622,87 @@ fn tile_image(
         clip.width.ceil() as u32,
         clip.height.ceil() as u32,
     );
-    let Some(mask) = bounds.and_then(|bounds| {
-        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
-        let mut builder = PathBuilder::new();
-        builder.push_rect(bounds.to_rect());
-        let path = builder.finish()?;
-        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
-        Some(mask)
+    let Some(bounds) = bounds else {
+        return;
+    };
+
+    // An opaque tile on whole pixels is a copy, not a blend.
+    //
+    // `draw_pixmap` reaches the same pixels through a pattern shader and a
+    // full-canvas mask, at about seven microseconds for a sixteen-pixel tile.
+    // A page of the era with a tiled background is a few thousand of those per
+    // band — the era fixture is 2,835 — which made tiling the single largest
+    // cost of putting a realistic page on screen, charged again every time the
+    // reader scrolled a line.
+    //
+    // The three things that make it a copy are all decided rather than
+    // assumed. `opaque` is settled at decode: composited over anything,
+    // `source-over` of a fully opaque source is the source. The placement is
+    // rounded to whole pixels here, the same way the slow path rounds it, and
+    // the scale is 1:1 — so no sampling happens and nearest-neighbour has
+    // nothing to choose between. And the mask is a pixel-aligned rectangle,
+    // whose coverage is all or nothing, so clipping to it is the same as
+    // copying only the columns inside it.
+    // Copying is only the same picture as compositing where the tiles cover
+    // every pixel of the clip, and that is a narrower case than it looks.
+    //
+    // `draw_pixmap` does not draw a bitmap into a rectangle; it fills the
+    // destination with the bitmap as a *pattern*, and a pattern sampled
+    // outside its bounds pads by repeating its edge. Drawing a 3x3 tile at
+    // y = -3 — entirely above the canvas — paints the whole canvas, held back
+    // only by the mask. So wherever the tile grid leaves part of the clip
+    // uncovered, the old path fills it with smeared edge pixels, and a copy
+    // leaves it alone. The two agree only where nothing is left over.
+    //
+    // Three conditions, each ruling out a way the grid can fail to cover:
+    // a single row or column of tiles (`repeat-x`, `repeat-y`, `no-repeat`)
+    // leaves the rest of the clip to the padding; a grid that starts inside
+    // the clip or stops short of it leaves a margin; and a fractional
+    // placement lets the rounding below move tiles independently, so a 3px
+    // tile from -1.5 lands at -2, 2, 5 and leaves the column at 1 to nobody.
+    //
+    // Found by the conformance suite rather than by reasoning about it. The
+    // first version of this had only the opacity check and took the background
+    // tests from 901 failures to 922 — every one of them a page whose tiles do
+    // not cover their box. Anything this turns away keeps the slower path and
+    // the pixels it has always produced.
+    let covers_clip = tile_x
+        && tile_y
+        && first_x <= bounds.left() as f32
+        && first_y <= bounds.top() as f32
+        && first_x + columns as f32 * width >= bounds.right() as f32
+        && first_y + rows as f32 * height >= bounds.bottom() as f32;
+    let whole_pixels = first_x.fract() == 0.0
+        && first_y.fract() == 0.0
+        && width.fract() == 0.0
+        && height.fract() == 0.0;
+    if image.opaque && covers_clip && whole_pixels {
+        for row in 0..rows {
+            for column in 0..columns {
+                copy_tile(
+                    pixmap,
+                    image,
+                    (first_x + column as f32 * width).round() as i32,
+                    (first_y + row as f32 * height).round() as i32,
+                    bounds,
+                );
+            }
+        }
+        return;
+    }
+
+    let Some(mask) = ({
+        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height());
+        if let Some(mask) = mask.as_mut() {
+            let mut builder = PathBuilder::new();
+            builder.push_rect(bounds.to_rect());
+            if let Some(path) = builder.finish() {
+                mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            } else {
+                mask.clear();
+            }
+        }
+        mask
     }) else {
         return;
     };
@@ -1645,6 +1719,52 @@ fn tile_image(
                 Some(&mask),
             );
         }
+    }
+}
+
+/// Copies one opaque tile onto the canvas, clipped to `bounds`.
+///
+/// The fast half of `tile_image`; see the reasoning there for why a copy is
+/// the same picture as a composite in this case. Everything here is whole
+/// pixels, so each destination row is one `copy_from_slice` out of the
+/// corresponding source row.
+fn copy_tile(
+    pixmap: &mut Pixmap,
+    image: &DecodedImage,
+    at_x: i32,
+    at_y: i32,
+    bounds: tiny_skia::IntRect,
+) {
+    let canvas_width = pixmap.width() as i32;
+    let canvas_height = pixmap.height() as i32;
+    let tile_width = image.pixmap.width() as i32;
+    let tile_height = image.pixmap.height() as i32;
+
+    // Clipped to the canvas and to the rectangle the mask would have enforced.
+    let left = at_x.max(bounds.left()).max(0);
+    let right = (at_x + tile_width).min(bounds.right()).min(canvas_width);
+    let top = at_y.max(bounds.top()).max(0);
+    let bottom = (at_y + tile_height).min(bounds.bottom()).min(canvas_height);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let span = (right - left) as usize;
+    let source = image.pixmap.pixels();
+    let destination = pixmap.pixels_mut();
+    for row in top..bottom {
+        let from = ((row - at_y) * tile_width + (left - at_x)) as usize;
+        let onto = (row * canvas_width + left) as usize;
+        // Bounds are checked above, but the slices are indexed rather than
+        // trusted: the arithmetic above mixes the tile's coordinates with the
+        // canvas's, and a panic here would take the renderer down.
+        let (Some(taken), Some(put)) = (
+            source.get(from..from + span),
+            destination.get_mut(onto..onto + span),
+        ) else {
+            continue;
+        };
+        put.copy_from_slice(taken);
     }
 }
 
@@ -1785,6 +1905,76 @@ fn draw_tofu(pixmap: &mut Pixmap, glyph: &text::PositionedGlyph, x: f32, y: f32,
     }
 }
 
+/// How far from its baseline a glyph's outline is allowed to reach, in ems,
+/// for the purpose of deciding it cannot be on screen.
+///
+/// Deliberately far looser than any real outline. Typography puts ascenders
+/// and descenders inside about 1.2em of the baseline; four is chosen so that
+/// the question this answers — "is this glyph nowhere near the canvas?" — is
+/// never a close call. The glyphs it lets through are cropped exactly a few
+/// lines further down, so the cost of being generous is a handful of extra
+/// cache lookups at the edges of a band, and the cost of being too tight
+/// would be text missing from the page.
+const GLYPH_REACH: f32 = 4.0;
+
+/// Whether a glyph could possibly put a pixel on the canvas.
+///
+/// Conservative on purpose: a `true` here means "rasterise it and find out",
+/// and only a `false` skips anything. See `GLYPH_REACH`.
+///
+/// A non-finite size or position makes every comparison below false, so the
+/// glyph is skipped — which is what happens to it further down anyway, where
+/// `rasterise` refuses a size that is not finite.
+fn reaches_canvas(
+    glyph: &text::PositionedGlyph,
+    x: f32,
+    y: f32,
+    canvas_width: f32,
+    canvas_height: f32,
+) -> bool {
+    let reach = glyph.font_size * GLYPH_REACH + 1.0;
+    y + reach > 0.0
+        && y - reach < canvas_height
+        && x + glyph.advance + reach > 0.0
+        && x - reach < canvas_width
+}
+
+/// Whether a glyph would have put a pixel on the canvas, worked out the exact
+/// way — by rasterising it and cropping it as the drawing path does.
+///
+/// Only for the `debug_assert` that holds [`GLYPH_REACH`] honest, which is why
+/// it costs exactly what the fast path exists to avoid.
+#[cfg(debug_assertions)]
+fn would_have_drawn(
+    pixmap: &Pixmap,
+    fonts: &mut FontStore,
+    glyph: &text::PositionedGlyph,
+    x: f32,
+    y: f32,
+) -> bool {
+    if glyph.glyph_id == NOTDEF {
+        // Tofu is drawn from the glyph's own advance and size rather than from
+        // an outline, and crops itself.
+        return false;
+    }
+    let Some((_, left, top, width, height)) = fonts.rasterise(glyph) else {
+        return false;
+    };
+    let (Some(x), Some(y)) = (
+        (x.floor() as i32).checked_add(left),
+        (y.floor() as i32).checked_sub(top),
+    ) else {
+        return false;
+    };
+    let (glyph_width, glyph_height) = (width as i32, height as i32);
+    let (canvas_width, canvas_height) = (pixmap.width() as i32, pixmap.height() as i32);
+    let from_x = (-x).max(0);
+    let from_y = (-y).max(0);
+    let to_x = (canvas_width - x).min(glyph_width);
+    let to_y = (canvas_height - y).min(glyph_height);
+    to_x > from_x && to_y > from_y
+}
+
 fn draw_glyph(
     pixmap: &mut Pixmap,
     fonts: &mut FontStore,
@@ -1801,6 +1991,40 @@ fn draw_glyph(
     // same family as the `margin: 1e40px` bug, one layer further in.
     let (x, y) = (origin_x + glyph.x, origin_y + glyph.y);
     if !in_range(x) || !in_range(y) {
+        return;
+    }
+
+    // Nowhere near the canvas, decided without touching the glyph cache.
+    //
+    // A display list is the whole document (that is what lets a band be a
+    // shift rather than a re-render), so painting one band walks every glyph
+    // on the page. A long article is a quarter of a million of them, and each
+    // one was being rasterised — a cache lookup and, until recently, a copy of
+    // the bitmap — before the crop below noticed it was a thousand rows off
+    // screen. Two thousand glyphs were drawn; the other 99% were looked up and
+    // thrown away.
+    //
+    // The crop below is exact because it has the rasterised bitmap's placement
+    // to work from. This runs before there is one, so it asks the looser
+    // question: could a glyph of this size, with its baseline here, reach the
+    // canvas at all? `GLYPH_REACH` ems either side of the baseline is far more
+    // than any outline in the bundled faces uses, and those are the only faces
+    // this browser has (ADR-0010) — so the margin is a bound on the fonts that
+    // exist rather than a guess about fonts in general. The `debug_assert`
+    // holds it to that: whatever this skips is rasterised anyway when
+    // assertions are on, and checked to have really been off the canvas.
+    let (canvas_width, canvas_height) = (pixmap.width() as f32, pixmap.height() as f32);
+    if !reaches_canvas(glyph, x, y, canvas_width, canvas_height) {
+        #[cfg(debug_assertions)]
+        {
+            let skipped = would_have_drawn(pixmap, fonts, glyph, x, y);
+            debug_assert!(
+                !skipped,
+                "a glyph {}px at ({x}, {y}) was skipped as off-canvas on a \
+                 {canvas_width}x{canvas_height} band, and would have drawn",
+                glyph.font_size
+            );
+        }
         return;
     }
 
@@ -3006,7 +3230,25 @@ mod tile_tests {
     fn red_tile() -> DecodedImage {
         let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
         pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
-        DecodedImage { pixmap }
+        DecodedImage {
+            pixmap,
+            opaque: true,
+        }
+    }
+
+    /// A 4x4 image, half-transparent red.
+    ///
+    /// Here so the blending path keeps a test of its own. Every other tile in
+    /// this module is opaque, and an opaque tile is copied rather than
+    /// composited — so without this, the arithmetic that puts a see-through
+    /// background over what is under it would be exercised by nothing.
+    fn translucent_tile() -> DecodedImage {
+        let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 128));
+        DecodedImage {
+            pixmap,
+            opaque: false,
+        }
     }
 
     /// A 4x4 image with a red top row and left column, white elsewhere.
@@ -3028,7 +3270,10 @@ mod tile_tests {
         for y in 0..4usize {
             pixels[y * 4] = red;
         }
-        DecodedImage { pixmap }
+        DecodedImage {
+            pixmap,
+            opaque: true,
+        }
     }
 
     fn canvas() -> Pixmap {
@@ -3051,6 +3296,143 @@ mod tile_tests {
     fn is_red(pixmap: &Pixmap, x: u32, y: u32) -> bool {
         let pixel = pixmap.pixels()[(y * pixmap.width() + x) as usize];
         pixel.red() > 200 && pixel.green() < 100
+    }
+
+    #[test]
+    fn a_see_through_tile_lets_what_is_under_it_show() {
+        // The path the test above compares against, checked to be doing
+        // something rather than merely agreeing. A half-transparent red over
+        // white is pink: neither the red that a copy would leave nor the white
+        // that drawing nothing would.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(
+            &mut pixmap,
+            &translucent_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::Repeat,
+        );
+        let pixel = pixmap.pixels()[0];
+        assert!(
+            pixel.red() == 255 && pixel.green() > 100 && pixel.green() < 160,
+            "expected pink, got ({}, {}, {})",
+            pixel.red(),
+            pixel.green(),
+            pixel.blue()
+        );
+    }
+
+    #[test]
+    fn copying_a_tile_draws_what_compositing_it_would_wherever_it_is_used() {
+        // The safety net under the copying path, swept over the geometries
+        // that decide whether it is taken: tiles that do and do not divide
+        // their box, clips at whole and fractional coordinates, clips starting
+        // off the canvas, anchors above and to the left of the box, anchors on
+        // half pixels, and all four repeat modes.
+        //
+        // `opaque` is what chooses the path, so the same pixels are drawn
+        // twice with only that flipped and compared byte for byte. Cases the
+        // copying path turns away still pass here — they take the composite
+        // path both times, which is the point: this says the choice is safe,
+        // not that it is always made.
+        //
+        // Written after the first version of the copying path passed a
+        // narrower version of this test and still broke twenty-one conformance
+        // backgrounds.
+        for (tile_width, tile_height) in [(3u32, 3u32), (15, 15), (4, 7)] {
+            let mut pixmap = Pixmap::new(tile_width, tile_height).expect("tile");
+            pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
+            // One corner in another colour, so a tile landing a pixel out
+            // shows up. A uniform tile hides every placement error there is.
+            let red = PremultipliedColor::from_rgba(255, 0, 0, 255).expect("opaque red");
+            pixmap.pixels_mut()[0] = red;
+            let copied = DecodedImage {
+                pixmap: pixmap.clone(),
+                opaque: true,
+            };
+            let composited = DecodedImage {
+                pixmap,
+                opaque: false,
+            };
+
+            for (x, y, width, height) in [
+                (0.0f32, 0.0f32, 40.0f32, 40.0f32),
+                (2.5, 3.5, 30.0, 25.0),
+                (-5.0, -3.0, 50.0, 50.0),
+                (10.0, 10.0, 33.0, 17.0),
+            ] {
+                let rect = Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                let anchors = [
+                    (x, y),
+                    (x, y + height - tile_height as f32),
+                    (x - 7.0, y - 9.0),
+                    (x + 1.5, y + 2.5),
+                ];
+                for anchor in anchors {
+                    for repeat in [
+                        BackgroundRepeat::Repeat,
+                        BackgroundRepeat::RepeatX,
+                        BackgroundRepeat::RepeatY,
+                        BackgroundRepeat::NoRepeat,
+                    ] {
+                        let mut by_copy = canvas_of(40, 40);
+                        let mut by_composite = canvas_of(40, 40);
+                        tile_image(&mut by_copy, &copied, &rect, anchor, repeat);
+                        tile_image(&mut by_composite, &composited, &rect, anchor, repeat);
+                        if let Some(report) = first_difference(&by_copy, &by_composite, 40) {
+                            panic!(
+                                "tile {tile_width}x{tile_height}, clip ({x}, {y}, {width}, \
+                                 {height}), anchor {anchor:?}, {repeat:?}: {report}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A white canvas of the given size.
+    fn canvas_of(width: u32, height: u32) -> Pixmap {
+        let mut pixmap = Pixmap::new(width, height).expect("canvas");
+        pixmap.fill(tiny_skia::Color::WHITE);
+        pixmap
+    }
+
+    /// Where two canvases first disagree, described for a failure message.
+    ///
+    /// A whole-buffer `assert_eq!` says only that two megabytes differ, which
+    /// is no help at all in working out whether a tile landed a pixel out or a
+    /// gap was left between two of them.
+    fn first_difference(left: &Pixmap, right: &Pixmap, width: u32) -> Option<String> {
+        let (left, right) = (left.pixels(), right.pixels());
+        let (at, (copy, composite)) = left
+            .iter()
+            .zip(right.iter())
+            .enumerate()
+            .find(|(_, (copy, composite))| copy != composite)?;
+        let (x, y) = (at as u32 % width, at as u32 / width);
+        Some(format!(
+            "at ({x}, {y}) copying gives ({}, {}, {}, {}) and compositing gives ({}, {}, {}, {})",
+            copy.red(),
+            copy.green(),
+            copy.blue(),
+            copy.alpha(),
+            composite.red(),
+            composite.green(),
+            composite.blue(),
+            composite.alpha(),
+        ))
     }
 
     #[test]
