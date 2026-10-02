@@ -38,6 +38,13 @@ const MAX_BINARY_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 /// payload lands. Tracked with the vendor-versus-fetch decision in issue #7.
 const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How many times each interaction is repeated, with the worst one reported.
+const LATENCY_REPEATS: usize = 5;
+
+/// The viewport the interaction budgets are measured at.
+const LATENCY_WIDTH: u32 = 1000;
+const LATENCY_HEIGHT: u32 = 800;
+
 /// Result of evaluating a single budget.
 enum Outcome {
     Pass {
@@ -87,6 +94,8 @@ fn main() -> ExitCode {
         third_party_requests(),
         font_payload(),
     ];
+    let mut checks = checks;
+    checks.extend(interaction_latency());
 
     report(&checks)
 }
@@ -162,16 +171,7 @@ fn resident_memory() -> Check {
         };
     };
 
-    // The browser, not this harness. `Renderer::new` re-invokes whatever is
-    // running, which here is `budgets` — and `budgets --render-child` is not a
-    // renderer, so the first thing the parent read was garbage. The wire layer
-    // caught it ("length field does not fit the frame"), which is the bounds
-    // checking working, and the measurement was still wrong.
-    let browser = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(BROWSER)))
-        .filter(|path| path.exists());
-    let Some(browser) = browser else {
+    let Some(browser) = browser_beside_us() else {
         return Check {
             name,
             limit,
@@ -579,6 +579,191 @@ fn binary_path() -> Option<PathBuf> {
 }
 
 /// Prints the budget table and returns the process exit code.
+/// How long the window is frozen for when a reader does something (#207).
+///
+/// The three operations a reader performs constantly, each measured on the era
+/// fixture and each charged to the thread that draws the window. Every one of
+/// these is synchronous: the time it takes *is* the time the browser does not
+/// respond for, which is why "lots of hanging ui issues" was the original
+/// report and why these are the numbers that answer it.
+///
+/// The limits come from what a person notices rather than from what the
+/// browser currently manages, the same way the memory budget is set against
+/// PLAN.md's claim and not against the last measurement. A budget pinned to
+/// today's number fails on the first honest change and teaches everyone to
+/// raise it; a budget set at the threshold of a complaint keeps meaning the
+/// same thing as the code moves.
+///
+/// Measured as the worst of [`LATENCY_REPEATS`] runs, because a reader does not
+/// experience an average: they experience the occasion the window stalled, and
+/// that is the one they report.
+///
+/// One page, opened once, then asked for a band and a keystroke, because that
+/// is the order a reader does them in and because a renderer that had never
+/// drawn the page would answer the other two differently.
+fn interaction_latency() -> Vec<Check> {
+    // A band must land within a frame. Two frames at 60Hz rather than one:
+    // scrolling that misses every other frame reads as a stutter, and this is
+    // CI rather than a quiet desktop.
+    const BAND_LIMIT_MS: u128 = 32;
+    // A keystroke re-renders the page. Half of the hundred milliseconds at
+    // which an action stops feeling immediate, because typing is a run of them
+    // and the next letter should not queue behind the last.
+    const KEYSTROKE_LIMIT_MS: u128 = 50;
+    // Opening a page is the one a reader expects to take a moment, so this is
+    // the whole of that hundred milliseconds.
+    const OPEN_LIMIT_MS: u128 = 100;
+
+    let names = [
+        ("opening a page", OPEN_LIMIT_MS),
+        ("scrolling a band", BAND_LIMIT_MS),
+        ("a keystroke", KEYSTROKE_LIMIT_MS),
+    ];
+    let pending = |blocked_on: &'static str| {
+        names
+            .iter()
+            .map(|(name, limit)| Check {
+                name,
+                limit: format!("<= {limit} ms"),
+                outcome: Outcome::Pending { blocked_on },
+            })
+            .collect::<Vec<_>>()
+    };
+    let failed = |reason: String| {
+        names
+            .iter()
+            .map(|(name, limit)| Check {
+                name,
+                limit: format!("<= {limit} ms"),
+                outcome: Outcome::Fail {
+                    measured: "-".to_owned(),
+                    reason: reason.clone(),
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let Some(browser) = browser_beside_us() else {
+        return pending("a release build of the browser beside this harness");
+    };
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../ref/fixtures/era-page.html")
+        .canonicalize();
+    let Ok(fixture) = fixture else {
+        return failed("the era reference fixture is missing".to_owned());
+    };
+    let Ok(body) = std::fs::read(&fixture) else {
+        return failed("the era reference fixture could not be read".to_owned());
+    };
+    let url = net::file_url(&fixture);
+    let Ok((origin, path)) = net::parse_url(&url) else {
+        return failed("could not parse the fixture URL".to_owned());
+    };
+
+    let renderer = sandbox::Renderer::with_program(browser);
+    let document = || shell::viewport::Document {
+        body: body.clone(),
+        content_type: None,
+        origin: origin.clone(),
+        path: path.clone(),
+    };
+
+    // Each on its own child, because opening is what is being measured and a
+    // reused process would be measuring the second navigation.
+    let mut opening = std::time::Duration::ZERO;
+    for _ in 0..LATENCY_REPEATS {
+        let started = std::time::Instant::now();
+        let page = shell::viewport::Viewport::open(
+            &renderer,
+            document(),
+            LATENCY_WIDTH,
+            LATENCY_HEIGHT,
+            false,
+            false,
+            1.0,
+        );
+        let taken = started.elapsed();
+        if let Err(error) = page {
+            return failed(format!("the page did not render: {error}"));
+        }
+        opening = opening.max(taken);
+    }
+
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        document(),
+        LATENCY_WIDTH,
+        LATENCY_HEIGHT,
+        false,
+        false,
+        1.0,
+    );
+    let mut page = match page {
+        Ok(page) => page,
+        Err(error) => return failed(format!("the page did not render: {error}")),
+    };
+
+    let mut band = std::time::Duration::ZERO;
+    for _ in 0..LATENCY_REPEATS {
+        let started = std::time::Instant::now();
+        let _ = page.request_band(0, LATENCY_HEIGHT / 2, LATENCY_HEIGHT);
+        while page.band_outstanding() && !page.accept_band() {
+            std::hint::spin_loop();
+        }
+        band = band.max(started.elapsed());
+    }
+
+    let mut keystroke = std::time::Duration::ZERO;
+    for _ in 0..LATENCY_REPEATS {
+        let started = std::time::Instant::now();
+        page.type_key(sandbox::message::Key::Insert("a".to_owned()));
+        keystroke = keystroke.max(started.elapsed());
+    }
+
+    vec![
+        latency_check(names[0], opening),
+        latency_check(names[1], band),
+        latency_check(names[2], keystroke),
+    ]
+}
+
+/// One interaction measured against its limit.
+///
+/// Its own function so the comparison can be tested. The measurement needs a
+/// window, a page and a renderer; deciding whether a number is over a limit
+/// needs none of those, and it is the half that would fail silently — a budget
+/// that cannot report FAIL is decoration.
+fn latency_check((name, limit): (&'static str, u128), taken: std::time::Duration) -> Check {
+    let measured = format!("{} ms", taken.as_millis());
+    Check {
+        name,
+        limit: format!("<= {limit} ms"),
+        outcome: if taken.as_millis() <= limit {
+            Outcome::Pass { measured }
+        } else {
+            Outcome::Fail {
+                measured,
+                reason: "the window does not answer for this long, which is what #207 reported"
+                    .to_owned(),
+            }
+        },
+    }
+}
+
+/// The browser binary beside this harness.
+///
+/// The browser, not this harness. `Renderer::new` re-invokes whatever is
+/// running, which here is `budgets` — and `budgets --render-child` is not a
+/// renderer, so the first thing the parent read was garbage. The wire layer
+/// caught it ("length field does not fit the frame"), which is the bounds
+/// checking working, and the measurement was still wrong.
+fn browser_beside_us() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(BROWSER)))
+        .filter(|path| path.exists())
+}
+
 fn report(checks: &[Check]) -> ExitCode {
     let mut failed = 0usize;
     let mut pending = 0usize;
@@ -623,7 +808,37 @@ fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn an_interaction_over_its_limit_fails_the_budget() {
+        // The half of the latency budgets that has no window in it, and the
+        // half that would otherwise be taken on trust. A budget whose
+        // comparison is wrong reports PASS for a browser that freezes, which is
+        // worse than having no budget at all.
+        let over = latency_check(("scrolling a band", 32), Duration::from_millis(33));
+        assert!(
+            matches!(over.outcome, Outcome::Fail { .. }),
+            "33ms against a 32ms limit must fail"
+        );
+        // The limit itself is allowed: `<= 32 ms` is what the report prints, so
+        // 32 passing is what it must mean.
+        let at = latency_check(("scrolling a band", 32), Duration::from_millis(32));
+        assert!(
+            matches!(at.outcome, Outcome::Pass { .. }),
+            "32ms against a 32ms limit must pass"
+        );
+        // Milliseconds, not nanoseconds: a measurement is reported in whole
+        // milliseconds, so a limit compared against the wrong unit would pass
+        // everything.
+        let far_over = latency_check(("opening a page", 100), Duration::from_secs(4));
+        assert!(
+            matches!(far_over.outcome, Outcome::Fail { .. }),
+            "4s must fail"
+        );
+    }
 
     #[test]
     fn the_newest_source_is_a_source_of_this_browser() {
