@@ -8,6 +8,7 @@ members = [
     "tests/gaps",
     "tests/ref",
     "tests/timings",
+    "tools/icons",
 ]
 
 [workspace.package]

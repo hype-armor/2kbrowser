@@ -1,39 +1,42 @@
-name: Nightly fuzz
+name: Fuzz soak
 
-# `tests/fuzz` has been a real fuzzer for a while and nothing ever ran it for
-# longer than a few seconds. `cargo test` runs `tests/soak.rs`, which says in
-# its own header that it is a fixed-seed regression test and that catching *new*
-# bugs is somebody else's job — and nobody was doing that job. This is that job.
+# A long fuzzing run, on demand. `cargo test` runs `tests/soak.rs`, which says
+# in its own header that it is a fixed-seed regression pass and that catching
+# *new* bugs is the long soak's job. This is where that job is run from, so it
+# does not have to be reconstructed from shell history every time.
+#
+# # It is not on a schedule, and that is a choice with a cost
+#
+# It was written with a nightly `schedule:` trigger and the trigger was taken
+# out deliberately. Naming the trade honestly, because the next person to read
+# this file will wonder:
+#
+# Nothing now runs this unless somebody asks. A dumb mutator finds things by
+# being left alone for a long time, so a soak nobody starts finds nothing — and
+# that is not hypothetical here. The soak that prompted this file found a panic
+# in `html5ever` inside four minutes, and then found a *second* shape of the
+# same bug only because the fuzzer was run again after the first fix. Neither
+# would have surfaced from `cargo test` at any point.
+#
+# So: run it by hand after touching a parser, after changing anything in
+# `crates/dom`, `crates/css`, `crates/paint`, `crates/net` or `crates/sandbox`,
+# and after fixing something the fuzzer found — that last one especially. If
+# this becomes a thing nobody remembers, the honest fix is to put the trigger
+# back rather than to pretend `cargo test` covers it.
 #
 # # Why a second workflow rather than a job in `ci.yml`
 #
 # Read the comments at the top of `ci.yml` before changing either file; that one
-# is shaped by its bill. Two of its decisions make a fuzz job a bad fit there.
+# is shaped by its bill, and a soak does not belong in it.
 #
-# Its matrix is event-scoped: a `pull_request` or a push to `main` fans out to
-# macOS and Windows, which bill at 10x and 2x. Adding `schedule:` to that `on:`
-# block fires the whole thing nightly — the exact spend those comments exist to
-# avoid — unless both existing jobs grow an `if:` guard against an event they
-# have nothing to do with.
-#
-# And its concurrency group cancels in-progress runs per ref. A scheduled run's
-# ref is `refs/heads/main`, which is the one ref exempted, so today it would
-# survive; but that exemption is about not losing a measurement of a shippable
-# commit, and resting an hour-long soak on it is resting it on a rule written
-# for something else. A soak that has been running for fifty minutes is the most
-# valuable thing on the machine and must not be cancellable by a push.
+# Its matrix is event-scoped, so a `pull_request` or a push to `main` fans out
+# to macOS and Windows at 10x and 2x. A twenty-minute-per-target soak attached
+# to that is the exact spend those comments exist to avoid. Its concurrency
+# group also cancels in-progress runs per ref, and a soak that has been running
+# for fifty minutes must not be cancellable by somebody's push.
 on:
-  schedule:
-    # 04:17 UTC nightly. Off the hour on purpose: GitHub queues scheduled
-    # workflows platform-wide and the top of the hour is where everybody else
-    # put theirs, so a job asking for six runners waits behind them.
-    #
-    # GitHub disables scheduled workflows in a repository with no activity for
-    # 60 days. If this stops running, that is the first thing to check.
-    - cron: "17 4 * * *"
-  # So a soak can be started deliberately — after a change to a parser, or to
-  # chase a finding with a longer budget — rather than waiting for the small
-  # hours to find out.
+  # The only trigger. Inputs so a soak can be aimed: a longer budget to chase
+  # something, or a fixed seed to re-run a run that found something.
   workflow_dispatch:
     inputs:
       minutes:
@@ -74,7 +77,7 @@ jobs:
   # `unsafe` in it (ADR-0002) and no platform branches on the paths a mutated
   # document reaches. Paying macOS's 10x for a second opinion on the same
   # arithmetic would buy nothing. Standard Linux runners are free on a public
-  # repository, which is what makes six of them nightly reasonable at all.
+  # repository, which is what makes six at a time reasonable at all.
   #
   # One runner per target rather than six targets on one, for three reasons.
   # Each gets a whole machine, so the budget buys iterations instead of context
@@ -103,10 +106,10 @@ jobs:
           rustc --version && cargo --version
           echo "id=$(rustc --version | tr -c '[:alnum:]' '-')" >> "$GITHUB_OUTPUT"
 
-      # Restore only. `ci.yml` owns this cache; a nightly job that also saved
-      # would write six entries a night under keys the daytime jobs read,
-      # pushing the ones they actually want out of a 10 GB allowance. Missing it
-      # entirely costs this job a few minutes of compiling and nothing else.
+      # Restore only. `ci.yml` owns this cache; a soak that also saved would
+      # write six entries per run under keys the ordinary jobs read, pushing the
+      # ones they actually want out of a 10 GB allowance. Missing it entirely
+      # costs this job a few minutes of compiling and nothing else.
       - name: Restore dependency cache
         uses: actions/cache/restore@v4
         with:
@@ -123,7 +126,7 @@ jobs:
       # file that is easy to get wrong. The release profile sets
       # `panic = "abort"` (see the root `Cargo.toml`), and an abort cannot be
       # caught — the run would end at the first crash instead of recording it
-      # and carrying on, so a night that could have found four bugs finds one.
+      # and carrying on, so a run that could have found four bugs finds one.
       # It is slower. That is the trade, and it is the right way round.
       - name: Build the fuzzer
         run: cargo build -p fuzz
@@ -132,11 +135,12 @@ jobs:
         run: |
           set -o pipefail
 
-          # A fixed seed would feed the same inputs every night, and a nightly
-          # job that re-runs last night's inputs discovers nothing after the
-          # first night — it becomes `tests/soak.rs` on a timer. The run id is
-          # unique and monotonic, and it is printed in the output below, so
-          # tonight's inputs are new and any night's are reproducible by name.
+          # A fixed default seed would feed the same inputs to every run, which
+          # discovers nothing after the first one — it would be `tests/soak.rs`
+          # with extra steps. The run id is unique and monotonic, and it is
+          # printed in the output below, so each run explores somewhere new and
+          # any past run can be repeated by naming its seed in the `seed` input
+          # above.
           seed='${{ inputs.seed }}'
           if [ -z "$seed" ]; then
             seed=$(( ${{ github.run_id }} + ${{ github.run_attempt }} ))
@@ -189,8 +193,7 @@ jobs:
           fi
           exit "$status"
 
-      # The whole point of running this on a schedule. A soak that finds a
-      # crasher at four in the morning and then deletes the runner is worse than
+      # A soak that finds a crasher and then deletes the runner is worse than
       # no soak at all: it has spent the machine, told nobody what it found, and
       # left a red X that cannot be acted on.
       #
@@ -219,7 +222,7 @@ jobs:
             tests/fuzz/corpus/${{ matrix.target }}/slow-*.bin
             tests/fuzz/corpus/${{ matrix.target }}/in-flight.bin
           if-no-files-found: ignore
-          # Longer than the 90-day default. A crasher found on a Friday night
-          # may wait out a holiday before anyone reads it, and the artifact is a
-          # few kilobytes.
+          # Longer than the 90-day default. A crasher found on a Friday may
+          # wait out a holiday before anyone reads it, and the artifact is a few
+          # kilobytes.
           retention-days: 180

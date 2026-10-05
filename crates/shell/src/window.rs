@@ -3338,22 +3338,18 @@ impl App {
     }
 }
 
-/// How big the icon handed to the window manager is drawn.
+/// The window icon, decoded from the copy built into the binary.
 ///
-/// One size, because that is what winit takes. Large enough that a desktop
-/// scaling it up has something to work with, and the drawing carries its own
-/// answer for the small end — `shell::icon` weights the outlines heavier below
-/// about thirty pixels, so a manager that scales this down and one that asks
-/// for a small size directly do not get wildly different pictures.
-const ICON_SIZE: u32 = 128;
-
-/// The icon, if it can be drawn and the platform will take it.
+/// Generated from `assets/icon.png` by `cargo run -p icons`; see that tool for
+/// why there is one master and everything else is derived from it.
 ///
-/// `None` rather than a failure: a window with no icon is a window, and one
-/// that refused to open because a decoration could not be built would not be.
-fn app_icon() -> Option<winit::window::Icon> {
-    let (rgba, width, height) = crate::icon::rgba(ICON_SIZE)?;
-    winit::window::Icon::from_rgba(rgba, width, height).ok()
+/// winit wants straight alpha and one size, and scaling to a title bar or a
+/// taskbar is the compositor's job from there.
+fn window_icon() -> Option<winit::window::Icon> {
+    const BYTES: &[u8] = include_bytes!("../../../assets/generated/window-256.png");
+    let decoded = image::load_from_memory(BYTES).ok()?.into_rgba8();
+    let (width, height) = (decoded.width(), decoded.height());
+    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
 }
 
 /// `url` with `query` as its query string, replacing whatever it had.
@@ -3784,7 +3780,7 @@ impl ApplicationHandler<Wake> for App {
         };
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
-            .with_window_icon(app_icon())
+            .with_window_icon(window_icon())
             // Invisible until the accessibility adapter has been attached
             // below: AccessKit must be given the window before it is first
             // shown, and says so by panicking if it is not. Shown again a few
@@ -4696,6 +4692,21 @@ mod tests {
         // Shrinking to fit is only worth doing while what is left is usable; a
         // 200px-tall screen is not a reason to hand back a 104px window.
         assert_eq!(clamp_to_monitor((800, 800), (300, 200)), (800, 800));
+    }
+
+    #[test]
+    fn the_window_icon_is_there_and_decodes() {
+        // `window_icon` swallows a failure on purpose — a browser that refused
+        // to open over a decoration would be worse than a plain one — so
+        // nothing at runtime would ever say the icon had gone missing. A
+        // mistyped path, a truncated regeneration, or a master saved in a
+        // format `image` was not built to read would all show up as a window
+        // that quietly has no icon, on somebody else's desktop.
+        let icon = window_icon();
+        assert!(
+            icon.is_some(),
+            "the embedded window icon did not decode; regenerate with `cargo run -p icons`"
+        );
     }
 
     #[test]

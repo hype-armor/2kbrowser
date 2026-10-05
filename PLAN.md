@@ -494,8 +494,8 @@ are readable rather than jumbled.
 them: back and forward with a real history stack, an editable URL bar,
 find-in-page, tabs with a strip that only appears once there are two, the
 document-fallback notice and its override, the HTTP-transparency marker §4
-requires, bookmarks in a text file, an application icon drawn the same way the
-bar is rather than shipped as a folder of PNGs, and the address of the link
+requires, bookmarks in a text file, an application icon derived from one
+master by `cargo run -p icons`, and the address of the link
 under the pointer in the corner of the window — which matters more in a browser that
 spends this much of its chrome on *which host you are dealing with* than in one
 that does not (#139). The chrome is drawn by building a
@@ -577,7 +577,8 @@ remains is building it.
 
 Where that stands: the work in this milestone is done. All three platforms
 confine the renderer, each is checked from inside on every push, the parsers are
-fuzzed — on every `cargo test` and again on a schedule — a hang is now a finding
+fuzzed — on every `cargo test`, and at length whenever somebody runs the soak —
+a hang is now a finding
 rather than a hang, and the TLS configuration is asserted rather than inherited. What is left is not a task on
 this list — **nobody outside this project has read any of it.** The milestone's
 test is whether we would tell a stranger to browse untrusted sites with it, and
@@ -628,14 +629,25 @@ never happened anywhere except on somebody's laptop, by hand, when they
 remembered. A fuzzer that only ever re-runs the inputs it has already seen is a
 regression test with a fuzzer's name on it.
 
-`.github/workflows/fuzz.yml` runs it now: nightly, Linux only, one runner per
-target, twenty minutes each, seeded from the run id so tonight's inputs are ones
-nobody has tried. It is a second workflow rather than a job in `ci.yml` because
-that file's matrix is event-scoped to keep macOS and Windows off intermediate
-commits, and hanging a nightly trigger on it would fire the whole matrix in the
-small hours — the exact spend those comments exist to prevent. Findings are
-uploaded as an artifact before the runner is destroyed, including the in-flight
-file, which is the only record a hang leaves.
+`.github/workflows/fuzz.yml` is where it is run from now: Linux only, one
+runner per target, twenty minutes each by default, seeded from the run id so
+each run explores somewhere nobody has been. Findings are uploaded as an
+artifact before the runner is destroyed, including the in-flight file, which is
+the only record a hang leaves. It is a second workflow rather than a job in
+`ci.yml` because that file's matrix is event-scoped to keep macOS and Windows
+off intermediate commits, and a twenty-minute-per-target soak attached to it is
+the exact spend those comments exist to prevent.
+
+**It is dispatch-only, and that is a real gap rather than a detail.** The
+workflow was written with a nightly `schedule:` trigger and the trigger was
+removed deliberately, so nothing runs this unless somebody asks. A dumb mutator
+earns its keep by being left alone for a long time; a soak nobody starts finds
+nothing. The evidence is in this very section — the `html5ever` panic took four
+minutes to find once something finally ran, and the second shape of it was
+found only because the fuzzer was run *again* after the first fix. So the thing
+that has to happen by habit is: run it after touching a parser, and run it again
+after fixing whatever it found. If that habit does not hold, the answer is to
+put the trigger back, not to tell ourselves `cargo test` covers this.
 
 **A fifth panic, and it is in a dependency.** The first proper soak found it in
 about four minutes: `html5ever` 0.39.0's meta-charset scan indexes one past the
@@ -695,8 +707,8 @@ clean.
 Worth being blunt about why this mattered more than the number. A slow finding
 that cannot be reproduced from the file it recorded is worse than no finding:
 it puts something in the corpus that looks like a reproduction, and the next
-person renders it in 21 milliseconds and stops trusting the tool. The nightly
-job would have produced these on a schedule.
+person renders it in 21 milliseconds and stops trusting the tool. Every soak
+run would have produced them.
 
 **The corpus decides what gets fuzzed, and nobody had checked it.** The image
 target mutated the reference fixtures, and the reference fixtures hold two PNGs
@@ -1062,7 +1074,8 @@ This section used to answer that with "no: there is no sandbox, the parsers have
 never been fuzzed, and the TLS configuration has not been reviewed", and it went
 on saying so for the whole of M4. All three had stopped being true. The renderer
 is confined on all three platforms (ADR-0012, ADR-0016, ADR-0017), the parsers
-are fuzzed — by `tests/fuzz`, on every `cargo test` and again every night — and
+are fuzzed — by `tests/fuzz`, on every `cargo test` and at length on demand —
+and
 the TLS configuration is asserted rather than inherited (ADR-0013). A plan that
 describes the repository it was written against rather than the one on disk is
 worse than no plan, because it is read as if it were current.
