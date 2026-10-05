@@ -18,6 +18,12 @@ layout = { path = "../layout" }
 net = { path = "../net" }
 paint = { path = "../paint" }
 slop = { path = "../slop" }
+# Only to turn the embedded window icon into the straight-alpha buffer winit
+# wants. `paint::decode` is right there and is not the answer: it hands back
+# premultiplied pixels for the compositor, and un-premultiplying them to hand
+# back again would lose a little of every edge for no reason. Same version
+# `paint` already pins, so this is an edge in the graph rather than a crate.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 softbuffer = "0.4"
 text = { path = "../text" }
 winit = "0.30"

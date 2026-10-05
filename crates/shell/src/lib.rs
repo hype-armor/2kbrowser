@@ -14,7 +14,6 @@ pub mod fetches;
 pub mod field;
 pub mod history;
 pub mod home;
-pub mod icon;
 pub mod isolated;
 pub mod menu;
 pub mod preview;

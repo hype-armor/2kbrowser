@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=2kbrowser
+GenericName=Web Browser
+Comment=A web browser without the slop
+Exec=2kbrowser open %u
+Icon=2kbrowser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
