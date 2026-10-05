@@ -14,7 +14,90 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
-## Unreleased
+## 0.5.0
+
+**The window stops freezing (#207).** The entries below describe the first half
+of this: typing that no longer waits for a render, a busy tab that no longer
+takes the window with it, parsing that is no longer quadratic, and half of
+layout that turned out to be hashing a cache key. This is the rest of it, and
+the reason the release is dated when it is.
+
+Everything here was found by measuring, and measuring overturned three
+successive guesses — each of which would have been an afternoon spent making
+nothing faster. The renderer re-parses the document on every keystroke, which is
+the obvious thing to fix: parse is **0.2–2.6ms against a layout of 70ms**. Then
+`subtree_widths` looked like it was recomputing the same boxes; it is called
+9,601 times for 9,601 distinct keys, never twice for one. Then Unicode line
+breaking looked like what laying out prose costs, projected at 14ms from the
+call counts: **1.8ms**. In each case what was slow sat next to the thing being
+blamed.
+
+Four things were. Sizing a table column asked each cell for a minimum and a
+maximum width, and the minimum rebuilt every single-word run to measure it
+again — arriving at the number the maximum had just produced, for most cells of
+most tables of the era. A band of a long page rasterised **226,890 glyphs to
+draw about 2,000**, because a display list is the whole document and nothing
+asked whether a glyph was on screen before fetching its bitmap. Tiling an
+opaque background went through a pattern shader and a full-canvas mask at about
+seven microseconds a tile, which on the era fixture is **2,835 tiles and 19ms
+of a 24ms band** — charged again every time the reader scrolled a line. And
+resolving a line height per segment turned out to shape a probe glyph, so every
+segment did two cache lookups rather than one: **106,001 shaping lookups for
+53,000 segments**.
+
+On the fixture that looks like a real page of the era, opening it went from 45ms
+to under 30, scrolling a band from 13ms to 3–4, and a keystroke from 16ms to
+5–9. On a two-thousand-paragraph article a band went from 33ms to 15–17 and
+layout from 73–75ms to 48–62. Not a pixel changed: the reference baselines stayed
+byte-for-byte identical and conformance held at 901 failures through every
+commit, which for a release that rewrote parts of paint and text is the number
+that mattered most.
+
+Two changes were written, measured and deleted rather than kept — caching the
+parsed document between keystrokes, and handing back a segment's size without
+its glyphs — because neither could be shown to pay for itself. And one of them
+shipped a bug first: copying an opaque background tile instead of compositing it
+broke twenty-one conformance backgrounds, because `draw_pixmap` does not draw a
+bitmap into a rectangle but fills the destination with it as a *pattern*, and a
+pattern padded by its own edge covers ground the tiles themselves do not. The
+copying path is now narrowed to the case where the tiles cover their box, which
+is the only case where the two agree.
+
+**The three speeds a reader feels now have budgets.** Opening a page under
+100ms, scrolling a band inside two frames, a keystroke under 50ms — thresholds
+of perception rather than today's measurements, because a budget pinned to the
+current number fails on the first honest change and teaches everyone to raise
+it. They are scaled by how fast the machine measuring them is, so CI on a
+Raspberry Pi is held to what a Pi can do; without that the aarch64 runner would
+have failed for being a Raspberry Pi, which is how a check becomes one nobody
+reads.
+
+There is no cliff left to find, and that was checked rather than assumed:
+doubling the input roughly doubles the time for table rows, table columns,
+paragraphs, nesting depth, floats, and one unbreakable word. What remains are
+constants, and the largest is now **the finished pixmap crossing the process
+boundary** ADR-0012 puts there — about 10ms of a realistic page's 26. Spawning
+the renderer, the handshake and loading the fonts come to 0.5ms between them,
+which is worth writing down because it was the first thing suspected.
+
+**A screen reader can read a page (#9, ADR-0019).** The accessibility tree is
+built in the renderer and crosses the boundary **as data**, and the parent
+builds the native objects from it. The alternative — registering with UI
+Automation or AT-SPI from inside the sandbox — would hand platform API handles
+to the process that must not have them, which is the one thing ADR-0012 bought.
+The cost is a new parsing surface on the trusted side, and a dependency that
+goes in the *parent*, against the usual direction for this repository; ADR-0019
+spends most of its length on why that is the right trade.
+
+**A character the fonts do not cover draws a box, not nothing.** The shaper
+resolves it to `.notdef` and gives it a real advance, so the line was always the
+right length — and then nothing was drawn, because `.notdef` has no outline in
+these faces. A page in Chinese or Arabic came out *blank*, which is the worse of
+the two failures: a reader cannot tell "this page is empty" from "this browser
+has no font for it". ADR-0008 and PLAN.md both already said pages in uncovered
+scripts render as tofu; this is that sentence becoming true. Covering the
+scripts is the other half and a separate decision, since it is tens of megabytes
+against a font budget currently using four.
 
 **Typing no longer freezes the window, and a word costs one render** (#207). A
 keystroke costs the child a whole re-render — parse, cascade, layout, paint —
