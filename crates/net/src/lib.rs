@@ -6,12 +6,14 @@
 
 pub mod encoding;
 pub mod policy;
+pub mod site;
 pub mod tls;
 
 pub use policy::{
     Exception, LOCAL_SITE, Origin, Policy, Refusal, RequestKind, Scheme, file_url, is_drive_path,
     parse_url, resolve,
 };
+pub use site::site;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -123,6 +125,12 @@ pub enum FetchError {
     Io(std::io::Error),
     /// The body was larger than [`MAX_BODY_BYTES`].
     TooLarge,
+    /// The redirects went on past [`MAX_HOPS`].
+    ///
+    /// Its own variant rather than a transport error because it is a refusal:
+    /// a chain that long is a loop or a server arguing with itself, and either
+    /// way stopping is the right answer rather than a failure to report.
+    TooManyRedirects,
 }
 
 impl std::fmt::Display for FetchError {
@@ -149,6 +157,7 @@ impl std::fmt::Display for FetchError {
             FetchError::Status { code } => write!(f, "server returned {code}"),
             FetchError::Io(error) => write!(f, "{error}"),
             FetchError::TooLarge => write!(f, "response exceeded the size limit"),
+            FetchError::TooManyRedirects => write!(f, "too many redirects"),
         }
     }
 }
@@ -169,6 +178,52 @@ pub const MAX_FORM_BYTES: u64 = 1024 * 1024;
 /// A browser must not let a hostile server exhaust its memory, and 32 MiB is
 /// far beyond any document this engine renders.
 pub const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How many redirects one request may follow.
+///
+/// Redirects are followed here rather than by `ureq`, which would happily do it
+/// and is configured not to. Two things have to happen at every hop and only
+/// this side can do either: the policy has to be asked again, because a
+/// same-site URL that redirects to a tracker is a third-party request the rule
+/// would otherwise never see; and where the chain *stopped* has to travel back,
+/// because that — not what was typed — is what a relative link on the page
+/// resolves against.
+pub const MAX_HOPS: u32 = 8;
+
+/// What one request came back with.
+enum Landed {
+    /// A redirect, carrying its `Location` exactly as the server wrote it.
+    Elsewhere(String),
+    /// A response with a body.
+    Here {
+        /// What the server answered with.
+        status: u16,
+        /// The bytes.
+        bytes: Vec<u8>,
+        /// Its `Content-Type`, when there was one.
+        content_type: Option<String>,
+        /// Whether it may outlive the page that asked (ADR-0018).
+        storable: bool,
+    },
+}
+
+/// Where a request ended up, and what was there.
+///
+/// The origin and path are the ones the chain *landed* on. A page served after
+/// a redirect belongs to where it came from, not to where it was asked for:
+/// `hackernews.com` redirects to `news.ycombinator.com`, and a browser that
+/// kept the first resolves every relative link on the page against a host that
+/// only knows how to redirect again — which is how `item?id=49737849` arrives
+/// as `/item` and Hacker News answers "No such item."
+struct Arrived {
+    origin: Origin,
+    path: String,
+    status: u16,
+    bytes: Vec<u8>,
+    content_type: Option<String>,
+    trust: Trust,
+    storable: bool,
+}
 
 /// A fetched resource.
 #[derive(Debug, Clone)]
@@ -216,6 +271,46 @@ pub struct Fetched {
     pub path: String,
     /// How its certificate chain was verified.
     pub trust: Trust,
+    /// What the server answered with.
+    ///
+    /// 200 for anything that had no status to have — a local file, a form's
+    /// answer. Carried because a navigation now *keeps* the body of a 4xx or a
+    /// 5xx (#203), and the reader has to be able to tell a site's own "not
+    /// found" from the page they asked for.
+    pub status: u16,
+    /// Whether the response allows this to be kept once the page that asked
+    /// for it is gone (ADR-0018).
+    ///
+    /// `false` where the server said `Cache-Control: no-store` or `Pragma:
+    /// no-cache`. The second matters more here than it would in a modern
+    /// browser, because this browser is aimed at the servers of the HTTP/1.0
+    /// era and `Pragma` is what they actually send.
+    ///
+    /// Nothing else about caching is parsed. `max-age`, `Expires` and
+    /// revalidation are a freshness model, and a cache that lives for one run
+    /// does not need one — it needs to know what it is not allowed to keep.
+    pub storable: bool,
+}
+
+/// Whether a response's headers allow it to be stored (ADR-0018).
+///
+/// Both header values are comma-separated lists of directives, and a directive
+/// may carry an argument this does not read — so each is split rather than
+/// matched whole, or `Cache-Control: max-age=0, no-store` would look like
+/// nothing at all.
+fn storable(cache_control: Option<&str>, pragma: Option<&str>) -> bool {
+    let says = |value: Option<&str>, directive: &str| {
+        value.is_some_and(|value| {
+            value.split(',').any(|part| {
+                part.split('=')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case(directive)
+            })
+        })
+    };
+    !says(cache_control, "no-store") && !says(pragma, "no-cache")
 }
 
 /// Fetches resources subject to a [`Policy`].
@@ -226,6 +321,117 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
+    /// Makes a request, following redirects and asking the policy at each one.
+    ///
+    /// The policy is applied *before* every hop rather than to the URL the
+    /// caller named. Applying it once at the front is what a browser does when
+    /// it lets `ureq` follow redirects for it, and it leaves the rule with a
+    /// door in it: a subresource on the page's own site that answers `302
+    /// Location: https://tracker.example.net/pixel.gif` gets the request made
+    /// and the rule never sees the host it was made to. ADR-0006's budget says
+    /// *no third-party request was ever made*, and that has to be true of the
+    /// second request as much as the first.
+    ///
+    /// Where the chain stopped comes back in [`Arrived`], because that is the
+    /// document's real origin — for the policy, for the chrome, and above all
+    /// for resolving the links on the page.
+    fn follow(
+        &self,
+        url: &str,
+        document: Option<&Origin>,
+        kind: RequestKind,
+    ) -> Result<Arrived, FetchError> {
+        let (mut origin, mut path) = parse_url(url).map_err(FetchError::Refused)?;
+        if let Err(refusal) = self.policy.check(document, &origin, kind) {
+            count_refusal(&refusal);
+            return Err(FetchError::Refused(refusal));
+        }
+        count_if_third_party(document, &origin, kind);
+
+        // A file has no transport and nothing to redirect with.
+        if origin.scheme == Scheme::File {
+            let bytes = read_file(&path)?;
+            return Ok(Arrived {
+                origin,
+                path,
+                // A file that opened is the file. There is no status to have,
+                // and 200 is the honest stand-in: the thing was served.
+                status: 200,
+                bytes,
+                content_type: None,
+                trust: Trust::NotEncrypted,
+                storable: true,
+            });
+        }
+
+        let mut url = url.to_owned();
+        // Sticky rather than taken from the last hop: if any step of the chain
+        // needed this computer's own roots, the reader is behind something
+        // intercepting the connection and the chrome has to say so (ADR-0015).
+        let mut trust = Trust::Public;
+        for _ in 0..=MAX_HOPS {
+            let (landed, hop) = fetch_http(&url)?;
+            if hop == Trust::LocalRoot {
+                trust = Trust::LocalRoot;
+            }
+            let location = match landed {
+                Landed::Here {
+                    status,
+                    bytes,
+                    content_type,
+                    storable,
+                } => {
+                    // A 4xx or a 5xx means opposite things to the two kinds of
+                    // request, so this is the one place the kind decides what a
+                    // status *is* (#203).
+                    //
+                    // For a navigation it is a page. The body is the site's own
+                    // "not found", or a proxy's block notice, or the sentence a
+                    // server wrote to explain itself, and throwing it away to
+                    // show `server returned 403` instead tells the reader less
+                    // than the server did.
+                    //
+                    // For a subresource it is a failure, exactly as before. A
+                    // 404's HTML body is not a stylesheet, and handing it to the
+                    // CSS parser because the status was ignored would apply a
+                    // page of garbage rules to the document.
+                    if status >= 400 && kind != RequestKind::Navigation {
+                        return Err(FetchError::Status { code: status });
+                    }
+                    return Ok(Arrived {
+                        origin,
+                        path,
+                        status,
+                        bytes,
+                        content_type,
+                        trust,
+                        storable,
+                    });
+                }
+                Landed::Elsewhere(location) => location,
+            };
+
+            url = resolve(&origin, &path, &location);
+            let (next, next_path) = parse_url(&url).map_err(FetchError::Refused)?;
+            // Asked before the guard below because a navigation is exempt from
+            // the policy entirely, and "follow this redirect to the disk" is
+            // not something a navigation may do either. A page cannot be
+            // allowed to reach a local file by bouncing off a server.
+            if next.scheme == Scheme::File {
+                let refusal = Refusal::LocalFile;
+                count_refusal(&refusal);
+                return Err(FetchError::Refused(refusal));
+            }
+            if let Err(refusal) = self.policy.check(document, &next, kind) {
+                count_refusal(&refusal);
+                return Err(FetchError::Refused(refusal));
+            }
+            count_if_third_party(document, &next, kind);
+            (origin, path) = (next, next_path);
+        }
+        Err(FetchError::TooManyRedirects)
+    }
+
     /// Fetches a URL.
     ///
     /// `document` is the origin of the page making the request, or `None` for a
@@ -236,30 +442,17 @@ impl Fetcher {
         document: Option<&Origin>,
         kind: RequestKind,
     ) -> Result<Resource, FetchError> {
-        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        if let Err(refusal) = self.policy.check(document, &origin, kind) {
-            count_refusal(&refusal);
-            return Err(FetchError::Refused(refusal));
-        }
-
-        count_if_third_party(document, &origin, kind);
-
-        let (bytes, content_type, _) = match origin.scheme {
-            // A file has no transport, so its encoding comes from the document
-            // or the default.
-            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted),
-            Scheme::Http | Scheme::Https => fetch_http(url)?,
-        };
+        let arrived = self.follow(url, document, kind)?;
         // Not UTF-8 by assumption: most of the surviving old web is not, and
         // guessing wrong turns every accented letter into a replacement
         // character (ADR-0004).
         let (body, encoding, encoding_source) =
-            encoding::decode_document(&bytes, content_type.as_deref());
+            encoding::decode_document(&arrived.bytes, arrived.content_type.as_deref());
         Ok(Resource {
             body,
-            bytes,
-            origin,
-            path,
+            bytes: arrived.bytes,
+            origin: arrived.origin,
+            path: arrived.path,
             encoding: encoding.name(),
             encoding_source,
         })
@@ -298,13 +491,23 @@ impl Fetcher {
             .check(None, &origin, RequestKind::Navigation)
             .map_err(FetchError::Refused)?;
 
-        let (bytes, content_type, trust) = post_http(url, body)?;
+        let (posted, trust) = post_http(url, body)?;
+        // Where the form's answer actually came from. A `post` is usually
+        // answered by a redirect to the page to show, and that page's links
+        // resolve against where it was served rather than against the address
+        // the form was sent to.
+        let (origin, path) = parse_url(&posted.landed_on).unwrap_or((origin, path));
         Ok(Fetched {
-            body: bytes,
-            content_type,
+            body: posted.bytes,
+            content_type: posted.content_type,
             origin,
             path,
             trust,
+            status: posted.status,
+            // A response to a form submission is a page, not a subresource, and
+            // never reaches the cache. Saying so here rather than relying on
+            // that: the answer to "may this be kept?" for a POST is no.
+            storable: false,
         })
     }
 
@@ -319,23 +522,19 @@ impl Fetcher {
         document: Option<&Origin>,
         kind: RequestKind,
     ) -> Result<Fetched, FetchError> {
-        let (origin, path) = parse_url(url).map_err(FetchError::Refused)?;
-        if let Err(refusal) = self.policy.check(document, &origin, kind) {
-            count_refusal(&refusal);
-            return Err(FetchError::Refused(refusal));
-        }
-        count_if_third_party(document, &origin, kind);
-
-        let (body, content_type, trust) = match origin.scheme {
-            Scheme::File => (read_file(&path)?, None, Trust::NotEncrypted),
-            Scheme::Http | Scheme::Https => fetch_http(url)?,
-        };
+        // A local file has no headers to say it may not be kept. It is still
+        // never served to a second document, because the policy refuses that
+        // outright (`Refusal::LocalFile`) — a stronger rule than that flag, and
+        // applied before the cache is consulted at all.
+        let arrived = self.follow(url, document, kind)?;
         Ok(Fetched {
-            body,
-            content_type,
-            origin,
-            path,
-            trust,
+            body: arrived.bytes,
+            content_type: arrived.content_type,
+            origin: arrived.origin,
+            path: arrived.path,
+            trust: arrived.trust,
+            status: arrived.status,
+            storable: arrived.storable,
         })
     }
 }
@@ -383,79 +582,140 @@ pub enum Trust {
 /// a working browser, and the fact that it took local roots travels back so the
 /// chrome can say so. Any other certificate failure — expired, wrong name — is
 /// final, because those are wrong whoever signed them.
-fn fetch_http(url: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
+fn fetch_http(url: &str) -> Result<(Landed, Trust), FetchError> {
     match get(tls::agent(), url) {
-        Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
+        Ok(landed) => Ok((landed, Trust::Public)),
         Err(error) => {
             if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
                 return Err(into_fetch_error(error));
             }
-            let (bytes, content_type) =
-                get(tls::platform_agent(), url).map_err(into_fetch_error)?;
-            Ok((bytes, content_type, Trust::LocalRoot))
+            let landed = get(tls::platform_agent(), url).map_err(into_fetch_error)?;
+            Ok((landed, Trust::LocalRoot))
         }
     }
 }
 
 /// One form, through the same two-agent dance `fetch_http` does.
-fn post_http(url: &str, body: &str) -> Result<(Vec<u8>, Option<String>, Trust), FetchError> {
+///
+/// Also reports the URL the answer was finally served from, which is not the
+/// one it was sent to whenever the server answers a `post` with a redirect —
+/// which is what a server that does not want the form re-sent on reload does,
+/// and therefore what most of them do.
+fn post_http(url: &str, body: &str) -> Result<(Posted, Trust), FetchError> {
     match send(tls::agent(), url, body) {
-        Ok((bytes, content_type)) => Ok((bytes, content_type, Trust::Public)),
+        Ok(posted) => Ok((posted, Trust::Public)),
         Err(error) => {
             if !matches!(tls::classify(&error), Some(tls::Handshake::UntrustedRoot)) {
                 return Err(into_fetch_error(error));
             }
-            let (bytes, content_type) =
-                send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
-            Ok((bytes, content_type, Trust::LocalRoot))
+            let posted = send(tls::platform_agent(), url, body).map_err(into_fetch_error)?;
+            Ok((posted, Trust::LocalRoot))
         }
     }
 }
 
+/// What a form's answer came back as.
+///
+/// A shape rather than a tuple, because the tuple had grown to five and a
+/// caller reading `(bytes, content_type, trust, landed_on, status)` positionally
+/// is one reordering away from a bug nothing would catch.
+struct Posted {
+    /// The answer's body.
+    bytes: Vec<u8>,
+    /// Its `Content-Type`, when there was one.
+    content_type: Option<String>,
+    /// Where the answer was finally served from, which is not where the form
+    /// was sent whenever the server answered with a redirect.
+    landed_on: String,
+    /// What the server answered with.
+    status: u16,
+}
+
 /// One form sent through a given agent.
-fn send(
-    agent: &ureq::Agent,
-    url: &str,
-    body: &str,
-) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
+fn send(agent: &ureq::Agent, url: &str, body: &str) -> Result<Posted, ureq::Error> {
+    use ureq::ResponseExt;
+
     let response = agent
         .post(url)
         .content_type("application/x-www-form-urlencoded")
         .send(body)?;
 
+    // A form's redirects are left to `ureq`, unlike a plain request's. There is
+    // nothing for this side to decide at each hop: the third-party rule does
+    // not apply to a submission (ADR-0006), and the method handling a redirect
+    // needs — `post` becoming `get` on a 303 and staying a `post` on a 307 — is
+    // exactly what the library already does correctly.
+    let landed_on = response.get_uri().to_string();
+
     let content_type = response
         .headers()
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
+    // A form answered with a 4xx or a 5xx keeps its body for the same reason a
+    // navigation does: "your password was wrong" is a page, and the status
+    // alone does not say it (#203).
+    let status = response.status().as_u16();
     let bytes = response
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()?;
-    Ok((bytes, content_type))
+    Ok(Posted {
+        bytes,
+        content_type,
+        landed_on,
+        status,
+    })
 }
 
-/// One request through a given agent.
-fn get(agent: &ureq::Agent, url: &str) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
+/// One request through a given agent, and one hop only.
+///
+/// `max_redirects(0)` is what makes this one hop: `ureq` hands the redirect
+/// back as an ordinary response instead of chasing it. The chasing is
+/// [`Fetcher::follow`]'s, because a redirect is a decision — the policy has to
+/// see the host at the other end, and the caller has to learn where it stopped.
+fn get(agent: &ureq::Agent, url: &str) -> Result<Landed, ureq::Error> {
     // No custom User-Agent games: this browser does not run scripts, and
     // pretending otherwise to get the script path served would produce exactly
     // the silent breakage ADR-0003 rejects.
-    let response = agent.get(url).call()?;
+    let response = agent.get(url).config().max_redirects(0).build().call()?;
 
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
 
+    // A 3xx without a `Location` names nowhere to go, so it is whatever it
+    // came with — usually nothing, which is a blank page rather than a hang.
+    if response.status().is_redirection()
+        && let Some(location) = header("location")
+    {
+        return Ok(Landed::Elsewhere(location));
+    }
+
+    let content_type = header("content-type");
+    let keep = storable(
+        header("cache-control").as_deref(),
+        header("pragma").as_deref(),
+    );
+
+    let status = response.status().as_u16();
     let bytes = response
         .into_body()
         .with_config()
         .limit(MAX_BODY_BYTES)
         .read_to_vec()?;
-    Ok((bytes, content_type))
+    Ok(Landed::Here {
+        status,
+        bytes,
+        content_type,
+        storable: keep,
+    })
 }
 
 /// Turns a `ureq` failure into one this browser can explain.
@@ -478,6 +738,34 @@ fn into_fetch_error(error: ureq::Error) -> FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_store_and_pragma_no_cache_stop_a_response_being_kept() {
+        assert!(storable(None, None), "nothing said means keep");
+        assert!(!storable(Some("no-store"), None));
+        assert!(!storable(None, Some("no-cache")));
+        // The one this browser is aimed at: an HTTP/1.0 server sends `Pragma`
+        // and nothing else.
+        assert!(!storable(Some("max-age=0"), Some("no-cache")));
+    }
+
+    #[test]
+    fn a_directive_in_a_list_still_counts() {
+        // Both headers are comma-separated lists, and matching the value whole
+        // would read `max-age=0, no-store` as saying nothing at all.
+        assert!(!storable(Some("max-age=0, no-store"), None));
+        assert!(!storable(Some("public, No-Store, must-revalidate"), None));
+        assert!(
+            storable(Some("no-cache"), None),
+            "`Cache-Control: no-cache` is revalidate-before-use, not do-not-store",
+        );
+    }
+
+    #[test]
+    fn a_directive_that_merely_starts_the_same_does_not_count() {
+        assert!(storable(Some("no-store-ish"), None));
+        assert!(storable(Some("no-transform"), None));
+    }
 
     #[test]
     fn reads_a_local_file() {

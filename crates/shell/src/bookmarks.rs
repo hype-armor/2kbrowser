@@ -5,10 +5,11 @@
 //! whole list is a few kilobytes, and someone who wants to edit it in a text
 //! editor or grep it should be able to.
 //!
-//! The file is the only state this browser keeps between runs. That is worth
-//! saying plainly, because "no account, no sync, no profile" is part of the
-//! product (§1) and a browser that quietly accumulated more would be walking
-//! it back.
+//! One of three files this browser keeps between runs — the site exceptions
+//! (ADR-0006) and the history (ADR-0021) are the others. That is worth counting
+//! out loud, because "no account, no sync, no profile" is part of the product
+//! (§1) and a browser that quietly accumulated more would be walking it back.
+//! Each one of the three had to argue for itself; this was the first.
 
 use std::path::{Path, PathBuf};
 

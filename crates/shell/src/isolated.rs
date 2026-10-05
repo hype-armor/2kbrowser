@@ -9,7 +9,7 @@
 //! so: the pixels that come back across the pipe are byte-identical to the ones
 //! produced without one.
 
-use sandbox::child::{Fetched, Render};
+use sandbox::child::Render;
 use sandbox::message::{Link, Missing, Mode, Rendered};
 use sandbox::{Error, ToChild};
 use text::FontStore;
@@ -21,7 +21,7 @@ use text::FontStore;
 /// applies ADR-0006's policy — which is the improvement worth having: the rule
 /// is now enforced in a process a compromised renderer cannot reach.
 struct PipeLoader<'a> {
-    fetch: &'a mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
+    parent: &'a mut dyn sandbox::child::Parent,
 }
 
 impl crate::render::Loader for PipeLoader<'_> {
@@ -49,7 +49,8 @@ impl crate::render::Loader for PipeLoader<'_> {
         // it from the untrusted side would let a compromised renderer claim to
         // be an origin it is not, which is the whole policy defeated in one
         // field.
-        (self.fetch)(urls, kind)
+        self.parent
+            .fetch(urls, kind)
             .into_iter()
             .map(|resource| {
                 resource.map(|got| crate::render::Loaded {
@@ -58,6 +59,12 @@ impl crate::render::Loader for PipeLoader<'_> {
                 })
             })
             .collect()
+    }
+
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        // Straight across the pipe. The child never holds the history; it asks
+        // about the links it parsed and gets a yes or no for each (#181).
+        self.parent.visited(urls)
     }
 }
 
@@ -90,6 +97,14 @@ pub struct PageRenderer {
     /// go back to the parent for the document's bytes would be a keystroke that
     /// crossed the boundary twice.
     last: Option<ToChild>,
+    /// The document column the page is being shown from (#204).
+    ///
+    /// Kept beside `last` rather than in it, because the parent never asks for
+    /// a first render anywhere but the left edge — a page opens at its
+    /// beginning. Only a band moves sideways, and a *re-render* has to follow
+    /// it: typing into a form halfway across a wide page would otherwise answer
+    /// by painting the page's left edge, sliding it out from under the reader.
+    band_left: u32,
     /// What has been typed into this page's controls, by node.
     ///
     /// The document is re-parsed on every render and these are re-applied to
@@ -97,14 +112,60 @@ pub struct PageRenderer {
     /// arena in the same order — and the bytes are the same bytes, since they
     /// are the ones in `last`.
     values: Vec<(dom::NodeId, String)>,
-    /// The control being typed in, and its editing state.
-    focus: Option<(dom::NodeId, crate::field::Field)>,
+    /// What the reader has ticked, chosen or unticked, by node. Re-applied
+    /// after a parse the same way, and for the same reason, as `values`.
+    chosen: Vec<(dom::NodeId, bool)>,
+    /// The control the keyboard is on, and whatever it needs remembering.
+    focus: Option<Focus>,
     /// A form the reader asked to send, waiting for the next render to carry
     /// it out (#110).
     ///
     /// Taken rather than held: one press sends one form, and a submission left
     /// lying here would be re-sent by the next resize.
     submit: Option<sandbox::message::Submission>,
+    /// A dropdown the reader opened, waiting for the next render to carry it
+    /// out to the parent.
+    ///
+    /// Taken rather than held, like `submit`: one press opens one list, and a
+    /// dropdown left lying here would spring open again on the next resize.
+    open: Option<sandbox::message::Dropdown>,
+}
+
+/// What the keyboard is on, and what that control needs remembered about it.
+///
+/// Two shapes because there are two kinds of control and they need different
+/// things kept. A field is being *edited*, so it carries a caret and a
+/// selection that no re-render may lose. A checkbox is not being edited at
+/// all: it is somewhere the keyboard is pointing, and the only thing worth
+/// remembering is which one (#151).
+///
+/// Before this there was one shape — a node and a text editing state — and so
+/// only the controls that had one could be reached. A form could be filled in
+/// with a pointer and not with a keyboard.
+#[derive(Debug, Clone)]
+enum Focus {
+    /// A text field or `<textarea>`, with what is being typed in it.
+    Typing {
+        /// The control.
+        node: dom::NodeId,
+        /// Its caret, selection and text.
+        field: crate::field::Field,
+    },
+    /// A control that is pressed rather than typed in: a checkbox, a radio, a
+    /// `<select>`, a button.
+    Pressable {
+        /// The control.
+        node: dom::NodeId,
+    },
+}
+
+impl Focus {
+    /// Which control it is on, whichever shape it has.
+    fn node(&self) -> dom::NodeId {
+        match self {
+            Focus::Typing { node, .. } | Focus::Pressable { node } => *node,
+        }
+    }
 }
 
 impl Default for PageRenderer {
@@ -123,9 +184,12 @@ impl PageRenderer {
             zoom: 1.0,
             force_document: false,
             last: None,
+            band_left: 0,
             values: Vec::new(),
+            chosen: Vec::new(),
             focus: None,
             submit: None,
+            open: None,
         }
     }
 
@@ -172,12 +236,13 @@ fn links_of(page: &crate::render::Page) -> Vec<Link> {
         .into_iter()
         .enumerate()
         .flat_map(|(group, link)| {
-            let (url, jump_to) = (link.url, link.jump_to);
+            let (url, jump_to, pinned) = (link.url, link.jump_to, link.pinned);
             link.rects.into_iter().map(move |rect| Link {
                 rect,
                 url: url.clone(),
                 group: group as u32,
                 jump_to,
+                pinned,
             })
         })
         .collect()
@@ -193,6 +258,14 @@ fn missing_of(page: &crate::render::Page) -> Vec<Missing> {
     page.missing_images()
         .into_iter()
         .map(|(rect, url)| Missing { rect, url })
+        .collect()
+}
+
+/// Every picture on the page, in the shape the wire wants (#205).
+fn pictures_of(page: &crate::render::Page) -> Vec<sandbox::Picture> {
+    page.pictures()
+        .into_iter()
+        .map(|(rect, url)| sandbox::Picture { rect, url })
         .collect()
 }
 
@@ -221,8 +294,39 @@ impl PageRenderer {
             .as_ref()
             .and_then(|page| page.button_at(at.0, at.1))
         {
-            self.set_focus(None);
+            self.set_focus(Some(button));
             self.ask_to_send(button);
+            return;
+        }
+        // Then a control that changes when it is pressed: a checkbox, a radio,
+        // a row of a list box. It answers the press *instead of* taking the
+        // typing, because there is nothing to type into one — and it takes the
+        // keyboard, so that Tab carries on from what was just pressed rather
+        // than from the top of the page (#151).
+        let pressed = self
+            .page
+            .as_ref()
+            .and_then(|page| page.choice_at(at.0, at.1));
+        if let Some((control, changed)) = pressed {
+            self.set_focus(Some(control));
+            self.record(changed);
+            return;
+        }
+        // Then a closed dropdown, which is opened rather than changed: what is
+        // in it has to be drawn over the page, and only the parent has
+        // anywhere to draw that.
+        if let Some((node, rect, options, on)) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.dropdown_at(at.0, at.1))
+        {
+            self.set_focus(Some(node));
+            self.open = Some(sandbox::message::Dropdown {
+                rect,
+                node: node.0 as u32,
+                options,
+                on: on as u32,
+            });
             return;
         }
         let found = self
@@ -230,6 +334,37 @@ impl PageRenderer {
             .as_ref()
             .and_then(|page| page.control_at(at.0, at.1));
         self.set_focus(found);
+    }
+
+    /// Chooses one option of a `<select>`, named the way this side named it.
+    ///
+    /// Everything the parent hands back is checked rather than trusted. The id
+    /// is an index into this process's arena and the index is a position in a
+    /// list only this process has; either could be stale by the time it
+    /// returns, because a render in between re-parsed the document. A name
+    /// that no longer fits changes nothing, which is what a message that no
+    /// longer makes sense should do.
+    fn choose(&mut self, node: u32, index: u32) {
+        let changed = self
+            .page
+            .as_ref()
+            .map(|page| page.choose_in(dom::NodeId(node as usize), index as usize))
+            .unwrap_or_default();
+        self.record(changed);
+    }
+
+    /// Records what a press changed, for the next render to apply.
+    ///
+    /// Kept beside the document rather than written into it, the same way a
+    /// typed value is and for the same reason: the document is re-parsed on
+    /// every render, and anything written into the old one would be gone.
+    fn record(&mut self, changes: Vec<(dom::NodeId, bool)>) {
+        for (node, on) in changes {
+            match self.chosen.iter_mut().find(|(at, _)| *at == node) {
+                Some(entry) => entry.1 = on,
+                None => self.chosen.push((node, on)),
+            }
+        }
     }
 
     /// Collects the form `node` is in, for the parent to send.
@@ -255,23 +390,37 @@ impl PageRenderer {
         });
     }
 
-    /// Moves the focus to a control, starting its editing state from what the
-    /// control currently holds.
+    /// Moves the focus to a control, in whichever shape that control needs.
+    ///
+    /// A field starts its editing state from what the control currently holds,
+    /// so that focusing `<input value="Smith">` and pressing a key appends
+    /// rather than replaces. Everything else is remembered by name alone: there
+    /// is nothing in a checkbox to put a caret in.
     fn set_focus(&mut self, node: Option<dom::NodeId>) {
         self.flush_focus();
         self.focus = node.map(|node| {
-            let value = self
-                .page
-                .as_ref()
-                .map(|page| page.control_value(node))
-                .unwrap_or_default();
-            (node, crate::field::Field::with_cursor_at_end(value))
+            let page = self.page.as_ref();
+            if page.is_some_and(|page| page.takes_typing(node)) {
+                let value = page
+                    .map(|page| page.control_value(node))
+                    .unwrap_or_default();
+                Focus::Typing {
+                    node,
+                    field: crate::field::Field::with_cursor_at_end(value),
+                }
+            } else {
+                Focus::Pressable { node }
+            }
         });
     }
 
     /// Writes what is being edited back into the values the next render reads.
+    ///
+    /// Nothing to write for a control that is not being typed in: what a
+    /// checkbox holds was recorded when it was pressed, not while it was
+    /// focused.
     fn flush_focus(&mut self) {
-        let Some((node, field)) = &self.focus else {
+        let Some(Focus::Typing { node, field }) = &self.focus else {
             return;
         };
         let (node, text) = (*node, field.text().to_owned());
@@ -281,28 +430,31 @@ impl PageRenderer {
         }
     }
 
-    /// Moves to the next text control in document order, or the previous one.
+    /// Moves to the next control in document order, or the previous one.
+    ///
+    /// *Every* control, not only the ones with something to type in (#151): a
+    /// form whose boxes can be ticked with a pointer and by no other means is
+    /// a form half its readers cannot fill in.
+    ///
+    /// Each radio of a group is its own stop. A browser enters the group once
+    /// and moves within it with the arrows, which is fewer stops to tab
+    /// through; it is also a second rule to learn, and this way every control
+    /// on the page behaves the same. Worth revisiting on a page with thirty
+    /// radios in it.
     ///
     /// Past the end it gives up the focus rather than wrapping. Wrapping is
-    /// what a browser does inside a *form*, and this engine has no form
-    /// submission to make that boundary mean anything yet — so falling out is
-    /// the honest behaviour, and it hands Tab back to the window, which walks
-    /// the page's links with it.
+    /// what a browser does inside a *form*, and falling out hands Tab back to
+    /// the window, which walks the page's links with it.
     fn step_focus(&mut self, back: bool) {
         let controls: Vec<dom::NodeId> = self
             .page
             .as_ref()
-            .map(|page| {
-                page.text_controls()
-                    .into_iter()
-                    .map(|(node, _)| node)
-                    .collect()
-            })
+            .map(|page| page.focusable().into_iter().map(|(node, _)| node).collect())
             .unwrap_or_default();
         let at = self
             .focus
             .as_ref()
-            .and_then(|(node, _)| controls.iter().position(|it| it == node));
+            .and_then(|focus| controls.iter().position(|it| *it == focus.node()));
         let next = match (at, back) {
             (Some(at), false) => controls.get(at + 1).copied(),
             (Some(at), true) => at.checked_sub(1).and_then(|at| controls.get(at).copied()),
@@ -320,13 +472,19 @@ impl PageRenderer {
             Key::Escape => return self.set_focus(None),
             _ => {}
         }
+        // A control that is pressed rather than typed in answers a different
+        // set of keys, so it is answered before the editing below rather than
+        // inside it — there is no field there to reach.
+        if let Some(Focus::Pressable { node }) = &self.focus {
+            return self.press_key(*node, key);
+        }
         let multiline = self
             .focus
             .as_ref()
             .zip(self.page.as_ref())
-            .is_some_and(|((node, _), page)| page.is_multiline(*node));
+            .is_some_and(|(focus, page)| page.is_multiline(focus.node()));
         let mut submitting = false;
-        let Some((node, field)) = &mut self.focus else {
+        let Some(Focus::Typing { node, field }) = &mut self.focus else {
             return;
         };
         let node = *node;
@@ -355,7 +513,10 @@ impl PageRenderer {
             Key::Home { extend } => field.home(*extend),
             Key::End { extend } => field.end(*extend),
             Key::SelectAll => field.select_all(),
-            Key::Tab { .. } | Key::Escape => {}
+            // Handled above, or not this control's: the arrows belong to a
+            // `<select>`, and in a field they are the window's, so the page
+            // still scrolls under a caret.
+            Key::Tab { .. } | Key::Escape | Key::Up | Key::Down => {}
         }
         self.flush_focus();
         if submitting {
@@ -365,16 +526,91 @@ impl PageRenderer {
             self.ask_to_send(node);
         }
     }
+
+    /// What has the keyboard, in the terms the parent is told it in.
+    fn focused(&self) -> sandbox::message::Focused {
+        use sandbox::message::Focused;
+        match &self.focus {
+            None => Focused::Nothing,
+            Some(Focus::Typing { .. }) => Focused::Typing,
+            Some(Focus::Pressable { .. }) => Focused::Pressable,
+        }
+    }
+
+    /// One keystroke on a control that is pressed rather than typed in (#151).
+    ///
+    /// The keys a reader already knows, and no others:
+    ///
+    /// * **Space** presses it — a box ticks, a radio is chosen, a button is
+    ///   pressed, a dropdown opens. It arrives as a space character because the
+    ///   parent has no idea what is focused and should not have to; deciding
+    ///   what a space means is this side's job, exactly as it already is for a
+    ///   newline in a one-line field.
+    /// * **Enter** sends the form. On a button it presses *that* button, which
+    ///   is the difference between a form with one button and a form with two
+    ///   meaning opposite things.
+    /// * **Up and Down** move a `<select>` through its options without opening
+    ///   the list, which is what a dropdown has always done and is the quickest
+    ///   way to answer one.
+    ///
+    /// Everything else falls through and does nothing, rather than being
+    /// swallowed. A control with the keyboard must not stop the page scrolling
+    /// with keys that mean nothing to it.
+    fn press_key(&mut self, node: dom::NodeId, key: &sandbox::message::Key) {
+        use sandbox::message::Key;
+        let is_button = self.page.as_ref().is_some_and(|page| page.is_button(node));
+        match key {
+            Key::Insert(text) if text.contains('\n') => {
+                if is_button {
+                    return self.ask_to_send(node);
+                }
+                // Nothing was pressed, so no button is a successful control —
+                // the same rule Enter in a one-line field follows.
+                self.ask_to_send(node);
+            }
+            Key::Insert(text) if text == " " => {
+                if is_button {
+                    return self.ask_to_send(node);
+                }
+                if let Some((select, rect, options, on)) =
+                    self.page.as_ref().and_then(|page| page.dropdown_of(node))
+                {
+                    self.open = Some(sandbox::message::Dropdown {
+                        rect,
+                        node: select.0 as u32,
+                        options,
+                        on: on as u32,
+                    });
+                    return;
+                }
+                let changed = self
+                    .page
+                    .as_ref()
+                    .map(|page| page.press(node))
+                    .unwrap_or_default();
+                self.record(changed);
+            }
+            Key::Up | Key::Down => {
+                let changed = self
+                    .page
+                    .as_ref()
+                    .map(|page| page.step_option(node, matches!(key, Key::Up)))
+                    .unwrap_or_default();
+                self.record(changed);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Render for PageRenderer {
     fn render(
         &mut self,
         request: &ToChild,
-        fetch: &mut dyn FnMut(&[String], net::RequestKind) -> Vec<Fetched>,
+        parent: &mut dyn sandbox::child::Parent,
     ) -> Result<Rendered, String> {
-        // Typing and focusing are re-renders of the page already held, so they
-        // borrow the request it came from. Kept here rather than asked for
+        // Typing, focusing and choosing are re-renders of the page already
+        // held, so they borrow the request it came from. Kept here rather than asked for
         // again: a keystroke that had to go back over the pipe for the
         // document's bytes would cross the boundary twice to move a cursor.
         let held;
@@ -384,12 +620,27 @@ impl Render for PageRenderer {
                 held = self.last.clone();
                 held.as_ref().ok_or("nothing has been rendered yet")?
             }
-            ToChild::Type { key } => {
-                self.apply(key);
+            ToChild::Type { keys } => {
+                // Every key, then one render. The run arrived together because
+                // the reader typed faster than the page renders, and rendering
+                // once per letter would be work each following letter
+                // immediately invalidated (#207).
+                for key in keys {
+                    self.apply(key);
+                }
+                held = self.last.clone();
+                held.as_ref().ok_or("nothing has been rendered yet")?
+            }
+            ToChild::Choose { node, index } => {
+                self.choose(*node, *index);
                 held = self.last.clone();
                 held.as_ref().ok_or("nothing has been rendered yet")?
             }
             other => {
+                // A fresh render, which is a new page or the same one at a new
+                // size. Either way it opens at the left edge, the way a resize
+                // already returns to the top of the document.
+                self.band_left = 0;
                 self.last = Some(other.clone());
                 other
             }
@@ -410,14 +661,48 @@ impl Render for PageRenderer {
             return Err("expected a render request".to_owned());
         };
 
+        let base = origin.as_ref().map(|origin| (origin, path.as_str()));
+        let own_url = base.map(|(origin, path)| net::resolve(origin, path, path));
+
+        // A picture opened by its own address is not a document, and decoding a
+        // JPEG as text produces a page of mojibake (#201). A document is
+        // invented to hold it instead, so it gets the same layout, scrollbar
+        // and placeholder as an image inside a page — decided here rather than
+        // by the parent, because deciding it needs the bytes, and the bytes
+        // stay on this side (ADR-0012).
+        let picture = crate::render::document_for_a_picture(
+            body,
+            content_type.as_deref(),
+            own_url.as_deref(),
+        );
         // Decoded here rather than by the parent, so the encoding sniffer stays
         // on the sandboxed side with every other parser.
-        let (html, ..) = net::encoding::decode_document(body, content_type.as_deref());
+        let html = match &picture {
+            Some(document) => document.clone(),
+            None => net::encoding::decode_document(body, content_type.as_deref()).0,
+        };
 
         // Every subresource — images, stylesheets, `@import` chains, frames —
         // goes over the pipe. Nothing in this process opens a socket or a file.
-        let mut loader = PipeLoader { fetch };
-        let base = origin.as_ref().map(|origin| (origin, path.as_str()));
+        let mut pipe_loader = PipeLoader { parent };
+        // Except the picture above, which is already here: asking for it would
+        // fetch the same photograph a second time to put it in the page
+        // invented to show it.
+        let mut held;
+        let loader: &mut dyn crate::render::Loader = match (&picture, &own_url) {
+            (Some(_), Some(url)) => {
+                held = crate::render::Preloaded::new(
+                    url.clone(),
+                    crate::render::Loaded {
+                        bytes: body.clone(),
+                        content_type: content_type.clone(),
+                    },
+                    &mut pipe_loader,
+                );
+                &mut held
+            }
+            _ => &mut pipe_loader,
+        };
         // Both set is a request the parent never makes, and this side is where
         // messages from a stranger arrive — so it is decided rather than
         // assumed away. The author's layout wins, because it is the one that
@@ -426,6 +711,7 @@ impl Render for PageRenderer {
         let page = crate::render::render_sized(
             &html,
             *width,
+            self.band_left,
             *top,
             *height,
             crate::render::Settings {
@@ -434,13 +720,17 @@ impl Render for PageRenderer {
                 force_document: *force_document,
                 zoom: *zoom,
                 values: self.values.clone(),
-                focus: self
-                    .focus
-                    .as_ref()
-                    .map(|(node, field)| (*node, field.cursor())),
+                chosen: self.chosen.clone(),
+                focus: self.focus.as_ref().map(|focus| match focus {
+                    Focus::Typing { node, field } => (*node, Some(field.cursor())),
+                    // A ring and no caret: there is nothing in a checkbox to
+                    // put one in, and a caret drawn in one would be a cursor
+                    // promising an insertion point that does not exist.
+                    Focus::Pressable { node } => (*node, None),
+                }),
             },
             &mut self.fonts,
-            &mut loader,
+            loader,
             base,
         );
 
@@ -452,15 +742,24 @@ impl Render for PageRenderer {
             width: page.pixmap.width(),
             height: page.pixmap.height(),
             top: page.band_top,
+            left: page.band_left,
             content_height: page.content_height,
+            content_width: page.content_width,
             mode: mode_of(&page),
             title: page.title.clone(),
             links: links_of(&page),
             missing: missing_of(&page),
+            pictures: pictures_of(&page),
             buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            pressables: page
+                .pressables()
+                .into_iter()
+                .map(|(_, rect)| rect)
+                .collect(),
             submit: self.submit.take(),
+            open: self.open.take(),
             can_toggle_layout: self.can_toggle_layout(&page),
-            editing: self.focus.is_some(),
+            focused: self.focused(),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
         };
@@ -470,7 +769,7 @@ impl Render for PageRenderer {
         Ok(rendered)
     }
 
-    fn band(&mut self, top: u32, height: u32) -> Result<Rendered, String> {
+    fn band(&mut self, left: u32, top: u32, height: u32) -> Result<Rendered, String> {
         // Remembered so that a keystroke re-renders the rows the reader is
         // looking at (#110). Typing is a re-render of the whole page, built
         // from the request the page came from — and that request names the band
@@ -484,12 +783,14 @@ impl Render for PageRenderer {
         {
             (*at, *rows) = (top, height);
         }
+        // The same, for the axis the request carries and the message does not.
+        self.band_left = left;
         let Some(page) = &self.page else {
             return Err("no page to paint a band of".to_owned());
         };
         // A frameset has no display list to repaint from, and needs none: its
         // canvas is its viewport, so there are no rows below the ones it holds.
-        let Some(pixmap) = page.paint_band(&mut self.fonts, top, height) else {
+        let Some(pixmap) = page.paint_band(&mut self.fonts, left, top, height) else {
             return Err("this page cannot be repainted a band at a time".to_owned());
         };
         Ok(Rendered {
@@ -497,7 +798,9 @@ impl Render for PageRenderer {
             width: pixmap.width(),
             height: pixmap.height(),
             top,
+            left,
             content_height: page.content_height,
+            content_width: page.content_width,
             // Unchanged by moving down the page, and re-sent because the
             // message is one shape: the parent replaces what it holds rather
             // than merging, so a band that omitted these would blank the tab's
@@ -506,15 +809,35 @@ impl Render for PageRenderer {
             title: page.title.clone(),
             links: links_of(page),
             missing: missing_of(page),
+            pictures: pictures_of(page),
             buttons: page.buttons().into_iter().map(|(_, rect)| rect).collect(),
+            pressables: page
+                .pressables()
+                .into_iter()
+                .map(|(_, rect)| rect)
+                .collect(),
             // A band is a repaint of rows already laid out, and repainting is
-            // not a thing anybody asked a form to be sent by.
+            // not a thing anybody asked a form to be sent by, or a dropdown to
+            // be opened by.
             submit: None,
+            open: None,
             can_toggle_layout: self.can_toggle_layout(page),
-            editing: self.focus.is_some(),
+            focused: self.focused(),
             images_loaded: page.images_loaded as u32,
             background: packed(page.background),
         })
+    }
+
+    fn accessibility(&mut self) -> sandbox::access::Tree {
+        let Some(page) = &self.page else {
+            return sandbox::access::Tree::default();
+        };
+        crate::access::tree_of_frames(
+            page.frames
+                .iter()
+                .map(|frame| (&frame.doc, &frame.layout, (frame.rect.x, frame.rect.y))),
+            self.focus.as_ref().map(Focus::node),
+        )
     }
 
     fn find(&mut self, query: &str) -> Vec<layout::Rect> {
@@ -538,6 +861,17 @@ impl Render for PageRenderer {
             None => (Vec::new(), String::new()),
         }
     }
+
+    fn copy_focused(&mut self) -> String {
+        // Only a field is being typed in; a checkbox or a `<select>` has the
+        // keyboard without holding text, and there is nothing in one to copy.
+        match &self.focus {
+            Some(Focus::Typing { field, .. }) => {
+                field.selected_text().unwrap_or_default().to_owned()
+            }
+            _ => String::new(),
+        }
+    }
 }
 
 /// Runs this process as a renderer child, reading from stdin and writing to
@@ -547,6 +881,37 @@ impl Render for PageRenderer {
 /// interleave with a frame and corrupt it, and this is the one process where a
 /// stray `println!` is a protocol violation rather than noise.
 pub fn run_child() -> Result<(), Error> {
+    // The renderer runs on a thread of its own, and a large one (#176).
+    //
+    // The cascade, layout and paint each recurse once per nesting level, so a
+    // document's depth is the depth of three recursions in a row.
+    // `dom::MAX_DEPTH` caps that depth; this is the other half of the same
+    // decision, because a cap is only safe if a stack can hold it. Measured at
+    // the cap: about 8 MiB in release and 32 MiB in debug, against a main
+    // thread's 8 MiB — so release sat exactly on the edge and debug was well
+    // past it.
+    //
+    // Reserved address space rather than memory: pages are committed as they
+    // are touched, so an ordinary page costs what it always did.
+    //
+    // Spawned *before* the filter is installed, because `clone` is not on the
+    // allowlist and putting it there to make room for this thread would put it
+    // there for an attacker's thread too. The filter goes on inside the thread
+    // instead, and reaches back over the main one.
+    std::thread::Builder::new()
+        .name("renderer".to_owned())
+        .stack_size(dom::DEPTH_STACK)
+        .spawn(render_until_the_parent_goes)
+        .map_err(Error::Io)?
+        .join()
+        // A panic on the render thread has already said why on stderr.
+        // Reported rather than resumed: resuming across a join loses the
+        // original location and gains nothing.
+        .unwrap_or(Err(Error::Died))
+}
+
+/// The renderer proper, on the thread [`run_child`] made for it.
+fn render_until_the_parent_goes() -> Result<(), Error> {
     // Before anything is read. The very first frame carries the document, so it
     // is already attacker-influenced — confining afterwards would be confining
     // after the interesting bytes had arrived.
@@ -554,7 +919,12 @@ pub fn run_child() -> Result<(), Error> {
     // The font store is built after this on purpose too: it reads only embedded
     // data (ADR-0010), and building it under the filter is the check that it
     // really does not touch the filesystem.
-    let confinement = sandbox::confine::apply();
+    //
+    // Every thread and not just this one. The main thread is asleep in `join`
+    // and is not where a compromise starts, but an attacker already inside the
+    // renderer could aim at the address it returns to and land somewhere with
+    // no filter on it. `TSYNC` closes that for the cost of a flag.
+    let confinement = sandbox::confine::apply_to_every_thread();
     // Only when the platform *has* a sandbox and it failed anyway — a kernel
     // too old, or a container that forbids installing a filter. That is a fact
     // about this machine and worth a line every time.
@@ -578,6 +948,7 @@ pub fn run_child() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandbox::child::Fetched;
 
     fn request(body: &[u8], width: u32) -> ToChild {
         ToChild::Render {
@@ -621,8 +992,32 @@ mod tests {
         }
     }
 
-    fn no_fetch(urls: &[String], _: net::RequestKind) -> Vec<Fetched> {
-        vec![None; urls.len()]
+    /// A parent that supplies nothing and has been nowhere.
+    struct Nothing;
+
+    impl sandbox::child::Parent for Nothing {
+        fn fetch(&mut self, urls: &[String], _: net::RequestKind) -> Vec<Fetched> {
+            vec![None; urls.len()]
+        }
+
+        fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+            vec![false; urls.len()]
+        }
+    }
+
+    /// A parent that answers fetches from a closure and has been nowhere.
+    struct Supplying<F>(F);
+
+    impl<F: FnMut(&[String], net::RequestKind) -> Vec<Fetched>> sandbox::child::Parent
+        for Supplying<F>
+    {
+        fn fetch(&mut self, urls: &[String], kind: net::RequestKind) -> Vec<Fetched> {
+            (self.0)(urls, kind)
+        }
+
+        fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+            vec![false; urls.len()]
+        }
     }
 
     /// A real PNG, so a decode that succeeds means the bytes arrived intact.
@@ -648,7 +1043,7 @@ mod tests {
 
         let mut renderer = PageRenderer::new();
         let crossed = renderer
-            .render(&request(html.as_bytes(), 300), &mut no_fetch)
+            .render(&request(html.as_bytes(), 300), &mut Nothing)
             .expect("renders");
 
         assert_eq!(crossed.width, direct.pixmap.width());
@@ -667,7 +1062,7 @@ mod tests {
         let html = "<title>Named</title><body><p>x</p></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(html.as_bytes(), 200), &mut no_fetch)
+            .render(&request(html.as_bytes(), 200), &mut Nothing)
             .expect("renders");
         assert_eq!(page.title.as_deref(), Some("Named"));
         assert_eq!(page.mode, Mode::Authored);
@@ -682,7 +1077,7 @@ mod tests {
                     <div style=\"display: grid\">a</div></div></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(html.as_bytes(), 200), &mut no_fetch)
+            .render(&request(html.as_bytes(), 200), &mut Nothing)
             .expect("renders");
         match page.mode {
             Mode::Document { unsupported_share } => {
@@ -703,7 +1098,7 @@ mod tests {
 
         let mut plain = PageRenderer::new();
         let ordinary = plain
-            .render(&request(html.as_bytes(), 300), &mut no_fetch)
+            .render(&request(html.as_bytes(), 300), &mut Nothing)
             .expect("renders");
         assert_eq!(
             ordinary.mode,
@@ -713,10 +1108,7 @@ mod tests {
 
         let mut forcing = PageRenderer::new();
         let forced = forcing
-            .render(
-                &overriding(html.as_bytes(), 300, false, true),
-                &mut no_fetch,
-            )
+            .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
         assert!(
             matches!(forced.mode, Mode::Document { .. }),
@@ -743,12 +1135,9 @@ mod tests {
         let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
         let mut renderer = PageRenderer::new();
         renderer
-            .render(
-                &overriding(html.as_bytes(), 300, false, true),
-                &mut no_fetch,
-            )
+            .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
-        let band = renderer.band(0, 200).expect("paints a band");
+        let band = renderer.band(0, 0, 200).expect("paints a band");
         assert!(
             band.can_toggle_layout,
             "the band lost the reader's override"
@@ -765,12 +1154,9 @@ mod tests {
         let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
         let mut renderer = PageRenderer::new();
         let whole = renderer
-            .render(
-                &overriding(html.as_bytes(), 300, false, true),
-                &mut no_fetch,
-            )
+            .render(&overriding(html.as_bytes(), 300, false, true), &mut Nothing)
             .expect("renders");
-        let band = renderer.band(0, 200).expect("paints a band");
+        let band = renderer.band(0, 0, 200).expect("paints a band");
         assert_eq!(
             band.background, whole.background,
             "the band reported a different canvas colour from its own page"
@@ -817,7 +1203,7 @@ mod tests {
                     force_document: true,
                     zoom: 1.0,
                 },
-                &mut fetch,
+                &mut Supplying(&mut fetch),
             )
             .expect("renders");
 
@@ -842,7 +1228,7 @@ mod tests {
         let html = "<body><h1>Title</h1><p>An ordinary paragraph.</p></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&overriding(html.as_bytes(), 300, true, true), &mut no_fetch)
+            .render(&overriding(html.as_bytes(), 300, true, true), &mut Nothing)
             .expect("renders");
         assert_eq!(page.mode, Mode::Authored, "the author's layout lost");
         assert!(
@@ -862,7 +1248,7 @@ mod tests {
 
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(&body, 200), &mut no_fetch)
+            .render(&request(&body, 200), &mut Nothing)
             .expect("renders");
         assert!(page.width > 0);
     }
@@ -875,7 +1261,7 @@ mod tests {
         let html = "<body><a href=\"b.html\">there</a></body>";
         let mut renderer = PageRenderer::new();
         let page = renderer
-            .render(&request(html.as_bytes(), 200), &mut no_fetch)
+            .render(&request(html.as_bytes(), 200), &mut Nothing)
             .expect("renders");
         assert!(page.links.is_empty());
     }
@@ -904,7 +1290,7 @@ mod tests {
                     force_document: false,
                     zoom: 1.0,
                 },
-                &mut no_fetch,
+                &mut Nothing,
             )
             .expect("renders");
 
@@ -974,7 +1360,7 @@ mod tests {
                     force_document: false,
                     zoom: 1.0,
                 },
-                &mut fetch,
+                &mut Supplying(&mut fetch),
             )
             .expect("renders");
 
@@ -1033,11 +1419,42 @@ mod tests {
                     force_document: false,
                     zoom: 1.0,
                 },
-                &mut fetch,
+                &mut Supplying(&mut fetch),
             )
             .expect("renders anyway");
 
         assert_eq!(refused, 1, "it was asked for exactly once");
         assert!(page.width > 0, "the page still rendered");
+    }
+
+    #[test]
+    fn a_page_nested_far_past_the_cap_still_renders() {
+        // #176, end to end. The cascade, layout and paint each recurse once per
+        // nesting level, so this used to be three stack overflows waiting for a
+        // page deep enough — and what died was the renderer process, taking the
+        // page with it.
+        //
+        // Two things fixed it and both are load-bearing: `dom::MAX_DEPTH` caps
+        // the tree the parser builds, and the renderer runs on a stack sized
+        // for that cap. This test needs the second as much as the first,
+        // because a libtest thread gets 2 MiB and the cap costs around 32 in a
+        // debug build.
+        let deep = format!(
+            "<body>{}<p>bottom</p>{}</body>",
+            "<div>".repeat(dom::MAX_DEPTH * 8),
+            "</div>".repeat(dom::MAX_DEPTH * 8),
+        );
+        let rendered = std::thread::Builder::new()
+            .stack_size(dom::DEPTH_STACK)
+            .spawn(move || {
+                let mut renderer = PageRenderer::new();
+                renderer
+                    .render(&request(deep.as_bytes(), 300), &mut Nothing)
+                    .map(|page| page.pixels.len())
+            })
+            .expect("a thread")
+            .join()
+            .expect("the renderer fell over");
+        assert!(rendered.expect("renders") > 0);
     }
 }

@@ -120,6 +120,36 @@ pub struct DisplayList {
     )>,
     /// The items, in paint order.
     pub items: Vec<DisplayItem>,
+    /// Half-open ranges of `items` that came from `position: fixed` subtrees.
+    ///
+    /// Those items are the one thing on the page whose coordinates are the
+    /// *window's* rather than the document's: a page is laid out once and
+    /// `rasterise_band` draws a slice of it by shifting every item up by the
+    /// band's top, and a fixed box must not move when the reader scrolls
+    /// (#108). So it must not be shifted.
+    ///
+    /// Ranges rather than a list of their own, so the items stay in paint
+    /// order where they were emitted. A separate list has to be drawn at some
+    /// fixed point — last, in the obvious version — and that is wrong:
+    /// `left-offset-position-fixed-001` covers a fixed red square with an
+    /// absolutely positioned green one that comes after it in the source, and
+    /// a fixed box painted last shows the red.
+    ///
+    /// The same trick `clip` above uses, and for the same reason: a subtree
+    /// emits a contiguous run, so where it starts and stops is all that has to
+    /// be remembered.
+    pub pinned: Vec<(usize, usize)>,
+}
+
+impl DisplayList {
+    /// Whether the item at `at` came from a `position: fixed` subtree, and so
+    /// is drawn at the window's coordinates rather than the document's.
+    ///
+    /// A linear scan of the ranges, which is the right shape here: almost
+    /// every page has none at all, and a page with one has one.
+    pub fn is_pinned(&self, at: usize) -> bool {
+        self.pinned.iter().any(|&(from, to)| at >= from && at < to)
+    }
 }
 
 impl Default for DisplayList {
@@ -130,6 +160,7 @@ impl Default for DisplayList {
             canvas: Color::WHITE,
             canvas_image: None,
             items: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 }
@@ -143,12 +174,13 @@ pub fn build_display_list(layout: &Layout) -> DisplayList {
         canvas: layout.canvas_background.over(Color::WHITE),
         canvas_image: layout.canvas_image,
         items: Vec::new(),
+        pinned: Vec::new(),
     };
     // §14.2 again: an element whose background was propagated to the canvas
     // does not paint it a second time. Drawing it twice is invisible while the
     // colour is opaque and wrong the moment it is not.
     let propagated = layout.canvas_image.map(|(node, ..)| node);
-    paint_box(&layout.root, 0.0, 0.0, propagated, &mut list);
+    paint_box(&layout.root, 0.0, 0.0, propagated, &mut list, true);
     list
 }
 
@@ -158,6 +190,9 @@ fn paint_box(
     offset_y: f32,
     propagated: Option<dom::NodeId>,
     list: &mut DisplayList,
+    // Whether this box is a stacking context, and so the one that sorts the
+    // context-forming boxes beneath it. The root always is (§9.9.1).
+    context: bool,
 ) {
     let x = offset_x + box_.rect.x;
     let y = offset_y + box_.rect.y;
@@ -335,6 +370,24 @@ fn paint_box(
     if let Some(layout) = &box_.text {
         let content_x = x + box_.content_origin.0;
         let content_y = y + box_.content_origin.1;
+        // A list box's chosen rows, under its own text rather than over it —
+        // and so before the loop that draws the glyphs rather than after it,
+        // which a child box could not be. A bar light enough to read dark text
+        // through, because inverting the text would mean shaping the line
+        // twice to say the one thing the bar already says.
+        for row in &box_.chosen_rows {
+            if let Some(line) = layout.lines.get(*row) {
+                list.items.push(DisplayItem::Rect {
+                    rect: Rect {
+                        x,
+                        y: content_y + line.y,
+                        width: box_.rect.width,
+                        height: line.baseline * 1.25,
+                    },
+                    color: CHOSEN_ROW,
+                });
+            }
+        }
         for line in &layout.lines {
             let dx = line_offset(
                 box_.style.text_align.against(box_.style.direction),
@@ -402,25 +455,168 @@ fn paint_box(
     //
     // A stable sort, so boxes that tie keep document order — which is both what
     // §9.9 says and what keeps a rendering reproducible (ADR-0005).
-    let mut order: Vec<&LayoutBox> = box_.children.iter().collect();
-    order.sort_by_key(|child| {
-        let positioned = child.style.position.is_positioned();
+    //
+    // §9.9.1 decides *which* boxes sort here. A stacking context sorts its own
+    // children together with every context-forming box below them that no
+    // nearer context has claimed — a positioned box with `z-index: auto` is
+    // not one, so it seals nothing, and a `z-index: -1` descendant of it can
+    // finally get behind an ancestor's background (#107). A box that is not a
+    // context leaves those to whichever ancestor is, and paints only what is
+    // left.
+    let mut order: Vec<Stacked<'_>> = Vec::new();
+    // What paints in place either way: content that is not positioned at all.
+    // Its own positioned descendants are not its to paint — they were taken by
+    // whichever ancestor is a stacking context.
+    order.extend(
+        box_.children
+            .iter()
+            .filter(|child| {
+                !child.style.position.is_positioned()
+                    && child.style.float == css::style::Float::None
+            })
+            .map(|child| Stacked { box_: child, x, y }),
+    );
+    if context {
+        lift_positioned(box_, x, y, &mut order);
+    }
+    // Floats are lifted by whichever box `lift_floats` would have stopped at:
+    // a stacking context, a positioned box, or a float. Each of those paints
+    // its own subtree as a unit, so each has to gather the floats inside it or
+    // they are gathered by nobody and painted by nobody.
+    if context || box_.style.position.is_positioned() || box_.style.float != css::style::Float::None
+    {
+        lift_floats(box_, x, y, &mut order);
+    }
+    order.sort_by_key(|stacked| {
+        let positioned = stacked.box_.style.position.is_positioned();
         // `z-index` means nothing on an unpositioned box, so it is not read
         // from one: honouring it there would invent a stacking order the spec
         // does not give.
         let z = if positioned {
-            child.style.z_index.unwrap_or(0)
+            stacked.box_.style.z_index.unwrap_or(0)
         } else {
             0
         };
-        (z, positioned)
+        // Appendix E's layers 3, 4 and 6, in that order: in-flow block boxes,
+        // then non-positioned floats, then positioned boxes. A float above the
+        // block boxes is what #165 is: a float that overhangs the bottom of its
+        // container was painted with that container and then covered by the
+        // next sibling's background.
+        let layer = match () {
+            () if positioned => 2,
+            () if stacked.box_.style.float != css::style::Float::None => 1,
+            () => 0,
+        };
+        (z, layer)
     });
-    for child in order {
-        paint_box(child, x, y, propagated, list);
+    for stacked in order {
+        let child = stacked.box_;
+        let inside = forms_a_stacking_context(child);
+        // A fixed subtree's items are pinned where they are emitted.
+        // Everything inside it is positioned against the viewport already —
+        // §10.1 made that the containing block — so what is left is to stop
+        // the band rasteriser shifting it with the page, and the cleanest
+        // place to mark that is where the subtree begins.
+        if child.style.position == css::style::Position::Fixed {
+            let from = list.items.len();
+            paint_box(child, stacked.x, stacked.y, propagated, list, inside);
+            list.pinned.push((from, list.items.len()));
+            continue;
+        }
+        paint_box(child, stacked.x, stacked.y, propagated, list, inside);
     }
 
     if let Some(clip) = clip {
         clip_items(&mut list.items, clip_from, clip);
+    }
+}
+
+/// A box waiting to be painted, with the origin of the parent that positions it.
+///
+/// A box lifted out of a `z-index: auto` subtree is painted a level or more
+/// above where it sits, so it carries where it actually is: recomputing the
+/// offset at the level that paints it would place it against the wrong parent.
+#[derive(Clone, Copy)]
+struct Stacked<'a> {
+    box_: &'a LayoutBox,
+    x: f32,
+    y: f32,
+}
+
+/// Whether a box forms a stacking context of its own (§9.9.1).
+///
+/// A positioned box with a numeric `z-index` does. One with `z-index: auto`
+/// does **not** — it makes a box in its parent's stacking context and nothing
+/// more, so its own positioned descendants belong to that same context and
+/// sort against its siblings rather than being sealed inside it.
+///
+/// `position: fixed` is the exception. CSS 2.1 does not say so in as many
+/// words, every browser does it, and the suite tests for both halves at once:
+/// `visuren/fixed-pos-stacking-001` has an `#absolute` half whose negative
+/// descendant must escape and a `#fixed` half whose must not.
+fn forms_a_stacking_context(box_: &LayoutBox) -> bool {
+    box_.style.position == css::style::Position::Fixed
+        || (box_.style.position.is_positioned() && box_.style.z_index.is_some())
+}
+
+/// Collects the positioned boxes inside `box_` that belong to an ancestor's
+/// stacking context, in tree order.
+///
+/// *Every* positioned descendant, not only the ones that form a context of
+/// their own: Appendix E sorts child contexts and `z-index: auto` positioned
+/// descendants together, at the context, in tree order. Collecting only the
+/// first kind leaves the second painted inside whatever parent happens to
+/// contain it, which puts it at that parent's place in the order rather than
+/// its own — `zindex/z-index-004` is two absolutely positioned siblings, one
+/// with `z-index: 0` and one without, and getting this wrong paints them in
+/// the wrong order.
+///
+/// `x` and `y` are the origin `box_`'s children are measured from. The walk
+/// stops descending at a box that forms a context, because its own descendants
+/// belong to *it* and go no further out.
+fn lift_positioned<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<Stacked<'a>>) {
+    for child in &box_.children {
+        let positioned = child.style.position.is_positioned();
+        if positioned {
+            out.push(Stacked { box_: child, x, y });
+        }
+        if !forms_a_stacking_context(child) {
+            lift_positioned(child, x + child.rect.x, y + child.rect.y, out);
+        }
+    }
+}
+
+/// Collects the floats inside `box_` that belong to an ancestor's stacking
+/// context, in tree order.
+///
+/// The twin of [`lift_positioned`], and for the same reason one level down.
+/// Appendix E paints floats as their own layer of the stacking context — above
+/// in-flow block backgrounds, below positioned boxes — rather than with
+/// whichever box happens to contain them. Painting one in place is invisible
+/// while it fits inside its container and wrong the moment it does not: since
+/// #41 a container is as tall as its in-flow content and no taller, so a float
+/// routinely hangs out of the bottom of one, and the next sibling's background
+/// then paints over the part that hangs out.
+///
+/// The walk stops at a box that forms a context, whose floats are its own, and
+/// at a positioned box: Appendix E paints a `z-index: auto` positioned box as
+/// though it started a context, so what floats inside it stays inside it.
+///
+/// It does not descend into a float either. A float establishes a block
+/// formatting context, so a float within one is contained by it and has nothing
+/// to hang out of.
+fn lift_floats<'a>(box_: &'a LayoutBox, x: f32, y: f32, out: &mut Vec<Stacked<'a>>) {
+    for child in &box_.children {
+        if child.style.position.is_positioned() {
+            continue;
+        }
+        if child.style.float != css::style::Float::None {
+            out.push(Stacked { box_: child, x, y });
+            continue;
+        }
+        if !forms_a_stacking_context(child) {
+            lift_floats(child, x + child.rect.x, y + child.rect.y, out);
+        }
     }
 }
 
@@ -531,17 +727,20 @@ fn paint_inline_box(
         border.top.used_width(font_size),
         border.bottom.used_width(font_size),
     );
+    // Which *physical* side each of the box's two logical ends is on. §8.4 puts
+    // the start side on the first fragment and the end side on the last, and
+    // §9.10 decides which is which: in right-to-left text a box opens on the
+    // right and closes on the left. Painting `opens` as the left unconditionally
+    // drew both sides on the first fragment of an rtl box and neither on the
+    // last (#113).
+    let rtl = style.direction == css::style::Direction::Rtl;
+    let has_left = if rtl { fragment.closes } else { fragment.opens };
+    let has_right = if rtl { fragment.opens } else { fragment.closes };
     // The reserved stretch starts at the margin's outer edge, so the border box
     // is inside it by whichever margins are on this fragment.
-    let left = origin_x
-        + fragment.x
-        + if fragment.opens {
-            px(style.margin.left)
-        } else {
-            0.0
-        };
+    let left = origin_x + fragment.x + if has_left { px(style.margin.left) } else { 0.0 };
     let right = origin_x + fragment.x + fragment.width
-        - if fragment.closes {
+        - if has_right {
             px(style.margin.right)
         } else {
             0.0
@@ -594,7 +793,7 @@ fn paint_inline_box(
             &border.left,
             Side::Left,
             border.left.used_width(font_size),
-            fragment.opens,
+            has_left,
             Rect {
                 y: rect.y + border_top,
                 width: border.left.used_width(font_size),
@@ -606,7 +805,7 @@ fn paint_inline_box(
             &border.right,
             Side::Right,
             border.right.used_width(font_size),
-            fragment.closes,
+            has_right,
             Rect {
                 x: rect.x + rect.width - border.right.used_width(font_size),
                 y: rect.y + border_top,
@@ -764,6 +963,18 @@ fn shaded(color: Color, factor: f32) -> Color {
 }
 
 /// How much darker a shadowed edge is drawn.
+/// The bar behind a chosen row of a list box.
+///
+/// UA furniture rather than anything the page asked for, like the control's own
+/// border — and it cannot come from the stylesheet the way that border does,
+/// because a `<select>`'s options are hidden and its rows are lines of one text
+/// layout rather than boxes the cascade can reach.
+///
+/// Light on purpose. A saturated bar would need the text on it inverted to stay
+/// legible, which would mean shaping that line a second time in a second colour
+/// to say the one thing the bar already says.
+const CHOSEN_ROW: Color = Color::rgb(0xcf, 0xdd, 0xee);
+
 const SHADOW: f32 = 0.5;
 
 /// A band across a side's *thickness*, measured from its outer edge.
@@ -919,24 +1130,31 @@ pub fn rasterise(
     width: u32,
     height: u32,
 ) -> Option<Pixmap> {
-    rasterise_band(list, fonts, images, width, 0.0, height)
+    rasterise_band(list, fonts, images, width, 0.0, 0.0, height)
 }
 
-/// Rasterises the rows `[top, top + height)` of a document.
+/// Rasterises the rows `[top, top + height)` of a document, starting `left`
+/// pixels in from its left edge.
 ///
 /// The display list is in document coordinates and does not change between
 /// bands — it is built once from the layout, and drawing a band is a matter of
 /// where the rows are taken from. That is what makes a band cheap: no parse, no
 /// cascade, no layout, just paint.
 ///
-/// Items are shifted by `top` as they are drawn rather than the list being
-/// rewritten, so nothing is allocated per band and the drawable-range check
-/// still sees the coordinate that actually reaches the rasteriser.
+/// Items are shifted by `left` and `top` as they are drawn rather than the list
+/// being rewritten, so nothing is allocated per band and the drawable-range
+/// check still sees the coordinate that actually reaches the rasteriser.
+///
+/// `left` is how a page wider than its window is read (#204). The two axes are
+/// the same operation and deliberately share one: a band is a rectangle of the
+/// document, and there was never a reason beyond habit for its horizontal edge
+/// to be fixed at zero.
 pub fn rasterise_band(
     list: &DisplayList,
     fonts: &mut FontStore,
     images: &ImageStore,
     width: u32,
+    left: f32,
     top: f32,
     height: u32,
 ) -> Option<Pixmap> {
@@ -959,39 +1177,78 @@ pub fn rasterise_band(
         let full = Rect {
             x: 0.0,
             y: 0.0,
-            width: pixmap.width() as f32,
+            width: left + pixmap.width() as f32,
             height: top + pixmap.height() as f32,
         };
         let anchor = anchor_of(&area, position, image);
         if let Some(slice) = banded(&full, top, pixmap.height() as f32) {
-            let slice = shifted(&slice, top);
+            let slice = shifted(&slice, left, top);
             if drawable(&slice) {
                 tile_image(
                     &mut pixmap,
                     image,
                     &slice,
-                    (anchor.0, anchor.1 - top),
+                    (anchor.0 - left, anchor.1 - top),
                     repeat,
                 );
             }
         }
     }
 
-    for item in &list.items {
+    // In one pass and in order, with the pinned runs drawn at no shift at all:
+    // their coordinates are already the window's, which is the whole of what
+    // `position: fixed` means once the containing block is the viewport (#108).
+    for (at, item) in list.items.iter().enumerate() {
+        // A pinned item is not shifted along *either* axis. Its coordinates are
+        // the window's, and a fixed sidebar that slid away when the reader
+        // scrolled sideways would be no more fixed than one that slid away when
+        // they scrolled down (#108, #204).
+        let (dx, dy) = if list.is_pinned(at) {
+            (0.0, 0.0)
+        } else {
+            (left, top)
+        };
+        draw_items(
+            &mut pixmap,
+            fonts,
+            images,
+            std::slice::from_ref(item),
+            dx,
+            dy,
+        );
+    }
+    Some(pixmap)
+}
+
+/// Draws a run of display items into a band, shifting them by `left` and `top`.
+///
+/// Called twice: once for the page's own items, and once for the pinned ones
+/// with a shift of zero. That second call is the whole of `position: fixed`'s
+/// painting half — a page is laid out once and a band is a slice of it, so an
+/// item that must not scroll is simply an item that is not shifted (#108).
+fn draw_items(
+    pixmap: &mut Pixmap,
+    fonts: &mut FontStore,
+    images: &ImageStore,
+    items: &[DisplayItem],
+    left: f32,
+    top: f32,
+) {
+    for item in items {
         // Nothing beyond the drawable range is drawn at all. See `MAX_COORD`:
         // this is the one place every item passes through, so it is the one
         // place the check has to be.
         match item {
             DisplayItem::Rect { rect, color } => {
-                let rect = shifted(rect, top);
+                let rect = shifted(rect, left, top);
                 if drawable(&rect) {
-                    fill_rect(&mut pixmap, &rect, *color);
+                    fill_rect(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Ellipse { rect, color } => {
-                let rect = shifted(rect, top);
+                let rect = shifted(rect, left, top);
                 if drawable(&rect) {
-                    fill_ellipse(&mut pixmap, &rect, *color);
+                    fill_ellipse(pixmap, &rect, *color);
                 }
             }
             DisplayItem::Image {
@@ -999,11 +1256,11 @@ pub fn rasterise_band(
                 rect,
                 placeholder,
             } => {
-                let rect = shifted(rect, top);
+                let rect = shifted(rect, left, top);
                 if drawable(&rect) {
                     match images.get(&ImageKey::content(*node)) {
-                        Some(image) => draw_image(&mut pixmap, image, &rect),
-                        None if *placeholder => draw_missing(&mut pixmap, fonts, &rect),
+                        Some(image) => draw_image(pixmap, image, &rect),
+                        None if *placeholder => draw_missing(pixmap, fonts, &rect),
                         None => {}
                     }
                 }
@@ -1021,13 +1278,13 @@ pub fn rasterise_band(
                     // coordinates and is then shifted with everything else, so
                     // a band draws the tiles a whole-page render would have.
                     let anchor = anchor_of(rect, *position, image);
-                    let slice = shifted(&slice, top);
+                    let slice = shifted(&slice, left, top);
                     if drawable(&slice) {
                         tile_image(
-                            &mut pixmap,
+                            pixmap,
                             image,
                             &slice,
-                            (anchor.0, anchor.1 - top),
+                            (anchor.0 - left, anchor.1 - top),
                             *repeat,
                         );
                     }
@@ -1039,22 +1296,66 @@ pub fn rasterise_band(
                 origin_y,
                 color,
             } => {
+                let origin_x = *origin_x - left;
                 let origin_y = *origin_y - top;
-                if in_range(*origin_x) && in_range(origin_y) {
-                    draw_glyph(&mut pixmap, fonts, glyph, *origin_x, origin_y, *color);
+                if in_range(origin_x) && in_range(origin_y) {
+                    draw_glyph(pixmap, fonts, glyph, origin_x, origin_y, *color);
                 }
             }
         }
     }
-    Some(pixmap)
 }
 
 /// The same rectangle, moved into a band's coordinates.
-fn shifted(rect: &Rect, top: f32) -> Rect {
+fn shifted(rect: &Rect, left: f32, top: f32) -> Rect {
     Rect {
+        x: rect.x - left,
         y: rect.y - top,
         ..*rect
     }
+}
+
+/// How far to the right the document's painted content reaches.
+///
+/// The scrollable width, answered from the display list because that is the one
+/// place every drawn thing passes through — a box, a picture, a tile and a
+/// glyph all end up here, and anything that does not is by definition not on
+/// the screen to be scrolled to.
+///
+/// Pinned items are left out. Their coordinates are the window's rather than
+/// the document's (#108), so a `position: fixed` bar the width of the viewport
+/// would otherwise claim to be content sitting at whatever the reader had
+/// already scrolled to.
+///
+/// Clamped to the drawable range: a page can name a coordinate far outside it,
+/// and `draw_items` already declines to draw one. A scroll range that ran to
+/// 10^9 would be a scrollbar with no thumb and a document that never ends.
+pub fn content_width(list: &DisplayList) -> f32 {
+    let mut widest: f32 = 0.0;
+    for (at, item) in list.items.iter().enumerate() {
+        if list.is_pinned(at) {
+            continue;
+        }
+        let right = match item {
+            DisplayItem::Rect { rect, .. }
+            | DisplayItem::Ellipse { rect, .. }
+            | DisplayItem::Image { rect, .. }
+            | DisplayItem::Tile { rect, .. } => rect.x + rect.width,
+            // A glyph is positioned within its run and then advances, and
+            // neither offset is in the run's rectangle: a line of `<pre>` runs
+            // past the box holding it, which is exactly the case #204 is about.
+            DisplayItem::Glyph {
+                glyph, origin_x, ..
+            } => origin_x + glyph.x + glyph.advance,
+        };
+        // `>` rather than `max`: a NaN coordinate fails the comparison and is
+        // skipped, where `max` would carry it out of here and into a scroll
+        // range nothing could clamp.
+        if right > widest {
+            widest = right;
+        }
+    }
+    widest.clamp(0.0, MAX_COORD)
 }
 
 /// The rows of a rectangle a band can see, still in document coordinates.
@@ -1318,13 +1619,87 @@ fn tile_image(
         clip.width.ceil() as u32,
         clip.height.ceil() as u32,
     );
-    let Some(mask) = bounds.and_then(|bounds| {
-        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
-        let mut builder = PathBuilder::new();
-        builder.push_rect(bounds.to_rect());
-        let path = builder.finish()?;
-        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
-        Some(mask)
+    let Some(bounds) = bounds else {
+        return;
+    };
+
+    // An opaque tile on whole pixels is a copy, not a blend.
+    //
+    // `draw_pixmap` reaches the same pixels through a pattern shader and a
+    // full-canvas mask, at about seven microseconds for a sixteen-pixel tile.
+    // A page of the era with a tiled background is a few thousand of those per
+    // band — the era fixture is 2,835 — which made tiling the single largest
+    // cost of putting a realistic page on screen, charged again every time the
+    // reader scrolled a line.
+    //
+    // The three things that make it a copy are all decided rather than
+    // assumed. `opaque` is settled at decode: composited over anything,
+    // `source-over` of a fully opaque source is the source. The placement is
+    // rounded to whole pixels here, the same way the slow path rounds it, and
+    // the scale is 1:1 — so no sampling happens and nearest-neighbour has
+    // nothing to choose between. And the mask is a pixel-aligned rectangle,
+    // whose coverage is all or nothing, so clipping to it is the same as
+    // copying only the columns inside it.
+    // Copying is only the same picture as compositing where the tiles cover
+    // every pixel of the clip, and that is a narrower case than it looks.
+    //
+    // `draw_pixmap` does not draw a bitmap into a rectangle; it fills the
+    // destination with the bitmap as a *pattern*, and a pattern sampled
+    // outside its bounds pads by repeating its edge. Drawing a 3x3 tile at
+    // y = -3 — entirely above the canvas — paints the whole canvas, held back
+    // only by the mask. So wherever the tile grid leaves part of the clip
+    // uncovered, the old path fills it with smeared edge pixels, and a copy
+    // leaves it alone. The two agree only where nothing is left over.
+    //
+    // Three conditions, each ruling out a way the grid can fail to cover:
+    // a single row or column of tiles (`repeat-x`, `repeat-y`, `no-repeat`)
+    // leaves the rest of the clip to the padding; a grid that starts inside
+    // the clip or stops short of it leaves a margin; and a fractional
+    // placement lets the rounding below move tiles independently, so a 3px
+    // tile from -1.5 lands at -2, 2, 5 and leaves the column at 1 to nobody.
+    //
+    // Found by the conformance suite rather than by reasoning about it. The
+    // first version of this had only the opacity check and took the background
+    // tests from 901 failures to 922 — every one of them a page whose tiles do
+    // not cover their box. Anything this turns away keeps the slower path and
+    // the pixels it has always produced.
+    let covers_clip = tile_x
+        && tile_y
+        && first_x <= bounds.left() as f32
+        && first_y <= bounds.top() as f32
+        && first_x + columns as f32 * width >= bounds.right() as f32
+        && first_y + rows as f32 * height >= bounds.bottom() as f32;
+    let whole_pixels = first_x.fract() == 0.0
+        && first_y.fract() == 0.0
+        && width.fract() == 0.0
+        && height.fract() == 0.0;
+    if image.opaque && covers_clip && whole_pixels {
+        for row in 0..rows {
+            for column in 0..columns {
+                copy_tile(
+                    pixmap,
+                    image,
+                    (first_x + column as f32 * width).round() as i32,
+                    (first_y + row as f32 * height).round() as i32,
+                    bounds,
+                );
+            }
+        }
+        return;
+    }
+
+    let Some(mask) = ({
+        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height());
+        if let Some(mask) = mask.as_mut() {
+            let mut builder = PathBuilder::new();
+            builder.push_rect(bounds.to_rect());
+            if let Some(path) = builder.finish() {
+                mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            } else {
+                mask.clear();
+            }
+        }
+        mask
     }) else {
         return;
     };
@@ -1341,6 +1716,52 @@ fn tile_image(
                 Some(&mask),
             );
         }
+    }
+}
+
+/// Copies one opaque tile onto the canvas, clipped to `bounds`.
+///
+/// The fast half of `tile_image`; see the reasoning there for why a copy is
+/// the same picture as a composite in this case. Everything here is whole
+/// pixels, so each destination row is one `copy_from_slice` out of the
+/// corresponding source row.
+fn copy_tile(
+    pixmap: &mut Pixmap,
+    image: &DecodedImage,
+    at_x: i32,
+    at_y: i32,
+    bounds: tiny_skia::IntRect,
+) {
+    let canvas_width = pixmap.width() as i32;
+    let canvas_height = pixmap.height() as i32;
+    let tile_width = image.pixmap.width() as i32;
+    let tile_height = image.pixmap.height() as i32;
+
+    // Clipped to the canvas and to the rectangle the mask would have enforced.
+    let left = at_x.max(bounds.left()).max(0);
+    let right = (at_x + tile_width).min(bounds.right()).min(canvas_width);
+    let top = at_y.max(bounds.top()).max(0);
+    let bottom = (at_y + tile_height).min(bounds.bottom()).min(canvas_height);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let span = (right - left) as usize;
+    let source = image.pixmap.pixels();
+    let destination = pixmap.pixels_mut();
+    for row in top..bottom {
+        let from = ((row - at_y) * tile_width + (left - at_x)) as usize;
+        let onto = (row * canvas_width + left) as usize;
+        // Bounds are checked above, but the slices are indexed rather than
+        // trusted: the arithmetic above mixes the tile's coordinates with the
+        // canvas's, and a panic here would take the renderer down.
+        let (Some(taken), Some(put)) = (
+            source.get(from..from + span),
+            destination.get_mut(onto..onto + span),
+        ) else {
+            continue;
+        };
+        put.copy_from_slice(taken);
     }
 }
 
@@ -1396,6 +1817,161 @@ fn fill_rect(pixmap: &mut Pixmap, rect: &Rect, color: Color) {
     );
 }
 
+/// The glyph every font reserves for "no glyph for this character".
+const NOTDEF: u16 = 0;
+
+/// How much of the font size a tofu box stands above the baseline.
+///
+/// Cap height rather than the full ascent: a box drawn to the ascender sits
+/// noticeably higher than the letters beside it, and a line mixing covered and
+/// uncovered script should read as one line.
+const TOFU_HEIGHT: f32 = 0.66;
+
+/// How much of the advance is left clear either side, so a run of them reads as
+/// separate boxes rather than as a bar.
+const TOFU_SIDE: f32 = 0.12;
+
+/// How thick the box's edge is drawn, as a share of the font size, and the
+/// floor it never goes below.
+const TOFU_EDGE: f32 = 0.06;
+const TOFU_EDGE_MIN: f32 = 1.0;
+
+/// Below this many pixels of advance a tofu is not drawn at all.
+///
+/// A box smaller than this is a smudge rather than a character, and a page set
+/// in 4px text would gain nothing from a row of them. The same judgement the
+/// image placeholder makes at its own size.
+const TOFU_MIN: f32 = 4.0;
+
+/// Draws a hollow box where a character has no glyph.
+///
+/// `x` is the pen position and `y` the baseline, which is what the glyph path
+/// around this already holds.
+fn draw_tofu(pixmap: &mut Pixmap, glyph: &text::PositionedGlyph, x: f32, y: f32, color: Color) {
+    let advance = glyph.advance;
+    let height = glyph.font_size * TOFU_HEIGHT;
+    if advance < TOFU_MIN || height < TOFU_MIN {
+        return;
+    }
+    let inset = advance * TOFU_SIDE;
+    // Snapped to whole pixels, unlike a glyph. A glyph is antialiased and reads
+    // correctly at a fractional position; a one-pixel edge drawn at one is
+    // spread across two rows at half intensity, so a box of them comes out as a
+    // grey smudge rather than as a box.
+    //
+    // It also makes the box a function of the rounded baseline rather than the
+    // exact one, which matters more than it sounds: two layouts whose baselines
+    // differ by a fraction of a pixel — an anonymous block beside a `<br>`, say
+    // — would otherwise draw boxes of different heights, and a hard edge turns
+    // a sub-pixel difference into a visible one.
+    let rect = Rect {
+        x: (x + inset).round(),
+        y: (y - height).round(),
+        width: (advance - inset * 2.0).round().max(1.0),
+        height: height.round().max(1.0),
+    };
+    let edge = (glyph.font_size * TOFU_EDGE).max(TOFU_EDGE_MIN).round();
+    // Hollow, so it reads as a container for a character that is missing rather
+    // than as a solid block, which at small sizes is indistinguishable from
+    // censored text.
+    if rect.width <= edge * 2.0 || rect.height <= edge * 2.0 {
+        fill_rect(pixmap, &rect, color);
+        return;
+    }
+    for side in [
+        Rect {
+            height: edge,
+            ..rect
+        },
+        Rect {
+            y: rect.y + rect.height - edge,
+            height: edge,
+            ..rect
+        },
+        Rect {
+            width: edge,
+            ..rect
+        },
+        Rect {
+            x: rect.x + rect.width - edge,
+            width: edge,
+            ..rect
+        },
+    ] {
+        fill_rect(pixmap, &side, color);
+    }
+}
+
+/// How far from its baseline a glyph's outline is allowed to reach, in ems,
+/// for the purpose of deciding it cannot be on screen.
+///
+/// Deliberately far looser than any real outline. Typography puts ascenders
+/// and descenders inside about 1.2em of the baseline; four is chosen so that
+/// the question this answers — "is this glyph nowhere near the canvas?" — is
+/// never a close call. The glyphs it lets through are cropped exactly a few
+/// lines further down, so the cost of being generous is a handful of extra
+/// cache lookups at the edges of a band, and the cost of being too tight
+/// would be text missing from the page.
+const GLYPH_REACH: f32 = 4.0;
+
+/// Whether a glyph could possibly put a pixel on the canvas.
+///
+/// Conservative on purpose: a `true` here means "rasterise it and find out",
+/// and only a `false` skips anything. See `GLYPH_REACH`.
+///
+/// A non-finite size or position makes every comparison below false, so the
+/// glyph is skipped — which is what happens to it further down anyway, where
+/// `rasterise` refuses a size that is not finite.
+fn reaches_canvas(
+    glyph: &text::PositionedGlyph,
+    x: f32,
+    y: f32,
+    canvas_width: f32,
+    canvas_height: f32,
+) -> bool {
+    let reach = glyph.font_size * GLYPH_REACH + 1.0;
+    y + reach > 0.0
+        && y - reach < canvas_height
+        && x + glyph.advance + reach > 0.0
+        && x - reach < canvas_width
+}
+
+/// Whether a glyph would have put a pixel on the canvas, worked out the exact
+/// way — by rasterising it and cropping it as the drawing path does.
+///
+/// Only for the `debug_assert` that holds [`GLYPH_REACH`] honest, which is why
+/// it costs exactly what the fast path exists to avoid.
+#[cfg(debug_assertions)]
+fn would_have_drawn(
+    pixmap: &Pixmap,
+    fonts: &mut FontStore,
+    glyph: &text::PositionedGlyph,
+    x: f32,
+    y: f32,
+) -> bool {
+    if glyph.glyph_id == NOTDEF {
+        // Tofu is drawn from the glyph's own advance and size rather than from
+        // an outline, and crops itself.
+        return false;
+    }
+    let Some((_, left, top, width, height)) = fonts.rasterise(glyph) else {
+        return false;
+    };
+    let (Some(x), Some(y)) = (
+        (x.floor() as i32).checked_add(left),
+        (y.floor() as i32).checked_sub(top),
+    ) else {
+        return false;
+    };
+    let (glyph_width, glyph_height) = (width as i32, height as i32);
+    let (canvas_width, canvas_height) = (pixmap.width() as i32, pixmap.height() as i32);
+    let from_x = (-x).max(0);
+    let from_y = (-y).max(0);
+    let to_x = (canvas_width - x).min(glyph_width);
+    let to_y = (canvas_height - y).min(glyph_height);
+    to_x > from_x && to_y > from_y
+}
+
 fn draw_glyph(
     pixmap: &mut Pixmap,
     fonts: &mut FontStore,
@@ -1412,6 +1988,56 @@ fn draw_glyph(
     // same family as the `margin: 1e40px` bug, one layer further in.
     let (x, y) = (origin_x + glyph.x, origin_y + glyph.y);
     if !in_range(x) || !in_range(y) {
+        return;
+    }
+
+    // Nowhere near the canvas, decided without touching the glyph cache.
+    //
+    // A display list is the whole document (that is what lets a band be a
+    // shift rather than a re-render), so painting one band walks every glyph
+    // on the page. A long article is a quarter of a million of them, and each
+    // one was being rasterised — a cache lookup and, until recently, a copy of
+    // the bitmap — before the crop below noticed it was a thousand rows off
+    // screen. Two thousand glyphs were drawn; the other 99% were looked up and
+    // thrown away.
+    //
+    // The crop below is exact because it has the rasterised bitmap's placement
+    // to work from. This runs before there is one, so it asks the looser
+    // question: could a glyph of this size, with its baseline here, reach the
+    // canvas at all? `GLYPH_REACH` ems either side of the baseline is far more
+    // than any outline in the bundled faces uses, and those are the only faces
+    // this browser has (ADR-0010) — so the margin is a bound on the fonts that
+    // exist rather than a guess about fonts in general. The `debug_assert`
+    // holds it to that: whatever this skips is rasterised anyway when
+    // assertions are on, and checked to have really been off the canvas.
+    let (canvas_width, canvas_height) = (pixmap.width() as f32, pixmap.height() as f32);
+    if !reaches_canvas(glyph, x, y, canvas_width, canvas_height) {
+        #[cfg(debug_assertions)]
+        {
+            let skipped = would_have_drawn(pixmap, fonts, glyph, x, y);
+            debug_assert!(
+                !skipped,
+                "a glyph {}px at ({x}, {y}) was skipped as off-canvas on a \
+                 {canvas_width}x{canvas_height} band, and would have drawn",
+                glyph.font_size
+            );
+        }
+        return;
+    }
+
+    // A character the bundled fonts do not cover (#97). The shaper resolves it
+    // to `.notdef` and gives it a real advance, so the line is the right length
+    // and the layout is right — and then nothing is drawn, because `.notdef`
+    // has no outline in these faces. A page in Chinese or Arabic came out
+    // *blank*, which is the worse of the two failures: a reader cannot tell
+    // "this page is empty" from "this browser has no font for it".
+    //
+    // ADR-0008 and PLAN.md both already say pages in uncovered scripts render
+    // as tofu. This is that sentence becoming true. Covering the scripts is the
+    // other half and a separate decision, since it is tens of megabytes against
+    // a font budget currently using four.
+    if glyph.glyph_id == NOTDEF {
+        draw_tofu(pixmap, glyph, x, y, color);
         return;
     }
 
@@ -1868,9 +2494,16 @@ mod tests {
         for band_height in [7u32, 16, 23] {
             let mut top = 0u32;
             while top < height {
-                let band =
-                    rasterise_band(&list, &mut fonts, &images, width, top as f32, band_height)
-                        .expect("band");
+                let band = rasterise_band(
+                    &list,
+                    &mut fonts,
+                    &images,
+                    width,
+                    0.0,
+                    top as f32,
+                    band_height,
+                )
+                .expect("band");
                 for row in 0..band_height {
                     let document_row = top + row;
                     if document_row >= height {
@@ -1889,6 +2522,122 @@ mod tests {
                 top += band_height;
             }
         }
+    }
+
+    #[test]
+    fn a_band_is_exactly_the_columns_it_names_from_the_whole_page() {
+        // The same property, sideways (#204). It is the one horizontal
+        // scrolling rests on: the reader moving right must see the columns they
+        // would have seen from a canvas wide enough to hold the whole page, or
+        // scrolling is a rendering change in disguise.
+        //
+        // Checked against a *wide* canvas rather than the window-sized one,
+        // because the whole point is that the page is wider than the window —
+        // there is no other way to have the right answer to compare with.
+        let html = "<body><div class=wide><p>one two three four five six seven</p>\
+             <pre>a line of fixed width output that runs well past any window</pre>\
+             <p>eight nine ten</p></div></body>";
+        let css_text = "body { background: #eef; margin: 0 }
+             .wide { width: 700px; border: 3px solid #333; padding: 7px }
+             pre { margin: 0 }";
+        let window = 120;
+        let whole_width = 760;
+
+        // Laid out once, at the window's width — which is what actually
+        // happens: the page overflows the viewport rather than being laid out
+        // for a wider one.
+        let (list, mut fonts, height) = scene(html, css_text, window);
+        assert!(
+            content_width(&list) > window as f32 * 2.0,
+            "the fixture does not overflow its window: {}",
+            content_width(&list)
+        );
+        let images = ImageStore::new();
+        let whole =
+            rasterise_band(&list, &mut fonts, &images, whole_width, 0.0, 0.0, height).expect("all");
+
+        for left in [0u32, 1, 60, 119, 300, 640] {
+            let band = rasterise_band(&list, &mut fonts, &images, window, left as f32, 0.0, height)
+                .expect("band");
+            for row in 0..height {
+                for column in 0..window {
+                    let document_column = left + column;
+                    if document_column >= whole_width {
+                        break;
+                    }
+                    let from_band = band.pixels()[(row * window + column) as usize];
+                    let from_whole = whole.pixels()[(row * whole_width + document_column) as usize];
+                    assert_eq!(
+                        from_band, from_whole,
+                        "band at {left}: row {row} column {column} is not document column \
+                         {document_column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_content_width_reaches_the_furthest_thing_drawn() {
+        let list = DisplayList {
+            canvas: Color::rgb(0xff, 0xff, 0xff),
+            canvas_image: None,
+            items: vec![
+                DisplayItem::Rect {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 10.0,
+                    },
+                    color: Color::rgb(0, 0, 0),
+                },
+                DisplayItem::Rect {
+                    rect: Rect {
+                        x: 400.0,
+                        y: 0.0,
+                        width: 250.0,
+                        height: 10.0,
+                    },
+                    color: Color::rgb(0, 0, 0),
+                },
+            ],
+            pinned: Vec::new(),
+        };
+        assert_eq!(content_width(&list), 650.0);
+    }
+
+    #[test]
+    fn a_fixed_box_is_not_something_to_scroll_to() {
+        // A `position: fixed` item's coordinates are the window's, not the
+        // document's (#108). Counting one as content would give every page with
+        // a fixed bar a scroll range it does not have — and the range would
+        // move as the reader scrolled, which is not a thing a document does.
+        let bar = DisplayItem::Rect {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 900.0,
+                height: 10.0,
+            },
+            color: Color::rgb(0, 0, 0),
+        };
+        let text = DisplayItem::Rect {
+            rect: Rect {
+                x: 0.0,
+                y: 20.0,
+                width: 300.0,
+                height: 10.0,
+            },
+            color: Color::rgb(0, 0, 0),
+        };
+        let list = DisplayList {
+            canvas: Color::rgb(0xff, 0xff, 0xff),
+            canvas_image: None,
+            items: vec![bar, text],
+            pinned: vec![(0, 1)],
+        };
+        assert_eq!(content_width(&list), 300.0, "the fixed bar was counted");
     }
 
     fn count_non_white(pixmap: &Pixmap) -> usize {
@@ -2478,7 +3227,25 @@ mod tile_tests {
     fn red_tile() -> DecodedImage {
         let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
         pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
-        DecodedImage { pixmap }
+        DecodedImage {
+            pixmap,
+            opaque: true,
+        }
+    }
+
+    /// A 4x4 image, half-transparent red.
+    ///
+    /// Here so the blending path keeps a test of its own. Every other tile in
+    /// this module is opaque, and an opaque tile is copied rather than
+    /// composited — so without this, the arithmetic that puts a see-through
+    /// background over what is under it would be exercised by nothing.
+    fn translucent_tile() -> DecodedImage {
+        let mut pixmap = Pixmap::new(4, 4).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 128));
+        DecodedImage {
+            pixmap,
+            opaque: false,
+        }
     }
 
     /// A 4x4 image with a red top row and left column, white elsewhere.
@@ -2500,7 +3267,10 @@ mod tile_tests {
         for y in 0..4usize {
             pixels[y * 4] = red;
         }
-        DecodedImage { pixmap }
+        DecodedImage {
+            pixmap,
+            opaque: true,
+        }
     }
 
     fn canvas() -> Pixmap {
@@ -2523,6 +3293,143 @@ mod tile_tests {
     fn is_red(pixmap: &Pixmap, x: u32, y: u32) -> bool {
         let pixel = pixmap.pixels()[(y * pixmap.width() + x) as usize];
         pixel.red() > 200 && pixel.green() < 100
+    }
+
+    #[test]
+    fn a_see_through_tile_lets_what_is_under_it_show() {
+        // The path the test above compares against, checked to be doing
+        // something rather than merely agreeing. A half-transparent red over
+        // white is pink: neither the red that a copy would leave nor the white
+        // that drawing nothing would.
+        let mut pixmap = canvas();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        tile_image(
+            &mut pixmap,
+            &translucent_tile(),
+            &rect,
+            (rect.x, rect.y),
+            BackgroundRepeat::Repeat,
+        );
+        let pixel = pixmap.pixels()[0];
+        assert!(
+            pixel.red() == 255 && pixel.green() > 100 && pixel.green() < 160,
+            "expected pink, got ({}, {}, {})",
+            pixel.red(),
+            pixel.green(),
+            pixel.blue()
+        );
+    }
+
+    #[test]
+    fn copying_a_tile_draws_what_compositing_it_would_wherever_it_is_used() {
+        // The safety net under the copying path, swept over the geometries
+        // that decide whether it is taken: tiles that do and do not divide
+        // their box, clips at whole and fractional coordinates, clips starting
+        // off the canvas, anchors above and to the left of the box, anchors on
+        // half pixels, and all four repeat modes.
+        //
+        // `opaque` is what chooses the path, so the same pixels are drawn
+        // twice with only that flipped and compared byte for byte. Cases the
+        // copying path turns away still pass here — they take the composite
+        // path both times, which is the point: this says the choice is safe,
+        // not that it is always made.
+        //
+        // Written after the first version of the copying path passed a
+        // narrower version of this test and still broke twenty-one conformance
+        // backgrounds.
+        for (tile_width, tile_height) in [(3u32, 3u32), (15, 15), (4, 7)] {
+            let mut pixmap = Pixmap::new(tile_width, tile_height).expect("tile");
+            pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
+            // One corner in another colour, so a tile landing a pixel out
+            // shows up. A uniform tile hides every placement error there is.
+            let red = PremultipliedColor::from_rgba(255, 0, 0, 255).expect("opaque red");
+            pixmap.pixels_mut()[0] = red;
+            let copied = DecodedImage {
+                pixmap: pixmap.clone(),
+                opaque: true,
+            };
+            let composited = DecodedImage {
+                pixmap,
+                opaque: false,
+            };
+
+            for (x, y, width, height) in [
+                (0.0f32, 0.0f32, 40.0f32, 40.0f32),
+                (2.5, 3.5, 30.0, 25.0),
+                (-5.0, -3.0, 50.0, 50.0),
+                (10.0, 10.0, 33.0, 17.0),
+            ] {
+                let rect = Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                let anchors = [
+                    (x, y),
+                    (x, y + height - tile_height as f32),
+                    (x - 7.0, y - 9.0),
+                    (x + 1.5, y + 2.5),
+                ];
+                for anchor in anchors {
+                    for repeat in [
+                        BackgroundRepeat::Repeat,
+                        BackgroundRepeat::RepeatX,
+                        BackgroundRepeat::RepeatY,
+                        BackgroundRepeat::NoRepeat,
+                    ] {
+                        let mut by_copy = canvas_of(40, 40);
+                        let mut by_composite = canvas_of(40, 40);
+                        tile_image(&mut by_copy, &copied, &rect, anchor, repeat);
+                        tile_image(&mut by_composite, &composited, &rect, anchor, repeat);
+                        if let Some(report) = first_difference(&by_copy, &by_composite, 40) {
+                            panic!(
+                                "tile {tile_width}x{tile_height}, clip ({x}, {y}, {width}, \
+                                 {height}), anchor {anchor:?}, {repeat:?}: {report}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A white canvas of the given size.
+    fn canvas_of(width: u32, height: u32) -> Pixmap {
+        let mut pixmap = Pixmap::new(width, height).expect("canvas");
+        pixmap.fill(tiny_skia::Color::WHITE);
+        pixmap
+    }
+
+    /// Where two canvases first disagree, described for a failure message.
+    ///
+    /// A whole-buffer `assert_eq!` says only that two megabytes differ, which
+    /// is no help at all in working out whether a tile landed a pixel out or a
+    /// gap was left between two of them.
+    fn first_difference(left: &Pixmap, right: &Pixmap, width: u32) -> Option<String> {
+        let (left, right) = (left.pixels(), right.pixels());
+        let (at, (copy, composite)) = left
+            .iter()
+            .zip(right.iter())
+            .enumerate()
+            .find(|(_, (copy, composite))| copy != composite)?;
+        let (x, y) = (at as u32 % width, at as u32 / width);
+        Some(format!(
+            "at ({x}, {y}) copying gives ({}, {}, {}, {}) and compositing gives ({}, {}, {}, {})",
+            copy.red(),
+            copy.green(),
+            copy.blue(),
+            copy.alpha(),
+            composite.red(),
+            composite.green(),
+            composite.blue(),
+            composite.alpha(),
+        ))
     }
 
     #[test]
@@ -2716,7 +3623,7 @@ mod tile_tests {
             tile_image(
                 &mut band,
                 &tile,
-                &shifted(&slice, top),
+                &shifted(&slice, 0.0, top),
                 (anchor.0, anchor.1 - top),
                 BackgroundRepeat::Repeat,
             );
@@ -2986,5 +3893,485 @@ mod missing_image_tests {
             "only {inked} inked pixels across the middle of a 240x160 \
              placeholder, so the label is not there"
         );
+    }
+}
+
+#[cfg(test)]
+mod tofu_tests {
+    use super::*;
+
+    /// One line of `text` at 20px, rasterised onto white.
+    fn draw(text: &str) -> Pixmap {
+        let mut fonts = FontStore::new();
+        let style = css::style::ComputedStyle {
+            font_size: 20.0,
+            ..css::style::ComputedStyle::default()
+        };
+        let runs = [text::InlineRun::text(text, style.clone())];
+        let layout = fonts.layout_runs(&runs, &style, 400.0);
+        let mut pixmap = Pixmap::new(400, 60).expect("a pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
+        for line in &layout.lines {
+            for glyph in &line.glyphs {
+                draw_glyph(
+                    &mut pixmap,
+                    &mut fonts,
+                    glyph,
+                    0.0,
+                    30.0,
+                    Color::rgb(0, 0, 0),
+                );
+            }
+        }
+        pixmap
+    }
+
+    /// How many pixels are not the white the canvas started as.
+    fn inked(pixmap: &Pixmap) -> usize {
+        pixmap
+            .pixels()
+            .iter()
+            .filter(|pixel| pixel.red() != 0xff || pixel.green() != 0xff || pixel.blue() != 0xff)
+            .count()
+    }
+
+    #[test]
+    fn a_script_the_bundled_fonts_do_not_cover_draws_something() {
+        // #97. The shaper resolves these to `.notdef` and gives them real
+        // advances, so the line was always the right length — and then nothing
+        // was drawn, so a page in Chinese came out blank. A reader cannot tell
+        // "this page is empty" from "this browser has no font for it".
+        for (script, text) in [
+            ("CJK", "你好世界"),
+            ("Arabic", "مرحبا"),
+            ("Devanagari", "नमस्ते"),
+            ("Thai", "สวัสดี"),
+        ] {
+            let ink = inked(&draw(text));
+            assert!(ink > 0, "{script} drew nothing at all");
+        }
+    }
+
+    #[test]
+    fn a_script_the_fonts_do_cover_still_draws_its_own_glyphs() {
+        // The tofu must not be reaching text that has glyphs. Hebrew is the
+        // interesting one: Liberation is metric-compatible with Arial and
+        // inherits its coverage, which is why it renders where Arabic does not.
+        for (script, text) in [
+            ("Latin", "Hello"),
+            ("Greek", "Καλημέρα"),
+            ("Hebrew", "שלום"),
+        ] {
+            let pixmap = draw(text);
+            let ink = inked(&pixmap);
+            assert!(ink > 0, "{script} drew nothing");
+            // A tofu is a hollow rectangle: its rows are either empty or have
+            // ink at both ends and none between. Real text is not that regular,
+            // so a row with ink somewhere strictly inside it is proof of a
+            // glyph rather than a box.
+            let inside = (0..pixmap.height()).any(|y| {
+                let row: Vec<bool> = (0..pixmap.width())
+                    .map(|x| {
+                        let p = pixmap.pixels()[(y * pixmap.width() + x) as usize];
+                        p.red() != 0xff || p.green() != 0xff || p.blue() != 0xff
+                    })
+                    .collect();
+                match (
+                    row.iter().position(|on| *on),
+                    row.iter().rposition(|on| *on),
+                ) {
+                    (Some(first), Some(last)) if last > first + 1 => {
+                        row[first + 1..last].iter().any(|on| *on)
+                    }
+                    _ => false,
+                }
+            });
+            assert!(inside, "{script} drew hollow boxes rather than glyphs");
+        }
+    }
+
+    #[test]
+    fn a_space_is_not_drawn_as_a_box() {
+        // A space has a glyph and an advance; only a character with *no* glyph
+        // gets a box. Getting this wrong would put a box between every word.
+        assert_eq!(inked(&draw(" ")), 0);
+        assert_eq!(inked(&draw("   ")), 0);
+    }
+
+    #[test]
+    fn a_tofu_is_no_wider_than_the_advance_it_stands_in() {
+        // Otherwise a run of them overlaps and reads as a bar rather than as
+        // one box per character.
+        let mut fonts = FontStore::new();
+        let style = css::style::ComputedStyle {
+            font_size: 20.0,
+            ..css::style::ComputedStyle::default()
+        };
+        let runs = [text::InlineRun::text("你好", style.clone())];
+        let layout = fonts.layout_runs(&runs, &style, 400.0);
+        let line = layout.lines.first().expect("a line");
+        let glyphs = &line.glyphs;
+        assert_eq!(glyphs.len(), 2, "two characters, two glyphs");
+        assert!(
+            glyphs[0].advance > 0.0,
+            "an uncovered character still reserves its width",
+        );
+        assert!(
+            glyphs[0].x + glyphs[0].advance <= glyphs[1].x + 0.01,
+            "the first box ends before the second begins",
+        );
+    }
+
+    #[test]
+    fn text_too_small_to_read_draws_no_boxes() {
+        // A page of 3px scaffolding text would otherwise become a page of
+        // smudges — the same judgement the image placeholder makes at its own
+        // size.
+        let mut fonts = FontStore::new();
+        let style = css::style::ComputedStyle {
+            font_size: 3.0,
+            ..css::style::ComputedStyle::default()
+        };
+        let runs = [text::InlineRun::text("你好世界", style.clone())];
+        let layout = fonts.layout_runs(&runs, &style, 400.0);
+        let mut pixmap = Pixmap::new(400, 60).expect("a pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
+        for line in &layout.lines {
+            for glyph in &line.glyphs {
+                draw_glyph(
+                    &mut pixmap,
+                    &mut fonts,
+                    glyph,
+                    0.0,
+                    30.0,
+                    Color::rgb(0, 0, 0),
+                );
+            }
+        }
+        assert_eq!(inked(&pixmap), 0);
+    }
+}
+
+#[cfg(test)]
+mod rtl_inline_side_tests {
+    use super::*;
+    use css::style::{BorderSide, BorderStyle, Direction};
+
+    /// A span's style with a border only on the side named, so which side got
+    /// drawn can be read off the display list by colour.
+    fn bordered(direction: Direction) -> css::style::ComputedStyle {
+        let side = |color: Color| BorderSide {
+            width: css::value::Length::Px(4.0),
+            style: BorderStyle::Solid,
+            color: Some(color),
+        };
+        let mut style = css::style::ComputedStyle {
+            direction,
+            ..css::style::ComputedStyle::default()
+        };
+        style.border.left = side(Color::rgb(0xff, 0x00, 0x00));
+        style.border.right = side(Color::rgb(0x00, 0x00, 0xff));
+        style
+    }
+
+    /// Which border colours a fragment drew.
+    fn sides(fragment: &text::InlineBoxFragment, style: &css::style::ComputedStyle) -> Vec<Color> {
+        let mut list = DisplayList::default();
+        paint_inline_box(fragment, style, 0.0, 0.0, &mut list);
+        list.items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fragment(opens: bool, closes: bool) -> text::InlineBoxFragment {
+        text::InlineBoxFragment {
+            source: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 16.0,
+            opens,
+            closes,
+        }
+    }
+
+    const RED: Color = Color::rgb(0xff, 0x00, 0x00);
+    const BLUE: Color = Color::rgb(0x00, 0x00, 0xff);
+
+    #[test]
+    fn a_left_to_right_box_opens_on_the_left() {
+        let style = bordered(Direction::Ltr);
+        let first = sides(&fragment(true, false), &style);
+        assert!(first.contains(&RED), "the first fragment drew no left side");
+        assert!(
+            !first.contains(&BLUE),
+            "the first fragment drew the closing side too",
+        );
+        let last = sides(&fragment(false, true), &style);
+        assert!(last.contains(&BLUE));
+        assert!(!last.contains(&RED));
+    }
+
+    #[test]
+    fn a_right_to_left_box_opens_on_the_right() {
+        // #113. §9.10: a right-to-left box begins on the right, so its opening
+        // side is the physical *right* border. Painting `opens` as the left
+        // unconditionally put both sides on the first fragment of an rtl box
+        // and neither on the last.
+        let style = bordered(Direction::Rtl);
+        let first = sides(&fragment(true, false), &style);
+        assert!(
+            first.contains(&BLUE),
+            "the first fragment of an rtl box drew no right side",
+        );
+        assert!(
+            !first.contains(&RED),
+            "it drew the left side, which belongs to the last fragment",
+        );
+        let last = sides(&fragment(false, true), &style);
+        assert!(last.contains(&RED));
+        assert!(!last.contains(&BLUE));
+    }
+
+    #[test]
+    fn a_middle_fragment_draws_neither_side_in_either_direction() {
+        for direction in [Direction::Ltr, Direction::Rtl] {
+            let drawn = sides(&fragment(false, false), &bordered(direction));
+            assert!(!drawn.contains(&RED), "{direction:?} drew a left side");
+            assert!(!drawn.contains(&BLUE), "{direction:?} drew a right side");
+        }
+    }
+
+    #[test]
+    fn a_box_on_one_line_draws_both_sides_in_either_direction() {
+        for direction in [Direction::Ltr, Direction::Rtl] {
+            let drawn = sides(&fragment(true, true), &bordered(direction));
+            assert!(drawn.contains(&RED), "{direction:?} lost its left side");
+            assert!(drawn.contains(&BLUE), "{direction:?} lost its right side");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stacking_context_tests {
+    use super::*;
+    use css::Stylesheet;
+
+    /// The colours of the filled rectangles a page paints, in paint order.
+    fn painted(html: &str, css_text: &str) -> Vec<Color> {
+        let doc = dom::parse(html);
+        let styles = css::cascade::cascade(
+            &doc,
+            &[
+                Stylesheet::parse(css::ua::UA_STYLESHEET),
+                Stylesheet::parse(css_text),
+            ],
+        );
+        let mut fonts = FontStore::new();
+        let out = layout::layout(
+            &doc,
+            &styles,
+            &mut fonts,
+            &layout::IntrinsicSizes::new(),
+            300.0,
+            300.0,
+        );
+        build_display_list(&out)
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Rect { color, .. } if !color.is_transparent() => Some(*color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const RED: Color = Color::rgb(0xff, 0x00, 0x00);
+    const GREEN: Color = Color::rgb(0x00, 0x80, 0x00);
+
+    /// Whether `first` is painted before `last`, so `last` covers it.
+    fn before(order: &[Color], first: Color, last: Color) -> bool {
+        match (
+            order.iter().position(|c| *c == first),
+            order.iter().rposition(|c| *c == last),
+        ) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_float_paints_over_a_later_siblings_background() {
+        // #165, and Appendix E: floats are layer 4 and in-flow block
+        // backgrounds are layer 3. Since #41 a container is as tall as its
+        // in-flow content and no taller, so a float routinely hangs out of the
+        // bottom of one — and painting it with its container put it under
+        // whatever came next.
+        let order = painted(
+            "<body><div class=a><span class=f></span></div><div class=b></div></body>",
+            "body { margin: 0 }
+             .a { height: 10px }
+             .f { float: left; width: 50px; height: 60px; background: green }
+             .b { height: 60px; background: red }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the float went under the next block's background: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_float_inside_a_float_is_still_painted() {
+        // The float lift stops at a float, because a float establishes a block
+        // formatting context and contains its own. Stopping there without
+        // having that float gather them is how they stop being painted at all
+        // — 27 of the `margin-padding-clear` tests, which are built out of
+        // exactly this shape.
+        let order = painted(
+            "<body><div class=outer><div class=inner></div></div></body>",
+            "body { margin: 0 }
+             .outer { float: left; width: 80px; height: 80px; background: red }
+             .inner { float: left; width: 40px; height: 40px; background: green }",
+        );
+        assert!(
+            order.contains(&GREEN),
+            "the nested float vanished: {order:?}"
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "and it belongs over its container: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_float_still_paints_under_a_positioned_box() {
+        // Layer 4 is below layer 6. Lifting floats must not lift them past the
+        // positioned boxes that were already being lifted.
+        let order = painted(
+            "<body><span class=f></span><div class=p></div></body>",
+            "body { margin: 0 }
+             .f { float: left; width: 50px; height: 50px; background: red }
+             .p { position: absolute; top: 0; left: 0;
+                  width: 50px; height: 50px; background: green }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "a float painted over a positioned box: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_z_index_auto_box_does_not_seal_a_negative_descendant() {
+        // #107, and the `#absolute` half of `visuren/fixed-pos-stacking-001`.
+        // §9.9.1: a positioned box with `z-index: auto` makes a box in its
+        // parent's stacking context and not a context of its own, so a
+        // `z-index: -1` descendant escapes to the nearest real context and
+        // paints behind that box's own background.
+        let order = painted(
+            "<body><div id=\"a\"><div><div id=\"b\"></div></div></div></body>",
+            "#a { position: absolute; background: #008000; width: 50px; height: 50px } \
+             #a div { position: absolute } \
+             #b { position: absolute; z-index: -1; background: #ff0000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the red descendant did not get behind the green ancestor: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_fixed_box_does_seal_one() {
+        // The `#fixed` half of the same test. CSS 2.1 does not say so in as
+        // many words; every browser does it, and the suite tests for it.
+        let order = painted(
+            "<body><div id=\"a\"><div><div id=\"b\"></div></div></div></body>",
+            "#a { position: fixed; background: #ff0000; width: 50px; height: 50px } \
+             #a div { position: absolute } \
+             #b { position: absolute; z-index: -1; background: #008000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the descendant escaped a fixed box, which is a context: {order:?}",
+        );
+    }
+
+    #[test]
+    fn positioned_siblings_keep_tree_order_when_their_z_ties() {
+        // `zindex/z-index-004`: one absolutely positioned box with `z-index: 0`
+        // and one with `z-index: auto`, siblings. They tie, so the later one
+        // wins — which only works if the lifted boxes keep their document
+        // order rather than being appended after the ones that were not
+        // lifted.
+        let order = painted(
+            "<body><div id=\"w\"><div id=\"a\"></div><div id=\"b\"></div></div></body>",
+            "#w { position: relative } \
+             #a { position: absolute; z-index: 0; background: #ff0000; \
+                  width: 50px; height: 50px } \
+             #b { position: absolute; background: #008000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(
+            before(&order, RED, GREEN),
+            "the later sibling did not paint last: {order:?}",
+        );
+    }
+
+    #[test]
+    fn a_numeric_z_index_still_sorts_against_its_siblings() {
+        // The half that must not change: a negative one goes behind.
+        let order = painted(
+            "<body><div id=\"a\"></div><div id=\"b\"></div></body>",
+            "#a { position: absolute; background: #008000; width: 50px; height: 50px } \
+             #b { position: absolute; z-index: -1; background: #ff0000; \
+                  width: 50px; height: 50px }",
+        );
+        assert!(before(&order, RED, GREEN), "{order:?}");
+    }
+
+    #[test]
+    fn what_forms_a_context_and_what_does_not() {
+        let context = |position, z| {
+            let box_ = LayoutBox {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                style: css::style::ComputedStyle {
+                    position,
+                    z_index: z,
+                    ..css::style::ComputedStyle::default()
+                },
+                text: None,
+                content_origin: (0.0, 0.0),
+                content_width: 0.0,
+                children: Vec::new(),
+                replaced: None,
+                replaced_image: false,
+                node: None,
+                round: false,
+                chosen_rows: Vec::new(),
+                top_border_gap: None,
+                absolute_at: None,
+            };
+            forms_a_stacking_context(&box_)
+        };
+        use css::style::Position;
+        assert!(!context(Position::Static, None));
+        assert!(!context(Position::Static, Some(3)), "z means nothing here");
+        assert!(
+            !context(Position::Absolute, None),
+            "`auto` is not a context"
+        );
+        assert!(context(Position::Absolute, Some(0)));
+        assert!(context(Position::Relative, Some(-1)));
+        assert!(context(Position::Fixed, None), "fixed always is");
     }
 }

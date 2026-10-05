@@ -43,8 +43,20 @@ pub enum Item {
     OpenInNewTab(String),
     /// Put this link's address on the clipboard.
     CopyLink(String),
+    /// Write this picture to the reader's disk (#205).
+    SaveImage(String),
+    /// Put this picture's address on the clipboard.
+    CopyImageAddress(String),
+    /// Open this picture on its own, as a page.
+    OpenImage(String),
     /// Put the selected text on the clipboard.
     CopySelection,
+    /// Put the clipboard into whatever is being typed in.
+    Paste,
+    /// Show this page's markup, as a page (#198).
+    ViewSource,
+    /// Show what the browser knows about this page (#198).
+    PageInformation,
 }
 
 impl Item {
@@ -56,7 +68,13 @@ impl Item {
             Item::Reload => "Reload",
             Item::OpenInNewTab(_) => "Open link in new tab",
             Item::CopyLink(_) => "Copy link address",
+            Item::SaveImage(_) => "Save image as…",
+            Item::CopyImageAddress(_) => "Copy image address",
+            Item::OpenImage(_) => "Open image in new tab",
             Item::CopySelection => "Copy",
+            Item::Paste => "Paste",
+            Item::ViewSource => "View page source",
+            Item::PageInformation => "Page information",
         }
     }
 }
@@ -68,9 +86,17 @@ impl Item {
 /// instead: the menu is shorter to read, and there is nothing in it to click
 /// in hope. "Reload" is the one entry that is always there, because there is
 /// always a page to fetch again.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "four independent yes-or-no facts about what the pointer is on; a \
+              struct holding them would be built at the one call site and read \
+              at the one other"
+)]
 pub fn items_for(
     link: Option<String>,
+    image: Option<String>,
     selection: bool,
+    typing: bool,
     can_go_back: bool,
     can_go_forward: bool,
 ) -> Vec<Item> {
@@ -79,8 +105,25 @@ pub fn items_for(
         items.push(Item::OpenInNewTab(url.clone()));
         items.push(Item::CopyLink(url));
     }
+    // After the link's entries and before everything else, because an `<img>`
+    // inside an `<a>` is the era's whole navigation — a thumbnail that is also
+    // a link — so both sets are usually here at once, and the thing the reader
+    // pressed the button over is the picture.
+    if let Some(url) = image {
+        items.push(Item::SaveImage(url.clone()));
+        items.push(Item::CopyImageAddress(url.clone()));
+        items.push(Item::OpenImage(url));
+    }
     if selection {
         items.push(Item::CopySelection);
+    }
+    // Only where there is somewhere for it to go. Paste is the one entry here
+    // that acts on something *other* than what the pointer is over — it needs a
+    // field with the keyboard — and offering it with nowhere to put the text
+    // would be an entry that does nothing, which is what the rule at the top of
+    // this function exists to prevent.
+    if typing {
+        items.push(Item::Paste);
     }
     if can_go_back {
         items.push(Item::Back);
@@ -89,6 +132,11 @@ pub fn items_for(
         items.push(Item::Forward);
     }
     items.push(Item::Reload);
+    // Last, and always: these are about the page rather than about what the
+    // pointer is on, and a reader looking for them wants them in the same place
+    // every time (#198).
+    items.push(Item::ViewSource);
+    items.push(Item::PageInformation);
     items
 }
 
@@ -219,7 +267,14 @@ mod tests {
 
     #[test]
     fn a_menu_on_a_link_offers_what_a_link_can_do() {
-        let items = items_for(Some("https://example.com/".to_owned()), false, true, false);
+        let items = items_for(
+            Some("https://example.com/".to_owned()),
+            None,
+            false,
+            false,
+            true,
+            false,
+        );
 
         assert_eq!(
             items,
@@ -228,7 +283,75 @@ mod tests {
                 Item::CopyLink("https://example.com/".to_owned()),
                 Item::Back,
                 Item::Reload,
+                Item::ViewSource,
+                Item::PageInformation,
             ]
+        );
+    }
+
+    #[test]
+    fn a_menu_over_a_picture_offers_what_a_picture_can_do() {
+        // #205. The browser could fetch, decode and draw a picture and had
+        // nowhere to put one, so none of these three had anywhere to be asked
+        // for.
+        let items = items_for(
+            None,
+            Some("https://example.com/cat.jpg".to_owned()),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![
+                Item::SaveImage("https://example.com/cat.jpg".to_owned()),
+                Item::CopyImageAddress("https://example.com/cat.jpg".to_owned()),
+                Item::OpenImage("https://example.com/cat.jpg".to_owned()),
+                Item::Reload,
+                Item::ViewSource,
+                Item::PageInformation,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thumbnail_that_is_also_a_link_offers_both() {
+        // Which is the era's whole navigation, so it is the common case rather
+        // than a corner of one. The link's entries come first because the
+        // element the pointer is *in* is the anchor, and the picture's follow
+        // because the thing under it is the picture.
+        let items = items_for(
+            Some("https://example.com/page.html".to_owned()),
+            Some("https://example.com/thumb.gif".to_owned()),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![
+                Item::OpenInNewTab("https://example.com/page.html".to_owned()),
+                Item::CopyLink("https://example.com/page.html".to_owned()),
+                Item::SaveImage("https://example.com/thumb.gif".to_owned()),
+                Item::CopyImageAddress("https://example.com/thumb.gif".to_owned()),
+                Item::OpenImage("https://example.com/thumb.gif".to_owned()),
+                Item::Reload,
+                Item::ViewSource,
+                Item::PageInformation,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_menu_off_a_picture_says_nothing_about_pictures() {
+        let items = items_for(None, None, false, false, false, false);
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Item::SaveImage(_) | Item::OpenImage(_))),
+            "{items:?}"
         );
     }
 
@@ -236,8 +359,8 @@ mod tests {
     fn a_menu_over_a_selection_offers_to_copy_it() {
         // The entry only exists when there is something to copy — the same
         // rule as back and forward, for the same reason.
-        assert!(!items_for(None, false, false, false).contains(&Item::CopySelection));
-        assert!(items_for(None, true, false, false).contains(&Item::CopySelection));
+        assert!(!items_for(None, None, false, false, false, false).contains(&Item::CopySelection));
+        assert!(items_for(None, None, true, false, false, false).contains(&Item::CopySelection));
     }
 
     #[test]
@@ -245,7 +368,14 @@ mod tests {
         // Nearest first: what the pointer is on, then what is on the page,
         // then what the tab can do. A menu that put "Reload" above "Copy link
         // address" would make the reader read the whole list every time.
-        let items = items_for(Some("https://example.com/".to_owned()), true, true, false);
+        let items = items_for(
+            Some("https://example.com/".to_owned()),
+            None,
+            true,
+            false,
+            true,
+            false,
+        );
 
         assert_eq!(
             items,
@@ -255,24 +385,41 @@ mod tests {
                 Item::CopySelection,
                 Item::Back,
                 Item::Reload,
+                Item::ViewSource,
+                Item::PageInformation,
             ]
         );
     }
 
     #[test]
     fn a_menu_on_bare_page_offers_only_what_the_page_can_do() {
-        assert_eq!(items_for(None, false, false, false), vec![Item::Reload]);
+        assert_eq!(
+            items_for(None, None, false, false, false, false),
+            vec![Item::Reload, Item::ViewSource, Item::PageInformation],
+            "there is always a page to fetch again, to read the markup of, and \
+             to ask about (#198)"
+        );
+    }
+
+    #[test]
+    fn paste_is_offered_only_where_there_is_somewhere_to_put_it() {
+        // The one entry here that acts on something other than what the pointer
+        // is over: it needs a field with the keyboard. Offering it otherwise
+        // would be an entry that does nothing, which is the thing this menu
+        // does not do.
+        assert!(!items_for(None, None, false, false, false, false).contains(&Item::Paste));
+        assert!(items_for(None, None, false, true, false, false).contains(&Item::Paste));
     }
 
     #[test]
     fn nothing_is_offered_that_would_do_nothing() {
         // Greyed-out entries are a list of things you cannot have. Leaving
         // them out is shorter to read and cannot be clicked in hope.
-        let fresh = items_for(None, false, false, false);
+        let fresh = items_for(None, None, false, false, false, false);
         assert!(!fresh.contains(&Item::Back), "{fresh:?}");
         assert!(!fresh.contains(&Item::Forward), "{fresh:?}");
 
-        let travelled = items_for(None, false, true, true);
+        let travelled = items_for(None, None, false, false, true, true);
         assert!(travelled.contains(&Item::Back));
         assert!(travelled.contains(&Item::Forward));
     }

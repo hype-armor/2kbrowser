@@ -14,7 +14,537 @@ made no releases until this file existed, and inventing boundaries for work
 that shipped without them would be tidier than it is true — `git log` is the
 record for everything earlier.
 
-## Unreleased
+## 0.5.0
+
+**The window stops freezing (#207).** The entries below describe the first half
+of this: typing that no longer waits for a render, a busy tab that no longer
+takes the window with it, parsing that is no longer quadratic, and half of
+layout that turned out to be hashing a cache key. This is the rest of it, and
+the reason the release is dated when it is.
+
+Everything here was found by measuring, and measuring overturned three
+successive guesses — each of which would have been an afternoon spent making
+nothing faster. The renderer re-parses the document on every keystroke, which is
+the obvious thing to fix: parse is **0.2–2.6ms against a layout of 70ms**. Then
+`subtree_widths` looked like it was recomputing the same boxes; it is called
+9,601 times for 9,601 distinct keys, never twice for one. Then Unicode line
+breaking looked like what laying out prose costs, projected at 14ms from the
+call counts: **1.8ms**. In each case what was slow sat next to the thing being
+blamed.
+
+Four things were. Sizing a table column asked each cell for a minimum and a
+maximum width, and the minimum rebuilt every single-word run to measure it
+again — arriving at the number the maximum had just produced, for most cells of
+most tables of the era. A band of a long page rasterised **226,890 glyphs to
+draw about 2,000**, because a display list is the whole document and nothing
+asked whether a glyph was on screen before fetching its bitmap. Tiling an
+opaque background went through a pattern shader and a full-canvas mask at about
+seven microseconds a tile, which on the era fixture is **2,835 tiles and 19ms
+of a 24ms band** — charged again every time the reader scrolled a line. And
+resolving a line height per segment turned out to shape a probe glyph, so every
+segment did two cache lookups rather than one: **106,001 shaping lookups for
+53,000 segments**.
+
+On the fixture that looks like a real page of the era, opening it went from 45ms
+to under 30, scrolling a band from 13ms to 3–4, and a keystroke from 16ms to
+5–9. On a two-thousand-paragraph article a band went from 33ms to 15–17 and
+layout from 73–75ms to 48–62. Not a pixel changed: the reference baselines stayed
+byte-for-byte identical and conformance held at 901 failures through every
+commit, which for a release that rewrote parts of paint and text is the number
+that mattered most.
+
+Two changes were written, measured and deleted rather than kept — caching the
+parsed document between keystrokes, and handing back a segment's size without
+its glyphs — because neither could be shown to pay for itself. And one of them
+shipped a bug first: copying an opaque background tile instead of compositing it
+broke twenty-one conformance backgrounds, because `draw_pixmap` does not draw a
+bitmap into a rectangle but fills the destination with it as a *pattern*, and a
+pattern padded by its own edge covers ground the tiles themselves do not. The
+copying path is now narrowed to the case where the tiles cover their box, which
+is the only case where the two agree.
+
+**The three speeds a reader feels now have budgets.** Opening a page under
+100ms, scrolling a band inside two frames, a keystroke under 50ms — thresholds
+of perception rather than today's measurements, because a budget pinned to the
+current number fails on the first honest change and teaches everyone to raise
+it. They are scaled by how fast the machine measuring them is, so CI on a
+Raspberry Pi is held to what a Pi can do; without that the aarch64 runner would
+have failed for being a Raspberry Pi, which is how a check becomes one nobody
+reads.
+
+There is no cliff left to find, and that was checked rather than assumed:
+doubling the input roughly doubles the time for table rows, table columns,
+paragraphs, nesting depth, floats, and one unbreakable word. What remains are
+constants, and the largest is now **the finished pixmap crossing the process
+boundary** ADR-0012 puts there — about 10ms of a realistic page's 26. Spawning
+the renderer, the handshake and loading the fonts come to 0.5ms between them,
+which is worth writing down because it was the first thing suspected.
+
+**A screen reader can read a page (#9, ADR-0019).** The accessibility tree is
+built in the renderer and crosses the boundary **as data**, and the parent
+builds the native objects from it. The alternative — registering with UI
+Automation or AT-SPI from inside the sandbox — would hand platform API handles
+to the process that must not have them, which is the one thing ADR-0012 bought.
+The cost is a new parsing surface on the trusted side, and a dependency that
+goes in the *parent*, against the usual direction for this repository; ADR-0019
+spends most of its length on why that is the right trade.
+
+**A character the fonts do not cover draws a box, not nothing.** The shaper
+resolves it to `.notdef` and gives it a real advance, so the line was always the
+right length — and then nothing was drawn, because `.notdef` has no outline in
+these faces. A page in Chinese or Arabic came out *blank*, which is the worse of
+the two failures: a reader cannot tell "this page is empty" from "this browser
+has no font for it". ADR-0008 and PLAN.md both already said pages in uncovered
+scripts render as tofu; this is that sentence becoming true. Covering the
+scripts is the other half and a separate decision, since it is tens of megabytes
+against a font budget currently using four.
+
+**Typing no longer freezes the window, and a word costs one render** (#207). A
+keystroke costs the child a whole re-render — parse, cascade, layout, paint —
+about 110 ms on a long page. A person types faster than that, so the old
+arrangement was the worst available: every key blocked the window for a render,
+a five-letter word meant five of them and about half a second of frozen window,
+and each of those renders was invalidated by the next letter before anybody
+could see it.
+
+Two changes, both following the pattern bands set. Typing is now **sent rather
+than waited for** — `request_type` and `take_typed` mirror `request_band` and
+`take_band`, with a slot of their own so a keystroke's answer is never mistaken
+for a scroll's. And keystrokes **coalesce**: the first goes out at once, and
+anything typed while that render runs waits and goes as one run, which the child
+applies in order before rendering once.
+
+Measured, five letters against one:
+
+| page | one keystroke | a five-letter burst |
+| --- | --- | --- |
+| era page | 16 ms | 24 ms |
+| long page | 108 ms | 100 ms |
+| big table | 140 ms | 165 ms |
+
+A burst now costs about what a single keystroke does, because it *is* a single
+render. It used to cost five, by construction — one per letter — and the
+end-to-end test asserts exactly that: a run of three letters comes back as one
+answer, not three.
+
+What could go wrong here is a lost or reordered letter, so that is what the
+tests are aimed at. The coalescing rules are checked as arithmetic, including
+counting that a burst costs two renders rather than one per letter; and a live
+child is sent a run and its pixels compared against the same letters sent one at
+a time, which catches any reordering. The window harness now also types with no
+delay at all — the old check typed at 60 ms intervals, which never exercised any
+of this — and measures how far right the ink reaches, so a dropped letter shows.
+
+**A busy tab no longer hangs the window** (#207). Every request the browser
+made happened inside the event handler that asked for it: `show` called the
+fetcher and waited, and so did opening a tab, sending a form and saving a
+picture. A request is a DNS lookup, a connection, a handshake and however long
+the server takes — and for all of it the window drew nothing, answered nothing,
+and could not be scrolled. It was never the *tab* that was busy. It was the only
+thread there is.
+
+Requests now go to a small pool of workers and their answers arrive as a
+wake-up, exactly as a painted band already did. The page you are reading stays
+alive while the next one is on its way, in this tab or another; a tab opened
+from a link appears at once and fills in when its answer comes, rather than
+appearing only after the site replied.
+
+What that needs, and what is tested: an answer has to find the tab that asked
+after the reader has opened, closed and reordered tabs, so tabs carry an
+identity rather than being found by position. An answer nobody is waiting for is
+dropped rather than shown — a reader who types one address, waits, and types
+another gets the second, and a tab closed while it was loading gets nothing.
+Neither is an error and neither says anything. Four workers rather than one,
+because a slow site must not hold up a fast one queued behind it.
+
+The policy is unchanged and that is worth stating precisely: a `Fetcher` is its
+policy and nothing else, so ADR-0006 is enforced on the worker exactly as it was
+on the main thread. Saving a picture still goes out as a *subresource*, so one
+the page was not allowed to load cannot be had by asking again.
+
+**Parsing deeply nested markup is no longer quadratic** (#179). Doubling the
+nesting depth used to quadruple the time — 155 ms at 8,000 levels, 604 ms at
+16,000 — and a profile put **96% of every instruction** in html5ever's
+`in_scope_named::<button_scope>`. That is the spec doing what the spec says: a
+`<div>` start tag must first close any `p` in button scope, which means walking
+the stack of open elements to a boundary, and `div` is not a boundary. Every tag
+walked the whole stack. Upgrading does not help — 0.40 measures the same — it is
+the algorithm rather than a bug.
+
+So the stack is not allowed to get deep. `MAX_DEPTH` already said that nesting
+past 512 is flattened rather than represented faithfully (#176); that decision
+was made for the renderer's stack, and the parser's stack is the same problem
+one step earlier. A start tag that would open the 513th level is dropped before
+the tree builder sees it, and the end tag matching it is dropped with it so the
+token stream stays balanced.
+
+A 100,000-level document now parses in 33 ms. What is *inside* the nesting is
+untouched — text still arrives and is still inserted — so what disappears is
+surplus nesting, which the old cap had already collapsed into a row of empty
+boxes. Nothing real is near this: the era fixture here is 14 deep and the
+deepest document in the CSS 2.1 suite is 13.
+
+**Opening with no address shows a home page**. `2kbrowser open` used to answer
+"no input given" and exit, which is correct and useless. It now starts on a page
+built out of what the browser already knows — the pages you saved and the pages
+you went to — because that is the most likely place you want to go and it costs
+no request to find out. Nothing is fetched and nothing is configurable: a home
+page that phoned somewhere on startup would be at odds with ADR-0006, which
+refuses third-party requests on a page you *asked* for.
+
+**Half of layout was hashing a cache key** (#207). The report said "lots of
+hanging ui issues" and named nothing, which is the most honest form a
+performance report takes and the least actionable — so the first thing built for
+it was not a fix but a way to find out: `tests/timings` measures every operation
+the event loop performs *synchronously*, because the window is a single thread
+and anything it waits for is a frame it does not draw. What an operation costs
+there is how long the browser is frozen for when a reader asks for it.
+
+The answer was that a keystroke on a long page cost 138 ms. Typing into a form
+re-renders the whole page in the child — parse, cascade, layout, paint — and of
+that, layout was 85 ms and everything else together was 30. Inside layout, text
+was all of it: the same page with its text removed laid out in 1.4 ms.
+
+That pointed at the shaping cache, which turned out to be working perfectly and
+to be the problem anyway. It was keyed on `(AttrsOwned, String)` — a dozen-field
+struct and an owned copy of the word — so every word of the page allocated a
+`String` to look itself up and hashed the whole struct to do it, twice, since
+the face metrics are keyed the same way. A profile of a warm re-layout put
+**38% of every instruction in SipHash's `write`** and another 10% in building,
+hashing and comparing the struct around it. Sixty thousand words of prose was
+sixty thousand hashes of the same handful of styles.
+
+So the attributes are interned. The struct is hashed once per *style* rather
+than once per word, the per-word caches are keyed on the number that comes back,
+and a short list of recently-seen attribute sets — compared rather than hashed —
+means even that is rare within a paragraph. The segment lookup takes a `&str`
+and allocates nothing.
+
+What that is worth, measured against the same binary with and without the change
+and with nothing else running — three runs each, and the band column carried as
+a control because painting a band does no layout at all:
+
+| page | operation | before | after | |
+|---|---|---|---|---|
+| long page | keystroke | 139 ms | 110 ms | −21% |
+| long page | open | 164 ms | 133 ms | −19% |
+| big table | keystroke | 121 ms | 108 ms | −11% |
+| big table | open | 179 ms | 155 ms | −13% |
+| either | band | 25 ms | 27 ms | unchanged, as it must be |
+
+A warm re-layout's instruction count fell from 442M to 266M and the profile went
+from one dominant cost to flat, which is the part that is exactly measurable.
+The wall-clock gain is smaller than that ratio because layout is about two
+thirds of a keystroke and the rest of the re-render — parse, cascade, display
+list, raster, and the pixels crossing the pipe — is untouched.
+
+An earlier draft of this entry quoted "122 ms to 60 ms" for layout. That was a
+real measurement of a *different and larger* fixture than the one the table
+above uses, and putting it beside the end-to-end numbers implied a halving that
+does not carry through. Layout on the long page went from about 85 ms to about
+56 ms, which is what the 29 ms off its keystroke accounts for.
+
+The property that makes any of this safe is the one ADR-0005 already demands: identical input must produce identical output, so
+a cache can change how long a page takes and cannot change how it looks — and
+the reference tests compare rendered pages against baselines byte for byte,
+which is what would catch a cache that returned the wrong glyphs.
+
+What is *not* fixed is the shape of the thing: a keystroke still re-lays-out the
+whole document, which is O(page) however fast each word is. And the harness
+surfaced something larger that this change does not touch — a navigation runs
+its network fetch on the event-loop thread, so clicking a link freezes the
+window for the whole round trip. Both are recorded in #207 rather than claimed.
+
+**A page wider than its window can be read** (#204). Scrolling had one axis.
+Anything that overflowed the viewport sideways — a scanned page, a large
+photograph opened by its own address, a block of fixed-width output, a table
+with more columns than its author expected — was simply cut off at the right
+edge, with no way to reach the rest of it.
+
+A band is a rectangle of the document, and there was never a reason beyond habit
+for its horizontal edge to be fixed at zero. So it is not: `rasterise_band` takes
+a left as well as a top, `position: fixed` items are exempt from both shifts for
+the reason they were always exempt from one, and the display list now also
+answers how far right the page reaches — from the items themselves, since that
+is the one place everything drawn passes through, and a glyph's advance is
+exactly the case (`<pre>` running past the box holding it) the feature is about.
+
+Above that the window grew the other half of everything it already had: a scroll
+offset, a scrollbar along the bottom that drags, the wheel and its Shift
+modifier, the arrow keys, Home, and the horizontal halves of hit-testing, the
+find highlights, the focus outline and the accessibility transform. A page that
+fits across its window is unchanged in every one of those — no bar, no offset,
+no extra work — which is nearly every page.
+
+One thing about it is deliberately not symmetric. A vertical band is painted
+three windows tall, so scrolling down usually costs nothing; a band is only ever
+as *wide* as the window, so there is nowhere to put a horizontal margin and
+scrolling sideways always asks the child for a repaint. What the reader sees
+while that arrives is the band they have, shifted, with the page's own canvas
+colour where it has no pixels — the same bargain the rows have always made, and
+better than a page that appears not to have moved at all.
+
+**Right-click a picture and keep it** (#205). The browser could fetch an image,
+decode it and draw it, and had nowhere to put one. The context menu now offers
+to save it, copy its address, or open it on its own, and there is a `downloads`
+module to write the file.
+
+Two things it is careful about. The bytes are fetched again rather than asked of
+the renderer: they are over there, and a process that is untrusted by
+construction (ADR-0012) should not be deciding what lands in the reader's files.
+And the filename is rebuilt character by character from the URL rather than
+trusted — a URL is written by whoever served the page, and a name that could
+carry a separator is a name that could leave the directory it was given.
+
+**An error status is a page, not a one-line complaint** (#203, and #208 with
+it). A 4xx or a 5xx used to reach the reader as `server returned 401` in the
+chrome and a blank window. Two things were wrong with that, and they needed
+opposite fixes.
+
+**The server usually sent a page, and it was being thrown away.** A site's own
+"not found", a proxy's block notice, the sentence somebody wrote to explain a
+503 — `ureq` treats those statuses as errors by default and the body goes with
+them. It does not any more: a status is now a *page* for a navigation, and the
+site's own words are what the reader sees. That is #208 exactly — a proxy block
+notice is a 403 with a body, and showing `server returned 403` instead told the
+reader less than the proxy did.
+
+It is still a **failure** for a subresource, which is the opposite decision made
+on purpose. A 404's HTML body is not a stylesheet, and handing it to the CSS
+parser because the status was ignored would apply a page of garbage rules to the
+document.
+
+**And when the server sent nothing, the browser now says something.** A great
+many servers answer a 401 or a 403 with headers and no body at all. Those get a
+page of the browser's own, naming the status and saying which end the problem is
+at — because that decides whether trying again could possibly help. A 401 gets
+the answer that is specific to this browser: there is no HTTP authentication
+here, so the page cannot be reached at all, and advice to sign in would be
+advice nobody could take.
+
+The page information view shows the status, so a site's own 404 is still
+identifiable as one.
+
+**Copy and paste, everywhere text is.** Copying a page selection has worked
+since selection did. Nothing else had: the address bar swallowed every Ctrl
+chord but Ctrl+A, so the one field you most often want to copy out of or paste
+into was the one that could do neither, and a form control on a page could be
+typed into but never pasted into.
+
+Ctrl+C, Ctrl+X and Ctrl+V now work in the address bar, in the find field, and in
+a text control on the page. The right-click menu gains **Paste**, offered only
+when something has the keyboard to put it in — a pointer could already copy from
+that menu and had no way to paste.
+
+Pasting into a one-line field flattens the text: a run of breaks becomes one
+space, and breaks at the edges add nothing, because copying a line out of a
+terminal usually takes the newline with it. A `<textarea>` keeps them, since
+that is a decision about a one-line field rather than about the clipboard.
+
+**Copying out of a page control needed the boundary crossed carefully.** What is
+in a control is the page's business (ADR-0012), and the three `Focused` states
+the child reports are deliberately nothing more than "something is being typed
+in". So the text is *asked for*, by a new `CopyFocused` message, only when a
+reader presses a copy chord — the same shape as a form submission, where the
+untrusted side proposes and the trusted side disposes. Nothing is carried on a
+render, and a page cannot make its own contents cross.
+
+A copy chord with nothing selected in the control falls through to the page's
+own selection rather than being swallowed, because a focused checkbox takes
+keystrokes while having nothing to copy.
+
+Both halves are checked in a real window against the real clipboard, which is
+where they live: `cargo test` has no clipboard and no focus. A field takes a
+cut and goes empty, takes a paste and fills again; and an address copied out of
+the bar, on another page, pasted back and entered, arrives where it was copied
+from.
+
+**Debugging tools: console, inspector, network, storage, and view source**
+(#198). All four of the asked-for tools, as one generated page rather than four
+panels — a page for the reason the saved list and the history are pages: the
+engine already knows how to show a document, and a devtools *window* would be a
+second piece of interface with its own scrolling and its own bugs. Ctrl+U shows
+the markup, Ctrl+Shift+I shows the rest, and both are in the right-click menu.
+
+Two of the four mean something different here, and saying so is most of the job.
+**The console has nothing to listen to** — ADR-0003 means no script runs, so
+nothing on the page can log anything. What it shows instead is the browser's own
+account of the page: why it was laid out the way it was, what was refused, what
+did not arrive. **Storage is empty by construction** — no `localStorage`
+without scripts, no cookies, and a cache that lives in memory for one run
+(ADR-0018). Rather than draw an empty table that reads as a missing feature, it
+says so and then names the three files the browser itself keeps.
+
+**The inspector is the accessibility tree**, which ADR-0019 already sends across
+the process boundary as data. That is not a stand-in for a DOM inspector so much
+as a better answer to the question usually being asked — *what did this page
+actually turn into?* — because it is the structure the page produced rather than
+the markup it was written in. The markup is one keystroke away, unchanged.
+
+View source shows the bytes the parent already holds, decoded the way the
+document itself was decoded. Nothing is fetched again: a source view that
+re-asked the server could show something the page on screen never was.
+
+**A preformatted line keeps the spaces it starts with.** Found while building
+the inspector below, which drew every level of the tree flush left. Spaces
+following a line break were folded into the segment that *carried* the break, so
+a `<pre>`'s indentation landed at the end of the line above, where nothing can
+see it. They are a segment of their own now, shaped, at the start of the line
+the break begins — so they take room, they are in the line's text for a search
+to find, and an inline box's background is drawn across them.
+
+Every line of every indented `<pre>` on the old web was affected, and so was
+view-source, which is a `<pre>` of somebody's markup. Conformance is unchanged
+at 901; this is a case the CSS 2.1 suite does not cover.
+
+**Where you have been survives the window** (#197, ADR-0021). ADR-0018 walked up
+to this and stopped: *"On disk is a persistent record of what a person has read
+… That is a separate and much larger decision, and this does not license it."*
+This is that decision. Ctrl+H shows the list, Ctrl+Shift+H forgets it, and
+`2kbrowser history` prints it with `--forget` to empty it.
+
+What keeps it honest is what the file is allowed to be. It is `history.tsv`
+beside the bookmarks and the site exceptions, in the same tab-separated format
+anybody can read, edit or delete. It is **bounded** at 500 addresses, because a
+bound is the thing a reader can check — a history with no ceiling becomes a life
+story by doing nothing at all. It holds **one line per address**, not one per
+visit, so it stays a list somebody can scan and so it says nothing about habits.
+And nothing sends it anywhere: there is no code here that could, and ADR-0021 is
+what stops one being written.
+
+That makes three files outliving a run rather than two, which is the real cost
+and is stated rather than absorbed — the README said two and has been corrected.
+
+**A new tab opens on nothing** (#196). It used to open on the page you were
+already looking at — and re-fetch it to get there. That was never neutral: it is
+a second copy of something nobody asked to duplicate. Nothing is the honest
+third option, and the address bar takes the focus so the tab is one keystroke
+from being useful. The strip calls it `New tab`, because a tab with no name is
+a gap in the strip.
+
+**The address bar takes a caret and a drag** (#199). It had exactly one
+behaviour — focus, and select everything — so the only way to reach one
+character of a long URL was the arrow keys. A press now puts the caret where the
+pointer is and a drag selects what it crosses. The first click into an unfocused
+bar still selects the whole address, which is what an address bar has always
+done and what the common next action wants.
+
+Both are checked by `window-clicks.sh`, because both are event-loop behaviour
+that `cargo test` cannot reach. The blank-tab check measures the *page* going
+blank rather than the address bar emptying: the bar's field is drawn on the
+chrome's grey, so "is this row white?" is answered no whether there is an
+address in it or not — the first version of that check passed without the
+feature, which is the one kind of check worth nothing.
+
+**A text box looks like one, and keeps its own alignment** (#195). An `inset`
+border darkens its top and left and leaves its bottom and right as given, which
+was written for the era's grey window background. On a white page the light
+edges vanish, so a field drew as a dark top-left corner and nothing else —
+which reads as a rendering fault rather than as a control. The border is
+`#999999` now: still sunken, still there on white.
+
+And a control's `text-align` is set rather than inherited, so a field inside a
+centred block no longer centres what is typed into it. An author rule on the
+control still wins, which is the whole of "unless otherwise styled": this only
+stops a control picking up an alignment meant for the prose around it.
+
+**An image opened by its own address renders as one** (#201). A JPEG is not a
+document, and decoding one as text produced a page of mojibake. A document is
+invented to hold it instead — `<img>` and nothing else — so a picture gets the
+same layout, the same scrollbar and the same `Load image` placeholder as one
+inside a page, rather than a second rendering path that could drift from the
+first.
+
+The `Content-Type` decides whenever there is one: a server saying `text/html` is
+believed even if the bytes open like a PNG, because sniffing *against* a
+declared type is how a browser gets talked into treating one thing as another.
+Sniffing only fills a silence — and the silence is not rare, since a `file:`
+URL has no headers at all, which is how most people open an image on their own
+disk.
+
+The picture already in hand is not asked for twice. The navigation downloaded
+it; the page invented to show it names it as its only subresource, and that
+request is answered from the bytes rather than from the network.
+
+**A page belongs to where the redirect left it.** Reported as Hacker News's
+comment pages answering "No such item." in this browser and rendering fine in
+Firefox. They do: `hackernews.com` is a redirect to `news.ycombinator.com`, and
+this browser resolved the front page's links against the address that was
+*asked for* rather than the one the page was *served from*. So `item?id=…` came
+out as `https://hackernews.com/item?id=…`, which redirects again — and that
+redirect keeps the path and throws the query away, so Hacker News was asked for
+`/item` with no item, and said so. Firefox resolves against the final URL and
+never goes near the redirect twice.
+
+The fix is that the fetcher now reports where the chain stopped, and everything
+downstream uses it: relative links, the third-party rule's idea of this page's
+site, the padlock, and the address bar — which used to name one site while the
+page belonged to another. Back and Forward get the corrected address too, since
+returning to a redirect's starting point only asks to be redirected again.
+
+**And the policy is applied at every hop, not just the first.** Chasing
+redirects had been left to `ureq`, which does it perfectly well and does it
+without asking anybody. That left a door in ADR-0006's headline rule: a
+subresource on the page's own site that answers `302 Location:
+https://tracker.example.net/pixel.gif` got the request *made*, and the rule
+never saw the host it was made to. The budget in `tests/budgets` says "no
+third-party request was ever made", and that has to be true of the second
+request as much as the first. Redirects are followed here now, bounded at eight,
+with the policy asked before each one — and a redirect to a `file:` URL is
+refused even on a navigation, which is exempt from the third-party rule and is
+still not allowed to reach the disk by bouncing off a server.
+
+Both halves have tests that fail without them, against a real socket: a
+redirect is the one thing about a fetch that cannot be posed to a file on disk.
+
+**A subdomain is the same site** (ADR-0020). ADR-0006 refuses third-party
+subresources, and "third party" has meant *a different host* since the rule was
+written. That is the strictest reading, and it is wrong about ordinary sites: a
+page at `www.example.com` whose images sit on `images.example.com` is one
+publisher serving one site under two names — which was as true in 1999 as it is
+now — and refusing it removed nothing a tracker does while costing the reader
+the pictures. The boundary is now the **registrable domain**, the thing somebody
+actually buys.
+
+Which needs a list, because "the last two labels" makes `alice.co.uk` and
+`bob.co.uk` one site and every `*.github.io` page one site. The complete answer
+is the Public Suffix List — several thousand entries, maintained elsewhere,
+stale the day it is vendored — and ADR-0006 exists partly to avoid subscribing
+to somebody else's list. So this is a small one plus a rule, and **it is allowed
+to be incomplete because of which way it fails**: every entry only ever makes a
+suffix *longer*, so a missing entry splits one site in two and costs a
+permission prompt. It can never join two sites and cost a request. A filter list
+that falls behind stops blocking things; this one cannot.
+
+Addresses are never split into labels, which is not a nicety: `10.0.0.1` and
+`20.0.0.1` would otherwise share a registrable domain of `0.1` and be read as
+one site — two unrelated machines joined by arithmetic that was never about
+them.
+
+Exceptions are keyed by the site now rather than by the host, so a grant made on
+`www.example.com` also holds on `shop.example.com`. Not a widening in substance:
+those two are already first-party to each other, so either could fetch the
+resource and hand it over. An existing `sites.tsv` is read through the same rule
+and keeps granting what it says it grants. The cross-page cache (ADR-0018) stays
+partitioned by *host*, which is now finer than it strictly needs to be — a
+partition too fine costs a cache miss, and one too coarse is the thing the key
+exists to prevent.
+
+Measured before merging, over the stylesheet, image and frame references of 18
+live pages — a thousand references between them. 159 changed side, and not one
+was an advertising or tracking host: they are `media.cnn.com`,
+`assets.science.nasa.gov`, `c.arstechnica.com`, `static.theguardian.com`. A
+publisher's own pictures, on a name the publisher owns. `doubleclick.net`,
+`googlesyndication.com`, `adnxs.com`, `scorecardresearch.com` and the rest of
+that list stayed exactly where they were. So did a publisher's *second domain* —
+`ichef.bbci.co.uk` on `bbc.co.uk`, `i.guim.co.uk` on `theguardian.com` — which
+is not a subdomain and which no rule short of knowing who owns what could join.
+
+Worth saying plainly, because it is the case that prompted this: it changes
+nothing on Wikipedia. Its stylesheets were always same-host, and its images come
+from `wikimedia.org`, which is a different registrable domain from
+`wikipedia.org` and still refused. What that page needs is flexbox, not network
+policy.
 
 **Forms submit** (#110). This is the first thing this browser sends *up* to a
 server, and it was held back to last for that reason rather than because it was

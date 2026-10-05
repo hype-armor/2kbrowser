@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fuzz::{Target, run_once};
+use fuzz::{Target, run_once, with_room_to_recurse};
 
 /// Runs every file in `corpus/<target>/` through the target.
 fn replay(target: Target) {
@@ -84,7 +84,13 @@ fn every_recorded_input_still_parses() {
     // One test rather than six, because the whole set runs in well under a
     // second and six near-identical test bodies is six places to forget a
     // target when one is added.
-    for target in Target::ALL {
-        replay(target);
-    }
+    //
+    // On a stack of its own: `corpus/render` holds a deeply nested page, which
+    // is legal input since #176 capped the depth rather than refusing it, and a
+    // libtest thread's 2 MiB is nowhere near what walking one costs.
+    with_room_to_recurse(|| {
+        for target in Target::ALL {
+            replay(target);
+        }
+    });
 }

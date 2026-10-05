@@ -38,6 +38,43 @@ const MAX_BINARY_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 /// payload lands. Tracked with the vendor-versus-fetch decision in issue #7.
 const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How many times each interaction is repeated, with the worst one reported.
+const LATENCY_REPEATS: usize = 5;
+
+/// What [`machine_work`] costs on the machine the latency limits were chosen
+/// on, in milliseconds.
+///
+/// The limits below are thresholds of human perception, which makes them claims
+/// about the computer in front of the reader and not about this code alone. CI
+/// runs this harness on three desktop-class runners and on a Raspberry Pi, and
+/// asking a Pi to open a page inside the hundred milliseconds a person notices
+/// is asking it to be a different computer. A budget that fails for that reason
+/// is one everybody learns to ignore.
+///
+/// So the limits are scaled by how much slower this machine is than that one.
+/// The alternative — skipping the check where it cannot be met — risks a
+/// harness that reports PENDING everywhere and therefore enforces nothing,
+/// which this file's own header calls worse than having no harness at all.
+/// Scaling always enforces something: a machine four times slower gets four
+/// times the limit and still catches a regression that doubles the cost.
+const REFERENCE_WORK_MS: f64 = 5.0;
+
+/// How much slower than the reference a machine may be and still be held to
+/// these limits at all.
+///
+/// Scaling without a ceiling degrades into a budget that passes anything: a
+/// machine measuring thirty times slower would be allowed three seconds to open
+/// a page, which is not a limit anybody would notice being broken. Past this,
+/// the honest report is that the measurement does not mean anything here, which
+/// is what PENDING is for. Eight is well beyond the Raspberry Pi this is
+/// actually about and well below the factor an unoptimised build shows (around
+/// thirty, which is how this ceiling came to be written).
+const MAX_MACHINE_FACTOR: f64 = 8.0;
+
+/// The viewport the interaction budgets are measured at.
+const LATENCY_WIDTH: u32 = 1000;
+const LATENCY_HEIGHT: u32 = 800;
+
 /// Result of evaluating a single budget.
 enum Outcome {
     Pass {
@@ -87,6 +124,8 @@ fn main() -> ExitCode {
         third_party_requests(),
         font_payload(),
     ];
+    let mut checks = checks;
+    checks.extend(interaction_latency());
 
     report(&checks)
 }
@@ -162,16 +201,7 @@ fn resident_memory() -> Check {
         };
     };
 
-    // The browser, not this harness. `Renderer::new` re-invokes whatever is
-    // running, which here is `budgets` — and `budgets --render-child` is not a
-    // renderer, so the first thing the parent read was garbage. The wire layer
-    // caught it ("length field does not fit the frame"), which is the bounds
-    // checking working, and the measurement was still wrong.
-    let browser = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(BROWSER)))
-        .filter(|path| path.exists());
-    let Some(browser) = browser else {
+    let Some(browser) = browser_beside_us() else {
         return Check {
             name,
             limit,
@@ -579,6 +609,258 @@ fn binary_path() -> Option<PathBuf> {
 }
 
 /// Prints the budget table and returns the process exit code.
+/// How long the window is frozen for when a reader does something (#207).
+///
+/// The three operations a reader performs constantly, each measured on the era
+/// fixture and each charged to the thread that draws the window. Every one of
+/// these is synchronous: the time it takes *is* the time the browser does not
+/// respond for, which is why "lots of hanging ui issues" was the original
+/// report and why these are the numbers that answer it.
+///
+/// The limits come from what a person notices rather than from what the
+/// browser currently manages, the same way the memory budget is set against
+/// PLAN.md's claim and not against the last measurement. A budget pinned to
+/// today's number fails on the first honest change and teaches everyone to
+/// raise it; a budget set at the threshold of a complaint keeps meaning the
+/// same thing as the code moves.
+///
+/// Measured as the worst of [`LATENCY_REPEATS`] runs, because a reader does not
+/// experience an average: they experience the occasion the window stalled, and
+/// that is the one they report.
+///
+/// One page, opened once, then asked for a band and a keystroke, because that
+/// is the order a reader does them in and because a renderer that had never
+/// drawn the page would answer the other two differently.
+fn interaction_latency() -> Vec<Check> {
+    // A band must land within a frame. Two frames at 60Hz rather than one:
+    // scrolling that misses every other frame reads as a stutter, and this is
+    // CI rather than a quiet desktop.
+    const BAND_LIMIT_MS: u128 = 32;
+    // A keystroke re-renders the page. Half of the hundred milliseconds at
+    // which an action stops feeling immediate, because typing is a run of them
+    // and the next letter should not queue behind the last.
+    const KEYSTROKE_LIMIT_MS: u128 = 50;
+    // Opening a page is the one a reader expects to take a moment, so this is
+    // the whole of that hundred milliseconds.
+    const OPEN_LIMIT_MS: u128 = 100;
+
+    // Measured before anything else, so the limits are known even for the
+    // reports that never get as far as rendering a page.
+    let factor = machine_factor();
+    let names = [
+        ("opening a page", scaled_limit(OPEN_LIMIT_MS, factor)),
+        ("scrolling a band", scaled_limit(BAND_LIMIT_MS, factor)),
+        ("a keystroke", scaled_limit(KEYSTROKE_LIMIT_MS, factor)),
+    ];
+    let pending = |blocked_on: &'static str| {
+        names
+            .iter()
+            .map(|(name, (_, shown))| Check {
+                name,
+                limit: shown.clone(),
+                outcome: Outcome::Pending { blocked_on },
+            })
+            .collect::<Vec<_>>()
+    };
+    let failed = |reason: String| {
+        names
+            .iter()
+            .map(|(name, (_, shown))| Check {
+                name,
+                limit: shown.clone(),
+                outcome: Outcome::Fail {
+                    measured: "-".to_owned(),
+                    reason: reason.clone(),
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if factor > MAX_MACHINE_FACTOR {
+        return pending(
+            "a machine too far slower than the one these thresholds describe for them to \
+             mean anything here",
+        );
+    }
+    let Some(browser) = browser_beside_us() else {
+        return pending("a release build of the browser beside this harness");
+    };
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../ref/fixtures/era-page.html")
+        .canonicalize();
+    let Ok(fixture) = fixture else {
+        return failed("the era reference fixture is missing".to_owned());
+    };
+    let Ok(body) = std::fs::read(&fixture) else {
+        return failed("the era reference fixture could not be read".to_owned());
+    };
+    let url = net::file_url(&fixture);
+    let Ok((origin, path)) = net::parse_url(&url) else {
+        return failed("could not parse the fixture URL".to_owned());
+    };
+
+    let renderer = sandbox::Renderer::with_program(browser);
+    let document = || shell::viewport::Document {
+        body: body.clone(),
+        content_type: None,
+        origin: origin.clone(),
+        path: path.clone(),
+    };
+
+    // Each on its own child, because opening is what is being measured and a
+    // reused process would be measuring the second navigation.
+    let mut opening = std::time::Duration::ZERO;
+    for _ in 0..LATENCY_REPEATS {
+        let started = std::time::Instant::now();
+        let page = shell::viewport::Viewport::open(
+            &renderer,
+            document(),
+            LATENCY_WIDTH,
+            LATENCY_HEIGHT,
+            false,
+            false,
+            1.0,
+        );
+        let taken = started.elapsed();
+        if let Err(error) = page {
+            return failed(format!("the page did not render: {error}"));
+        }
+        opening = opening.max(taken);
+    }
+
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        document(),
+        LATENCY_WIDTH,
+        LATENCY_HEIGHT,
+        false,
+        false,
+        1.0,
+    );
+    let mut page = match page {
+        Ok(page) => page,
+        Err(error) => return failed(format!("the page did not render: {error}")),
+    };
+
+    let mut band = std::time::Duration::ZERO;
+    for _ in 0..LATENCY_REPEATS {
+        let started = std::time::Instant::now();
+        let _ = page.request_band(0, LATENCY_HEIGHT / 2, LATENCY_HEIGHT);
+        while page.band_outstanding() && !page.accept_band() {
+            std::hint::spin_loop();
+        }
+        band = band.max(started.elapsed());
+    }
+
+    let mut keystroke = std::time::Duration::ZERO;
+    for _ in 0..LATENCY_REPEATS {
+        let started = std::time::Instant::now();
+        page.type_key(sandbox::message::Key::Insert("a".to_owned()));
+        keystroke = keystroke.max(started.elapsed());
+    }
+
+    vec![
+        latency_check(&names[0], opening),
+        latency_check(&names[1], band),
+        latency_check(&names[2], keystroke),
+    ]
+}
+
+/// A fixed amount of work, for finding out how fast this machine is.
+///
+/// Four mebibytes written and read sixteen times over, which is the shape of
+/// what rendering actually does — a canvas is a few megabytes and painting
+/// walks it. A pure arithmetic loop would measure a part of the machine that
+/// painting a page does not lean on.
+///
+/// Deterministic, so the only thing that varies between runs is the machine.
+fn machine_work() -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let mut buffer = vec![0u32; 1 << 20];
+    for round in 0..16u32 {
+        for (at, slot) in buffer.iter_mut().enumerate() {
+            *slot = slot.wrapping_add((at as u32) ^ round);
+        }
+    }
+    let total = buffer
+        .iter()
+        .fold(0u32, |sum, slot| sum.wrapping_add(*slot));
+    // Kept, so that the optimiser cannot delete the loop that was being timed.
+    std::hint::black_box(total);
+    started.elapsed()
+}
+
+/// How much slower this machine is than the one the limits were chosen on.
+///
+/// The best of several runs rather than the worst or the mean: the thing being
+/// estimated is how fast the machine *can* go, and every source of noise here —
+/// another job on the runner, a migration between cores — makes a run slower
+/// and none makes it faster. The worst run would measure the neighbours.
+///
+/// Never below one. A machine faster than the reference does not get a limit
+/// tighter than the threshold a person notices, because there is no such thing
+/// as responding better than imperceptibly.
+fn machine_factor() -> f64 {
+    // Nine rather than a handful. The same container measured 1.0 on one run and
+    // 1.9 on the next because something else was running on it, and the factor
+    // only has to be roughly right — but a limit that halves between runs is one
+    // nobody can reason about. More samples cost about forty milliseconds and
+    // make the minimum steadier.
+    let best = (0..9).map(|_| machine_work()).min().unwrap_or_default();
+    (best.as_secs_f64() * 1e3 / REFERENCE_WORK_MS).max(1.0)
+}
+
+/// A perception threshold, scaled for the machine measuring it.
+fn scaled_limit(perception_ms: u128, factor: f64) -> (u128, String) {
+    let scaled = (perception_ms as f64 * factor).round() as u128;
+    let shown = if scaled == perception_ms {
+        format!("<= {perception_ms} ms")
+    } else {
+        format!("<= {scaled} ms ({perception_ms} x {factor:.1})")
+    };
+    (scaled, shown)
+}
+
+/// One interaction measured against its limit.
+///
+/// Its own function so the comparison can be tested. The measurement needs a
+/// window, a page and a renderer; deciding whether a number is over a limit
+/// needs none of those, and it is the half that would fail silently — a budget
+/// that cannot report FAIL is decoration.
+fn latency_check(
+    (name, (limit, shown)): &(&'static str, (u128, String)),
+    taken: std::time::Duration,
+) -> Check {
+    let measured = format!("{} ms", taken.as_millis());
+    Check {
+        name,
+        limit: shown.clone(),
+        outcome: if taken.as_millis() <= *limit {
+            Outcome::Pass { measured }
+        } else {
+            Outcome::Fail {
+                measured,
+                reason: "the window does not answer for this long, which is what #207 reported"
+                    .to_owned(),
+            }
+        },
+    }
+}
+
+/// The browser binary beside this harness.
+///
+/// The browser, not this harness. `Renderer::new` re-invokes whatever is
+/// running, which here is `budgets` — and `budgets --render-child` is not a
+/// renderer, so the first thing the parent read was garbage. The wire layer
+/// caught it ("length field does not fit the frame"), which is the bounds
+/// checking working, and the measurement was still wrong.
+fn browser_beside_us() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(BROWSER)))
+        .filter(|path| path.exists())
+}
+
 fn report(checks: &[Check]) -> ExitCode {
     let mut failed = 0usize;
     let mut pending = 0usize;
@@ -623,7 +905,72 @@ fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn a_slower_machine_gets_a_looser_limit_and_a_faster_one_does_not() {
+        // The scaling is what keeps these budgets enforceable on a Raspberry Pi
+        // without making them meaningless on a desktop, so both ends matter.
+        let (limit, shown) = scaled_limit(100, 4.0);
+        assert_eq!(
+            limit, 400,
+            "a machine four times slower gets four times the limit"
+        );
+        assert!(
+            shown.contains("100 x 4.0"),
+            "the report has to say why the limit moved, or it reads as a changed budget: {shown}"
+        );
+
+        // A fast machine is held to the threshold a person notices and no
+        // tighter: there is no responding better than imperceptibly, and a
+        // limit that chased the hardware down would fail on the quiet runs.
+        let (limit, shown) = scaled_limit(100, 1.0);
+        assert_eq!(limit, 100);
+        assert_eq!(
+            shown, "<= 100 ms",
+            "an unscaled limit should read as the plain number"
+        );
+        // One call, not two compared against each other. This is a
+        // measurement, and two of them differ by whatever the machine was
+        // doing in between — the first version of this line compared two and
+        // failed, which it deserved to.
+        let factor = machine_factor();
+        assert!(factor >= 1.0, "the factor is never below one: {factor}");
+    }
+
+    #[test]
+    fn an_interaction_over_its_limit_fails_the_budget() {
+        // The half of the latency budgets that has no window in it, and the
+        // half that would otherwise be taken on trust. A budget whose
+        // comparison is wrong reports PASS for a browser that freezes, which is
+        // worse than having no budget at all.
+        let band = ("scrolling a band", scaled_limit(32, 1.0));
+        let over = latency_check(&band, Duration::from_millis(33));
+        assert!(
+            matches!(over.outcome, Outcome::Fail { .. }),
+            "33ms against a 32ms limit must fail"
+        );
+        // The limit itself is allowed: `<= 32 ms` is what the report prints, so
+        // 32 passing is what it must mean.
+        let at = latency_check(&band, Duration::from_millis(32));
+        assert!(
+            matches!(at.outcome, Outcome::Pass { .. }),
+            "32ms against a 32ms limit must pass"
+        );
+        // Milliseconds, not nanoseconds: a measurement is reported in whole
+        // milliseconds, so a limit compared against the wrong unit would pass
+        // everything.
+        let far_over = latency_check(
+            &("opening a page", scaled_limit(100, 1.0)),
+            Duration::from_secs(4),
+        );
+        assert!(
+            matches!(far_over.outcome, Outcome::Fail { .. }),
+            "4s must fail"
+        );
+    }
 
     #[test]
     fn the_newest_source_is_a_source_of_this_browser() {

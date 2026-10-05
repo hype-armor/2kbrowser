@@ -13,6 +13,11 @@
   /* The anonymous box paints nothing of its own, so this colour must not
      appear anywhere: it is the container the table was generated inside. */
   .container { background: #fe9 }
+  /* The third anonymous box: a cell around a row's child that is not one.
+     The cell paints nothing of its own, so the outline marking what went into
+     one is on the child rather than on the cell. */
+  .loose { background: #fc9; border: 1px solid #c60 }
+
   /* 10.3.7: both offsets given with `width: auto` stretches the box between
      them instead of shrinking it to fit. */
   .frame { position: relative; height: 60px; border: 2px solid #630; margin-top: 8px }
@@ -38,6 +43,28 @@
     <span class="row"><span class="cell">r2c1</span><span class="cell">r2c2</span></span>
     <span class="row"><span class="cell">r3c1</span><span class="cell">r3c2</span></span>
   </span>
+</div>
+
+<h2>a row's children that are not cells get cells of their own</h2>
+<div class="container">
+  <span class="row"><span class="loose">alone in a cell</span></span>
+  <span class="row"><span class="loose">a</span><span class="loose">b</span><span class="loose">c</span></span>
+</div>
+
+<h2>a real cell ends the run</h2>
+<div class="container">
+  <span class="row">
+    <span class="loose">before</span><span class="cell">authored</span><span class="loose">after</span>
+  </span>
+  <span class="row">
+    <span class="cell">authored</span>loose text<span class="cell">authored</span>
+  </span>
+</div>
+
+<h2>an anonymous cell steps over a column a rowspan still holds</h2>
+<div class="container">
+  <span class="row"><span class="cell" rowspan="2">tall</span><span class="cell">r1c2</span></span>
+  <span class="row"><span class="loose">under c2, not under the tall one</span></span>
 </div>
 
 <h2>a table element that is not a table</h2>

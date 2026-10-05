@@ -15,6 +15,15 @@ use tiny_skia::{Pixmap, PremultipliedColorU8};
 pub struct DecodedImage {
     /// Pixels, premultiplied, as tiny-skia wants them.
     pub pixmap: Pixmap,
+    /// Whether every pixel is fully opaque.
+    ///
+    /// Answered once, here, because the question is asked per band and the
+    /// answer cannot change: a tile drawn over something is a blend, and a
+    /// tile drawn over something *opaquely* is a copy. Deciding that at
+    /// decode time costs one pass over an image that has just been decoded
+    /// anyway; deciding it while painting would cost a pass over it every
+    /// time the reader scrolled a line (#207).
+    pub opaque: bool,
 }
 
 impl DecodedImage {
@@ -55,8 +64,10 @@ pub fn decode(bytes: &[u8]) -> Option<DecodedImage> {
     let decoded = reader.decode().ok()?.into_rgba8();
 
     let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
+    let mut opaque = true;
     for (source, target) in decoded.pixels().zip(pixmap.pixels_mut()) {
         let [r, g, b, a] = source.0;
+        opaque &= a == u8::MAX;
         // tiny-skia composites premultiplied; `image` hands back straight alpha.
         let scale = |channel: u8| ((u32::from(channel) * u32::from(a)) / 255) as u8;
         *target =
@@ -64,7 +75,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodedImage> {
                 PremultipliedColorU8::from_rgba(0, 0, 0, 0).expect("transparent is valid")
             });
     }
-    Some(DecodedImage { pixmap })
+    Some(DecodedImage { pixmap, opaque })
 }
 
 /// Which of an element's two possible images this is.

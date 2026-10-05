@@ -8,6 +8,7 @@
 //! `RefCell` *during parsing only*. [`parse`] hands back a plain [`Document`]
 //! with no interior mutability left in it.
 
+mod depth;
 mod meta_charset;
 
 use std::cell::{Ref, RefCell};
@@ -20,6 +21,49 @@ use html5ever::tree_builder::{
 use html5ever::{Attribute, LocalName, Namespace, ParseOpts, QualName, TokenizerResult};
 
 use meta_charset::DefuseMetaCharset;
+
+/// Deepest a document may nest.
+///
+/// Markup past this is flattened rather than refused (#176). The number is not
+/// about markup at all — it is about *stack*, because everything that consumes
+/// this tree walks it recursively and the tree's depth is therefore the depth
+/// of three recursions in a row.
+///
+/// Measured, per nesting level, in a release build:
+///
+/// | walk | stack per level |
+/// | --- | --- |
+/// | cascade | ~4 KiB |
+/// | layout | ~16 KiB |
+/// | paint | ~16 KiB |
+///
+/// A debug build costs four times that. So 512 levels is around 8 MiB of stack
+/// in release and 32 MiB in debug — which is why the renderer runs on a stack
+/// sized for it rather than on a thread's default 8 MiB, and why that stack and
+/// this number have to move together.
+///
+/// 512 is the number Blink uses for the same job, and it is far past anything
+/// real: the era fixture here is 14 deep across 185 elements, and the deepest
+/// document in the CSS 2.1 suite is 13.
+pub const MAX_DEPTH: usize = 512;
+
+/// Stack a walk over a [`MAX_DEPTH`] document needs.
+///
+/// Here, beside the cap, because the two are a pair: raising one without the
+/// other is how #176 comes back. It is not a fact about the DOM — the walks
+/// that spend this stack are the cascade, layout and paint, in three other
+/// crates — but it is a fact about what this cap *costs*, and splitting the
+/// pair across crates is exactly how the pairing gets lost.
+///
+/// A debug build spends about 64 KiB per nesting level across those three
+/// walks, so the cap costs around 32 MiB. This is that with room to spare.
+///
+/// Reserved address space rather than memory: pages are committed as they are
+/// touched, so a thread that renders an ordinary page costs what it always did.
+/// Anything that renders a page a stranger wrote needs a thread with this much
+/// — the renderer child, and the fuzzer, which is a renderer with worse taste
+/// in documents.
+pub const DEPTH_STACK: usize = 64 * 1024 * 1024;
 
 /// Index of a node within a [`Document`]'s arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -110,6 +154,21 @@ pub struct Document {
     /// Empty on a freshly parsed document, which is every document until a key
     /// is pressed in one.
     values: std::collections::HashMap<NodeId, String>,
+    /// Which controls the reader has turned on or off, where that is no longer
+    /// what the markup said.
+    ///
+    /// The same separation as `values`, for the same reason: `checked` and
+    /// `selected` in the markup are *defaults*, and what somebody has ticked is
+    /// a property of the control. A page styling `input:checked` or
+    /// `option[selected]` would otherwise restyle itself the moment a box was
+    /// ticked, which is a rule about the markup answered with a fact about the
+    /// session.
+    ///
+    /// One map covers a checkbox, a radio *and* an `<option>`, because all
+    /// three ask the same question — is this one on? — and keying an option by
+    /// its own node is what lets a `<select>` share this rather than need a
+    /// second record shaped differently.
+    chosen: std::collections::HashMap<NodeId, bool>,
 }
 
 impl Document {
@@ -124,6 +183,7 @@ impl Document {
             root: NodeId(0),
             quirks: QuirksMode::NoQuirks,
             values: std::collections::HashMap::new(),
+            chosen: std::collections::HashMap::new(),
         }
     }
 
@@ -145,9 +205,51 @@ impl Document {
         self.values.insert(id, value.into());
     }
 
-    /// Whether anything has been typed into this document at all.
+    /// Whether a control is on, if the reader has said either way.
+    ///
+    /// `None` means nobody has touched it and the caller falls back to the
+    /// markup — the `checked` or `selected` attribute. `Some(false)` is a
+    /// distinct answer from `None` and the reason this is an `Option` at all:
+    /// it is a box that *was* ticked by the markup and has been unticked, which
+    /// is the case a form with a pre-ticked "send me email" box turns on.
+    pub fn chosen(&self, id: NodeId) -> Option<bool> {
+        self.chosen.get(&id).copied()
+    }
+
+    /// Records that a control is on or off.
+    pub fn set_chosen(&mut self, id: NodeId, on: bool) {
+        self.chosen.insert(id, on);
+    }
+
+    /// Whether a control is on: a ticked box, a chosen radio, a selected
+    /// option.
+    ///
+    /// The reader's answer first, the markup's only as a default — the same
+    /// order [`Document::value_of`] is read in and for the same reason. It
+    /// lives here rather than in layout or in the cascade because both of those
+    /// ask it, of the same node, and must not be able to disagree: the cascade
+    /// decides which option a dropdown *shows* and layout decides which one it
+    /// *sends*, and a browser where those two differ is one that submits
+    /// something other than what is on screen.
+    ///
+    /// Which attribute carries the default is the element's business: an
+    /// `<option>` is `selected` and everything else is `checked`.
+    pub fn is_on(&self, id: NodeId) -> bool {
+        if let Some(chosen) = self.chosen(id) {
+            return chosen;
+        }
+        self.element(id).is_some_and(|element| {
+            let attribute = match element.local_name() {
+                "option" => "selected",
+                _ => "checked",
+            };
+            element.attr(attribute).is_some()
+        })
+    }
+
+    /// Whether the reader has changed anything in this document at all.
     pub fn is_edited(&self) -> bool {
-        !self.values.is_empty()
+        !self.values.is_empty() || !self.chosen.is_empty()
     }
 
     /// Quirks mode, as determined by the parser from the doctype.
@@ -301,6 +403,48 @@ impl Document {
         }
     }
 
+    /// How deep `id` sits below the root.
+    ///
+    /// Walked rather than stored because the parser moves subtrees around —
+    /// the adoption agency algorithm exists to do exactly that — and a stored
+    /// depth would be wrong for every descendant of anything it moved. The walk
+    /// is bounded by [`MAX_DEPTH`], which is the invariant `no_deeper_than`
+    /// keeps, so this is a short climb and not a tree traversal.
+    fn depth_of(&self, id: NodeId) -> usize {
+        let mut depth = 0;
+        let mut at = id;
+        while let Some(parent) = self.nodes[at.0].parent {
+            depth += 1;
+            at = parent;
+        }
+        depth
+    }
+
+    /// `id`, or its nearest ancestor shallow enough to take a child.
+    ///
+    /// The whole of the depth cap (#176). Everything downstream of the parser
+    /// — the cascade, layout, and paint — walks this tree recursively, so the
+    /// depth of the tree is the depth of three recursions in a row, and a page
+    /// that nests deeply enough overflows the stack of the process holding it.
+    /// Bounding it here rather than in each of those three is one rule in one
+    /// place, and it is what every browser does: the markup past the cap is
+    /// flattened rather than refused, so the page still renders and the content
+    /// is still there.
+    fn no_deeper_than(&self, id: NodeId, limit: usize) -> NodeId {
+        let depth = self.depth_of(id);
+        if depth < limit {
+            return id;
+        }
+        let mut at = id;
+        for _ in 0..=(depth - limit) {
+            match self.nodes[at.0].parent {
+                Some(parent) => at = parent,
+                None => break,
+            }
+        }
+        at
+    }
+
     fn append(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
         self.nodes[child.0].parent = Some(parent);
@@ -394,9 +538,15 @@ impl TreeSink for DomSink {
 
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
         let mut doc = self.doc.borrow_mut();
+        // The one place nesting is created, and so the one place it is capped
+        // (#176). Past the cap the markup is flattened: the element is still
+        // created and still in the tree, just as a sibling rather than a child,
+        // which is what a browser does with markup this deep and is a great
+        // deal better than not rendering the page at all.
+        let parent = doc.no_deeper_than(*parent, MAX_DEPTH);
         match child {
-            NodeOrText::AppendNode(node) => doc.append(*parent, node),
-            NodeOrText::AppendText(text) => doc.append_text(*parent, &text),
+            NodeOrText::AppendNode(node) => doc.append(parent, node),
+            NodeOrText::AppendText(text) => doc.append_text(parent, &text),
         }
     }
 
@@ -507,7 +657,14 @@ pub fn parse(html: &str) -> Document {
     };
     let options = ParseOpts::default();
     let tree_builder = TreeBuilder::new(sink, options.tree_builder);
-    let tokenizer = Tokenizer::new(DefuseMetaCharset(tree_builder), options.tokenizer);
+    // Two wrappers between the tokenizer and the tree builder, and the order
+    // is not arbitrary: the depth cap is outermost, so a tag it refuses never
+    // reaches the charset workaround either. Both are working around the same
+    // library from the same side.
+    let tokenizer = Tokenizer::new(
+        depth::CapDepth::new(DefuseMetaCharset(tree_builder)),
+        options.tokenizer,
+    );
 
     let input = BufferQueue::default();
     input.push_back(StrTendril::from(html));
@@ -518,7 +675,7 @@ pub fn parse(html: &str) -> Document {
     }
     debug_assert!(input.is_empty(), "the parser stopped with input left");
     tokenizer.end();
-    tokenizer.sink.0.sink.finish()
+    tokenizer.sink.inner.0.sink.finish()
 }
 
 #[cfg(test)]
@@ -681,5 +838,63 @@ mod tests {
         let doc = parse(r#"<body><p id="">x</p><a name="">y</a></body>"#);
 
         assert_eq!(doc.fragment_target(""), None);
+    }
+
+    #[test]
+    fn nesting_past_the_cap_is_flattened_rather_than_kept() {
+        // #176. Everything downstream of this walks the tree recursively — the
+        // cascade, layout, and paint, one after another — so the tree's depth
+        // is the depth of three recursions and a deep enough page took the
+        // renderer's stack with it.
+        let deep = format!(
+            "<body>{}<p>bottom</p>{}</body>",
+            "<div>".repeat(MAX_DEPTH * 4),
+            "</div>".repeat(MAX_DEPTH * 4),
+        );
+        let doc = parse(&deep);
+        let deepest = (0..doc.len())
+            .map(NodeId)
+            .map(|id| doc.depth_of(id))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            deepest <= MAX_DEPTH,
+            "{deepest} deep against a cap of {MAX_DEPTH}",
+        );
+    }
+
+    #[test]
+    fn the_content_past_the_cap_is_still_there() {
+        // Flattened, not refused. A page that nests too deeply is still a page,
+        // and the words at the bottom of it are still what somebody came to
+        // read — which is the whole difference between this and giving up.
+        let deep = format!(
+            "<body>{}<p>bottom</p>{}</body>",
+            "<div>".repeat(MAX_DEPTH * 4),
+            "</div>".repeat(MAX_DEPTH * 4),
+        );
+        let doc = parse(&deep);
+        assert!(
+            doc.text_content(doc.root()).contains("bottom"),
+            "the text past the cap was dropped",
+        );
+    }
+
+    #[test]
+    fn an_ordinary_page_is_untouched_by_the_cap() {
+        // The cap is far past anything real — the era fixture here is 14 deep
+        // and the deepest document in the CSS 2.1 suite is 13 — so this is the
+        // assertion that matters most: the common case does not notice.
+        let doc = parse(
+            "<body><div><table><tr><td><p>Words <b>and <i>more</i></b></p>\
+             </td></tr></table></div></body>",
+        );
+        let deepest = (0..doc.len())
+            .map(NodeId)
+            .map(|id| doc.depth_of(id))
+            .max()
+            .unwrap_or(0);
+        assert!(deepest < 16, "an ordinary page came out {deepest} deep");
+        assert!(doc.text_content(doc.root()).contains("Words and more"));
     }
 }

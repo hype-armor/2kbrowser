@@ -13,21 +13,29 @@ const USAGE: &str = "\
 2kbrowser — a web browser without the slop
 
 USAGE:
-    2kbrowser open   <url-or-file> [--width <px>] [--height <px>]
+    2kbrowser open   [url-or-file] [--width <px>] [--height <px>]
     2kbrowser render <url-or-file> [--out <file.png>] [--width <px>] [--height <px>]
     2kbrowser links  <url-or-file> [--width <px>]
     2kbrowser bookmarks
+    2kbrowser history [--forget]
 
 OPTIONS:
     --out <path>     Where to write the PNG (render only; default: page.png)
     --width <px>     Viewport width (default: 800)
     --height <px>    Window height, or maximum canvas height for render
 
+`open` with no address starts on a page of what you saved and where you have
+been, built from this machine and fetched from nowhere.
+
 `links` lists every link on the page with the rectangle you would click to
 follow it — the same geometry the window uses, printed instead of drawn.
 
 `bookmarks` prints the saved list, and says where the file is. It is a plain
 tab-separated file: edit it in anything.
+
+`history` prints where the browser has been, newest first, and `--forget`
+empties it. That file is tab-separated too, and deleting it is the same as
+forgetting all of it (ADR-0021).
 
 Accepts http:, https:, and file: URLs, or a plain path. Third-party requests
 are refused by default (ADR-0006) and JavaScript is never run (ADR-0003).
@@ -36,8 +44,9 @@ In a window: click a link to follow it, or Tab to it and press Enter — Shift+T
 goes back, Escape drops the focus. Alt+Left and Alt+Right, or Backspace,
 go back and forward. Ctrl+L focuses the URL bar and Ctrl+F searches the page;
 Enter goes, Escape gives up. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab
-switches. Ctrl+D saves the page and Ctrl+B shows the saved list. Arrows and
-PageUp/PageDown scroll, Home/End jump, Esc or q quits.
+switches. Ctrl+D saves the page and Ctrl+B shows the saved list; Ctrl+H shows
+where you have been and Ctrl+Shift+H forgets it. Arrows and PageUp/PageDown
+scroll, Home/End jump, Esc or q quits.
 
 Ctrl and the wheel zooms, as do Ctrl+plus and Ctrl+minus; Ctrl+0 goes back to
 100%. The page is laid out again at the new size rather than magnified, so the
@@ -102,6 +111,7 @@ fn main() -> ExitCode {
         Some("links") => report(run_links(&args[1..])),
         Some("open") => report(run_open(&args[1..])),
         Some("bookmarks") => report(run_bookmarks()),
+        Some("history") => report(run_history(args.get(1).map(String::as_str))),
         Some("--help" | "-h" | "help") | None => say(USAGE),
         Some(other) => {
             eprintln!("error: unknown command `{other}`\n\n{USAGE}");
@@ -125,7 +135,13 @@ fn report(outcome: Result<String, String>) -> ExitCode {
 /// Opens a window. See the caveat in `window.rs`: this path is unverified.
 fn run_open(args: &[String]) -> Result<String, String> {
     let options = Options::parse(args)?;
-    let input = options.input.ok_or("no input given")?;
+    // No address is not a mistake to report. A browser opened with no argument
+    // is one somebody wants to use, and the one thing it should not do is
+    // refuse — so it opens on a page built from what it already knows.
+    let input = match options.input {
+        Some(input) => input,
+        None => home_page()?,
+    };
     let (document, url) = load_from(&input)?;
     window::open(
         document.body,
@@ -146,6 +162,27 @@ fn run_open(args: &[String]) -> Result<String, String> {
         },
     )?;
     Ok(String::new())
+}
+
+/// Writes the home page and hands back its address.
+///
+/// Written to disk rather than passed in memory because the whole browser loads
+/// *a document from a URL* — that is the one path the engine has, and inventing
+/// a second one so this page could skip the disk would be a second path to keep
+/// working. It is rewritten on every start, since what it lists changes.
+fn home_page() -> Result<String, String> {
+    let path = shell::home::path();
+    let html = shell::home::page(
+        &shell::bookmarks::Bookmarks::load(&shell::bookmarks::default_path()),
+        &shell::visits::Visits::load(&shell::visits::default_path()),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+    }
+    std::fs::write(&path, html)
+        .map_err(|error| format!("could not write the home page: {error}"))?;
+    Ok(net::file_url(&path))
 }
 
 /// Height of a window that nobody asked to be a particular size.
@@ -232,9 +269,9 @@ fn run_links(args: &[String]) -> Result<String, String> {
 
 /// Prints the saved list.
 ///
-/// The file is the only state this browser keeps between runs, so it is worth
-/// being able to see it without opening a window — and worth saying where it
-/// is, because it is a text file anyone can edit.
+/// One of the three files this browser keeps between runs, so it is worth being
+/// able to see it without opening a window — and worth saying where it is,
+/// because it is a text file anyone can edit.
 fn run_bookmarks() -> Result<String, String> {
     let path = shell::bookmarks::default_path();
     let marks = shell::bookmarks::Bookmarks::load(&path);
@@ -244,6 +281,40 @@ fn run_bookmarks() -> Result<String, String> {
     let mut message = format!("{} saved page(s) in {}:", marks.len(), path.display());
     for entry in marks.iter() {
         message.push_str("\n  ");
+        message.push_str(&entry.url);
+        if !entry.title.is_empty() {
+            message.push_str(&format!("\n      {}", entry.title));
+        }
+    }
+    Ok(message)
+}
+
+/// Prints where the browser has been, or forgets it (#197).
+fn run_history(flag: Option<&str>) -> Result<String, String> {
+    let path = shell::visits::default_path();
+    let mut visits = shell::visits::Visits::load(&path);
+    if let Some(flag) = flag {
+        if flag != "--forget" {
+            return Err(format!("unknown option `{flag}` for `history`"));
+        }
+        let had = visits.len();
+        visits.clear();
+        visits
+            .save(&path)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        return Ok(format!("forgot {had} address(es) ({})", path.display()));
+    }
+    if visits.is_empty() {
+        return Ok(format!("nothing here yet ({})", path.display()));
+    }
+    let mut message = format!("{} address(es) in {}:", visits.len(), path.display());
+    // Newest first, which is the order somebody looking for where they just
+    // were needs. The file is oldest first, because a file that is appended to
+    // grows downwards.
+    for entry in visits.iter().rev() {
+        message.push_str("\n  ");
+        message.push_str(&entry.when);
+        message.push_str("  ");
         message.push_str(&entry.url);
         if !entry.title.is_empty() {
             message.push_str(&format!("\n      {}", entry.title));
@@ -361,10 +432,16 @@ fn load_from(input: &str) -> Result<(shell::viewport::Document, String), String>
              something on this network can read it"
         );
     }
+    // A status with nothing behind it gets a page of the browser's own, the
+    // same as it would in a window (#203). Without this the command line
+    // rendered a 401 as a blank canvas, which says even less than the window's
+    // old one-line error did.
+    let (body, content_type) =
+        shell::status::substitute(fetched.status, fetched.body, fetched.content_type, &url);
     Ok((
         shell::viewport::Document {
-            body: fetched.body,
-            content_type: fetched.content_type,
+            body,
+            content_type,
             origin: fetched.origin,
             path: fetched.path,
         },

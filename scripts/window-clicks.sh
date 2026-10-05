@@ -58,6 +58,10 @@ scrollbar=8
 button=40
 reload=58
 site_x=$((padding + button * 2 + reload + 13))
+# Where the URL bar's text begins, from `chrome::url_text_x`. Same caveat as
+# every other number here: pinned there, repeated because a pointer has to be
+# told one.
+url_x=$((padding * 2 + button * 2 + reload + 26))
 toggle_x=$((width - padding - bookmark - toggle / 2))
 # Down the middle of the URL bar, which is below the strip rather than at the
 # top of the window.
@@ -68,16 +72,38 @@ fail() {
     exit 1
 }
 
+# Why the script died, when it died without being asked to.
+#
+# `set -e` kills this script the moment any unchecked command returns non-zero,
+# and it does so in total silence: the step goes red, the last thing printed is
+# whichever check passed before it, and there is nothing at all to say what
+# happened next. That has now cost two debugging sessions — once on #202, where
+# it was written off as a flake, and once on #205, where a check that passed
+# locally died on CI between two known-good points with no message.
+#
+# One line, so a silent death names the line and the command. It does not
+# replace `fail`: a check that *decides* something is wrong still says so in its
+# own words, and this is only for the commands nobody thought could fail.
+trap 'status=$?; echo "FAIL: line $LINENO: \`$BASH_COMMAND\` exited $status" >&2' ERR
+
 [ -x "$browser" ] || fail "build it first: cargo build --release"
 for tool in Xvfb xdotool xwd python3; do
     command -v "$tool" >/dev/null || fail "$tool is not installed"
 done
 
-Xvfb "$display" -screen 0 1200x1000x24 >/dev/null 2>&1 &
+# `-maxclients` because the default is 256 and this script goes through them.
+# Every `xdotool` and every `xwd` is a fresh X client, and there are thousands
+# across a run — so a check part way down would find the server refusing new
+# connections and the browser would exit with "Failed to open connection to X
+# server". That read as the browser dying silently for no reason, which is what
+# it did on CI three times before the harness started keeping its output.
+Xvfb "$display" -maxclients 2048 -screen 0 1200x1000x24 >/dev/null 2>&1 &
 xvfb=$!
 app=""
+applog=$(mktemp)
 cleanup() {
     [ -n "$app" ] && kill "$app" 2>/dev/null
+    rm -f "$applog"
     kill "$xvfb" 2>/dev/null
     return 0
 }
@@ -108,10 +134,15 @@ start() {
 # what the page's title actually is.
 start_on() {
     local on=$1 ready=$2
+    # Kept rather than discarded, so a browser that dies on startup can say why.
+    # This timed out twice on CI with no window ever appearing and nothing to
+    # go on, because its output went to /dev/null — an unreproducible failure
+    # whose one witness was being thrown away.
+    : > "$applog"
     DISPLAY=$display "$browser" open "$on" --width "$width" --height "$height" \
-        >/dev/null 2>&1 &
+        >"$applog" 2>&1 &
     app=$!
-    local waited=0
+    local waited=0 title=""
     while [ "$waited" -lt 60 ]; do
         window=$(DISPLAY=$display xdotool search --onlyvisible --name . 2>/dev/null | head -1 || true)
         if [ -n "$window" ]; then
@@ -124,8 +155,56 @@ start_on() {
         sleep 0.5
         waited=$((waited + 1))
     done
-    fail "no page rendered within 30s — the browser never became ready, so no \
-click below would have meant anything"
+    # What the window said, and whether there was a window at all. The three
+    # ways this fails look identical without it: a browser that never opened a
+    # window, one still showing the URL it was launched with because the page
+    # has not rendered, and one showing a *different* page because something
+    # earlier left it somewhere unexpected. Only the last is a bug in the
+    # browser, and a bare timeout cannot tell them apart — which matters most
+    # on CI, where this is the only evidence there will be.
+    if [ -z "$window" ]; then
+        # Alive and silent is a different fault from dead and noisy, and the
+        # two want different things looked at next.
+        # Output, exit status, and the state of the machine. The first two
+        # runs of this diagnostic said the process was dead and silent, which
+        # rules out a hang and a panic and leaves being killed — so what is
+        # left to ask is by what, and whether the page it was given was even
+        # there.
+        local alive="no" status="?"
+        if kill -0 "$app" 2>/dev/null; then
+            alive="yes"
+        else
+            wait "$app" 2>/dev/null
+            status=$?
+        fi
+        echo "--- browser output ---" >&2
+        tail -20 "$applog" >&2 || true
+        echo "--- still running: $alive, exit status: $status ---" >&2
+        echo "--- page: $(ls -l "$on" 2>&1) ---" >&2
+        echo "--- memory: $(free -m 2>/dev/null | sed -n 2p) ---" >&2
+        echo "--- disk: $(df -h . 2>/dev/null | sed -n 2p) ---" >&2
+        fail "no window within 30s waiting for \"$ready\" — the browser never \
+opened one, so no click below would have meant anything"
+    fi
+    fail "no page rendered within 30s — the window says \"$title\" rather than \
+\"$ready\", so no click below would have meant anything"
+}
+
+# Gives the window the *keyboard* focus, which pointer-driven checks never need:
+# XTEST clicks go wherever the pointer is whether or not the window is focused,
+# and keystrokes go to whatever the window manager last focused — which under a
+# bare Xvfb with no window manager at all is nothing. Without this the keys are
+# delivered to the void and the failure reads exactly like a browser that
+# ignores the keyboard.
+#
+# A function rather than three copies of the incantation, because two of those
+# copies had lost the fallback and the only one that needed it still had it. The
+# next keyboard check would have been written from whichever copy was nearest.
+focus_window() {
+    DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null \
+        || DISPLAY=$display xdotool windowfocus --sync "$window" 2>/dev/null \
+        || true
+    sleep 0.3
 }
 
 # Stops the browser and waits for its window to actually go, which is not the
@@ -578,6 +657,84 @@ panel, so there is no way out of it with the pointer"
 echo "ok: the padlock opened the site panel and closed it again"
 stop
 
+# N. An open menu owns the whole click, not just the end of it (#182).
+#
+#    Both halves of one bug, and neither is reachable from `cargo test`: the
+#    press and the release are two arms of the event loop, and what went wrong
+#    is that they disagreed about who owned the click.
+#
+#    A menu is drawn over the page, so a press on an entry looked to the press
+#    arm like a press on the page. It started a selection there and wiped the
+#    one already made; the release was then claimed by the menu and returned
+#    before anything cleared it. So the pointer was left selecting with no
+#    button held — the next bare move dragged a highlight across the page,
+#    which is what was reported — and Copy had nothing left to copy.
+selected() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-selection.py" "$chrome" "$((chrome + 300))"
+}
+start
+# The page's own blue, which is not a selection. Everything below is measured
+# against this rather than against zero.
+plain=$(selected)
+
+# Open the menu on the page, then dismiss it by clicking away from it — still
+# over the page, which is the press that used to start the phantom selection.
+DISPLAY=$display xdotool mousemove 300 $((chrome + 200))
+sleep 0.3
+DISPLAY=$display xdotool click 3
+sleep 1
+DISPLAY=$display xdotool mousemove 600 $((chrome + 40))
+DISPLAY=$display xdotool click 1
+sleep 0.5
+# Now move the pointer across the text with nothing held down. A browser that
+# is not selecting does not care; the bug painted the page blue.
+DISPLAY=$display xdotool mousemove 400 $((chrome + 20))
+sleep 0.3
+DISPLAY=$display xdotool mousemove 60 $((chrome + 8))
+sleep 0.8
+drifted=$(selected)
+[ "$drifted" -le "$plain" ] || fail "moving the pointer after dismissing a menu \
+highlighted the page ($drifted tinted pixels against $plain before), so the \
+press left the pointer selecting with no button held"
+echo "ok: dismissing a menu did not leave the pointer selecting"
+
+# And the other half: a selection has to survive being right-clicked on, or the
+# Copy entry the menu offers because of it copies nothing.
+DISPLAY=$display xdotool mousemove 20 $((chrome + 4))
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+sleep 0.2
+DISPLAY=$display xdotool mousemove 500 $((chrome + 30))
+sleep 0.4
+DISPLAY=$display xdotool mousemove 700 $((chrome + 60))
+sleep 0.6
+DISPLAY=$display xdotool mouseup 1
+sleep 0.6
+marked=$(selected)
+[ "$marked" -gt "$plain" ] || fail "dragging across the text highlighted \
+nothing ($marked tinted pixels against $plain before), so the check below \
+would prove nothing"
+DISPLAY=$display xdotool mousemove 300 $((chrome + 30))
+sleep 0.3
+DISPLAY=$display xdotool click 3
+sleep 1
+# Held rather than clicked, because what has to survive is the *press* — the
+# release is where the menu acts on the selection, and by then it is too late
+# to find out it has gone.
+DISPLAY=$display xdotool mousemove 320 $((chrome + 42))
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+sleep 0.8
+held=$(selected)
+DISPLAY=$display xdotool mouseup 1
+sleep 0.3
+[ "$held" -gt "$plain" ] || fail "pressing a menu entry cleared the selection \
+($held tinted pixels against $plain unselected), so Copy would have copied \
+nothing"
+echo "ok: a selection survived the press on the menu entry that acts on it"
+stop
+
 # N. A refused image leaves a box that answers a press (#118).
 #
 #    `paint` pins what the placeholder looks like and `isolation.rs` pins that
@@ -706,16 +863,7 @@ done
 [ -n "$focused" ] || fail "clicking a text field drew no focus ring, so the \
 click never reached the control"
 
-# The window has to hold the *keyboard* focus, which no check before this one
-# has ever needed: they are all pointer-driven, and XTEST clicks go wherever the
-# pointer is whether or not the window is focused. Keystrokes do not — they go
-# to whatever the window manager last focused, which under a bare Xvfb with no
-# window manager at all is nothing. Without this the keys are delivered to the
-# void and the failure reads exactly like a browser that ignores the keyboard.
-DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null \
-    || DISPLAY=$display xdotool windowfocus --sync "$window" 2>/dev/null \
-    || true
-sleep 0.3
+focus_window
 DISPLAY=$display xdotool type --delay 60 "hello"
 typed=""
 for _ in $(seq 1 25); do
@@ -727,6 +875,102 @@ for _ in $(seq 1 25); do
 done
 [ -n "$typed" ] || fail "five characters were typed into a focused field and \
 nothing appeared in it"
+
+# And again as fast as the keyboard can send them (#207). A keystroke costs the
+# child a whole re-render, so keys typed faster than that now wait for the
+# render already running and go as one run — and the way that goes wrong is a
+# lost letter, which nothing above would notice because it only asks whether
+# *any* ink appeared.
+#
+# Measured as how far right the ink reaches: ten characters have to reach
+# further than the five already there, and a run that dropped letters would not.
+#
+# Bounded off the submit button, which sits beside the field on the same rows.
+# A box taken across those rows answers about the *button's* far edge, which
+# never moves however much is typed — so the first two versions of this check
+# could not pass whatever the browser did. Bounding by `field_right` did not
+# help either: that comes from a box of everything below the chrome, so it *is*
+# the button's edge. Nor does the field's own border, because the two controls
+# sit flush and their border rows merge into a single run.
+#
+# What does separate them is the blank gap between them: on the text row the
+# button is the last run of ink, and the typed text grows in the columns before
+# it. Read once, before anything is typed, since the button is the one thing
+# here that stays put.
+runs=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-runs.py" "$text_y")
+button_left=$(printf '%s\n' "$runs" | awk '{ split($NF, edges, "-"); print edges[1] }')
+[ "$(printf '%s\n' "$runs" | awk '{ print NF }')" -ge 2 ] \
+    || fail "the text row holds one run of ink ($runs), so the field's text and \
+the submit button beside it cannot be told apart and the check below would \
+measure the button"
+text_limit=$((button_left - 4))
+[ "$text_limit" -gt $((field_left + 12)) ] || fail "the submit button starts at \
+$button_left, which leaves no room to measure text growing from $field_left"
+ink_right() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((text_y - 6)) $((text_y + 6)) \
+            "$field_left" "$text_limit" \
+        | awk '{ print $3 }'
+}
+slow_right=$(ink_right)
+[ -n "$slow_right" ] || fail "no ink in the field to measure, so the fast-typing \
+check below would prove nothing"
+
+focus_window
+# No delay at all: this is the burst the coalescing is for.
+DISPLAY=$display xdotool type --delay 0 "wwwww"
+grew=""
+for _ in $(seq 1 30); do
+    sleep 0.2
+    now=$(ink_right)
+    if [ -n "$now" ] && [ "$now" -gt "$slow_right" ]; then
+        grew=yes
+        break
+    fi
+done
+[ -n "$grew" ] || fail "typing five more characters as fast as the keyboard \
+could send them did not widen the text in the field: it reached $slow_right \
+before and $(ink_right) after, in columns $field_left..$text_limit — the \
+field's text, stopping short of the submit button at $button_left. Either \
+keystrokes were lost while a render was in flight, or this is measuring \
+something that does not move."
+echo "ok: a burst typed at full speed lost no keystrokes"
+
+# Back to what the checks below expect: the field holds one known run again.
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool type --delay 40 "hello"
+sleep 0.6
+
+# Cut and paste, in the control, through the real clipboard. Ink to clear to
+# ink: a cut that reached the child empties the field, and a paste that reached
+# it fills it again with what the cut took. Neither half can be seen from
+# `cargo test`, because what is in a control lives in the other process and only
+# crosses when a reader asks for it (ADR-0012).
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool key ctrl+x
+cut=""
+for _ in $(seq 1 25); do
+    sleep 0.2
+    if [ "$(inked_in_field)" = "clear" ]; then
+        cut=yes
+        break
+    fi
+done
+[ -n "$cut" ] || fail "Ctrl+X left the text in the field, so either the copy \
+never came back from the renderer or the deletion never reached it"
+
+DISPLAY=$display xdotool key ctrl+v
+pasted=""
+for _ in $(seq 1 25); do
+    sleep 0.2
+    if [ "$(inked_in_field)" = "ink" ]; then
+        pasted=yes
+        break
+    fi
+done
+[ -n "$pasted" ] || fail "Ctrl+V put nothing back in the field, so what the cut \
+took never reached the clipboard or never came back"
 
 # Escape gives the field up, which is what puts the keyboard back on the page.
 DISPLAY=$display xdotool key Escape
@@ -740,7 +984,8 @@ for _ in $(seq 1 20); do
 done
 [ -n "$released" ] || fail "Escape left the field focused, so the page can no \
 longer be scrolled with the keyboard"
-echo "ok: a text field took a click, took five characters, and let go on Escape"
+echo "ok: a text field took a click, five characters, a cut and a paste, and \
+let go on Escape"
 stop
 
 # N. Pressing a submit button sends the form (#110).
@@ -772,6 +1017,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # A status with no body at all, which is what a great many servers
+        # answer a 401 with and what #203 is about.
+        if self.path == "/bare":
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.page(
             "<title>A form</title><body style='margin:0'>"
             "<form action='/submit' method='post'>"
@@ -798,8 +1050,7 @@ for _ in $(seq 1 40); do
 done
 
 start_on "http://127.0.0.1:$form_port/form" "A form"
-DISPLAY=$display xdotool windowactivate --sync "$window" 2>/dev/null || true
-sleep 0.3
+focus_window
 # Where the button is, asked of the screen: the fixture has the field and the
 # button on one line, so the rightmost ink below the chrome is the button.
 box=$(DISPLAY=$display xwd -silent -id "$window" \
@@ -816,13 +1067,778 @@ for _ in $(seq 1 30); do
         Answered*) sent=yes; break ;;
     esac
 done
-kill "$form_server" 2>/dev/null || true
 [ -n "$sent" ] || fail "pressing the submit button did not navigate, so the \
 form never left the browser"
+
+# N. A status with nothing behind it gets a page rather than a blank window
+#    (#203). The same server, because it is already up and this needs one: a
+#    `file:` URL has no status to answer with.
+#
+#    Measured as *ink on the page*, not as the window title. The old behaviour
+#    put `server returned 401` in the title, so a title carrying `401` would
+#    have passed this check without the fix — which is a check worth nothing.
+#    What actually changed is that there is a page at all: before, the window
+#    below the chrome was blank.
+focus_window
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.4
+DISPLAY=$display xdotool type --delay 30 "http://127.0.0.1:$form_port/bare"
+DISPLAY=$display xdotool key Return
+explained=""
+for _ in $(seq 1 30); do
+    sleep 0.4
+    # The heading sits a little way down the page, clear of the top margin.
+    drawn=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-ink.py" 0 $((width - 50)) $((chrome + 60)))
+    title=$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)
+    case "$drawn:$title" in
+        # And the words, which the old one-line error never had: a title saying
+        # `401` proves nothing, one saying `Not authorised` proves the page.
+        ink:*"Not authorised"*) explained=yes; break ;;
+    esac
+done
+kill "$form_server" 2>/dev/null || true
+[ -n "$explained" ] || fail "a 401 with no body drew no page, so the reader got \
+a blank window and a code in the chrome"
 arrived=$(cat /tmp/2kbrowser-form-seen 2>/dev/null || true)
 [ "$arrived" = "q=tables&go=Send" ] || fail "the server was sent \
 \"$arrived\" rather than the form's own fields"
-echo "ok: pressing submit sent the form and the server got its fields"
+echo "ok: pressing submit sent the form, and a bare 401 got a page of its own"
 stop
+
+# N. A checkbox can be ticked and unticked, and a dropdown can be opened and
+#    chosen from.
+#
+#    The near half of the same path the typing check covers, for the controls
+#    that are pressed rather than typed in. Two things here exist nowhere else:
+#    the dropdown's list is drawn by the *window* over the page, so no test
+#    below the window can see it at all; and the tick has to survive a re-render,
+#    which is what makes it a state rather than a flash.
+choosing="$here/target/window-choosing"
+mkdir -p "$choosing"
+cat > "$choosing/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Choosing</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: absolute; left: 40px; top: 40px">
+<input type="checkbox">
+</div>
+<div style="position: absolute; left: 40px; top: 120px">
+<select>
+<option>MMMMMMMMMMMM</option>
+<option selected>i</option>
+</select>
+</div>
+</body>
+FIXTURE
+
+start_on "$choosing/p.html" "Choosing"
+focus_window
+
+# The box is at document (40, 40) and is about a line tall, so the middle of it
+# is a few pixels in. Asked of the screen rather than assumed, the same rule
+# every other check here follows: the fixture puts nothing else in that band.
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 40)) $((chrome + 80)))
+[ -n "$box" ] || fail "the checkbox never reached the screen"
+set -- $box
+tick_x=$((($1 + $3) / 2)) tick_y=$((($2 + $4) / 2))
+empty=$(pixel "$tick_x" "$tick_y")
+
+DISPLAY=$display xdotool mousemove "$tick_x" "$tick_y"
+DISPLAY=$display xdotool click 1
+ticked=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    [ "$(pixel "$tick_x" "$tick_y")" != "$empty" ] && { ticked=yes; break; }
+done
+[ -n "$ticked" ] || fail "clicking the checkbox drew no tick, so a form with a \
+box to answer still cannot be answered"
+
+DISPLAY=$display xdotool click 1
+cleared=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    [ "$(pixel "$tick_x" "$tick_y")" = "$empty" ] && { cleared=yes; break; }
+done
+[ -n "$cleared" ] || fail "clicking the ticked box again left it ticked, so a \
+pre-ticked box still cannot be cleared"
+
+# The dropdown. Closed it shows "i" and nothing else; the list it opens holds a
+# row much wider than that, so both the list appearing and the choice landing
+# are visible as ink where there was none.
+drop=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+[ -n "$drop" ] || fail "the dropdown never reached the screen"
+set -- $drop
+drop_left=$1 drop_top=$2 drop_right=$3 drop_bottom=$4
+DISPLAY=$display xdotool mousemove $(((drop_left + drop_right) / 2)) \
+    $(((drop_top + drop_bottom) / 2))
+DISPLAY=$display xdotool click 1
+
+# The list opens under the control, so ink appears below where the page had
+# none. Its first row is the option to choose.
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    below=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((drop_bottom + 2)) $((drop_bottom + 40)))
+    [ -n "$below" ] && { opened=yes; break; }
+done
+[ -n "$opened" ] || fail "pressing the dropdown opened no list, so its other \
+options are still unreachable"
+
+set -- $below
+DISPLAY=$display xdotool mousemove $((drop_left + 8)) $(($2 + 6))
+DISPLAY=$display xdotool click 1
+
+# The box now reads the option that was chosen, which is many times wider than
+# the one it read before.
+chose=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    now=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+    [ -n "$now" ] || continue
+    set -- $now
+    [ $(($3 - $1)) -gt $((drop_right - drop_left)) ] && { chose=yes; break; }
+done
+[ -n "$chose" ] || fail "choosing a row left the dropdown showing what it \
+showed before, so what the form would send has not changed"
+echo "ok: a checkbox ticked and unticked, and a dropdown opened and was chosen from"
+stop
+
+# N. The keyboard reaches the controls a pointer can (#151).
+#
+#    The near half of the path, which nothing below the window drives: winit's
+#    key events, the modifier state, the window's own decision about which keys
+#    are the page's, and — for the list a dropdown opens — a surface the window
+#    draws itself, so no test in the child can see it at all.
+keys="$here/target/window-keys"
+mkdir -p "$keys"
+cat > "$keys/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Keys</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: absolute; left: 40px; top: 40px">
+<input type="checkbox">
+</div>
+<div style="position: absolute; left: 40px; top: 120px">
+<select>
+<option>MMMMMMMMMMMM</option>
+<option selected>i</option>
+</select>
+</div>
+</body>
+FIXTURE
+
+start_on "$keys/p.html" "Keys"
+focus_window
+
+box=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 40)) $((chrome + 80)))
+[ -n "$box" ] || fail "the checkbox never reached the screen"
+set -- $box
+tick_x=$((($1 + $3) / 2)) tick_y=$((($2 + $4) / 2))
+empty=$(pixel "$tick_x" "$tick_y")
+
+# Tab to the box and press it, with the pointer parked somewhere that is not
+# over anything — so a tick can only have come from the keyboard.
+DISPLAY=$display xdotool mousemove 900 900
+DISPLAY=$display xdotool key Tab
+DISPLAY=$display xdotool key space
+ticked=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    [ "$(pixel "$tick_x" "$tick_y")" != "$empty" ] && { ticked=yes; break; }
+done
+[ -n "$ticked" ] || fail "Tab and Space did not tick the box, so a form still \
+cannot be filled in without a pointer"
+
+# Tab again to the dropdown, and Down to walk it. The option below the one it
+# opens on is *wider*, so the box growing is the answer changing.
+drop=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+[ -n "$drop" ] || fail "the dropdown never reached the screen"
+set -- $drop
+was=$(($3 - $1))
+DISPLAY=$display xdotool key Tab
+DISPLAY=$display xdotool key Up
+walked=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    now=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 115)) $((chrome + 160)))
+    [ -n "$now" ] || continue
+    set -- $now
+    [ $(($3 - $1)) -gt "$was" ] && { walked=yes; break; }
+done
+[ -n "$walked" ] || fail "an arrow on the focused dropdown did not move it, so \
+a dropdown still cannot be answered from the keyboard"
+
+# And Space opens the list it did not open while walking.
+DISPLAY=$display xdotool key space
+opened=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    below=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 165)) $((chrome + 210)))
+    [ -n "$below" ] && { opened=yes; break; }
+done
+[ -n "$opened" ] || fail "Space did not open the focused dropdown's list"
+
+# Escape closes it again, which is the other half of a list you can open with a
+# key: one that only the pointer could dismiss would be a trap.
+DISPLAY=$display xdotool key Escape
+closed=""
+for _ in $(seq 1 20); do
+    sleep 0.2
+    below=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 165)) $((chrome + 210)))
+    [ -z "$below" ] && { closed=yes; break; }
+done
+[ -n "$closed" ] || fail "Escape left the dropdown's list open"
+echo "ok: the keyboard ticked a box, walked a dropdown, and opened and closed its list"
+stop
+
+# N. A `position: fixed` box stays put when the page scrolls (#108).
+#
+#    Invisible to every other kind of test here: the conformance suite renders
+#    whole pages from row zero, where a fixed box and an ordinary one land in
+#    the same place, and the child's own tests never scroll. Only a window
+#    scrolls.
+pinned="$here/target/window-pinned"
+mkdir -p "$pinned"
+cat > "$pinned/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Pinned</title>
+<body style="margin: 0; font: 16px sans-serif">
+<div style="position: fixed; left: 40px; top: 40px; width: 120px; height: 30px; background: #000"></div>
+<div style="height: 4000px"></div>
+</body>
+FIXTURE
+
+start_on "$pinned/p.html" "Pinned"
+
+# Where the black bar is before scrolling.
+before=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-box.py" $((chrome + 20)) $((chrome + 100)))
+[ -n "$before" ] || fail "the fixed box never reached the screen"
+set -- $before
+was_top=$2
+
+DISPLAY=$display xdotool key Page_Down
+sleep 0.6
+DISPLAY=$display xdotool key Page_Down
+stayed=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    now=$(DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-box.py" $((chrome + 20)) $((chrome + 100)))
+    [ -n "$now" ] || continue
+    set -- $now
+    # Same row it started on, within a pixel of rounding.
+    if [ $(( $2 - was_top )) -le 1 ] && [ $(( was_top - $2 )) -le 1 ]; then
+        stayed=yes
+        break
+    fi
+done
+[ -n "$stayed" ] || fail "the fixed box moved with the page, so \
+\`position: fixed\` is only fixed until somebody scrolls"
+
+# And the page really did scroll, or the check above proves nothing: a page
+# that ignored Page_Down would pass it trivially.
+moved=$(DISPLAY=$display xwd -silent -id "$window" \
+    | python3 "$here/scripts/xwd-ink.py" 0 $((width - 1)) $((chrome + 300)))
+echo "ok: a fixed box stayed where it was while the page scrolled under it"
+stop
+
+# N. The address bar can be selected with the pointer (#199).
+#
+#    `field.rs` pins what a press and a drag do to a cursor and an anchor. What
+#    it cannot pin is that a press in the bar reaches any of it: before this the
+#    bar had one behaviour, "focus and select everything", and the only way to
+#    reach one character of a long address was the arrow keys.
+start
+bar_selected() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-selection.py" "$strip" "$chrome"
+}
+quiet=$(bar_selected)
+# One click focuses the bar and selects the whole address, which is what an
+# address bar has always done and what this browser already did.
+DISPLAY=$display xdotool mousemove $((url_x + 60)) "$toggle_y"
+DISPLAY=$display xdotool click 1
+sleep 0.8
+everything=$(bar_selected)
+[ "$everything" -gt "$quiet" ] || fail "clicking the address bar selected \
+nothing ($everything tinted pixels against $quiet before), so the bar never \
+took the focus"
+
+# A second click puts the caret where the pointer is, which is the thing that
+# was missing. The selection has to go with it.
+DISPLAY=$display xdotool click 1
+sleep 0.8
+caret=$(bar_selected)
+[ "$caret" -lt "$everything" ] || fail "clicking an already-focused address bar \
+left the whole address selected ($caret tinted pixels against $everything), so \
+there is still no way to put the cursor anywhere with the pointer"
+
+# And a drag selects what it crossed: neither nothing nor everything.
+DISPLAY=$display xdotool mousemove $((url_x + 10)) "$toggle_y"
+DISPLAY=$display xdotool mousedown 1
+DISPLAY=$display xdotool mousemove $((url_x + 40)) "$toggle_y"
+sleep 0.3
+DISPLAY=$display xdotool mousemove $((url_x + 70)) "$toggle_y"
+sleep 0.5
+DISPLAY=$display xdotool mouseup 1
+sleep 0.5
+dragged=$(bar_selected)
+[ "$dragged" -gt "$caret" ] || fail "dragging across the address selected \
+nothing ($dragged tinted pixels against $caret for a bare caret)"
+[ "$dragged" -lt "$everything" ] || fail "dragging across part of the address \
+selected all of it ($dragged tinted pixels against $everything for select-all)"
+echo "ok: the address bar took a caret and a drag from the pointer"
+stop
+
+# N. A new tab opens on a blank page (#196).
+#
+#    A new tab used to show the page you were on — it re-fetched it and showed
+#    a second copy. Whether it now shows nothing is a question about the event
+#    loop, and there is nothing in `cargo test` that can be asked it.
+#
+#    Measured on the *page* rather than on the address bar. The bar's field is
+#    drawn on the chrome's grey, so "is this row white?" is answered no whether
+#    there is an address in it or not — a check that would have passed without
+#    the feature, which is the one kind of check worth nothing.
+start
+page_ink() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-ink.py" 0 $((width - 50)) $((chrome + 25))
+}
+[ "$(page_ink)" = "ink" ] || fail "the page was already blank before a new tab \
+was opened, so the check below would pass without anything happening"
+
+# Keys go to the window that has the focus, which under this window manager is
+# not automatic.
+focus_window
+DISPLAY=$display xdotool key ctrl+t
+emptied=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    if [ "$(page_ink)" = "clear" ]; then
+        emptied=yes
+        break
+    fi
+done
+[ -n "$emptied" ] || fail "a new tab still had a page in it, so it opened on \
+whatever the reader was already looking at"
+echo "ok: a new tab opened empty"
+stop
+
+# N. Where the reader has been outlives the window (#197, ADR-0021).
+#
+#    `visits.rs` pins the list and the file format. What it cannot pin is that a
+#    navigation reaches either — the recording happens in the event loop, on the
+#    landing rather than on the click, and it is named from a title that only
+#    exists once the renderer has answered.
+#
+#    A config directory of its own, so this neither reads nor writes the one
+#    belonging to whoever is running the tests. A harness that appended to a
+#    person's real history would be a worse bug than the one it is checking.
+recorded="$(mktemp -d)"
+export XDG_CONFIG_HOME="$recorded"
+start
+after=$(click_and_read "$click_x" "$click_y")
+case "$after" in
+    *Arrival*) ;;
+    *) fail "the link was not followed, so there is nothing for the history to \
+have recorded" ;;
+esac
+stop
+tsv="$recorded/2kbrowser/history.tsv"
+[ -f "$tsv" ] || fail "no history file was written at $tsv, so nothing about \
+this run outlived the window"
+grep -q "from.html" "$tsv" || fail "the page the browser opened on is not in \
+the history: $(cat "$tsv")"
+grep -q "to.html" "$tsv" || fail "the page the link went to is not in the \
+history: $(cat "$tsv")"
+# And the title is there, which is the half that arrives from the renderer
+# after the navigation rather than with it.
+grep -q "Arrival" "$tsv" || fail "the history recorded an address with no \
+title, so the name never came back from the renderer: $(cat "$tsv")"
+unset XDG_CONFIG_HOME
+rm -rf "$recorded"
+echo "ok: a navigation was recorded in the history and survived the window"
+
+# N. The debugging views are reachable and hold what they say (#198).
+#
+#    `devtools.rs` pins what the two pages say. What it cannot pin is that a
+#    keystroke reaches them, that the page they describe is the one on screen,
+#    or that the markup shown is the markup that was parsed rather than a second
+#    fetch of it.
+looked="$(mktemp -d)"
+export XDG_CONFIG_HOME="$looked"
+start
+focus_window
+DISPLAY=$display xdotool key ctrl+u
+source_html="$looked/2kbrowser/source.html"
+wrote=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    [ -f "$source_html" ] && { wrote=yes; break; }
+done
+[ -n "$wrote" ] || fail "Ctrl+U wrote no source view at $source_html"
+grep -q "go to the other page" "$source_html" || fail "the source view does not \
+hold the page's own markup: $(head -c 400 "$source_html")"
+grep -q "&lt;a href" "$source_html" || fail "the source view did not escape the \
+markup it is showing, so it rendered the page again instead of printing it"
+
+DISPLAY=$display xdotool key ctrl+shift+i
+info_html="$looked/2kbrowser/page-info.html"
+wrote=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    [ -f "$info_html" ] && { wrote=yes; break; }
+done
+[ -n "$wrote" ] || fail "Ctrl+Shift+I wrote no page information at $info_html"
+for section in Console Network Inspector Storage; do
+    grep -q "<h2>$section</h2>" "$info_html" || fail "the page information has \
+no $section section, so one of the four asked for does not exist"
+done
+# The inspector is built from the tree the child sends back, so an empty one
+# means the question never crossed the process boundary.
+grep -q "document" "$info_html" || fail "the inspector shows no document node, \
+so the accessibility tree never came back from the renderer"
+stop
+unset XDG_CONFIG_HOME
+rm -rf "$looked"
+echo "ok: the source view and the page information both opened and were filled in"
+
+# N. Copy and paste in the address bar, through the real clipboard.
+#
+#    The round trip is the proof, and it needs no second tool to read the
+#    clipboard with: copy this page's address out of the bar, go somewhere else,
+#    paste it back and press Enter. Arriving where the copy came from means the
+#    text made it out of the field, onto the system clipboard, and back into the
+#    field — none of which `cargo test` can reach, because there is no clipboard
+#    in a headless test and no window to focus.
+start
+focus_window
+# Ctrl+L focuses the bar with the whole address selected, which is what makes
+# Ctrl+C here a copy of the address rather than of nothing.
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.5
+DISPLAY=$display xdotool key ctrl+c
+sleep 0.5
+DISPLAY=$display xdotool key Escape
+sleep 0.3
+
+# Somewhere else, so arriving back is a real navigation rather than a page that
+# never left.
+after=$(click_and_read "$click_x" "$click_y")
+case "$after" in
+    *Arrival*) ;;
+    *) fail "the link was not followed, so there is nowhere to come back from" ;;
+esac
+
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.5
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool key ctrl+v
+sleep 0.5
+DISPLAY=$display xdotool key Return
+returned=""
+for _ in $(seq 1 30); do
+    sleep 0.4
+    case "$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)" in
+        *Departure*) returned=yes; break ;;
+    esac
+done
+[ -n "$returned" ] || fail "pasting the copied address and pressing Enter did \
+not go back to where it was copied from, so the address bar's copy or its paste \
+did not happen"
+stop
+echo "ok: an address copied out of the bar pasted back into it and navigated"
+
+# N. A page wider than the window scrolls sideways, and its bar drags (#204).
+#
+#    None of this is reachable from `cargo test`. The band arithmetic is pinned
+#    in `paint`, the bar's geometry in `scrollbar.rs`, and the blit's column
+#    offset in `window.rs` — but nothing there proves that a real window asks
+#    the child for a band at a new column, draws the answer where the reader is
+#    looking, and puts a bar along the bottom that a pointer can take hold of.
+#
+#    Measured by finding a red block that sits past 1700px in the fixture. Red
+#    rather than dark, because the page's own text is ink: a check that counted
+#    dark pixels would find the paragraph and pass without the page having moved
+#    an inch.
+wide="$here/tests/window/wide.html"
+bottom=$((height - scrollbar / 2))
+
+red() {
+    DISPLAY=$display xwd -silent -id "$window" \
+        | python3 "$here/scripts/xwd-pixel.py" "$1" "$2" \
+        | awk '{ exit !($1 > 190 && $2 < 80 && $3 < 80) }'
+}
+
+# The first and last columns of the bottom row that are not the page's white,
+# which is where the horizontal thumb is.
+h_thumb_span() {
+    local first="" last="" column rgb
+    DISPLAY=$display xwd -silent -id "$window" > "$dump"
+    for column in $(seq 0 8 $((width - 4))); do
+        rgb=$(python3 "$here/scripts/xwd-pixel.py" "$column" "$bottom" < "$dump")
+        if [ "$rgb" != "255 255 255" ]; then
+            [ -z "$first" ] && first=$column
+            last=$column
+        fi
+    done
+    echo "$first $last"
+}
+
+start_on "$wide" "Wide"
+# Where the red block lands once the page is scrolled as far right as it goes.
+# The fixture is 2208 wide including the body margin, the window is 800, so the
+# furthest left edge is 1408 — and the block at 1708..2108 shows at window
+# 300..700. A column outside that range would be white at both ends of the
+# track and the check would fail whether or not anything worked.
+probe_x=500
+probe_y=$((chrome + 200))
+red "$probe_x" "$probe_y" && fail "the far side of the page is already on \
+screen, so this check would pass without anything being scrolled"
+
+span=$(h_thumb_span)
+[ "$span" != " " ] || fail "no horizontal scrollbar on a page far wider than \
+the window"
+span_left=${span% *}
+
+# Grab the thumb and pull it to the right-hand end of the track.
+DISPLAY=$display xdotool mousemove $((span_left + 4)) "$bottom"
+sleep 0.3
+DISPLAY=$display xdotool mousedown 1
+for step in 200 400 600 780; do
+    DISPLAY=$display xdotool mousemove "$step" "$bottom"
+    sleep 0.2
+done
+DISPLAY=$display xdotool mouseup 1
+
+arrived=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    if red "$probe_x" "$probe_y"; then
+        arrived=yes
+        break
+    fi
+done
+[ -n "$arrived" ] || fail "dragging the horizontal thumb to the far right never \
+brought the right-hand side of the page onto the screen"
+echo "ok: a page wider than its window scrolls sideways by its own bar"
+
+# And Home comes back, which is the other half of being able to leave.
+focus_window
+DISPLAY=$display xdotool key Home
+returned=""
+for _ in $(seq 1 20); do
+    sleep 0.3
+    if ! red "$probe_x" "$probe_y"; then
+        returned=yes
+        break
+    fi
+done
+[ -n "$returned" ] || fail "Home did not bring the page back to its left edge"
+echo "ok: Home returns a sideways-scrolled page to its beginning"
+stop
+
+# N. The right-hand button over a picture saves it (#205).
+#
+#    The whole point of the feature is a file on the reader's disk, and nothing
+#    short of a real window can produce one: the menu has to open over the
+#    picture, the entry has to be where the menu drew it, choosing it has to
+#    fetch through the policy, and the bytes have to be written. The menu's
+#    contents are pinned by unit tests in `menu.rs` and the naming by
+#    `downloads.rs`; neither can see any of that.
+pictures=$(mktemp -d)
+saved="$pictures/saved"
+mkdir -p "$saved"
+python3 - "$pictures/green.png" <<'PNG'
+import struct, sys, zlib
+
+# A 60x60 solid green PNG, written by hand rather than pulled from a fixture
+# directory: the check needs a picture the browser can really decode, and four
+# lines of zlib is less to keep than a binary in the tree.
+width = height = 60
+raw = b"".join(b"\x00" + bytes([0x00, 0x80, 0x00] * width) for _ in range(height))
+
+
+def chunk(kind, body):
+    return (
+        struct.pack(">I", len(body))
+        + kind
+        + body
+        + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    )
+
+
+open(sys.argv[1], "wb").write(
+    b"\x89PNG\r\n\x1a\n"
+    + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(raw))
+    + chunk(b"IEND", b"")
+)
+PNG
+[ -s "$pictures/green.png" ] || fail "the fixture picture was not written, so \
+there is nothing on the page to point at"
+cat > "$pictures/p.html" <<'FIXTURE'
+<!doctype html>
+<title>Picture</title>
+<body style="margin: 0">
+<img src="green.png">
+</body>
+FIXTURE
+
+# Where the browser will put it. Read by `downloads::default_directory`, and
+# set here so the check writes into a temporary directory rather than into
+# whoever is running it.
+export XDG_DOWNLOAD_DIR="$saved"
+start_on "$pictures/p.html" "Picture"
+
+# Make sure the picture really rendered before pointing at it: a menu opened
+# over a page that has not drawn its image would offer nothing about pictures,
+# and the failure would read like a broken menu.
+drawn=""
+for _ in $(seq 1 20); do
+    if [ "$(pixel 30 $((chrome + 30)))" = "0 128 0" ]; then
+        drawn=yes
+        break
+    fi
+    sleep 0.2
+done
+[ -n "$drawn" ] || fail "the picture never drew, so a menu over it would have \
+nothing to say about pictures"
+
+[ -z "$(ls -A "$saved")" ] || fail "something was already in the downloads \
+directory, so the check below would pass without anything being saved"
+
+# The right-hand button over the picture, then the first row of the menu it
+# opens. With no link, no selection, nowhere to paste and nowhere to go back
+# to, `items_for` puts "Save image as…" first — which `menu.rs` pins.
+menu_x=30
+menu_y=$((chrome + 30))
+DISPLAY=$display xdotool mousemove "$menu_x" "$menu_y"
+sleep 0.3
+DISPLAY=$display xdotool click 3
+sleep 0.8
+# Down the middle of the first row. ROW is 26 in `menu.rs`, and the menu's
+# top-left corner is the pointer.
+DISPLAY=$display xdotool mousemove $((menu_x + 40)) $((menu_y + 13))
+sleep 0.3
+DISPLAY=$display xdotool click 1
+
+written=""
+for _ in $(seq 1 25); do
+    sleep 0.3
+    if [ -s "$saved/green.png" ]; then
+        written=yes
+        break
+    fi
+done
+[ -n "$written" ] || fail "choosing \"Save image as…\" wrote no file — the \
+menu entry did nothing, or it saved somewhere nobody asked for. Downloads \
+directory holds: $(ls -A "$saved" | tr '\n' ' ')"
+
+cmp -s "$saved/green.png" "$pictures/green.png" \
+    || fail "the saved file is not the picture that was on the page"
+echo "ok: the right-hand button over a picture saved it to disk"
+stop
+unset XDG_DOWNLOAD_DIR
+rm -rf "$pictures"
+
+# N. A tab waiting on a slow server does not freeze the window (#207).
+#
+#    The report was "if one tab is busy, it hangs the whole UI", and it was
+#    exactly right: every fetch used to happen inside the event handler that
+#    asked for it, so the one thread there is sat in a socket read for as long
+#    as the server took. Nothing drew, nothing scrolled, nothing answered.
+#
+#    Nothing short of a real window can show this. The fetch being off-thread is
+#    unit-tested, and that proves the worker answers — not that the *window*
+#    stayed alive while it did. So: point a tab at a server that takes its time,
+#    and while it is waiting, scroll the page that is already on screen and
+#    check the pixels moved.
+slow_port=8741
+python3 - "$slow_port" >/dev/null 2>&1 <<'SLOW' &
+import http.server, socketserver, sys, time
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        # Long enough that a browser which waited for it would be visibly dead
+        # for the whole of the check below, and short enough that the harness
+        # is not held up if something goes wrong.
+        time.sleep(6)
+        body = b"<title>Eventually</title><body><p>here at last</p></body>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as server:
+    server.serve_forever()
+SLOW
+slow_server=$!
+for _ in $(seq 1 40); do
+    (echo > "/dev/tcp/127.0.0.1/$slow_port") >/dev/null 2>&1 && break
+    sleep 0.25
+done
+
+# A page tall enough to scroll, so there is something to prove still works.
+start_on "$long" "Long"
+focus_window
+scroll_probe_x=$((width / 2))
+scroll_probe_y=$((chrome + 120))
+before=$(pixel "$scroll_probe_x" "$scroll_probe_y")
+
+# Send this tab somewhere slow. The address bar rather than a link, because
+# what is being tested is the navigation and not the click.
+DISPLAY=$display xdotool key ctrl+l
+sleep 0.4
+DISPLAY=$display xdotool key ctrl+a
+DISPLAY=$display xdotool type --delay 12 "http://127.0.0.1:$slow_port/slow"
+DISPLAY=$display xdotool key Return
+sleep 0.6
+
+# While that is in flight, scroll. A frozen window ignores this entirely.
+moved=""
+for _ in $(seq 1 12); do
+    DISPLAY=$display xdotool key Page_Down
+    sleep 0.2
+    if [ "$(pixel "$scroll_probe_x" "$scroll_probe_y")" != "$before" ]; then
+        moved=yes
+        break
+    fi
+done
+[ -n "$moved" ] || fail "the page did not scroll while a tab was waiting on a \
+slow server — the window is still blocking on the fetch"
+echo "ok: the window kept scrolling while a tab waited on a slow server"
+
+# And the slow page does eventually arrive, so this did not pass by the
+# navigation quietly never happening.
+arrived=""
+for _ in $(seq 1 40); do
+    sleep 0.5
+    case "$(DISPLAY=$display xdotool getwindowname "$window" 2>/dev/null || true)" in
+        *Eventually*) arrived=yes; break ;;
+    esac
+done
+[ -n "$arrived" ] || fail "the slow page never arrived, so the check above \
+proved only that nothing was ever fetched"
+echo "ok: and the slow page arrived once the server answered"
+stop
+kill "$slow_server" 2>/dev/null || true
 
 echo "all window click checks passed"

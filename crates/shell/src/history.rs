@@ -49,6 +49,21 @@ impl History {
         self.index = self.entries.len() - 1;
     }
 
+    /// Corrects where the current entry says the browser is.
+    ///
+    /// For a redirect, and only for a redirect. The entry was written from what
+    /// was asked for, and the server answered from somewhere else; leaving the
+    /// old address standing means the bar names one site while the page, the
+    /// padlock and every link on it belong to another. Back and Forward want
+    /// the corrected one too — returning to a redirect's starting point only
+    /// asks to be redirected again.
+    ///
+    /// Not `visit`: this is the same page arriving, not a second one, and
+    /// pushing an entry would make Back appear to do nothing.
+    pub fn arrived_at(&mut self, url: impl Into<String>) {
+        self.entries[self.index] = url.into();
+    }
+
     /// Steps back, returning where to go.
     pub fn back(&mut self) -> Option<&str> {
         self.index = self.index.checked_sub(1)?;

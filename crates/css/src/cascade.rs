@@ -76,54 +76,6 @@ impl StyleMap {
             style.display = crate::style::Display::None;
         }
     }
-
-    /// Holds a node's content at least `least` pixels from each side, leaving a
-    /// node that already asks for more alone.
-    ///
-    /// For the page gutter. The UA sheet's `body { margin: 8px }` is a default
-    /// and an author's `margin: 0` beats it, which leaves text against the
-    /// glass. What is wanted is a floor, and CSS has no way to write one: a UA
-    /// rule loses to the author, and an `!important` UA rule would win so hard
-    /// that a page could never ask for a *wider* margin either. So the floor is
-    /// applied after the cascade, like [`Self::hide`], instead of pretending to
-    /// be a stylesheet.
-    ///
-    /// The shortfall goes on the **padding**, and the margin the page asked for
-    /// counts towards the floor rather than being replaced by it. Padding is
-    /// inside the background where margin is outside it, and that is the whole
-    /// difference: a `body { margin: 0; background: navy }` page topped up with
-    /// margin is navy with a pale frame around it, which is precisely what the
-    /// gutter is not for. Topped up with padding it is navy to the glass with
-    /// its text held off — which is also what lets §14.2 hold without an
-    /// exception, since nothing then has to carry the body's background out to
-    /// the window on its behalf.
-    ///
-    /// `available_width` resolves a percentage, which has to be measured
-    /// against something before it can be compared with a length in pixels.
-    pub fn keep_off_the_edges(&mut self, node: NodeId, least: f32, available_width: f32) {
-        let Some(style) = self.styles.get_mut(&node) else {
-            return;
-        };
-        let font_size = style.font_size;
-        // An `auto` horizontal margin on a block of automatic width resolves to
-        // zero, so it has asked for nothing and the whole floor applies.
-        let px = |length: Length| match length {
-            Length::Auto => 0.0,
-            length => length.to_px(font_size, available_width),
-        };
-        // Unrolled rather than looped: two sides, and a loop over them needs
-        // either an enum or two mutable borrows of the same style.
-        let topped = |margin: Length, padding: Length| {
-            let short = least - px(margin) - px(padding);
-            (short > 0.0).then(|| Length::Px(px(padding) + short))
-        };
-        if let Some(left) = topped(style.margin.left, style.padding.left) {
-            style.padding.left = left;
-        }
-        if let Some(right) = topped(style.margin.right, style.padding.right) {
-            style.padding.right = right;
-        }
-    }
 }
 
 /// Sort key for a matched declaration, in increasing precedence order.
@@ -190,6 +142,27 @@ pub fn cascade_as(
     zoom: f32,
     colours: Colours,
 ) -> StyleMap {
+    cascade_with(
+        doc,
+        author_sheets,
+        zoom,
+        colours,
+        &crate::selector::VisitedLinks::none(),
+    )
+}
+
+/// The whole of it, plus which links have been followed (#181).
+///
+/// Separate from [`cascade_as`] because almost nothing has a history to offer:
+/// a caller with no reader behind it means "nothing followed", and saying so by
+/// omission is better than making every test construct an empty set.
+pub fn cascade_with(
+    doc: &Document,
+    author_sheets: &[Stylesheet],
+    zoom: f32,
+    colours: Colours,
+    visited: &crate::selector::VisitedLinks,
+) -> StyleMap {
     let ua = Stylesheet::parse(crate::ua::UA_STYLESHEET);
     let mut map = StyleMap::default();
     // The root carries the zoomed default, so an element that says nothing
@@ -213,6 +186,7 @@ pub fn cascade_as(
         // and changes how values parse (ADR-0004).
         quirks: doc.is_quirks(),
         zoom,
+        visited,
         colours,
     };
     let mut counters = Counters::default();
@@ -316,6 +290,29 @@ struct Rules<'a> {
     zoom: f32,
     /// Whose colours win where the markup names one.
     colours: Colours,
+    /// Which of this page's links the reader has already followed (#181).
+    visited: &'a crate::selector::VisitedLinks,
+}
+
+/// Whether a `:visited` rule may set this property.
+///
+/// The list every engine settled on: the colours, and nothing that changes a
+/// box's size, its font, or what it has to fetch. `border-color` is here in
+/// both its shorthand and its four sides, because a page that cannot colour a
+/// visited link's underline differently from its neighbour's is not obviously
+/// safer and is visibly worse.
+fn is_a_colour_property(name: &str) -> bool {
+    matches!(
+        name,
+        "color"
+            | "background-color"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "outline-color"
+    )
 }
 
 /// Whether a property names a colour the reader's sheet should be choosing.
@@ -421,9 +418,9 @@ fn addresses(doc: &Document, node: NodeId, rules: &Rules, which: PseudoElement) 
         .chain(rules.sheets.iter())
         .flat_map(|sheet| sheet.rules.iter())
         .any(|rule| {
-            rule.selectors
-                .iter()
-                .any(|selector| selector.pseudo == Some(which) && selector.matches(doc, node))
+            rule.selectors.iter().any(|selector| {
+                selector.pseudo == Some(which) && selector.matches(doc, node, rules.visited)
+            })
         })
 }
 
@@ -443,7 +440,7 @@ fn compute(
         .chain(rules.sheets.iter().map(|s| (s, Origin::Author)))
     {
         for rule in &sheet.rules {
-            let best = rule
+            let matching: Vec<_> = rule
                 .selectors
                 .iter()
                 // A rule addressing `::before` styles that box and nothing
@@ -451,11 +448,25 @@ fn compute(
                 // element and not its generated boxes. `matches` answers for
                 // the originating element in both cases, so this is the only
                 // thing keeping them apart.
-                .filter(|selector| selector.pseudo == pseudo && selector.matches(doc, node))
-                .map(|selector| selector.specificity())
-                .max();
+                .filter(|selector| {
+                    selector.pseudo == pseudo && selector.matches(doc, node, rules.visited)
+                })
+                .collect();
+            let best = matching.iter().map(|selector| selector.specificity()).max();
+            // A rule that reached this element *only* through `:visited` may
+            // set colours and nothing else. Where a page can read its own
+            // rendering back, anything else — a width, a font, a background
+            // image it has to fetch — turns "has this reader been there?" into
+            // a question the page can ask about any URL it likes, one link at a
+            // time. This browser runs no script (ADR-0003), so that channel is
+            // already shut; the restriction is kept anyway because it costs one
+            // predicate and it is the difference between shut and shut twice.
+            let restricted = !matching.is_empty() && matching.iter().all(|s| s.is_visited());
             if let Some(specificity) = best {
                 for declaration in &rule.declarations {
+                    if restricted && !is_a_colour_property(&declaration.name) {
+                        continue;
+                    }
                     order += 1;
                     matched.push((
                         Precedence {
@@ -1556,6 +1567,49 @@ impl Counters {
         }
     }
 
+    /// Drops a generated box's own reset where an enclosing instance remains.
+    ///
+    /// Blink's `RemoveCounterIfAncestorExists`, which it applies on leaving any
+    /// box that reset a counter: if the instance below this one on the stack
+    /// was created by an ancestor, this one can never be inherited by anything
+    /// that comes later — an ancestor's instance is always found first — so it
+    /// is dropped rather than left to shadow it.
+    ///
+    /// It is what tells these two apart, and nothing else does (#124):
+    ///
+    /// ```text
+    /// #a::before { counter-reset: c 7 }              a descendant of #a sees 7
+    /// #a { counter-reset: c 4 }
+    /// #a::before { counter-reset: c 9999 }           a descendant of #a sees 4
+    /// ```
+    ///
+    /// In the first the pseudo's instance is the only one, so it stays and is
+    /// what the element's content inherits. In the second `#a`'s own instance
+    /// is underneath it, so the pseudo's is dropped on the way out and the
+    /// content inherits `#a`'s. `counters-root-000` is the second shape, and
+    /// printed `19998.8` for a reference that says `4.8`.
+    ///
+    /// Only a *reset* creates an instance, so only a reset can leave one to
+    /// drop. An increment with no reset beside it acts on the enclosing
+    /// instance and is visible afterwards precisely because it never made one.
+    fn leave_generated(&mut self, style: &ComputedStyle, depth: usize) {
+        for (name, _) in &style.counter_reset {
+            let Some(at) = self
+                .instances
+                .iter()
+                .rposition(|instance| instance.name == *name && instance.depth == depth)
+            else {
+                continue;
+            };
+            let enclosed = self.instances[..at]
+                .iter()
+                .any(|instance| instance.name == *name && instance.depth < depth);
+            if enclosed {
+                self.instances.remove(at);
+            }
+        }
+    }
+
     /// Drops every instance whose scope ended when the walk left `depth`.
     fn leave(&mut self, depth: usize) {
         self.instances.retain(|instance| instance.depth <= depth);
@@ -1601,11 +1655,21 @@ impl Counters {
 /// is the style that is kept. Only a pseudo-element that declares one pays for
 /// it, which is nearly none of them.
 ///
-/// The operations are applied at the *element's* depth rather than a deeper
-/// one, because §12.4.1 scopes a reset to the box and its following siblings —
-/// and the following siblings of a `::before` box are the element's own
-/// content. A `div::before { counter-reset: n }` has to still be in scope for
-/// a `div div::before` inside it, which is what `counters()` prints as `0.0`.
+/// The operations are applied at the *pseudo-element's* depth — one deeper
+/// than the element it hangs off — because that is where its box actually is:
+/// a `::before` is the first child of its originating element, not a sibling
+/// of it. §12.4.1 scopes a reset to the box and its following siblings, and
+/// the following siblings of a `::before` box are the element's own content.
+/// So `div::before { counter-reset: n }` is still in scope for a
+/// `div div::before` inside it, which is what `counters()` prints as `0.0`,
+/// and is *not* in scope for a following sibling of the `div` — which it was
+/// when this ran at the element's own depth (#124).
+///
+/// Then [`Counters::leave_generated`] applies the other half of the rule. The
+/// two together are what Blink does, read out of `CountersAttachmentContext`
+/// rather than guessed at: it keeps one stack per counter name, pushes a
+/// pseudo-element's reset at the pseudo's own place in the layout tree, and
+/// pops it again on the way out when an enclosing instance remains.
 fn generated_box(
     doc: &Document,
     node: NodeId,
@@ -1626,8 +1690,11 @@ fn generated_box(
     {
         return generated.content.is_some().then_some(generated);
     }
-    step_counters(&generated, counters, depth);
+    step_counters(&generated, counters, depth + 1);
     let generated = compute(doc, node, parent_style, rules, counters, Some(which));
+    // After the content is resolved, not before: the pseudo's own `content`
+    // reads the counter it just set, which is §12.4's whole example.
+    counters.leave_generated(&generated, depth + 1);
     generated.content.is_some().then_some(generated)
 }
 
@@ -2062,20 +2129,16 @@ fn is_list_box(select: Option<&ElementData>) -> bool {
 
 /// Whether this is the one option a closed dropdown displays.
 ///
-/// The last option carrying `selected` wins, which is what browsers do with the
-/// malformed case of several; with none, the first option is shown, because
-/// that is what a dropdown opens on.
+/// The last option that is on wins, which is what browsers do with the
+/// malformed case of several `selected`; with none, the first option is shown,
+/// because that is what a dropdown opens on.
+///
+/// "On" rather than "carrying `selected`" because a reader can choose one, and
+/// then what the markup said is only where the dropdown started.
 fn is_shown_option(doc: &Document, select: NodeId, option: NodeId) -> bool {
     let mut options = Vec::new();
     collect_options(doc, select, &mut options);
-    let selected = options
-        .iter()
-        .rev()
-        .find(|&&id| {
-            doc.element(id)
-                .is_some_and(|element| element.attr("selected").is_some())
-        })
-        .copied();
+    let selected = options.iter().rev().find(|&&id| doc.is_on(id)).copied();
     match selected {
         Some(id) => id == option,
         None => options.first() == Some(&option),
@@ -4224,121 +4287,6 @@ mod tests {
         assert!(block.display.is_supported_layout());
     }
 
-    /// The body's style after the floor has been applied.
-    fn after_floor(css: &str, least: f32, available_width: f32) -> ComputedStyle {
-        let doc = dom::parse(&format!("<style>{css}</style><body>x</body>"));
-        let sheets = [Stylesheet::parse(css)];
-        let mut map = cascade(&doc, &sheets);
-        let body = doc.find_element("body").expect("a body");
-        map.keep_off_the_edges(body, least, available_width);
-        map.get(body).expect("a styled body").clone()
-    }
-
-    /// How far its content sits from each side of the window: the two edges
-    /// added together, which is the thing the floor is a floor on.
-    fn insets_after_floor(css: &str, least: f32, available_width: f32) -> (f32, f32) {
-        let style = after_floor(css, least, available_width);
-        let px = |length: Length| match length {
-            Length::Auto => 0.0,
-            length => length.to_px(style.font_size, available_width),
-        };
-        (
-            px(style.margin.left) + px(style.padding.left),
-            px(style.margin.right) + px(style.padding.right),
-        )
-    }
-
-    #[test]
-    fn the_edge_floor_holds_content_off_a_page_that_asked_for_nothing() {
-        assert_eq!(
-            insets_after_floor("body { margin: 0 }", 8.0, 400.0),
-            (8.0, 8.0)
-        );
-    }
-
-    #[test]
-    fn the_edge_floor_is_made_of_padding_so_a_background_still_reaches_the_glass() {
-        // The whole reason it is not margin. Margin is outside the background,
-        // so topping it up puts a pale frame around every `body { margin: 0 }`
-        // page that set a colour — which is the opposite of what a gutter is
-        // for, and left §14.2 needing an exception to paper over.
-        let style = after_floor("body { margin: 0 }", 8.0, 400.0);
-        assert_eq!(style.margin.left, Length::Px(0.0), "the margin was raised");
-        assert_eq!(style.padding.left, Length::Px(8.0));
-    }
-
-    #[test]
-    fn the_edge_floor_leaves_a_wider_margin_alone() {
-        // A floor that overwrote whatever it found would be a fixed margin, and
-        // would flatten every page's own spacing to the same eight pixels.
-        let style = after_floor("body { margin: 40px }", 8.0, 400.0);
-        assert_eq!(style.margin.left, Length::Px(40.0));
-        assert_eq!(
-            style.padding.left,
-            Length::Px(0.0),
-            "and adds nothing to it"
-        );
-    }
-
-    #[test]
-    fn the_edge_floor_counts_the_padding_a_page_already_asked_for() {
-        // The floor is on the distance from the glass, so a page that spent it
-        // on padding has already met it and a page that spent half of it needs
-        // only the other half.
-        let style = after_floor("body { margin: 0; padding: 0 20px }", 8.0, 400.0);
-        assert_eq!(style.padding.left, Length::Px(20.0), "padding was raised");
-
-        let topped = after_floor("body { margin: 0; padding: 0 3px }", 8.0, 400.0);
-        assert_eq!(
-            topped.padding.left,
-            Length::Px(8.0),
-            "3px plus the missing 5"
-        );
-    }
-
-    #[test]
-    fn the_edge_floor_measures_a_percentage_margin_before_judging_it() {
-        // 5% of 400px is 20px, which already clears the floor; 1% is 4px, which
-        // does not. Comparing the numbers unresolved would get both wrong.
-        let wide = after_floor("body { margin: 0 5% }", 8.0, 400.0);
-        assert_eq!(wide.margin.right, Length::Percent(5.0));
-        assert_eq!(
-            wide.padding.right,
-            Length::Px(0.0),
-            "a wide percentage was topped up anyway"
-        );
-
-        let narrow = after_floor("body { margin: 0 1% }", 8.0, 400.0);
-        assert_eq!(
-            narrow.padding.right,
-            Length::Px(4.0),
-            "1% of 400 is 4px, so 4 more are owed"
-        );
-    }
-
-    #[test]
-    fn the_edge_floor_treats_an_auto_margin_as_asking_for_nothing() {
-        // `margin: 0 auto` on a block of automatic width — which the body is —
-        // resolves to zero, so the page has asked for no room at all.
-        assert_eq!(
-            insets_after_floor("body { margin: 0 auto }", 8.0, 400.0),
-            (8.0, 8.0)
-        );
-    }
-
-    #[test]
-    fn the_edge_floor_ignores_the_vertical_margins() {
-        // The complaint is about text against the side of the window. Topping
-        // up the top margin as well would add a gap above every page.
-        let doc = dom::parse("<style>body { margin: 0 }</style><body>x</body>");
-        let sheets = [Stylesheet::parse("body { margin: 0 }")];
-        let mut map = cascade(&doc, &sheets);
-        let body = doc.find_element("body").expect("a body");
-        map.keep_off_the_edges(body, 8.0, 400.0);
-        let style = map.get(body).expect("a styled body");
-        assert_eq!(style.margin.top, Length::Px(0.0));
-        assert_eq!(style.margin.bottom, Length::Px(0.0));
-    }
     #[test]
     fn word_spacing_parses_like_letter_spacing() {
         let style = style_of("<p>x</p>", "p { word-spacing: 20px }", "p");
@@ -4399,5 +4347,220 @@ mod tests {
             "p",
         );
         assert_eq!(zero.outline.used_width(16.0), 0.0);
+    }
+
+    /// What a `.probe` element's `::before` prints, for the counter-scope
+    /// probes below.
+    fn probe(html: &str, css: &str) -> Option<String> {
+        let doc = dom::parse(html);
+        let map = cascade(&doc, &[Stylesheet::parse(css)]);
+        let node = (0..doc.len()).map(NodeId).find(|id| {
+            doc.element(*id)
+                .is_some_and(|element| element.classes().any(|c| c == "probe"))
+        })?;
+        map.pseudo(node, PseudoElement::Before)
+            .and_then(|style| style.content.clone())
+    }
+
+    /// The four probes #124 recorded against Chromium and could not reconcile.
+    ///
+    /// They are one model, and it is Blink's: a pseudo-element's counter
+    /// operations happen at the pseudo's own place in the tree — it is the
+    /// first child of its originating element, not a sibling of it — and on
+    /// leaving a box that reset a counter, the reset is dropped again if an
+    /// enclosing instance remains, because that one would always be inherited
+    /// first anyway.
+    #[test]
+    fn a_pseudo_elements_reset_is_in_scope_for_its_elements_content() {
+        assert_eq!(
+            probe(
+                "<div id=\"a\"><span class=\"probe\"></span></div>",
+                "#a::before { counter-reset: c 7; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("7"),
+            "the element's content is what follows the ::before box",
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_reset_does_not_reach_its_elements_siblings() {
+        // Unlike an element's own reset, which does. The pseudo's box is one
+        // level deeper, so the element's siblings are not its siblings — this
+        // is what running the operations at the element's depth got wrong.
+        assert_eq!(
+            probe(
+                "<div id=\"a\"></div><span class=\"probe\"></span>",
+                "#a::before { counter-reset: c 7; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("0"),
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_reset_gives_way_to_its_elements_own() {
+        // The case `counters-root-000` is built on, and the one that made this
+        // engine print `19998.8` where the reference says `4.8`. The pseudo's
+        // instance is dropped on the way out because the element's own is
+        // underneath it and would be inherited first regardless.
+        assert_eq!(
+            probe(
+                "<div id=\"a\"><span class=\"probe\"></span></div>",
+                "#a { counter-reset: c 4 } \
+                 #a::before { counter-reset: c 9999; counter-increment: c 1; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("4"),
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_increment_acts_on_the_instance_it_found() {
+        // And is visible afterwards, precisely because it never made an
+        // instance of its own for the rule above to drop.
+        assert_eq!(
+            probe(
+                "<div id=\"b\"><span class=\"probe\"></span></div>",
+                "#b { counter-reset: c 4 } \
+                 #b::before { counter-increment: c 1; content: \"\" } \
+                 .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("5"),
+        );
+    }
+
+    #[test]
+    fn a_pseudo_elements_reset_still_nests_for_counters() {
+        // The reading twenty-two `content-0NN` tests depend on: a
+        // `div::before` reset is still in scope for a `div div::before`
+        // inside it, and `counters()` prints both instances.
+        assert_eq!(
+            content_of(
+                "<div><div id=\"inner\">x</div></div>",
+                "div::before { counter-reset: n; content: counters(n, \".\") }",
+                "div",
+                PseudoElement::Before,
+            )
+            .as_deref(),
+            Some("0"),
+        );
+        let doc = dom::parse("<div><div id=\"inner\">x</div></div>");
+        let map = cascade(
+            &doc,
+            &[Stylesheet::parse(
+                "div::before { counter-reset: n; content: counters(n, \".\") }",
+            )],
+        );
+        let inner = (0..doc.len())
+            .map(NodeId)
+            .find(|id| doc.element(*id).is_some_and(|e| e.id() == Some("inner")))
+            .expect("the inner div");
+        assert_eq!(
+            map.pseudo(inner, PseudoElement::Before)
+                .and_then(|style| style.content.clone())
+                .as_deref(),
+            Some("0.0"),
+            "the outer pseudo's instance is still in scope for the inner one",
+        );
+    }
+
+    #[test]
+    fn an_elements_own_reset_still_reaches_its_following_siblings() {
+        // The half that must not change: §12.4.1 scopes an *element's* reset to
+        // the element, its following siblings, and their descendants.
+        assert_eq!(
+            probe(
+                "<div id=\"a\"></div><span class=\"probe\"></span>",
+                "#a { counter-reset: c 7 } .probe::before { content: counter(c) }",
+            )
+            .as_deref(),
+            Some("7"),
+        );
+    }
+
+    /// Styles the one link in `html`, told that it has been followed.
+    fn visited_link_style(html: &str, css: &str) -> ComputedStyle {
+        let doc = dom::parse(html);
+        let node = doc.find_element("a").expect("a link");
+        let visited: crate::selector::VisitedLinks = [node].into_iter().collect();
+        let sheets = [Stylesheet::parse(css)];
+        let map = cascade_with(&doc, &sheets, 1.0, Colours::Authors, &visited);
+        map.get(node).expect("the link is styled").clone()
+    }
+
+    #[test]
+    fn a_visited_rule_may_set_a_colour() {
+        let style = visited_link_style(
+            "<body><a href=\"/x\">x</a></body>",
+            "a:visited { color: #ff0000; background-color: #00ff00 }",
+        );
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
+        assert_eq!(style.background_color, Color::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn a_visited_rule_may_set_nothing_else() {
+        // The privacy rule (#181). Where a page can read its own rendering
+        // back, a width or a font behind `:visited` turns "has this reader been
+        // there?" into a question the page can ask about any URL it likes. This
+        // browser runs no script, so that channel is already shut; the
+        // restriction costs one predicate and shuts it twice.
+        let style = visited_link_style(
+            "<body><a href=\"/x\">x</a></body>",
+            "a:visited { color: #ff0000; width: 500px; font-size: 40px; \
+             display: block; margin-left: 30px }",
+        );
+        assert_eq!(style.color, Color::rgb(255, 0, 0), "the colour still wins");
+        assert_eq!(style.width, Length::Auto, "a width must not get through");
+        assert_eq!(style.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(style.display, Display::Inline);
+        assert_eq!(style.margin.left, Length::Px(0.0));
+    }
+
+    #[test]
+    fn a_rule_that_also_matches_without_visited_is_not_restricted() {
+        // `a, a:visited { … }` reaches this element both ways round. The
+        // restriction is about what `:visited` *reveals*, and a rule that
+        // applies to every link reveals nothing — holding it to colours would
+        // break ordinary pages for no gain.
+        let style = visited_link_style(
+            "<body><a href=\"/x\">x</a></body>",
+            "a, a:visited { width: 500px }",
+        );
+        assert_eq!(style.width, Length::Px(500.0));
+    }
+
+    #[test]
+    fn an_unvisited_link_takes_the_link_half() {
+        let doc = dom::parse("<body><a href=\"/x\">x</a></body>");
+        let node = doc.find_element("a").expect("a link");
+        let sheets = [Stylesheet::parse(
+            "a:link { color: #0000ff } a:visited { color: #ff0000 }",
+        )];
+        let nowhere = cascade_with(
+            &doc,
+            &sheets,
+            1.0,
+            Colours::Authors,
+            &crate::selector::VisitedLinks::none(),
+        );
+        assert_eq!(
+            nowhere.get(node).expect("styled").color,
+            Color::rgb(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn the_user_agent_sheet_makes_a_followed_link_purple() {
+        // The whole of what #181 asked for, with no author sheet at all.
+        let plain = style_of("<body><a href=\"/x\">x</a></body>", "", "a");
+        let followed = visited_link_style("<body><a href=\"/x\">x</a></body>", "");
+        assert_eq!(followed.color, Color::rgb(0x55, 0x1a, 0x8b));
+        assert_ne!(plain.color, followed.color);
     }
 }

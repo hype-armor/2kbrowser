@@ -72,6 +72,12 @@ pub fn agent() -> &'static Agent {
             // make a browser walk somewhere it was never pointed at. A handful
             // is every legitimate use.
             .max_redirects(8)
+            // A 4xx or a 5xx is a response, not a transport failure. Left as
+            // an error, `ureq` throws the body away with it — and the body is
+            // the page: a site's own "not found", a proxy's block notice, the
+            // sentence a server wrote to explain itself. This side decides what
+            // to do with a status; the library's job is to hand it over (#203).
+            .http_status_as_error(false)
             .build()
             .into()
     })
@@ -95,6 +101,7 @@ pub fn platform_agent() -> &'static Agent {
         Agent::config_builder()
             .tls_config(platform_tls_config())
             .max_redirects(8)
+            .http_status_as_error(false)
             .build()
             .into()
     })

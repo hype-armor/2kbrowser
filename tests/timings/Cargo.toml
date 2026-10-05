@@ -1,0 +1,18 @@
+[package]
+name = "timings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "timings"
+path = "src/main.rs"
+
+[dependencies]
+net = { path = "../../crates/net" }
+sandbox = { path = "../../crates/sandbox" }
+shell = { path = "../../crates/shell" }
+
+[lints]
+workspace = true

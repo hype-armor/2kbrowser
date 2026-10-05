@@ -105,14 +105,111 @@ pub struct Compound {
     pub classes: Vec<String>,
     /// Every `[attribute]` test in the compound.
     pub attributes: Vec<AttributeTest>,
+    /// Whether the compound carries `:root`.
+    ///
+    /// One of two pseudo-classes here, and only because it is decidable from
+    /// the tree alone: `:root` is the element with no element parent, which
+    /// this engine already knows at match time. `:hover` needs a pointer and
+    /// `:first-child` needs sibling counting that is a separate piece of work,
+    /// so those are still dropped by the arm below rather than half-answered.
+    pub root: bool,
+    /// Whether the compound carries `:link` or `:visited`, and which.
+    ///
+    /// The other decidable one, but not from the tree: whether a link has been
+    /// followed is the *parent's* knowledge, and it reaches the cascade as a
+    /// set of nodes rather than as history (#181). So this says what the
+    /// selector asked and the cascade answers it, which is the only split that
+    /// keeps a stranger's page from being handed somewhere the reader has been.
+    pub link: Option<LinkState>,
+}
+
+/// The links on this page the reader has already followed.
+///
+/// Node ids and not URLs, and that is the whole privacy design (#181). Working
+/// out which links have been followed needs the reader's history, which lives
+/// in the parent process; matching selectors happens in the child, which is
+/// rendering a stranger's document. Sending the history across would hand that
+/// stranger's renderer a list of everywhere its reader has been.
+///
+/// So the parent answers only about the links this page already contains — the
+/// child asks about the URLs it parsed out of the document, and gets back
+/// nothing it did not already know the existence of.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VisitedLinks(std::collections::HashSet<NodeId>);
+
+impl VisitedLinks {
+    /// Nothing followed, which is what every caller without a history means.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether this node is a link the reader has followed.
+    pub fn contains(&self, node: NodeId) -> bool {
+        self.0.contains(&node)
+    }
+
+    /// Records a followed link.
+    pub fn insert(&mut self, node: NodeId) {
+        self.0.insert(node);
+    }
+
+    /// How many there are.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether none were followed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<NodeId> for VisitedLinks {
+    fn from_iter<I: IntoIterator<Item = NodeId>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// Which half of `:link` / `:visited` a selector asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    /// `:link` — a link not yet followed.
+    Unvisited,
+    /// `:visited` — a link that has been.
+    Visited,
 }
 
 impl Compound {
     /// Whether this compound matches a single element, ignoring combinators.
-    fn matches(&self, doc: &Document, node: NodeId) -> bool {
+    fn matches(&self, doc: &Document, node: NodeId, visited: &VisitedLinks) -> bool {
         let Some(element) = doc.element(node) else {
             return false;
         };
+        // A link is a *source anchor*, which in HTML means an `a` or `area`
+        // carrying an `href` — an `<a name="top">` is an anchor and not a link,
+        // and neither half of `:link` / `:visited` matches it. Whether it has
+        // been followed is not in the document, so it arrives alongside.
+        if let Some(wanted) = self.link {
+            let is_link =
+                matches!(element.local_name(), "a" | "area") && element.attr("href").is_some();
+            if !is_link {
+                return false;
+            }
+            let followed = visited.contains(node);
+            if (wanted == LinkState::Visited) != followed {
+                return false;
+            }
+        }
+        // The element with no element above it. `<html>` on every ordinary
+        // page, and on a fragment rendered alone it is whatever the parser made
+        // the outermost element — which is the honest answer either way.
+        if self.root
+            && doc
+                .ancestors(node)
+                .any(|ancestor| doc.element(ancestor).is_some())
+        {
+            return false;
+        }
         if let Some(tag) = &self.tag
             && element.local_name() != tag
         {
@@ -140,6 +237,8 @@ impl Compound {
             && self.id.is_none()
             && self.classes.is_empty()
             && self.attributes.is_empty()
+            && !self.root
+            && self.link.is_none()
     }
 }
 
@@ -176,11 +275,25 @@ impl Selector {
         let mut out = Specificity::default();
         for (_, compound) in &self.parts {
             out.ids += u32::from(compound.id.is_some());
-            // An attribute selector counts at the same level as a class.
-            out.classes += (compound.classes.len() + compound.attributes.len()) as u32;
+            // An attribute selector counts at the same level as a class, and
+            // so does a pseudo-class — which is what `:root` is.
+            out.classes += (compound.classes.len()
+                + compound.attributes.len()
+                + usize::from(compound.root)
+                + usize::from(compound.link.is_some())) as u32;
             out.types += u32::from(compound.tag.is_some());
         }
         out
+    }
+
+    /// Whether any compound in this selector asked for `:visited`.
+    ///
+    /// The cascade uses it to hold such a rule to colours alone; see
+    /// `is_a_colour_property`.
+    pub fn is_visited(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|(_, compound)| compound.link == Some(LinkState::Visited))
     }
 
     /// Whether this selector matches `node`.
@@ -188,11 +301,14 @@ impl Selector {
     /// Evaluated right to left, which is what makes selector matching cheap:
     /// the rightmost compound rejects the overwhelming majority of candidates
     /// before any ancestor is touched.
-    pub fn matches(&self, doc: &Document, node: NodeId) -> bool {
+    ///
+    /// `visited` answers the half of `:link` / `:visited` the document cannot:
+    /// which of its links have been followed.
+    pub fn matches(&self, doc: &Document, node: NodeId, visited: &VisitedLinks) -> bool {
         let Some(last) = self.parts.last() else {
             return false;
         };
-        if !last.1.matches(doc, node) {
+        if !last.1.matches(doc, node, visited) {
             return false;
         }
 
@@ -209,7 +325,7 @@ impl Selector {
                     let Some(parent) = doc.node(current).parent else {
                         return false;
                     };
-                    if !compound.matches(doc, parent) {
+                    if !compound.matches(doc, parent, visited) {
                         return false;
                     }
                     current = parent;
@@ -218,7 +334,7 @@ impl Selector {
                     let Some(previous) = preceding_element(doc, current) else {
                         return false;
                     };
-                    if !compound.matches(doc, previous) {
+                    if !compound.matches(doc, previous, visited) {
                         return false;
                     }
                     current = previous;
@@ -233,7 +349,7 @@ impl Selector {
                         let Some(candidate) = ancestor else {
                             return false;
                         };
-                        if compound.matches(doc, candidate) {
+                        if compound.matches(doc, candidate, visited) {
                             current = candidate;
                             break;
                         }
@@ -452,9 +568,13 @@ fn parse_compound(input: &str) -> Option<Compound> {
     let mut chars = input.chars().peekable();
 
     // A leading type selector or `*`, if any.
+    //
+    // `:` ends it as well as `.`, `#` and `[`, or a bare `:root` would be read
+    // as a type selector named `:root` and rejected by the check below — which
+    // is what happened, so the rule was dropped rather than matched.
     let mut tag = String::new();
     while let Some(&c) = chars.peek() {
-        if c == '.' || c == '#' || c == '[' {
+        if c == '.' || c == '#' || c == '[' || c == ':' {
             break;
         }
         chars.next();
@@ -492,7 +612,7 @@ fn parse_compound(input: &str) -> Option<Compound> {
 
         let mut name = String::new();
         while let Some(&c) = chars.peek() {
-            if c == '.' || c == '#' || c == '[' {
+            if c == '.' || c == '#' || c == '[' || c == ':' {
                 break;
             }
             chars.next();
@@ -504,6 +624,22 @@ fn parse_compound(input: &str) -> Option<Compound> {
         match marker {
             '.' => compound.classes.push(name),
             '#' => compound.id = Some(name),
+            ':' if name.eq_ignore_ascii_case("root") => compound.root = true,
+            // Answered by the cascade rather than here: see `Compound::link`.
+            // A compound naming both is never matched by anything, which is
+            // correct — a link is followed or it is not.
+            ':' if name.eq_ignore_ascii_case("link") => {
+                if compound.link == Some(LinkState::Visited) {
+                    return None;
+                }
+                compound.link = Some(LinkState::Unvisited);
+            }
+            ':' if name.eq_ignore_ascii_case("visited") => {
+                if compound.link == Some(LinkState::Unvisited) {
+                    return None;
+                }
+                compound.link = Some(LinkState::Visited);
+            }
             // Pseudo-classes and anything else are out of scope; drop the whole
             // selector rather than match too broadly.
             _ => return None,
@@ -586,7 +722,11 @@ mod tests {
         let selectors = parse_selector_list(selector);
         doc.descendants(doc.root())
             .into_iter()
-            .filter(|&n| selectors.iter().any(|s| s.matches(doc, n)))
+            .filter(|&n| {
+                selectors
+                    .iter()
+                    .any(|s| s.matches(doc, n, &VisitedLinks::none()))
+            })
             .count()
     }
 
@@ -697,7 +837,7 @@ mod tests {
             .filter(|&n| {
                 parse_selector_list("div + div")
                     .iter()
-                    .any(|s| s.matches(&doc, n))
+                    .any(|s| s.matches(&doc, n, &VisitedLinks::none()))
             })
             .filter_map(|n| doc.element(n).and_then(|e| e.id().map(str::to_owned)))
             .collect();
@@ -756,5 +896,107 @@ mod tests {
                 "{selector} parsed"
             );
         }
+    }
+
+    #[test]
+    fn root_matches_the_element_with_no_element_above_it() {
+        let doc = dom::parse("<html><body><p>x</p></body></html>");
+        let selector = &parse_selector_list(":root")[0];
+        let html = doc.find_element("html").expect("an html element");
+        let body = doc.find_element("body").expect("a body");
+        assert!(selector.matches(&doc, html, &VisitedLinks::none()));
+        assert!(
+            !selector.matches(&doc, body, &VisitedLinks::none()),
+            ":root is not every element"
+        );
+    }
+
+    #[test]
+    fn root_was_being_read_as_a_type_selector_and_dropped() {
+        // The leading type selector ran to the first `.`, `#` or `[`, so a bare
+        // `:root` was read as a tag named ":root", failed the name check, and
+        // took its whole rule with it — which is why `:root { float: right }`
+        // did nothing at all (#128).
+        assert_eq!(parse_selector_list(":root").len(), 1);
+    }
+
+    #[test]
+    fn root_can_be_combined_the_way_any_compound_can() {
+        assert_eq!(parse_selector_list(":root p").len(), 1);
+        assert_eq!(parse_selector_list("html:root").len(), 1);
+    }
+
+    #[test]
+    fn a_pseudo_class_this_engine_cannot_answer_still_drops_its_selector() {
+        // `:root`, `:link` and `:visited` are here because they are decidable:
+        // the first from the tree alone, the other two from the tree plus what
+        // the parent says it has followed. The rest are not, and half-answering
+        // one matches too broadly.
+        for selector in [":hover", "p:first-child", "a:focus"] {
+            assert!(
+                parse_selector_list(selector).is_empty(),
+                "{selector} was accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_matches_the_half_it_is_in() {
+        let doc = dom::parse(
+            "<body><a href=\"/seen\">seen</a><a href=\"/new\">new</a>\
+             <a name=\"top\">anchor</a></body>",
+        );
+        let links: Vec<NodeId> = doc
+            .descendants(doc.root())
+            .into_iter()
+            .filter(|&n| doc.element(n).is_some_and(|e| e.local_name() == "a"))
+            .collect();
+        let (seen, new, anchor) = (links[0], links[1], links[2]);
+        let visited: VisitedLinks = [seen].into_iter().collect();
+
+        let unvisited = &parse_selector_list(":link")[0];
+        let followed = &parse_selector_list(":visited")[0];
+        assert!(followed.matches(&doc, seen, &visited));
+        assert!(!followed.matches(&doc, new, &visited));
+        assert!(unvisited.matches(&doc, new, &visited));
+        assert!(!unvisited.matches(&doc, seen, &visited));
+
+        // An `<a name="top">` is a destination, not a link. Neither half of the
+        // pair matches it, which is what keeps it from being painted as
+        // something you can follow.
+        assert!(!followed.matches(&doc, anchor, &visited));
+        assert!(!unvisited.matches(&doc, anchor, &visited));
+
+        // And with nothing followed, every link is unvisited.
+        let none = VisitedLinks::none();
+        assert!(unvisited.matches(&doc, seen, &none));
+        assert!(!followed.matches(&doc, seen, &none));
+    }
+
+    #[test]
+    fn a_compound_asking_for_both_halves_matches_nothing() {
+        // A link is followed or it is not, so `a:link:visited` is a selector
+        // that can never match. Dropped rather than answered, which is what
+        // this parser does with anything it cannot mean.
+        assert!(parse_selector_list("a:link:visited").is_empty());
+        assert!(parse_selector_list("a:visited:link").is_empty());
+    }
+
+    #[test]
+    fn a_visited_selector_is_recognisable_as_one() {
+        // What the cascade holds to colours alone.
+        assert!(parse_selector_list("a:visited")[0].is_visited());
+        assert!(parse_selector_list("div a:visited")[0].is_visited());
+        assert!(!parse_selector_list("a:link")[0].is_visited());
+        assert!(!parse_selector_list("a")[0].is_visited());
+    }
+
+    #[test]
+    fn root_counts_as_a_class_for_specificity() {
+        let root = parse_selector_list(":root")[0].specificity();
+        let tag = parse_selector_list("html")[0].specificity();
+        let class = parse_selector_list(".x")[0].specificity();
+        assert!(root > tag, "a pseudo-class outranks a type selector");
+        assert_eq!(root, class);
     }
 }

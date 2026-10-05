@@ -9,10 +9,20 @@
 //! because the document and the box tree stay on the far side of the boundary
 //! and are never sent. That is the point: the parent should not be parsing
 //! anything a stranger wrote.
+//!
+//! One message is no longer that shape, and it is worth saying so here rather
+//! than letting the sentence above quietly stop being true. ADR-0019 decided
+//! that the accessibility tree crosses as data, because the alternative is
+//! handing platform API handles to the sandboxed process. It is still not the
+//! document and still not the box tree — it is a flat list of roles, labels and
+//! rectangles, derived from both — but it is an arbitrary-depth structure with
+//! attacker-chosen text in it, which nothing else here is. [`crate::access`]
+//! holds it, and holds the four bounds that make it affordable.
 
 use layout::Rect;
 use net::{Origin, RequestKind, Scheme};
 
+use crate::access::Tree;
 use crate::wire::{Reader, WireError, Writer};
 
 /// How a page was rendered, as it crosses the boundary.
@@ -85,6 +95,21 @@ pub struct Missing {
     pub url: String,
 }
 
+/// A picture on the page, and the address it was fetched from (#205).
+///
+/// Travels outward with the page for the same reason the links do: the parent
+/// has no box tree — it is on the other side of the boundary — so a picture
+/// missing from this list is a picture the right-hand button has nothing to say
+/// about. The URL is already resolved, because resolving it needs the document
+/// that named it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    /// Where it is, in canvas coordinates.
+    pub rect: Rect,
+    /// The absolute URL it came from.
+    pub url: String,
+}
+
 /// A form the reader asked to send (#110).
 ///
 /// Assembled by the child, because the form is part of the document and the
@@ -104,6 +129,52 @@ pub struct Submission {
     pub post: bool,
     /// The successful controls, `application/x-www-form-urlencoded`.
     pub body: String,
+}
+
+/// What has the keyboard on the page, in as little detail as the parent needs.
+///
+/// This was one bit — "a control is taking the typing" — which was all the
+/// parent needed while only text fields could be focused. It cannot stay one
+/// bit now that a checkbox can be (#151): a focused checkbox takes keystrokes
+/// while having nothing to type, and Up and Down mean something to a focused
+/// `<select>` and nothing to a field, where they still scroll the page.
+///
+/// Three states and no more. *Which* control it is, what is in it and what it
+/// would send stay on the side that holds the document — what a reader is
+/// answering is the page's business (ADR-0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focused {
+    /// Nothing on the page. Every key is the window's.
+    Nothing,
+    /// A control being typed in, so a character is a character.
+    Typing,
+    /// A control that is pressed rather than typed in, so a space presses it
+    /// and the arrows move through what it offers.
+    Pressable,
+}
+
+/// A dropdown the reader has opened, and what is in it.
+///
+/// A closed `<select>` is a list nobody can see until it is opened, and there
+/// is nowhere on the page to open it — the list has to float over whatever is
+/// below. So the child says what the list holds and where the box is, and the
+/// parent draws it in the chrome's buffer beside the menu and the site panel,
+/// which is where everything that floats over a page already lives.
+///
+/// `node` is the child's own id for the `<select>`, echoed back untouched when
+/// a row is chosen. The parent does not read it and could not use it: it is an
+/// index into an arena on the other side of the boundary, and the child checks
+/// what it gets back rather than trusting it (ADR-0012).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dropdown {
+    /// The `<select>`'s box, in canvas coordinates, so the list opens under it.
+    pub rect: Rect,
+    /// The child's id for the `<select>`.
+    pub node: u32,
+    /// What each option reads as, in document order.
+    pub options: Vec<String>,
+    /// Which one it is currently open on.
+    pub on: u32,
 }
 
 /// A link's rectangle and where it leads.
@@ -128,6 +199,13 @@ pub struct Link {
     /// of the boundary. Sent with the link so that following one costs no
     /// round trip.
     pub jump_to: Option<f32>,
+    /// Whether the link sits in a `position: fixed` subtree, so its rectangle
+    /// is in *window* coordinates rather than document ones (#108).
+    ///
+    /// The parent turns a click into a document point by adding the scroll.
+    /// For a pinned link that is exactly wrong: the box stayed where it was,
+    /// so adding the scroll misses it by however far the page has moved.
+    pub pinned: bool,
 }
 
 fn write_rect(writer: &mut Writer, rect: &Rect) {
@@ -238,6 +316,14 @@ pub enum Key {
     },
     /// Give up the focus.
     Escape,
+    /// Move up: through a `<select>`'s options, without opening its list.
+    ///
+    /// Only sent when the page has a control focused that is pressed rather
+    /// than typed in, because otherwise the arrows are the window's and the
+    /// page scrolls under the caret (#151).
+    Up,
+    /// Move down, by the same rule.
+    Down,
 }
 
 impl Key {
@@ -273,6 +359,8 @@ impl Key {
                 writer.some(*back);
             }
             Key::Escape => writer.tag(9),
+            Key::Up => writer.tag(10),
+            Key::Down => writer.tag(11),
         }
     }
 
@@ -300,6 +388,8 @@ impl Key {
                 back: reader.some()?,
             },
             9 => Key::Escape,
+            10 => Key::Up,
+            11 => Key::Down,
             _ => return Err(WireError::Unknown),
         })
     }
@@ -344,12 +434,24 @@ pub enum ToChild {
         /// page as written.
         zoom: f32,
     },
+    /// Which of the URLs just asked about have been followed (#181).
+    ///
+    /// One flag per URL, matched by position, exactly as [`ToChild::Resources`]
+    /// answers a fetch. A reply of the wrong length is a parent that is not
+    /// what we think it is, and the child then treats every link as unvisited
+    /// rather than guessing which flag belonged to which URL.
+    Followed {
+        /// One per URL, in the order they were asked about.
+        visited: Vec<bool>,
+    },
     /// Paint a different band of the page already held.
     ///
     /// The point of the whole arrangement: the parse, the cascade, and the
     /// layout stay done, so moving down a long document costs only the pixels
     /// asked for. A band request never fetches anything.
     Band {
+        /// First document column to paint (#204).
+        left: u32,
         /// First document row to paint.
         top: u32,
         /// How many rows to paint.
@@ -366,6 +468,16 @@ pub enum ToChild {
         /// Where it is now.
         to: (f32, f32),
     },
+    /// Hand back whatever is selected inside the focused control, for the
+    /// clipboard.
+    ///
+    /// Asked only when the reader presses a copy chord, never on a render. What
+    /// is in a control is the page's business (ADR-0012) and the [`Focused`]
+    /// states are deliberately three bits of nothing; this is the one way text
+    /// leaves a control, and it leaves because a person asked for it — the same
+    /// shape as a form submission, where the untrusted side proposes and the
+    /// trusted side disposes.
+    CopyFocused,
     /// The answers to a [`ToParent::Fetch`], one per URL and in the same order.
     ///
     /// Order is the whole matching rule: the parent answers a batch with
@@ -397,11 +509,44 @@ pub enum ToChild {
         /// Where, in canvas coordinates.
         at: (f32, f32),
     },
-    /// A keystroke for whatever control is focused.
+    /// Keystrokes for whatever control is focused.
+    ///
+    /// A run of them rather than one, because a person types faster than a
+    /// page re-renders (#207). Every keystroke costs the child a whole
+    /// re-render — parse, cascade, layout, paint — so sending them one at a
+    /// time made a word cost as many renders as it had letters, and each of
+    /// those renders was work the next keystroke immediately invalidated.
+    /// Applied in order, then rendered once.
     Type {
-        /// What was pressed.
-        key: Key,
+        /// What was pressed, oldest first. Never empty.
+        keys: Vec<Key>,
     },
+    /// The reader picked a row out of a dropdown the child opened.
+    ///
+    /// `node` is the child's own id for the `<select>`, echoed back exactly as
+    /// it was sent. The parent never reads it and could not use it if it did.
+    /// The child checks that it still names a `<select>` and that the index is
+    /// one of its options, rather than trusting either: the parent is not the
+    /// untrusted side here, but a message is a message, and the check costs a
+    /// comparison.
+    Choose {
+        /// The `<select>` this is about, as the child named it.
+        node: u32,
+        /// Which of its options, in document order.
+        index: u32,
+    },
+    /// Asks for the page's accessibility tree (ADR-0019, #9).
+    ///
+    /// Asked rather than sent with every render, and that is a security
+    /// property as much as a saving: the tree is much the largest
+    /// attacker-chosen structure that crosses this boundary, so the parsing
+    /// surface it adds is not exercised at all until an assistive technology
+    /// has actually attached. A page costs nothing when nothing is using it.
+    ///
+    /// Answered from the page already held, like [`ToChild::Find`]. The
+    /// document and the box tree it is built from never cross, which is why
+    /// the only thing that can answer is the process holding them.
+    Accessibility,
 }
 
 impl ToChild {
@@ -448,10 +593,20 @@ impl ToChild {
                 writer.f32(at.0);
                 writer.f32(at.1);
             }
-            ToChild::Type { key } => {
-                writer.tag(7);
-                key.write(&mut writer);
+            ToChild::Accessibility => writer.tag(9),
+            ToChild::Choose { node, index } => {
+                writer.tag(8);
+                writer.u32(*node);
+                writer.u32(*index);
             }
+            ToChild::Type { keys } => {
+                writer.tag(7);
+                writer.u32(keys.len() as u32);
+                for key in keys {
+                    key.write(&mut writer);
+                }
+            }
+            ToChild::CopyFocused => writer.tag(11),
             ToChild::Select { from, to } => {
                 writer.tag(4);
                 writer.f32(from.0);
@@ -459,10 +614,18 @@ impl ToChild {
                 writer.f32(to.0);
                 writer.f32(to.1);
             }
-            ToChild::Band { top, height } => {
+            ToChild::Band { left, top, height } => {
                 writer.tag(3);
+                writer.u32(*left);
                 writer.u32(*top);
                 writer.u32(*height);
+            }
+            ToChild::Followed { visited } => {
+                writer.tag(10);
+                writer.u32(visited.len() as u32);
+                for followed in visited {
+                    writer.some(*followed);
+                }
             }
             ToChild::Resources { resources } => {
                 writer.tag(1);
@@ -537,15 +700,38 @@ impl ToChild {
                 query: reader.str()?,
             },
             3 => ToChild::Band {
+                left: reader.u32()?,
                 top: reader.u32()?,
                 height: reader.u32()?,
             },
             6 => ToChild::Focus {
                 at: (reader.f32()?, reader.f32()?),
             },
-            7 => ToChild::Type {
-                key: Key::read(&mut reader)?,
+            7 => {
+                // A count, not a plain `u32`: bounded by the bytes left, so a
+                // claim of four billion keystrokes cannot reserve for four
+                // billion keystrokes.
+                let count = reader.count()?;
+                let mut keys = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    keys.push(Key::read(&mut reader)?);
+                }
+                ToChild::Type { keys }
+            }
+            8 => ToChild::Choose {
+                node: reader.u32()?,
+                index: reader.u32()?,
             },
+            9 => ToChild::Accessibility,
+            10 => {
+                let count = reader.count()?;
+                let mut visited = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    visited.push(reader.some()?);
+                }
+                ToChild::Followed { visited }
+            }
+            11 => ToChild::CopyFocused,
             4 => ToChild::Select {
                 from: (reader.f32()?, reader.f32()?),
                 to: (reader.f32()?, reader.f32()?),
@@ -580,6 +766,20 @@ pub enum ToParent {
         /// subresource.
         kind: RequestKind,
     },
+    /// Asks which of these links the reader has already followed (#181).
+    ///
+    /// The direction is the point. The parent holds the history and could
+    /// simply send it, and must not: the child is rendering a stranger's
+    /// document, and a list of everywhere its reader has been is the last thing
+    /// it should hold. So the child asks about the URLs *it parsed out of this
+    /// page*, and the answer tells it nothing it did not already know existed.
+    ///
+    /// Bounded by the page: a document with ten thousand links asks about ten
+    /// thousand URLs, and each one was already in the bytes the child was sent.
+    Visited {
+        /// Absolute URLs, resolved by the child against the document.
+        urls: Vec<String>,
+    },
     /// The finished page.
     Rendered(Box<Rendered>),
     /// Rendering failed.
@@ -592,6 +792,11 @@ pub enum ToParent {
         /// One rectangle per match, in document order.
         rects: Vec<Rect>,
     },
+    /// The page's accessibility tree (ADR-0019, #9).
+    ///
+    /// Boxed for the reason `Rendered` is: this is by far the largest variant,
+    /// and every other one would be as big as it in every message otherwise.
+    Accessible(Box<Tree>),
     /// What a [`ToChild::Select`] drag covers.
     Selected {
         /// One rectangle per line it touches, to draw the highlight with.
@@ -616,8 +821,12 @@ pub struct Rendered {
     pub height: u32,
     /// The document row `pixels` starts at.
     pub top: u32,
+    /// The document column `pixels` starts at (#204).
+    pub left: u32,
     /// Height of the content, which may exceed the canvas.
     pub content_height: f32,
+    /// Width of the content, which may exceed the canvas (#204).
+    pub content_width: f32,
     /// How it was rendered (ADR-0009).
     pub mode: Mode,
     /// The page's `<title>`, when it had one.
@@ -632,6 +841,13 @@ pub struct Rendered {
     /// side, so the placeholder these describe says `Load image` rather than
     /// naming a reason it does not have.
     pub missing: Vec<Missing>,
+    /// Every picture on the page, with the address it came from (#205).
+    ///
+    /// Whether it arrived or not, which is what makes this a different list
+    /// from `missing` rather than a longer one: that list is the placeholders a
+    /// press can retry, and this is every picture a reader can point at, so the
+    /// right-hand button has something to offer over one.
+    pub pictures: Vec<Picture>,
     /// Whether there is a fallback decision to overrule.
     pub can_toggle_layout: bool,
     /// Where this page's buttons are, in document order (#110).
@@ -641,6 +857,15 @@ pub struct Rendered {
     /// could reach a button. Rectangles only: which form each belongs to and
     /// what it would send stays on the side that holds the document.
     pub buttons: Vec<Rect>,
+    /// Where this page's other pressable controls are: a checkbox, a radio, a
+    /// `<select>`.
+    ///
+    /// Separate from `buttons` because they answer a press differently — one
+    /// sends a form and one changes what a form would send — and because the
+    /// parent asks a different question of each. Rectangles only, like the
+    /// buttons: which control each is, and what pressing it does, stays on the
+    /// side that holds the document.
+    pub pressables: Vec<Rect>,
     /// A form the reader asked to send, if they did (#110).
     ///
     /// Answered with the render rather than as a message of its own, because
@@ -648,13 +873,18 @@ pub struct Rendered {
     /// navigation is being asked for. The parent reads it after the pixels and
     /// decides.
     pub submit: Option<Submission>,
-    /// Whether a form control on this page currently has the typing (#110).
+    /// A dropdown the reader pressed, waiting to be drawn over the page.
     ///
-    /// One bit, and deliberately no more: the parent needs to know whether a
-    /// keystroke belongs to the page or to the window, and has no business
-    /// knowing which field it is or what is in it. What a reader types into a
-    /// page is the page's business.
-    pub editing: bool,
+    /// Answered with the render for the same reason `submit` is: a press
+    /// happened, the page itself did not change, and something outside it is
+    /// being asked for.
+    pub open: Option<Dropdown>,
+    /// What on this page has the keyboard (#110, #151).
+    ///
+    /// The parent needs to know whether a keystroke belongs to the page or to
+    /// the window, and which keys the page would even use. It has no business
+    /// knowing which control it is or what is in it.
+    pub focused: Focused,
     /// How many images were fetched and decoded for this page.
     ///
     /// A diagnostic rather than something the window uses: `2kbrowser render`
@@ -692,7 +922,9 @@ impl ToParent {
                 writer.u32(page.width);
                 writer.u32(page.height);
                 writer.u32(page.top);
+                writer.u32(page.left);
                 writer.f32(page.content_height);
+                writer.f32(page.content_width);
                 page.mode.write(&mut writer);
                 writer.some(page.title.is_some());
                 if let Some(title) = &page.title {
@@ -707,14 +939,24 @@ impl ToParent {
                     if let Some(top) = link.jump_to {
                         writer.f32(top);
                     }
+                    writer.some(link.pinned);
                 }
                 writer.u32(page.missing.len() as u32);
                 for missing in &page.missing {
                     write_rect(&mut writer, &missing.rect);
                     writer.str(&missing.url);
                 }
+                writer.u32(page.pictures.len() as u32);
+                for picture in &page.pictures {
+                    write_rect(&mut writer, &picture.rect);
+                    writer.str(&picture.url);
+                }
                 writer.u32(page.buttons.len() as u32);
                 for rect in &page.buttons {
+                    write_rect(&mut writer, rect);
+                }
+                writer.u32(page.pressables.len() as u32);
+                for rect in &page.pressables {
                     write_rect(&mut writer, rect);
                 }
                 writer.some(page.submit.is_some());
@@ -723,8 +965,22 @@ impl ToParent {
                     writer.some(submit.post);
                     writer.str(&submit.body);
                 }
+                writer.some(page.open.is_some());
+                if let Some(open) = &page.open {
+                    write_rect(&mut writer, &open.rect);
+                    writer.u32(open.node);
+                    writer.u32(open.options.len() as u32);
+                    for option in &open.options {
+                        writer.str(option);
+                    }
+                    writer.u32(open.on);
+                }
                 writer.some(page.can_toggle_layout);
-                writer.some(page.editing);
+                writer.tag(match page.focused {
+                    Focused::Nothing => 0,
+                    Focused::Typing => 1,
+                    Focused::Pressable => 2,
+                });
                 writer.u32(page.images_loaded);
                 writer.u32(page.background);
             }
@@ -737,6 +993,17 @@ impl ToParent {
                 writer.u32(rects.len() as u32);
                 for rect in rects {
                     write_rect(&mut writer, rect);
+                }
+            }
+            ToParent::Accessible(tree) => {
+                writer.tag(5);
+                tree.write(&mut writer);
+            }
+            ToParent::Visited { urls } => {
+                writer.tag(6);
+                writer.u32(urls.len() as u32);
+                for url in urls {
+                    writer.str(url);
                 }
             }
             ToParent::Selected { rects, text } => {
@@ -777,7 +1044,9 @@ impl ToParent {
                 let width = reader.u32()?;
                 let height = reader.u32()?;
                 let top = reader.u32()?;
+                let left = reader.u32()?;
                 let content_height = reader.f32()?;
+                let content_width = reader.f32()?;
                 let mode = Mode::read(&mut reader)?;
                 let title = if reader.some()? {
                     Some(reader.str()?)
@@ -795,6 +1064,7 @@ impl ToParent {
                         url: reader.str()?,
                         group: reader.u32()?,
                         jump_to: reader.some()?.then(|| reader.f32()).transpose()?,
+                        pinned: reader.some()?,
                     });
                 }
                 let count = reader.count()?;
@@ -806,9 +1076,22 @@ impl ToParent {
                     });
                 }
                 let count = reader.count()?;
+                let mut pictures = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    pictures.push(Picture {
+                        rect: read_rect(&mut reader)?,
+                        url: reader.str()?,
+                    });
+                }
+                let count = reader.count()?;
                 let mut buttons = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     buttons.push(read_rect(&mut reader)?);
+                }
+                let count = reader.count()?;
+                let mut pressables = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    pressables.push(read_rect(&mut reader)?);
                 }
                 let submit = if reader.some()? {
                     Some(Submission {
@@ -819,8 +1102,32 @@ impl ToParent {
                 } else {
                     None
                 };
+                let open = if reader.some()? {
+                    let rect = read_rect(&mut reader)?;
+                    let node = reader.u32()?;
+                    // A count, so a claim of four billion options cannot
+                    // reserve for four billion options.
+                    let count = reader.count()?;
+                    let mut options = Vec::with_capacity(count.min(1024));
+                    for _ in 0..count {
+                        options.push(reader.str()?);
+                    }
+                    Some(Dropdown {
+                        rect,
+                        node,
+                        options,
+                        on: reader.u32()?,
+                    })
+                } else {
+                    None
+                };
                 let can_toggle_layout = reader.some()?;
-                let editing = reader.some()?;
+                let focused = match reader.tag()? {
+                    0 => Focused::Nothing,
+                    1 => Focused::Typing,
+                    2 => Focused::Pressable,
+                    _ => return Err(WireError::Unknown),
+                };
                 let images_loaded = reader.u32()?;
                 // Masked rather than rejected: the child is the untrusted side,
                 // and a stray high byte here is a colour question, not a
@@ -842,15 +1149,20 @@ impl ToParent {
                     width,
                     height,
                     top,
+                    left,
                     content_height,
+                    content_width,
                     mode,
                     title,
                     links,
                     missing,
+                    pictures,
                     buttons,
+                    pressables,
                     submit,
+                    open,
                     can_toggle_layout,
-                    editing,
+                    focused,
                     images_loaded,
                     background,
                 }))
@@ -882,6 +1194,18 @@ impl ToParent {
                     text: reader.str()?,
                 }
             }
+            5 => ToParent::Accessible(Box::new(Tree::read(&mut reader)?)),
+            6 => {
+                // A count, for the reason the two above give: bounded by the
+                // bytes left, so a claim of four billion links cannot reserve
+                // for four billion links.
+                let count = reader.count()?;
+                let mut urls = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    urls.push(reader.str()?);
+                }
+                ToParent::Visited { urls }
+            }
             _ => return Err(WireError::Unknown),
         };
         reader.finish()?;
@@ -899,7 +1223,9 @@ mod tests {
             width,
             height,
             top: 0,
+            left: 0,
             content_height: 123.5,
+            content_width: 456.25,
             mode: Mode::Document {
                 unsupported_share: 0.42,
             },
@@ -914,6 +1240,16 @@ mod tests {
                 url: "https://example.com/".to_owned(),
                 group: 0,
                 jump_to: Some(920.0),
+                pinned: true,
+            }],
+            pictures: vec![Picture {
+                rect: Rect {
+                    x: 9.0,
+                    y: 10.0,
+                    width: 50.0,
+                    height: 50.0,
+                },
+                url: "https://example.com/arrived.png".to_owned(),
             }],
             missing: vec![Missing {
                 rect: Rect {
@@ -936,7 +1272,9 @@ mod tests {
                 body: "q=tables".to_owned(),
             }),
             can_toggle_layout: true,
-            editing: false,
+            open: None,
+            pressables: Vec::new(),
+            focused: Focused::Nothing,
             images_loaded: 3,
             background: 0x001c_1b22,
         }
@@ -1092,8 +1430,12 @@ mod tests {
 
     #[test]
     fn an_unknown_tag_is_refused_rather_than_ignored() {
-        assert_eq!(ToChild::decode(&[9]), Err(WireError::Unknown));
-        assert_eq!(ToParent::decode(&[9]), Err(WireError::Unknown));
+        // Well past the tags either side uses, and deliberately not "one more
+        // than the last one": this test used tag 9 until #9's accessibility
+        // request became tag 9, at which point it was asserting that a message
+        // the wire knows is a message the wire does not.
+        assert_eq!(ToChild::decode(&[200]), Err(WireError::Unknown));
+        assert_eq!(ToParent::decode(&[200]), Err(WireError::Unknown));
         assert_eq!(ToParent::decode(&[]), Err(WireError::Truncated));
     }
 
@@ -1147,19 +1489,79 @@ mod tests {
     #[test]
     fn a_link_count_larger_than_the_frame_is_refused() {
         // Hand-built: claim a billion links in a frame with room for none.
+        //
+        // The fields up to the count are written out one by one because they
+        // have to be *got past* — the reader is a stream, so a frame that does
+        // not spell them exactly runs out before it reaches the count and comes
+        // back `Truncated`, which is a different refusal from the one this is
+        // about. That makes this a mirror of the encoder above, and a field
+        // added there has to be added here too.
         let mut writer = Writer::new();
         writer.tag(1);
         writer.bytes(&[]);
-        writer.u32(0);
-        writer.u32(0);
-        writer.u32(0);
-        writer.f32(0.0);
-        writer.tag(0);
-        writer.some(false);
+        writer.u32(0); // width
+        writer.u32(0); // height
+        writer.u32(0); // top
+        writer.u32(0); // left
+        writer.f32(0.0); // content height
+        writer.f32(0.0); // content width
+        writer.tag(0); // mode
+        writer.some(false); // no title
         writer.u32(1_000_000_000);
         assert_eq!(
             ToParent::decode(&writer.finish()),
             Err(WireError::BadLength)
         );
+    }
+
+    fn box_() -> Rect {
+        Rect {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+        }
+    }
+
+    #[test]
+    fn an_accessibility_request_and_its_answer_survive_the_wire() {
+        assert_eq!(
+            ToChild::decode(&ToChild::Accessibility.encode()),
+            Ok(ToChild::Accessibility),
+        );
+        let tree = crate::access::Tree {
+            nodes: vec![
+                crate::access::Node {
+                    name: "A page".to_owned(),
+                    children: 1,
+                    ..crate::access::Node::new(crate::access::Role::Document, box_())
+                },
+                crate::access::Node {
+                    name: "Next".to_owned(),
+                    value: Some("/next".to_owned()),
+                    ..crate::access::Node::new(crate::access::Role::Link, box_())
+                },
+            ],
+            focus: Some(1),
+        };
+        let message = ToParent::Accessible(Box::new(tree));
+        assert_eq!(ToParent::decode(&message.encode()), Ok(message));
+    }
+
+    #[test]
+    fn an_accessibility_frame_that_breaks_a_bound_is_refused() {
+        // The bounds are enforced where the bytes are read, not somewhere the
+        // caller has to remember to look — so this is the same `decode` every
+        // other message goes through, answering `Err` rather than handing back
+        // a tree with a hole in it.
+        let tree = crate::access::Tree {
+            nodes: vec![crate::access::Node {
+                name: "a".repeat(crate::access::MAX_STRING + 1),
+                ..crate::access::Node::new(crate::access::Role::Text, box_())
+            }],
+            focus: None,
+        };
+        let frame = ToParent::Accessible(Box::new(tree)).encode();
+        assert_eq!(ToParent::decode(&frame), Err(WireError::BadLength));
     }
 }

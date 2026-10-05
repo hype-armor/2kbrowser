@@ -413,14 +413,24 @@ fn a_point_on_a_link_finds_it_and_a_point_beside_it_does_not() {
     let links = page.links();
     let rect = links[0].rects[0];
 
-    let hit = page.link_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let hit = page.link_at(
+        rect.x + rect.width / 2.0,
+        rect.y + rect.height / 2.0,
+        (0.0, 0.0),
+    );
     assert!(
         hit.is_some_and(|url| url.ends_with("/there.html")),
         "{hit:?}"
     );
 
-    assert_eq!(page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0), None);
-    assert_eq!(page.link_at(rect.x, rect.y + rect.height + 200.0), None);
+    assert_eq!(
+        page.link_at(rect.x + rect.width + 80.0, rect.y + 2.0, (0.0, 0.0)),
+        None
+    );
+    assert_eq!(
+        page.link_at(rect.x, rect.y + rect.height + 200.0, (0.0, 0.0)),
+        None
+    );
 }
 
 #[test]
@@ -1316,7 +1326,7 @@ fn a_page_taller_than_its_band_is_still_scrollable_to_the_end() {
 
     // And the last rows of the document are reachable.
     let last = page.content_height() as u32 - 100;
-    page.request_band(last, 300).expect("asks");
+    page.request_band(0, last, 300).expect("asks");
     let arrived = loop {
         if page.accept_band() {
             break true;
@@ -1499,7 +1509,9 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
         (400, 250),
         (whole.height - 30, 90),
     ] {
-        let band = session.band(top, height).expect("the child paints a band");
+        let band = session
+            .band(0, top, height)
+            .expect("the child paints a band");
         assert_eq!(band.top, top);
         assert_eq!(band.width, whole.width);
         // Clipped to what the document has below `top`, exactly as a first
@@ -1522,7 +1534,7 @@ fn a_band_fetched_over_the_pipe_is_the_rows_it_names() {
     // A band is pixels, not a re-render: what the parent knows about the page
     // must survive one. A band that blanked the title or the links would empty
     // the tab strip and every keyboard target on the page.
-    let band = session.band(0, 100).expect("paints");
+    let band = session.band(0, 0, 100).expect("paints");
     assert_eq!(band.links.len(), whole.links.len());
     assert_eq!(band.title, whole.title);
     assert_eq!(band.can_toggle_layout, whole.can_toggle_layout);
@@ -1558,6 +1570,101 @@ fn tall_session(lines: usize, width: u32) -> (sandbox::Session, sandbox::Rendere
         .expect("the renderer opens the page")
 }
 
+/// A page wider than any window, in a live session (#204).
+fn wide_session(width: u32) -> (sandbox::Session, sandbox::Rendered) {
+    // A fixed-size box four times the viewport, with something drawn at its far
+    // end so that a band over there has ink in it rather than canvas.
+    let html = "<body bgcolor=\"#eef\"><div style=\"width: 1200px\">\
+         <div style=\"width: 200px; height: 40px; background: #f00; \
+         margin-left: 980px\"></div>\
+         <p>left edge</p></div></body>"
+        .to_owned();
+    let dir = std::env::temp_dir().join("2kbrowser-band-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("wide.html");
+    std::fs::write(&path, &html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")))
+        .open(
+            html.as_bytes().to_vec(),
+            None,
+            width,
+            0,
+            8000,
+            Some(origin),
+            at,
+            false,
+            false,
+            1.0,
+        )
+        .expect("the renderer opens the page")
+}
+
+#[test]
+fn a_page_wider_than_the_window_says_so_and_can_be_painted_from_the_right() {
+    // #204 end to end, across the real process boundary: the child has to
+    // report a width beyond its canvas, and answer a band asked for at a
+    // column other than zero.
+    let window = 300;
+    let (mut session, whole) = wide_session(window);
+    assert_eq!(whole.left, 0, "a page opens at its left edge");
+    assert_eq!(
+        whole.width, window,
+        "the canvas is still the window's width"
+    );
+    assert!(
+        whole.content_width > window as f32 * 3.0,
+        "a 1200px box in a {window}px window reported {} of content",
+        whole.content_width
+    );
+
+    // The fixture puts a red box at 980..1180, which no part of the window's
+    // first 300 columns can show. Counting its ink is what says the band came
+    // from where it was asked for — comparing two bands for mere inequality
+    // would pass on their lengths differing and prove nothing. Red rather than
+    // a dark grey because the page's own text is ink too, and counting that
+    // would have found a hundred and fifty pixels of "left edge".
+    let red = |band: &sandbox::Rendered| {
+        band.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[0] > 0xc0 && pixel[1] < 0x50 && pixel[2] < 0x50)
+            .count()
+    };
+
+    let near = session
+        .band(0, 0, 120)
+        .expect("paints the left of the page");
+    assert_eq!(red(&near), 0, "the red box is not in the first window");
+
+    let far = session
+        .band(900, 0, 120)
+        .expect("the child paints a band from the right of the page");
+    assert_eq!(far.left, 900);
+    assert_eq!(
+        far.width, window,
+        "a band is the window's width wherever it is"
+    );
+    assert_eq!(
+        far.content_width, whole.content_width,
+        "moving across the page changed how wide it is"
+    );
+    // 200 wide and 40 tall, of which columns 980..1180 fall inside the window
+    // at 900..1200 — all 200 of them.
+    assert!(
+        red(&far) > 200 * 30,
+        "a band at 900 found {} red pixels, so it painted the wrong columns",
+        red(&far)
+    );
+
+    // And going back is the page as it was. The display list does not change
+    // between bands, so this must be exact rather than merely similar.
+    let back = session.band(0, 0, 120).expect("paints");
+    assert_eq!(back.pixels, near.pixels);
+}
+
 #[test]
 fn a_band_asked_for_speculatively_arrives_without_being_waited_on() {
     // The point of putting the conversation on a thread. A reader approaching
@@ -1572,7 +1679,7 @@ fn a_band_asked_for_speculatively_arrives_without_being_waited_on() {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
 
-    session.request_band(200, 150).expect("asks");
+    session.request_band(0, 200, 150).expect("asks");
     assert!(session.band_outstanding(), "the band should be in flight");
 
     let band = loop {
@@ -1609,7 +1716,7 @@ fn a_blocking_question_does_not_swallow_a_band_in_flight() {
     // which is not a rare combination.
     let (mut session, _) = tall_session(120, 300);
 
-    session.request_band(300, 120).expect("asks for a band");
+    session.request_band(0, 300, 120).expect("asks for a band");
     let matches = session.find("line 7").expect("the child answers");
     assert!(!matches.is_empty(), "the fixture should contain the query");
 
@@ -1873,6 +1980,74 @@ fn an_image_that_loaded_leaves_no_placeholder() {
     );
 }
 
+#[test]
+fn a_picture_that_loaded_can_still_be_pointed_at() {
+    // #205, end to end. The window has no box tree — it is on the other side of
+    // the boundary — so a picture missing from the list the child sends is a
+    // picture the right-hand button has nothing to say about. The placeholder
+    // list is no help here by design: this picture arrived, so it is not in it.
+    let dir = std::env::temp_dir().join("2kbrowser-picture-menu");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("dot.png"), solid_png(40, 40, (0, 0x80, 0))).expect("write");
+    let path = dir.join("page.html");
+    let html = "<body style=\"margin: 0\"><img src=\"dot.png\"></body>";
+    std::fs::write(&path, html).expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+    let expected = net::file_url(&dir.join("dot.png"));
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: html.as_bytes().to_vec(),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        400,
+        400,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens");
+
+    assert_eq!(page.images_loaded(), 1, "the image was never fetched");
+    assert_eq!(
+        page.missing_at(20.0, 20.0),
+        None,
+        "a picture that arrived is not a placeholder"
+    );
+    assert_eq!(
+        page.picture_at(20.0, 20.0),
+        Some(expected.as_str()),
+        "a picture that arrived could not be pointed at, so the menu has \
+         nothing to offer over it"
+    );
+    assert_eq!(
+        page.picture_at(1000.0, 1000.0),
+        None,
+        "a point nowhere near the picture answered anyway"
+    );
+}
+
+#[test]
+fn a_picture_that_was_refused_can_be_pointed_at_too() {
+    // A placeholder is still something a reader can ask to save. Refusing to
+    // offer would be the browser deciding on their behalf that a fetch the
+    // policy stopped cannot be asked for by other means (ADR-0006).
+    let page = viewport(
+        "<body><img src=\"https://cdn.example.net/photo.jpg\" width=\"240\" \
+         height=\"160\"></body>",
+        400,
+    );
+    assert_eq!(
+        page.picture_at(20.0, 20.0),
+        Some("https://cdn.example.net/photo.jpg")
+    );
+}
+
 /// A cheap digest of a page's pixels.
 ///
 /// Compared instead of the buffers themselves because a failed comparison of
@@ -1896,6 +2071,60 @@ fn form_page(width: u32) -> shell::viewport::Viewport {
          </body>",
         width,
     )
+}
+
+#[test]
+fn a_burst_of_typing_is_one_render_and_arrives_in_order() {
+    // #207, end to end through a real child. A person types faster than a page
+    // re-renders, and every keystroke used to cost a whole one — so a word cost
+    // as many renders as it had letters, each of them invalidated by the next.
+    //
+    // Sent as a run and asked for without waiting. What this proves is the part
+    // that could go wrong silently: that the letters are applied in the order
+    // they were typed, and that one run is one answer rather than five.
+    let mut page = form_page(400);
+    assert!(
+        page.focus_at(20.0, 10.0),
+        "pressing the field focused nothing"
+    );
+
+    let before = look(&page);
+    let word = ["z", "y", "x"];
+    page.request_type(
+        word.iter()
+            .map(|letter| sandbox::message::Key::Insert((*letter).to_owned()))
+            .collect(),
+    );
+    assert!(
+        page.typing_outstanding(),
+        "the run was not sent, or was waited for after all"
+    );
+
+    let mut answers = 0;
+    while page.typing_outstanding() {
+        if page.accept_typed() {
+            answers += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(answers, 1, "three letters came back as {answers} renders");
+    assert_ne!(look(&page), before, "the typing never reached the page");
+
+    // In order. The field started as `Ada`, so a run applied backwards or out
+    // of sequence draws something different from one applied as typed — and
+    // the only way to tell from out here is the pixels.
+    let run = look(&page);
+    let mut separately = form_page(400);
+    assert!(separately.focus_at(20.0, 10.0));
+    for letter in word {
+        separately.type_key(sandbox::message::Key::Insert(letter.to_owned()));
+    }
+    assert_eq!(
+        run,
+        look(&separately),
+        "a run of keystrokes drew something different from the same keystrokes \
+         sent one at a time, so the batching changed what was typed"
+    );
 }
 
 #[test]
@@ -2035,7 +2264,7 @@ fn typing_repaints_the_rows_the_reader_is_looking_at() {
     assert_eq!(page.band_top(), 0);
 
     // Down the page, the way scrolling does it.
-    page.request_band(800, 400).expect("asks for a band");
+    page.request_band(0, 800, 400).expect("asks for a band");
     while !page.accept_band() {
         std::thread::yield_now();
     }
@@ -2264,5 +2493,444 @@ fn enter_in_a_textarea_is_a_newline_rather_than_a_send() {
     assert!(
         page.take_submission().is_none(),
         "Enter in a textarea sent the form instead of starting a line"
+    );
+}
+
+#[test]
+fn ticking_a_checkbox_changes_what_the_form_sends() {
+    // Through a real renderer child, because the point of this is that the
+    // change survives the re-parse a render does: the press is recorded beside
+    // the document and applied to the next one, and a bug there would show as
+    // a box that ticks and then unticks itself on the next keystroke.
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"post\" checked>\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a checkbox");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    assert!(
+        page.focus_is_pressable(),
+        "a press focuses the box it landed on, and as something pressed rather \
+         than typed in — there is nothing in a checkbox to put a caret in",
+    );
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(
+        sent.body, "go=Send",
+        "the box was unticked, so it is no longer a successful control",
+    );
+}
+
+#[test]
+fn a_box_stays_as_it_was_left_across_a_render() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"post\">\
+         <input name=\"q\" value=\"\">\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a checkbox");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    // Typing re-renders the whole page from the original bytes. A tick that
+    // lived in the document rather than beside it would be gone by now.
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    for letter in ["h", "i"] {
+        page.type_key(sandbox::message::Key::Insert(letter.to_owned()));
+    }
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(sent.body, "post=on&q=hi&go=Send");
+}
+
+#[test]
+fn pressing_a_dropdown_asks_the_parent_to_open_a_list() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <select name=\"where\">\
+         <option value=\"uk\">United Kingdom</option>\
+         <option value=\"fr\" selected>France</option>\
+         </select></form></body>",
+        400,
+    );
+    assert!(page.take_dropdown().is_none(), "nothing was pressed yet");
+    let box_ = page.pressables().first().copied().expect("a select");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    let open = page.take_dropdown().expect("the press opened a list");
+    assert_eq!(
+        open.options,
+        vec!["United Kingdom".to_owned(), "France".to_owned()],
+        "the list has to say what is in it — the parent has no document",
+    );
+    assert_eq!(open.on, 1, "and which one it is currently open on");
+    assert!(
+        page.take_dropdown().is_none(),
+        "one press opens one list, not every press after it",
+    );
+}
+
+#[test]
+fn choosing_a_row_changes_what_the_dropdown_shows_and_sends() {
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <select name=\"where\">\
+         <option value=\"uk\">United Kingdom</option>\
+         <option value=\"fr\" selected>France</option>\
+         </select>\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a select");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    let open = page.take_dropdown().expect("the press opened a list");
+    page.choose(open.node, 0);
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    let sent = page.take_submission().expect("the press asked to send");
+    assert_eq!(sent.body, "where=uk&go=Send");
+}
+
+#[test]
+fn a_row_that_is_not_there_changes_nothing() {
+    // The index arrives from another process. Past the end it picks nothing
+    // rather than panicking or picking the last one, which is the honest
+    // answer to a message that does not make sense.
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <select name=\"where\"><option value=\"uk\">UK</option></select>\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        400,
+    );
+    let box_ = page.pressables().first().copied().expect("a select");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    let open = page.take_dropdown().expect("the press opened a list");
+    page.choose(open.node, 99);
+    page.choose(u32::MAX, 0);
+
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    assert_eq!(
+        page.take_submission().expect("sent").body,
+        "where=uk&go=Send",
+    );
+}
+
+/// A page of one control of each kind, in a known order.
+fn keyboard_form() -> shell::viewport::Viewport {
+    viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"post\">\
+         <input type=\"radio\" name=\"size\" value=\"s\" checked>\
+         <input type=\"radio\" name=\"size\" value=\"m\">\
+         <select name=\"where\">\
+         <option value=\"uk\">United Kingdom</option>\
+         <option value=\"fr\" selected>France</option>\
+         </select>\
+         <input name=\"q\" value=\"\">\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        600,
+    )
+}
+
+/// Tabs forward `count` times from wherever the focus is.
+fn tab(page: &mut shell::viewport::Viewport, count: usize) {
+    for _ in 0..count {
+        page.type_key(sandbox::message::Key::Tab { back: false });
+    }
+}
+
+/// Presses the space bar, which is how the parent spells "press this".
+fn space(page: &mut shell::viewport::Viewport) {
+    page.type_key(sandbox::message::Key::Insert(" ".to_owned()));
+}
+
+/// Sends the form by pressing the button at the end of it, and returns what
+/// would be sent.
+fn sent(page: &mut shell::viewport::Viewport) -> String {
+    let button = page.buttons().first().copied().expect("a submit button");
+    page.focus_at(
+        button.x + button.width / 2.0,
+        button.y + button.height / 2.0,
+    );
+    page.take_submission()
+        .expect("the press asked to send")
+        .body
+}
+
+#[test]
+fn tab_reaches_every_control_and_not_only_the_ones_with_text_in_them() {
+    // #151. Six controls, six stops, and the seventh Tab falls out of the page
+    // rather than wrapping — which is what hands the key back to the window.
+    let mut page = keyboard_form();
+    for step in 1..=6 {
+        tab(&mut page, 1);
+        assert!(page.editing(), "Tab {step} focused nothing");
+    }
+    tab(&mut page, 1);
+    assert!(
+        !page.editing(),
+        "past the last control the focus is given up, so Tab goes back to \
+         walking the page's links",
+    );
+}
+
+#[test]
+fn a_field_takes_the_typing_and_a_box_does_not() {
+    // The one bit the window reads: it decides whether an arrow scrolls the
+    // page or moves a dropdown, so the two must not look alike.
+    let mut page = keyboard_form();
+    tab(&mut page, 1);
+    assert!(
+        page.focus_is_pressable(),
+        "the checkbox is pressed, not typed in"
+    );
+    tab(&mut page, 4);
+    assert!(
+        !page.focus_is_pressable(),
+        "the text field is typed in, so the arrows stay the window's and the \
+         page still scrolls under a caret",
+    );
+}
+
+#[test]
+fn space_ticks_the_focused_box() {
+    let mut page = keyboard_form();
+    tab(&mut page, 1);
+    space(&mut page);
+    assert_eq!(sent(&mut page), "post=on&size=s&where=fr&q=&go=Send");
+}
+
+#[test]
+fn space_chooses_the_focused_radio_and_clears_its_group() {
+    let mut page = keyboard_form();
+    tab(&mut page, 3);
+    space(&mut page);
+    assert_eq!(
+        sent(&mut page),
+        "size=m&where=fr&q=&go=Send",
+        "the group's other answer has to go, or the form sends two",
+    );
+}
+
+#[test]
+fn the_arrows_walk_a_dropdown_without_opening_it() {
+    // What a dropdown has always done, and the quickest way to answer one.
+    let mut page = keyboard_form();
+    tab(&mut page, 4);
+    page.type_key(sandbox::message::Key::Up);
+    assert!(
+        page.take_dropdown().is_none(),
+        "an arrow moves through the options rather than opening the list",
+    );
+    assert_eq!(sent(&mut page), "size=s&where=uk&q=&go=Send");
+}
+
+#[test]
+fn a_dropdown_does_not_wrap_at_either_end() {
+    // A reader holding Down expects to arrive at the last option and stay
+    // there, rather than to start again at the top.
+    let mut page = keyboard_form();
+    tab(&mut page, 4);
+    for _ in 0..5 {
+        page.type_key(sandbox::message::Key::Down);
+    }
+    assert_eq!(sent(&mut page), "size=s&where=fr&q=&go=Send");
+}
+
+#[test]
+fn space_opens_the_focused_dropdown() {
+    let mut page = keyboard_form();
+    tab(&mut page, 4);
+    space(&mut page);
+    let open = page.take_dropdown().expect("space opened the list");
+    assert_eq!(
+        open.options,
+        vec!["United Kingdom".to_owned(), "France".to_owned()],
+    );
+    assert_eq!(open.on, 1);
+}
+
+#[test]
+fn enter_on_a_control_sends_the_form_and_presses_no_button() {
+    let mut page = keyboard_form();
+    tab(&mut page, 1);
+    space(&mut page);
+    page.type_key(sandbox::message::Key::Insert("\n".to_owned()));
+    let sent = page.take_submission().expect("Enter asked to send");
+    assert_eq!(
+        sent.body, "post=on&size=s&where=fr&q=",
+        "nothing was pressed, so no button is a successful control",
+    );
+}
+
+#[test]
+fn space_on_a_focused_button_presses_that_button() {
+    let mut page = keyboard_form();
+    tab(&mut page, 6);
+    space(&mut page);
+    let sent = page.take_submission().expect("space pressed the button");
+    assert_eq!(
+        sent.body, "size=s&where=fr&q=&go=Send",
+        "the button that was pressed is a successful control and the others \
+         are not",
+    );
+}
+
+#[test]
+fn tab_steps_back_the_way_it_came() {
+    let mut page = keyboard_form();
+    tab(&mut page, 3);
+    page.type_key(sandbox::message::Key::Tab { back: true });
+    space(&mut page);
+    assert_eq!(
+        sent(&mut page),
+        "size=s&where=fr&q=&go=Send",
+        "Shift+Tab went back to the radio that was already chosen, and \
+         pressing it again changed nothing",
+    );
+}
+
+#[test]
+fn tab_does_not_stop_on_a_control_nobody_can_answer() {
+    // A disabled control answers nothing, so a stop on it is a stop that does
+    // nothing — worse than no stop at all.
+    let mut page = viewport(
+        "<body style=\"margin: 0\"><form action=\"/x\" style=\"margin: 0\">\
+         <input type=\"checkbox\" name=\"a\" disabled>\
+         <input type=\"checkbox\" name=\"b\">\
+         <input type=\"submit\" name=\"go\" value=\"Send\">\
+         </form></body>",
+        600,
+    );
+    tab(&mut page, 1);
+    space(&mut page);
+    assert_eq!(
+        sent(&mut page),
+        "b=on&go=Send",
+        "the first Tab went past the disabled box to the one that can answer",
+    );
+}
+
+#[test]
+fn pressing_a_control_focuses_it_so_tab_carries_on_from_there() {
+    let mut page = keyboard_form();
+    let box_ = page.pressables().first().copied().expect("the checkbox");
+    page.focus_at(box_.x + box_.width / 2.0, box_.y + box_.height / 2.0);
+    // Straight to the second radio, which is two stops on from the box.
+    tab(&mut page, 2);
+    space(&mut page);
+    assert_eq!(sent(&mut page), "post=on&size=m&where=fr&q=&go=Send");
+}
+
+/// The whole of #181, across a real process boundary.
+///
+/// The parent holds the history, the child holds the document, and the only
+/// thing that crosses is a question about links the child already has. Nothing
+/// below the boundary can be checked from here, so what is checked is the one
+/// thing that matters: the page comes back with the followed link drawn in a
+/// different colour from the one beside it, and it is the purple.
+#[test]
+fn a_followed_link_comes_back_purple_and_its_neighbour_does_not() {
+    let dir = std::env::temp_dir().join("2kbrowser-visited-tests");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("links.html");
+    // Two links side by side, one of them somewhere the reader has been. Large
+    // text on its own line each, so the pixels are easy to find.
+    std::fs::write(
+        &path,
+        "<body style=\"margin:0;background:#fff;font-size:40px\">\
+         <p style=\"margin:0\"><a href=\"seen.html\">AAAA</a></p>\
+         <p style=\"margin:0\"><a href=\"new.html\">AAAA</a></p></body>",
+    )
+    .expect("write");
+    let (origin, at) = net::parse_url(&net::file_url(&path)).expect("parses");
+
+    let renderer =
+        sandbox::Renderer::with_program(std::path::PathBuf::from(env!("CARGO_BIN_EXE_2kbrowser")));
+    // Where the reader has been. Recorded against the resolved URL, which is
+    // what the child will ask about.
+    let seen = net::resolve(&origin, &at, "seen.html");
+    renderer.record_visit(&seen);
+
+    let page = shell::viewport::Viewport::open(
+        &renderer,
+        shell::viewport::Document {
+            body: std::fs::read(&path).expect("read"),
+            content_type: None,
+            origin,
+            path: at,
+        },
+        400,
+        2000,
+        false,
+        false,
+        1.0,
+    )
+    .expect("the page opens");
+
+    // The two links' rectangles, in document order.
+    let links = page.links();
+    assert_eq!(links.len(), 2, "two links: {links:?}");
+
+    let pixel = |x: u32, y: u32| -> (u8, u8, u8) {
+        let at = ((y * page.width() + x) * 4) as usize;
+        let px = page.pixels();
+        (px[at], px[at + 1], px[at + 2])
+    };
+    // The darkest pixel in a link's box, which is the ink of its text rather
+    // than the white around it.
+    let ink = |rect: &layout::Rect| -> (u8, u8, u8) {
+        let mut best = (255u8, 255u8, 255u8);
+        for y in (rect.y as u32)..((rect.y + rect.height) as u32).min(page.height()) {
+            for x in (rect.x as u32)..((rect.x + rect.width) as u32).min(page.width()) {
+                let px = pixel(x, y);
+                let sum = px.0 as u32 + px.1 as u32 + px.2 as u32;
+                if sum < best.0 as u32 + best.1 as u32 + best.2 as u32 {
+                    best = px;
+                }
+            }
+        }
+        best
+    };
+
+    let followed = ink(&links[0].rects[0]);
+    let fresh = ink(&links[1].rects[0]);
+    assert_ne!(
+        followed, fresh,
+        "both links drew the same colour, so the visited half never arrived"
+    );
+    // Purple is red and blue with little green between them; the unvisited
+    // link is the blue every browser has used, with almost no red.
+    assert!(
+        followed.0 > followed.1 && followed.2 > followed.1,
+        "the followed link is not purple: {followed:?}"
+    );
+    assert!(
+        fresh.2 > fresh.0 && fresh.2 > fresh.1,
+        "the unvisited link is not blue: {fresh:?}"
     );
 }

@@ -47,6 +47,12 @@ pub struct Page {
     pub mode: RenderMode,
     /// Full content height in CSS pixels, which may exceed the canvas.
     pub content_height: f32,
+    /// How far right the content reaches, which may exceed the canvas (#204).
+    ///
+    /// The counterpart of `content_height`, and needed for the same reason: a
+    /// canvas is the viewport, not the document, and the difference between the
+    /// two is exactly what there is to scroll.
+    pub content_width: f32,
     /// How many images were fetched and decoded.
     pub images_loaded: usize,
     /// The documents on this canvas, in paint order.
@@ -59,6 +65,8 @@ pub struct Page {
     pub title: Option<String>,
     /// The document row `pixmap` starts at.
     pub band_top: u32,
+    /// The document column `pixmap` starts at (#204).
+    pub band_left: u32,
     /// The colour the canvas was cleared to, opaque (CSS 2.1 §14.2).
     ///
     /// The window needs it for the rows it has no pixels for — below a page
@@ -92,7 +100,13 @@ impl Page {
     /// `None` when this page cannot repaint — a frameset — which is safe
     /// because a frameset's canvas is its viewport and never has rows beyond
     /// the ones it already holds.
-    pub fn paint_band(&self, fonts: &mut FontStore, top: u32, height: u32) -> Option<Pixmap> {
+    pub fn paint_band(
+        &self,
+        fonts: &mut FontStore,
+        left: u32,
+        top: u32,
+        height: u32,
+    ) -> Option<Pixmap> {
         let source = self.source.as_ref()?;
         // Clipped to what the document has below `top`, the same way a first
         // render is clipped to its content. A band running off the bottom
@@ -100,11 +114,17 @@ impl Page {
         // not rows of the document — they would scroll past the end.
         let content_rows = self.content_height.ceil().max(1.0) as u32;
         let height = height.min(content_rows.saturating_sub(top)).max(1);
+        // `left` gets no such clipping, and deliberately. Height decides how
+        // many rows are allocated, so a band asking past the end would waste
+        // the pixels; width is the viewport's either way, and a band asked for
+        // past the right edge comes back as canvas colour — which is what is
+        // actually there.
         paint::rasterise_band(
             &source.list,
             fonts,
             &source.images,
             self.pixmap.width(),
+            left as f32,
             top as f32,
             height,
         )
@@ -213,12 +233,45 @@ impl Page {
         out
     }
 
+    /// Every `<img>` on the canvas, with the address it came from (#205).
+    ///
+    /// Whether the picture arrived or not, which is what separates this from
+    /// [`Page::missing_images`]: that list is the placeholders, and exists so a
+    /// press on one can ask for the image again. This is every picture a reader
+    /// can point at, so that a right-click over one has something to offer.
+    ///
+    /// Computed rather than carried on the frame, because it is asked for once
+    /// per render and a fourth list threaded through the pipeline to save one
+    /// tree walk would cost more to read than it saves.
+    pub fn pictures(&self) -> Vec<(layout::Rect, String)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                let Some(element) = frame.doc.element(node) else {
+                    continue;
+                };
+                if element.local_name() != "img" {
+                    continue;
+                }
+                let Some(src) = element.attr("src") else {
+                    continue;
+                };
+                let url = net::resolve(&frame.origin, &frame.path, src);
+                out.extend(frame.layout.rects_for(node).into_iter().map(|mut rect| {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    (rect, url.clone())
+                }));
+            }
+        }
+        out
+    }
+
     /// Every text control on the page, in document order, with where it is.
     ///
-    /// Text controls only: a checkbox has nothing to type into, and a button
-    /// has nothing to type into *and* nothing yet to press. Tab order is
-    /// document order, which is what HTML says when nothing declares otherwise
-    /// and what this engine can honestly offer — `tabindex` is not read (#110).
+    /// Text controls only, which is not the same list as [`Page::focusable`]:
+    /// this is what a *click* can put a caret in, and that is what Tab stops
+    /// on. A checkbox is in the second and not the first.
     pub fn text_controls(&self) -> Vec<(dom::NodeId, layout::Rect)> {
         let mut out = Vec::new();
         for frame in &self.frames {
@@ -246,9 +299,10 @@ impl Page {
 
     /// Every control that can be pressed, in document order, with where it is.
     ///
-    /// Buttons, so a form can be sent (#110). Checkboxes and radios are not
-    /// here: pressing one has to *change* it, and nothing can yet — offering a
-    /// target that does nothing would be worse than offering none.
+    /// Buttons, so a form can be sent (#110). Checkboxes, radios and
+    /// `<select>`s are in [`Page::pressables`] instead: they answer a press by
+    /// changing rather than by sending, which is a different question with a
+    /// different answer.
     pub fn buttons(&self) -> Vec<(dom::NodeId, layout::Rect)> {
         let mut out = Vec::new();
         for frame in &self.frames {
@@ -277,6 +331,284 @@ impl Page {
                 x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
             })
             .map(|(node, _)| node)
+    }
+
+    /// Every control that answers a press by changing: a checkbox, a radio, a
+    /// `<select>` of either shape.
+    ///
+    /// Document order, with where each one is. Buttons are not here — they
+    /// send rather than change, and [`Page::buttons`] already has them.
+    pub fn pressables(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                let pressable = matches!(
+                    layout::forms::control_of(&frame.doc, node),
+                    Some(
+                        layout::forms::Control::Checkbox
+                            | layout::forms::Control::Radio
+                            | layout::forms::Control::Select
+                    )
+                );
+                if !pressable {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every control the keyboard can reach, in document order, with where it
+    /// is (#151).
+    ///
+    /// All of them — fields, boxes, radios, dropdowns and buttons — because a
+    /// form that can be filled in with a pointer and by no other means is a
+    /// form half its readers cannot fill in. Document order, which is what HTML
+    /// says when nothing declares otherwise and what this engine can honestly
+    /// offer: `tabindex` is not read.
+    pub fn focusable(&self) -> Vec<(dom::NodeId, layout::Rect)> {
+        let mut out = Vec::new();
+        for frame in &self.frames {
+            for node in frame.doc.descendants(frame.doc.root()) {
+                if layout::forms::control_of(&frame.doc, node).is_none() {
+                    continue;
+                }
+                // A control the author disabled answers nothing, so stopping on
+                // it would be a stop that does nothing — worse than no stop.
+                if frame
+                    .doc
+                    .element(node)
+                    .is_some_and(|element| element.attr("disabled").is_some())
+                {
+                    continue;
+                }
+                if let Some(mut rect) = frame.layout.rects_for(node).into_iter().next() {
+                    rect.x += frame.rect.x;
+                    rect.y += frame.rect.y;
+                    out.push((node, rect));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a control is one there is something to type in.
+    ///
+    /// The line between the two shapes the focus comes in: a field carries a
+    /// caret and a selection, and everything else is somewhere the keyboard is
+    /// pointing.
+    pub fn takes_typing(&self, node: dom::NodeId) -> bool {
+        self.frames.iter().any(|frame| {
+            matches!(
+                layout::forms::control_of(&frame.doc, node),
+                Some(
+                    layout::forms::Control::Text
+                        | layout::forms::Control::Password
+                        | layout::forms::Control::TextArea
+                )
+            )
+        })
+    }
+
+    /// Whether a control is a button, which is pressed to *send* rather than to
+    /// change.
+    pub fn is_button(&self, node: dom::NodeId) -> bool {
+        self.frames.iter().any(|frame| {
+            layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Button)
+        })
+    }
+
+    /// What pressing a named control should change, as entries to record.
+    ///
+    /// The keyboard's way in to the same rule [`Page::choice_at`] reaches with
+    /// a point.
+    pub fn press(&self, node: dom::NodeId) -> Vec<(dom::NodeId, bool)> {
+        self.frames
+            .iter()
+            .find(|frame| frame.doc.element(node).is_some())
+            .map(|frame| layout::forms::press(&frame.doc, node))
+            .unwrap_or_default()
+    }
+
+    /// Moving a closed `<select>` one option up or down, without opening it.
+    ///
+    /// What a dropdown has always done under the arrows, and the quickest way
+    /// to answer one. Nothing for any other control, and nothing at either end:
+    /// a list does not wrap, because a reader holding Down expects to arrive at
+    /// the last option and stay there rather than to start again.
+    pub fn step_option(&self, node: dom::NodeId, up: bool) -> Vec<(dom::NodeId, bool)> {
+        self.frames
+            .iter()
+            .filter(|frame| {
+                layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Select)
+            })
+            .find_map(|frame| {
+                let options = layout::forms::options_of(&frame.doc, node);
+                let at = options.iter().position(|&id| frame.doc.is_on(id))?;
+                let next = if up {
+                    at.checked_sub(1)?
+                } else {
+                    (at + 1 < options.len()).then_some(at + 1)?
+                };
+                Some(layout::forms::press(&frame.doc, options[next]))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The list a named closed `<select>` would open, for a keyboard that has
+    /// no point to hit it with.
+    ///
+    /// The same answer [`Page::dropdown_at`] gives, reached by name instead.
+    pub fn dropdown_of(
+        &self,
+        node: dom::NodeId,
+    ) -> Option<(dom::NodeId, layout::Rect, Vec<String>, usize)> {
+        let frame = self.frames.iter().find(|frame| {
+            layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Select)
+                && !frame
+                    .doc
+                    .element(node)
+                    .is_some_and(layout::forms::is_list_box)
+        })?;
+        let mut rect = frame.layout.rects_for(node).into_iter().next()?;
+        rect.x += frame.rect.x;
+        rect.y += frame.rect.y;
+        let options = layout::forms::options_of(&frame.doc, node);
+        let on = options
+            .iter()
+            .position(|&id| frame.doc.is_on(id))
+            .unwrap_or(0);
+        let labels = options
+            .iter()
+            .map(|&id| layout::forms::option_label(&frame.doc, id))
+            .collect();
+        Some((node, rect, labels, on))
+    }
+
+    /// What a press at a point should change, as entries to record.
+    ///
+    /// Empty when the point is on nothing that can be changed, which includes
+    /// a point on a field or a button — both are pressed for other reasons and
+    /// both already have one.
+    ///
+    /// A closed `<select>` is not here either. Pressing one opens a list rather
+    /// than changing anything, and the list is drawn by the parent; see
+    /// [`Page::dropdown_at`].
+    ///
+    /// The control itself comes back beside the changes, because the press also
+    /// *focuses* it — and for a list box row those are two different nodes: the
+    /// option changes and the `<select>` takes the keyboard.
+    pub fn choice_at(&self, x: f32, y: f32) -> Option<(dom::NodeId, Vec<(dom::NodeId, bool)>)> {
+        for frame in &self.frames {
+            let (x, y) = (x - frame.rect.x, y - frame.rect.y);
+            for node in frame.doc.descendants(frame.doc.root()).into_iter().rev() {
+                let Some(control) = layout::forms::control_of(&frame.doc, node) else {
+                    continue;
+                };
+                let hit = match control {
+                    layout::forms::Control::Checkbox | layout::forms::Control::Radio => {
+                        on_any(&frame.layout.rects_for(node), x, y).then_some(node)
+                    }
+                    // A list box shows its options stacked inside one atomic
+                    // box, so the row under the pointer is the option under
+                    // the pointer and the press lands on that option rather
+                    // than on the `<select>`.
+                    layout::forms::Control::Select
+                        if frame
+                            .doc
+                            .element(node)
+                            .is_some_and(layout::forms::is_list_box) =>
+                    {
+                        frame.layout.row_in(node, x, y).and_then(|row| {
+                            layout::forms::options_of(&frame.doc, node)
+                                .get(row)
+                                .copied()
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(hit) = hit {
+                    return Some((node, layout::forms::press(&frame.doc, hit)));
+                }
+            }
+        }
+        None
+    }
+
+    /// The closed dropdown at a point, and what is in it.
+    ///
+    /// Only a closed one: a list box shows its options already and is changed
+    /// in place by [`Page::choice_at`]. The rectangle is where the `<select>`
+    /// is, so the parent can open the list under it.
+    pub fn dropdown_at(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<(dom::NodeId, layout::Rect, Vec<String>, usize)> {
+        for frame in &self.frames {
+            let (local_x, local_y) = (x - frame.rect.x, y - frame.rect.y);
+            for node in frame.doc.descendants(frame.doc.root()).into_iter().rev() {
+                if layout::forms::control_of(&frame.doc, node)
+                    != Some(layout::forms::Control::Select)
+                {
+                    continue;
+                }
+                if frame
+                    .doc
+                    .element(node)
+                    .is_some_and(layout::forms::is_list_box)
+                {
+                    continue;
+                }
+                let rects = frame.layout.rects_for(node);
+                if !on_any(&rects, local_x, local_y) {
+                    continue;
+                }
+                let options = layout::forms::options_of(&frame.doc, node);
+                let on = options
+                    .iter()
+                    .position(|&id| frame.doc.is_on(id))
+                    .unwrap_or(0);
+                let labels = options
+                    .iter()
+                    .map(|&id| layout::forms::option_label(&frame.doc, id))
+                    .collect();
+                let mut rect = rects.into_iter().next()?;
+                rect.x += frame.rect.x;
+                rect.y += frame.rect.y;
+                return Some((node, rect, labels, on));
+            }
+        }
+        None
+    }
+
+    /// Choosing one option of a `<select>` by its position in the list.
+    ///
+    /// The index arrives from outside this process, so it is looked up rather
+    /// than indexed with: an index past the end picks nothing and changes
+    /// nothing, which is the honest answer to a message that does not make
+    /// sense.
+    pub fn choose_in(&self, node: dom::NodeId, index: usize) -> Vec<(dom::NodeId, bool)> {
+        self.frames
+            .iter()
+            // Bounds-checked before anything reads it: the id crossed a
+            // process boundary, `Document` indexes its arena directly, and an
+            // id past the end would take the renderer down rather than pick
+            // nothing.
+            .filter(|frame| node.0 < frame.doc.len())
+            .filter(|frame| {
+                layout::forms::control_of(&frame.doc, node) == Some(layout::forms::Control::Select)
+            })
+            .find_map(|frame| {
+                let option = *layout::forms::options_of(&frame.doc, node).get(index)?;
+                Some(layout::forms::press(&frame.doc, option))
+            })
+            .unwrap_or_default()
     }
 
     /// The form `node` belongs to, collected and ready to send (#110).
@@ -375,6 +707,7 @@ impl Page {
                 }
                 out.push(Link {
                     rects,
+                    pinned: frame.layout.is_pinned(node),
                     url: net::resolve(&frame.origin, &frame.path, href),
                     jump_to: jump_to(frame, href),
                 });
@@ -389,6 +722,14 @@ impl Page {
 pub struct Link {
     /// Its rectangles. More than one when it wraps across a line break.
     pub rects: Vec<layout::Rect>,
+    /// Whether it is inside a `position: fixed` subtree, and so sits at the
+    /// window's coordinates rather than the document's (#108).
+    ///
+    /// The window hit-tests against this list rather than against the box
+    /// tree, which is in another process — so without this a fixed navigation
+    /// bar would stay on screen and stop being clickable the moment the reader
+    /// scrolled.
+    pub pinned: bool,
     /// The absolute URL it leads to.
     pub url: String,
     /// Where on this page it goes, for a link that does not leave it.
@@ -501,6 +842,45 @@ pub trait Loader {
             .map(|url| self.load(url, document, kind))
             .collect()
     }
+
+    /// Which of these addresses the reader has already been to (#181).
+    ///
+    /// Asked rather than told, and asked only about URLs already on the page.
+    /// The history lives with whoever implements this; what comes back is a
+    /// yes or no for links the document named itself, so the answer reveals
+    /// nothing the asker did not already hold.
+    ///
+    /// Nothing visited by default, which is the truth for every caller without
+    /// a reader behind it: the reference tests, the command line, and anything
+    /// rendering a page for its own sake.
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        vec![false; urls.len()]
+    }
+}
+
+/// The links on the page, as `(node, absolute url)`.
+///
+/// Source anchors only — an `a` or `area` with an `href` — because those are
+/// the elements `:link` and `:visited` are defined over. A fragment is dropped
+/// before asking: `page#section` and `page` are the same visit, and keeping the
+/// fragment would leave every anchor on a page you are reading looking unvisited.
+fn link_targets(doc: &dom::Document, base: Option<(&Origin, &str)>) -> Vec<(dom::NodeId, String)> {
+    let Some((origin, path)) = base else {
+        return Vec::new();
+    };
+    doc.descendants(doc.root())
+        .into_iter()
+        .filter_map(|node| {
+            let element = doc.element(node)?;
+            if !matches!(element.local_name(), "a" | "area") {
+                return None;
+            }
+            let href = element.attr("href")?;
+            let url = net::resolve(origin, path, href);
+            let url = url.split_once('#').map_or(url.as_str(), |(head, _)| head);
+            Some((node, url.to_owned()))
+        })
+        .collect()
 }
 
 /// A fetched subresource.
@@ -545,6 +925,140 @@ impl Loaded {
     }
 }
 
+/// A loader that already holds one resource and passes everything else on.
+///
+/// For a response that *is* the thing being shown rather than a page
+/// describing one — an image opened by its own URL (#201). The document built
+/// around it names it as its only subresource, and this answers that one
+/// request from the bytes already in hand. Without it the same picture would
+/// be fetched twice: once as the navigation, once as the image inside the
+/// page invented to hold it.
+pub struct Preloaded<'a> {
+    /// The URL this can answer without asking anybody.
+    url: String,
+    /// The answer.
+    held: Loaded,
+    /// Where everything else comes from.
+    inner: &'a mut dyn Loader,
+}
+
+impl<'a> Preloaded<'a> {
+    /// Holds `held` for `url`, deferring to `inner` for the rest.
+    pub fn new(url: String, held: Loaded, inner: &'a mut dyn Loader) -> Self {
+        Self { url, held, inner }
+    }
+}
+
+impl Loader for Preloaded<'_> {
+    fn load(&mut self, url: &str, document: Option<&Origin>, kind: RequestKind) -> Option<Loaded> {
+        if url == self.url {
+            return Some(self.held.clone());
+        }
+        self.inner.load(url, document, kind)
+    }
+
+    fn visited(&mut self, urls: &[String]) -> Vec<bool> {
+        self.inner.visited(urls)
+    }
+}
+
+/// The image formats this browser can draw, as `Content-Type` spells them.
+///
+/// `image/jpg` is not a registered type and servers send it anyway, which is
+/// the sort of thing a browser for the old web exists to cope with.
+const DRAWABLE_IMAGES: [&str; 5] = [
+    "image/png",
+    "image/x-png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+];
+
+/// Whether a response is a picture rather than a page (#201).
+///
+/// The header decides whenever there is one. A server saying `text/html` is
+/// believed even if the bytes open like a PNG, because sniffing *against* a
+/// declared type is how a browser gets talked into treating one thing as
+/// another. Sniffing only fills a silence — and the silence is not rare: a
+/// `file:` URL has no headers at all, which is how most people open an image
+/// on their own disk.
+fn is_a_picture(bytes: &[u8], content_type: Option<&str>) -> bool {
+    let declared = content_type
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|mime| !mime.is_empty());
+    match declared {
+        Some(mime) => DRAWABLE_IMAGES.contains(&mime.as_str()),
+        // The magic numbers of the three formats `paint` can decode. Each is
+        // unambiguous, and no HTML document begins with any of them.
+        None => {
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+                || bytes.starts_with(b"\xff\xd8\xff")
+                || bytes.starts_with(b"GIF87a")
+                || bytes.starts_with(b"GIF89a")
+        }
+    }
+}
+
+/// The document to show for a response that is an image (#201).
+///
+/// `None` for anything else, including an image with no address — there would
+/// be nothing to point the `img` at.
+///
+/// A page invented here rather than a second rendering path, so an image gets
+/// the same layout, the same scrollbar and the same `Load image` placeholder
+/// as one inside a document. The name is the last path segment: what a reader
+/// calls the file, and the only part of a URL full of tracking parameters
+/// worth putting in a title.
+pub fn document_for_a_picture(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    url: Option<&str>,
+) -> Option<String> {
+    let url = url?;
+    if !is_a_picture(bytes, content_type) {
+        return None;
+    }
+    let name = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(url);
+    Some(format!(
+        "<!doctype html>\n<html><head><title>{name}</title></head>\n\
+         <body><img src=\"{url}\" alt=\"{name}\"></body></html>",
+        name = escape_for_markup(name),
+        url = escape_for_markup(url),
+    ))
+}
+
+/// Escapes text for a document this browser writes itself.
+///
+/// The URL is the case that matters and it is not a corner one: the address in
+/// the issue carries `?utm_source=…&utm_campaign=…`, and an unescaped `&` in
+/// an attribute is an entity reference waiting to be misread.
+fn escape_for_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Loads subresources in this process, subject to the network policy.
 ///
 /// What the command line and the reference tests use. The browser itself does
@@ -563,33 +1077,6 @@ impl Loader for DirectLoader {
         })
     }
 }
-
-/// How close the page's content may come to the edge of the window.
-///
-/// `body { margin: 0 }` is in nearly every modern stylesheet, and those pages
-/// were written for a window with a scrollbar down one side and browser chrome
-/// around the rest — not for a viewport that ends where the glass does. Taken
-/// literally, the declaration puts the first letter of every line hard against
-/// the window frame, which is unpleasant to read and looks like a bug.
-///
-/// So the page keeps a gutter whatever it asks for. Eight pixels, matching the
-/// UA sheet's own body margin: enough to read against, not enough to be a
-/// second opinion about the page's design.
-///
-/// Made of **padding**, not margin, and the difference is the whole reason this
-/// comment is longer than the constant. Padding is inside the background where
-/// margin is outside it: a `body { margin: 0; background: navy }` page topped up
-/// with margin is navy with a pale frame around it — which is exactly the
-/// "looks like a bug" this exists to avoid, one step further out. Topped up with
-/// padding it is navy to the glass with its text held off.
-///
-/// It also keeps §14.2 honest. The compensation for the frame used to be that
-/// the box holding the page carried the body's background out to the window,
-/// which is right when that background is the canvas's and wrong when the root
-/// has one of its own — `html { background: purple }` with a navy body came out
-/// navy to the window edge instead of navy in a purple field. With the gutter
-/// inside the background there is nothing to compensate for.
-const PAGE_GUTTER: f32 = 8.0;
 
 /// Renders HTML at a given viewport width.
 ///
@@ -637,6 +1124,7 @@ pub fn render_with_base_and_loader(
     render_sized(
         html,
         width,
+        0,
         band_top,
         band_height,
         Settings::default(),
@@ -682,6 +1170,7 @@ fn render_in_viewport_with(
     render_sized(
         html,
         width,
+        0,
         0,
         height,
         Settings {
@@ -734,6 +1223,7 @@ pub fn render_as_document_with(
     render_sized(
         html,
         width,
+        0,
         band_top,
         band_height,
         Settings {
@@ -759,6 +1249,7 @@ pub fn render_as_authored_with(
     render_sized(
         html,
         width,
+        0,
         band_top,
         band_height,
         Settings {
@@ -793,8 +1284,15 @@ pub(crate) struct Settings {
     /// the node ids line up because parsing the same bytes builds the same
     /// arena in the same order.
     pub(crate) values: Vec<(dom::NodeId, String)>,
-    /// The control the reader is typing in, and where its caret is.
-    pub(crate) focus: Option<(dom::NodeId, usize)>,
+    /// What the reader has ticked, chosen or unticked on this page, by node.
+    ///
+    /// Re-applied after a parse for the same reason `values` is, and kept
+    /// apart from it because they answer different questions about the same
+    /// control: one is what a field holds, the other whether a box is on.
+    pub(crate) chosen: Vec<(dom::NodeId, bool)>,
+    /// The control the keyboard is on, and where its caret is — `None` for a
+    /// control there is nothing to type in, which gets the ring alone.
+    pub(crate) focus: Option<(dom::NodeId, Option<usize>)>,
     /// How much bigger than its own pixels the page is drawn.
     ///
     /// 1.0 is the page as written. It is applied in the cascade, where every
@@ -812,11 +1310,19 @@ impl Default for Settings {
             force_document: false,
             zoom: 1.0,
             values: Vec::new(),
+            chosen: Vec::new(),
             focus: None,
         }
     }
 }
 
+/// Renders a band of a document, at whatever corner of it the caller asks for.
+///
+/// `band_left` is zero for every caller but the one that repaints a page
+/// already open: a first render is a page opening, and a page opens at its
+/// beginning. It exists because a *re-render* need not — typing into a form
+/// halfway across a wide page re-renders it, and painting from the left edge
+/// would slide the page out from under the reader (#110, #204).
 #[expect(
     clippy::too_many_arguments,
     reason = "a render's inputs, threaded explicitly rather than bundled into a struct \
@@ -825,6 +1331,7 @@ impl Default for Settings {
 pub(crate) fn render_sized(
     html: &str,
     width: u32,
+    band_left: u32,
     band_top: u32,
     band_height: u32,
     settings: Settings,
@@ -835,6 +1342,9 @@ pub(crate) fn render_sized(
     let mut doc = dom::parse(html);
     for (node, value) in &settings.values {
         doc.set_value(*node, value.clone());
+    }
+    for (node, on) in &settings.chosen {
+        doc.set_chosen(*node, *on);
     }
     let doc = doc;
 
@@ -858,7 +1368,34 @@ pub(crate) fn render_sized(
     }
 
     let author_sheets = collect_stylesheets(&doc, loader, base, width as f32);
-    let styles = css::cascade::cascade_at(&doc, &author_sheets, settings.zoom);
+    // Which links have been followed, asked of whoever holds the history before
+    // the cascade needs the answer (#181). One round trip for the whole page,
+    // and only about addresses the page already named.
+    let targets = link_targets(&doc, base);
+    let visited: css::selector::VisitedLinks = {
+        let urls: Vec<String> = targets.iter().map(|(_, url)| url.clone()).collect();
+        let followed = loader.visited(&urls);
+        // A short or long answer is a loader that is not what we think it is.
+        // Every link unvisited is the safe reading: a link drawn blue that
+        // should be purple is a cosmetic loss and cannot be mistaken for the
+        // reverse.
+        if followed.len() == targets.len() {
+            targets
+                .iter()
+                .zip(followed)
+                .filter_map(|((node, _), seen)| seen.then_some(*node))
+                .collect()
+        } else {
+            css::selector::VisitedLinks::none()
+        }
+    };
+    let styles = css::cascade::cascade_with(
+        &doc,
+        &author_sheets,
+        settings.zoom,
+        css::cascade::Colours::Authors,
+        &visited,
+    );
 
     // Classify before laying out: if the page needs layout we do not implement,
     // producing the wrong layout first and discarding it would be wasted work.
@@ -920,12 +1457,6 @@ pub(crate) fn render_sized(
         }
     };
 
-    // Whatever the page asked for, it does not get to put its text against the
-    // glass. The body's own margin counts towards the gutter, so a page that
-    // left the UA default alone is unchanged and only `margin: 0` is topped up.
-    if let Some(body) = doc.find_element("body") {
-        styles.keep_off_the_edges(body, PAGE_GUTTER, width as f32);
-    }
     // Images are loaded whichever way the page is being rendered. They used to
     // be dropped on the document fallback, on the grounds that a rendering
     // which has discarded the author's layout should not spend requests on
@@ -986,8 +1517,16 @@ pub(crate) fn render_sized(
             .min(content_rows.saturating_sub(band_top))
             .max(1)
     };
-    let pixmap = paint::rasterise_band(&list, fonts, &images, width, band_top as f32, height)
-        .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
+    let pixmap = paint::rasterise_band(
+        &list,
+        fonts,
+        &images,
+        width,
+        band_left as f32,
+        band_top as f32,
+        height,
+    )
+    .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
 
     // The whole canvas is one document. `base` is what a link inside it
     // resolves against; without one there is nothing to resolve against and
@@ -1019,10 +1558,12 @@ pub(crate) fn render_sized(
         pixmap,
         mode,
         content_height,
+        content_width: paint::content_width(&list),
         images_loaded: images.len(),
         title,
         frames,
         band_top,
+        band_left,
         background: list.canvas,
         source: Some(Box::new(BandSource { list, images })),
     }
@@ -1174,6 +1715,7 @@ fn render_frameset(
     Page {
         pixmap,
         band_top: 0,
+        band_left: 0,
         // A frameset's canvas is composited from its frames rather than built
         // from one display list, so there is nothing to repaint a band from —
         // and nothing needs one, because a frameset is its viewport and never
@@ -1185,6 +1727,11 @@ fn render_frameset(
         // frames, which is what `render_frameset` clears its canvas to.
         background: css::Color::rgb(0xff, 0xff, 0xff),
         content_height: height as f32,
+        // A frameset is its own viewport in both directions: its cells are
+        // shares of the width it was given, so there is never anything to its
+        // right either. Each frame's own document scrolls inside its cell in a
+        // browser that implements that, which this one does not.
+        content_width: width as f32,
         images_loaded: loaded,
         // The frameset document's own title, not any frame's: a frame is a
         // part of the page, and its title is not the page's.
@@ -1490,6 +2037,13 @@ fn missing_images(
 
 /// Colour of the caret and the ring around the control being typed in.
 ///
+/// Whether a point is inside any of a node's rectangles.
+fn on_any(rects: &[layout::Rect], x: f32, y: f32) -> bool {
+    rects.iter().any(|rect| {
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    })
+}
+
 /// The chrome's focus blue, so a field on the page and the URL bar say "the
 /// typing goes here" the same way. Fixed rather than taken from the page: this
 /// is the browser speaking, and a focus ring tinted to match the author's
@@ -1514,7 +2068,7 @@ fn mark_focus(
     list: &mut paint::DisplayList,
     layout: &layout::Layout,
     styles: &css::cascade::StyleMap,
-    focus: Option<(dom::NodeId, usize)>,
+    focus: Option<(dom::NodeId, Option<usize>)>,
 ) {
     let Some((node, at)) = focus else { return };
     // A control the cascade hid is not one anybody is typing in, whatever the
@@ -1534,7 +2088,7 @@ fn mark_focus(
             });
         }
     }
-    if let Some(caret) = layout.caret_in(node, at) {
+    if let Some(caret) = at.and_then(|at| layout.caret_in(node, at)) {
         list.items.push(paint::DisplayItem::Rect {
             rect: caret,
             color: FOCUS,
@@ -2273,10 +2827,16 @@ mod tests {
                              it again because the first time nobody was watching.";
 
     #[test]
-    fn a_page_that_zeroes_its_body_margin_still_keeps_a_gutter() {
-        // `body { margin: 0 }` is in nearly every modern stylesheet, and taken
-        // literally it sets the first letter of every line against the window
-        // frame.
+    fn a_page_that_zeroes_its_body_margin_gets_zero() {
+        // There used to be a floor here: `body { margin: 0 }` is in nearly
+        // every modern stylesheet, and taken literally it sets the first letter
+        // of every line against the window frame — so the page was given eight
+        // pixels of padding whatever it asked for.
+        //
+        // The floor is gone. It was a reader-comfort decision the spec has no
+        // room for, and the suite measured the cost: sixty-nine reference tests
+        // compare a page that asks for a margin against one that asks for none,
+        // and every one of them disagreed by exactly those eight pixels.
         let mut fonts = FontStore::new();
         let page = render(
             &format!("<style>body {{ margin: 0 }}</style><body><p>{PARAGRAPH}</p></body>"),
@@ -2284,17 +2844,18 @@ mod tests {
             2000,
             &mut fonts,
         );
-        let (left, right) = ink_columns(&page);
-        assert!(left >= 8, "text starts at column {left}");
-        assert!(right <= 400 - 8, "text runs to column {right} of 400");
+        let (left, _) = ink_columns(&page);
+        assert_eq!(
+            left, 0,
+            "text starts at column {left}, not against the edge"
+        );
     }
 
     #[test]
-    fn the_gutter_is_a_floor_and_not_an_extra_margin() {
-        // The whole point of a floor: a page that already asked for room gets
-        // exactly the room it asked for. Adding the gutter on top would push
-        // every ordinary page inwards for no reason, and would keep pushing a
-        // generous one further in.
+    fn a_declared_body_margin_is_still_exactly_what_was_asked_for() {
+        // The other half, and the half that never changed: a page that asks for
+        // room gets the room it asked for, and the UA sheet's own 8px applies
+        // to a page that says nothing.
         let mut fonts = FontStore::new();
         let render_at = |css: &str, fonts: &mut FontStore| {
             ink_columns(&render(
@@ -2304,18 +2865,8 @@ mod tests {
                 fonts,
             ))
         };
-
-        // The UA sheet's own 8px, which is already the floor.
-        let default = render_at("", &mut fonts);
-        let zeroed = render_at("body { margin: 0 }", &mut fonts);
-        assert_eq!(
-            default, zeroed,
-            "the floor moved a page that had not asked for less than it"
-        );
-
-        // And a page asking for more keeps all of it, unchanged.
-        let generous = render_at("body { margin: 40px }", &mut fonts);
-        assert_eq!(generous.0, 40, "a 40px margin became {}", generous.0);
+        assert_eq!(render_at("", &mut fonts).0, 8, "the UA sheet's own margin");
+        assert_eq!(render_at("body { margin: 40px }", &mut fonts).0, 40);
     }
 
     #[test]
@@ -2942,6 +3493,131 @@ mod title_tests {
         assert_eq!(
             title_of("<html><head><title>Node &amp; Nib &#8212; 1998</title></head></html>"),
             Some("Node & Nib — 1998".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    //! A response that is a picture rather than a page (#201).
+
+    use super::*;
+
+    /// The bytes a PNG, a JPEG and a GIF start with.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF";
+    const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00";
+
+    #[test]
+    fn an_image_served_as_one_becomes_a_document_around_it() {
+        let document = document_for_a_picture(
+            JPEG,
+            Some("image/jpeg"),
+            Some("https://example.com/photos/cat.jpg"),
+        )
+        .expect("an image document");
+        assert!(
+            document.contains(r#"<img src="https://example.com/photos/cat.jpg""#),
+            "{document}"
+        );
+        assert!(document.contains("<title>cat.jpg</title>"), "{document}");
+    }
+
+    #[test]
+    fn an_image_with_no_content_type_is_recognised_by_its_bytes() {
+        // The `file:` case, which is most of how somebody opens an image on
+        // their own disk: there are no headers at all to go on.
+        for bytes in [PNG, JPEG, GIF] {
+            assert!(
+                document_for_a_picture(bytes, None, Some("file:///home/reader/x")).is_some(),
+                "{:?} was not recognised",
+                &bytes[..4]
+            );
+        }
+        assert!(
+            document_for_a_picture(b"<html><body>hello", None, Some("file:///x.html")).is_none(),
+            "a document was treated as a picture"
+        );
+    }
+
+    #[test]
+    fn a_declared_type_beats_what_the_bytes_look_like() {
+        // Sniffing *against* a declared type is how a browser gets talked into
+        // treating one thing as another. The header is believed both ways.
+        assert!(
+            document_for_a_picture(PNG, Some("text/html"), Some("https://example.com/x")).is_none(),
+            "a server saying text/html was overruled by the bytes"
+        );
+        assert!(
+            document_for_a_picture(
+                b"not really a jpeg",
+                Some("image/jpeg; charset=binary"),
+                Some("https://example.com/x")
+            )
+            .is_some(),
+            "a server saying image/jpeg was not believed"
+        );
+    }
+
+    #[test]
+    fn the_address_is_escaped_into_the_document() {
+        // The URL in the issue carries `?utm_source=…&utm_campaign=…`, and an
+        // unescaped `&` in an attribute is an entity reference waiting to be
+        // misread.
+        let document = document_for_a_picture(
+            PNG,
+            Some("image/png"),
+            Some("https://example.com/a.png?one=1&two=2"),
+        )
+        .expect("an image document");
+        assert!(
+            document.contains(r#"src="https://example.com/a.png?one=1&amp;two=2""#),
+            "{document}"
+        );
+        // And the name is the file, not the tracking parameters.
+        assert!(document.contains("<title>a.png</title>"), "{document}");
+    }
+
+    #[test]
+    fn an_image_with_no_address_is_left_alone() {
+        // There would be nothing to point the `img` at.
+        assert!(document_for_a_picture(PNG, Some("image/png"), None).is_none());
+    }
+
+    #[test]
+    fn the_picture_in_hand_is_not_asked_for_again() {
+        // The point of `Preloaded`: the navigation already downloaded the
+        // photograph, and the page invented to show it must not download it a
+        // second time.
+        struct Counting(usize);
+        impl Loader for Counting {
+            fn load(&mut self, _: &str, _: Option<&Origin>, _: RequestKind) -> Option<Loaded> {
+                self.0 += 1;
+                None
+            }
+        }
+        let mut inner = Counting(0);
+        let held = Loaded {
+            bytes: PNG.to_vec(),
+            content_type: Some("image/png".to_owned()),
+        };
+        let mut loader = Preloaded::new("https://example.com/a.png".to_owned(), held, &mut inner);
+
+        let got = loader.load("https://example.com/a.png", None, RequestKind::Subresource);
+        assert_eq!(got.expect("the held bytes").bytes, PNG);
+        assert!(
+            loader
+                .load(
+                    "https://example.com/other.png",
+                    None,
+                    RequestKind::Subresource
+                )
+                .is_none(),
+            "anything else should go through to the real loader"
+        );
+        assert_eq!(
+            inner.0, 1,
+            "the held URL should not have reached the loader"
         );
     }
 }

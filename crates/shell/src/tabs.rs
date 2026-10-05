@@ -54,6 +54,21 @@ impl<T> Tabs<T> {
         self.items.iter()
     }
 
+    /// One tab by position, mutably.
+    ///
+    /// What an answer that arrived late needs. A request outlives the
+    /// arrangement of the strip it started in — tabs are opened, closed and
+    /// switched while it is in flight — so the caller finds its tab by
+    /// something stable and then reaches it through this (#207).
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.items.get_mut(index)
+    }
+
+    /// Where the first tab satisfying `is_it` sits, if any.
+    pub fn position(&self, is_it: impl Fn(&T) -> bool) -> Option<usize> {
+        self.items.iter().position(is_it)
+    }
+
     /// Opens a tab after the active one and makes it active.
     ///
     /// After rather than at the end: a tab opened from a page belongs beside

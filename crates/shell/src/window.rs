@@ -36,6 +36,44 @@ use winit::window::{Window, WindowId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandReady;
 
+/// Anything that wakes the window from somewhere other than the reader.
+///
+/// Two sources now, which is why this is an enum rather than [`BandReady`]
+/// alone: a band finished on a renderer thread, and AccessKit reporting that an
+/// assistive technology has attached or gone away — which can happen on a
+/// platform thread of AccessKit's own (#178).
+#[derive(Debug)]
+pub enum Wake {
+    /// A band is painted and the window should redraw.
+    Band(BandReady),
+    /// AccessKit has something to say about who is listening.
+    Accessibility(accesskit_winit::Event),
+    /// A request has come back (#207).
+    ///
+    /// Carries nothing, exactly as `Band` does: the answer is waiting in the
+    /// channel and this only says to go and look. A payload through the event
+    /// loop's proxy would be a second way for the same thing to arrive.
+    Fetched,
+}
+
+impl From<BandReady> for Wake {
+    fn from(band: BandReady) -> Self {
+        Wake::Band(band)
+    }
+}
+
+impl From<accesskit_winit::Event> for Wake {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Wake::Accessibility(event)
+    }
+}
+
+/// The number the window's first tab carries.
+///
+/// One rather than zero, so a tab id is never confused with an index and a zero
+/// left somewhere by accident names no tab at all.
+const FIRST_TAB: crate::fetches::TabId = 1;
+
 /// How much taller than the window a painted band is.
 ///
 /// The reader sees one window's worth; painting three means scrolling roughly a
@@ -82,6 +120,35 @@ fn stepped_zoom(now: f32, steps: i32) -> f32 {
     ZOOM_STEPS[to]
 }
 
+/// Flattens pasted text onto one line.
+///
+/// A one-line field cannot show a newline and nothing here would draw one, so
+/// text arriving from the clipboard with paragraphs in it would leave the
+/// field holding characters the reader can neither see nor delete by eye. Each
+/// break becomes a space, which is what pasting into a one-line field does
+/// everywhere — and a `<textarea>` gets the text untouched, because a decision
+/// about a one-line field is not a decision about the clipboard.
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut after_break = false;
+    for character in text.chars() {
+        match character {
+            '\n' | '\r' => after_break = true,
+            other => {
+                // Collapsed rather than one space per break: a paste of
+                // `a\r\n\r\nb` is two paragraphs, not four spaces' worth of
+                // gap in the middle of an address.
+                if after_break && !out.is_empty() {
+                    out.push(' ');
+                }
+                after_break = false;
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 /// Turns what someone typed into a URL.
 ///
 /// A bare host is the overwhelmingly common case and has to work: typing
@@ -123,6 +190,21 @@ fn absolute_from_cwd(typed: &str) -> std::path::PathBuf {
     }
 }
 
+/// A scrollbar drag in progress.
+///
+/// `held` is how far along the thumb the pointer took hold, which is what stops
+/// the thumb jumping so its near edge is under the pointer the moment it is
+/// pressed — moving the page before the drag has begun.
+///
+/// `across` says which of the two bars it is. One field rather than two
+/// `Option`s, because a hand holds one thumb: a pair that must never both be
+/// set is a state the type should not be able to spell (#204).
+#[derive(Debug, Clone, Copy)]
+struct ThumbDrag {
+    across: bool,
+    held: f32,
+}
+
 /// Packs a rendered pixel for softbuffer.
 ///
 /// softbuffer wants 0RGB in a u32; tiny-skia stores premultiplied RGBA.
@@ -151,10 +233,18 @@ fn pack(pixel: &paint::PremultipliedColor) -> u32 {
 /// chrome's height is a constant, and when it changed from 34 to 46 the two
 /// sites were updated by hand and nothing would have said so if only one had
 /// been.
-fn document_point(pointer: (f32, f32), chrome_height: u32, scroll: f32) -> Option<(f32, f32)> {
+fn document_point(
+    pointer: (f32, f32),
+    chrome_height: u32,
+    scroll: (f32, f32),
+) -> Option<(f32, f32)> {
     let y = pointer.1 - chrome_height as f32;
     // Above the page is the bar, which owns its own clicks.
-    (y >= 0.0).then_some((pointer.0, y + scroll))
+    //
+    // The horizontal offset needs no such guard. There is no chrome to the left
+    // of the page — the window's left edge is the page's — so a column is a
+    // column of the document wherever the pointer is (#204).
+    (y >= 0.0).then_some((pointer.0 + scroll.0, y + scroll.1))
 }
 
 /// Shrinks a requested window to something the screen can actually show.
@@ -219,13 +309,58 @@ type Loaded = crate::viewport::Document;
 ///
 /// Everything here describes a page. What is *not* here — the window, the
 /// fonts, the pointer — belongs to the browser rather than to any page in it.
+/// A press in the URL bar that has not been let go of yet (#199).
+#[derive(Debug, Clone, Copy)]
+struct UrlDrag {
+    /// Whether the bar already had the focus when the press landed.
+    ///
+    /// A first click focuses and selects everything; a second one places the
+    /// caret. Without this the bar could be focused or edited but never both.
+    was_focused: bool,
+    /// Whether the pointer moved while the button was down, which is what
+    /// makes a press a drag rather than a click.
+    moved: bool,
+}
+
 struct Tab {
+    /// This tab, for as long as it exists (#207).
+    ///
+    /// Stable where an index is not: a request outlives the arrangement of the
+    /// strip it started in, so an answer that arrives after the reader has
+    /// opened, closed or reordered tabs has to be able to find the one that
+    /// asked.
+    id: crate::fetches::TabId,
+    /// Keystrokes typed while this tab's page was being re-rendered (#207).
+    ///
+    /// A keystroke costs the child a whole re-render — parse, cascade, layout,
+    /// paint — and a person types faster than that. Waiting for each one froze
+    /// the window for the length of a word, against the reader's own keys.
+    ///
+    /// So a key goes out at once when nothing is in flight, and otherwise waits
+    /// here for the render already running to finish. A burst then costs two
+    /// renders rather than one per letter, and the letters nobody could see yet
+    /// never got a render of their own.
+    typing: Vec<sandbox::message::Key>,
+    /// The request this tab is waiting for, if it is waiting for one.
+    ///
+    /// A reader who types an address, waits, and types another has two in
+    /// flight and wants the second. An answer whose number is not this one is
+    /// one nobody is waiting for any more, and is dropped.
+    pending: Option<u64>,
     loaded: Loaded,
     history: crate::history::History,
     /// The page, held by a live renderer process. `None` when the last
     /// navigation failed and there is nothing to show.
     page: Option<crate::viewport::Viewport>,
     scroll: f32,
+    /// How far the page has been scrolled sideways (#204).
+    ///
+    /// Almost always zero: a page laid out to the viewport's width has nothing
+    /// to the right of it, and the era's pages mostly were. It stops being zero
+    /// for the things that are wider than any window — a scanned page, a large
+    /// photograph opened by its own address, a `<pre>` block of fixed-width
+    /// output, a table with more columns than the author expected.
+    scroll_x: f32,
     /// What went wrong with the last navigation in this tab.
     error: Option<String>,
     /// Whether the reader has overruled the document fallback here (ADR-0009).
@@ -243,6 +378,12 @@ struct Tab {
     zoom: f32,
     /// Whether this page is in a layout decision the reader can change.
     can_toggle_layout: bool,
+    /// What the server answered this page with (#203).
+    ///
+    /// Kept because a page and its status are now two different things: a 404
+    /// with a body renders as the site wrote it, and nothing on screen would
+    /// otherwise say it was a 404 at all. The page information view reads it.
+    status: u16,
     /// Whether this page's certificate verified only against a local root.
     ///
     /// A property of the connection that fetched it, so it is remembered per
@@ -273,13 +414,20 @@ struct Tab {
 }
 
 impl Tab {
-    fn new(loaded: Loaded, url: String) -> Self {
+    fn new(id: crate::fetches::TabId, loaded: Loaded, url: String) -> Self {
         Self {
+            id,
+            typing: Vec::new(),
+            pending: None,
             loaded,
             history: crate::history::History::new(url),
             page: None,
             scroll: 0.0,
+            scroll_x: 0.0,
             error: None,
+            // Until something says otherwise. A tab that has not fetched
+            // anything has nothing to have gone wrong with it.
+            status: 200,
             forcing_authored: false,
             forcing_document: false,
             zoom: 1.0,
@@ -330,8 +478,46 @@ impl Tab {
             .and_then(crate::viewport::Viewport::title)
         {
             Some(title) => title,
+            None if self.is_blank() => "New tab",
             None => self.history.current(),
         }
+    }
+
+    /// Whether this tab is the empty one a new tab starts as (#196).
+    ///
+    /// No address is the test, because no address is the thing: there is
+    /// nothing to reload, nothing to go back to and nothing to say about the
+    /// connection, and every one of those questions is asked of the URL.
+    fn is_blank(&self) -> bool {
+        self.history.current().is_empty()
+    }
+
+    /// A tab with nothing in it (#196).
+    ///
+    /// A new tab used to show the page you were on, for the reason the old
+    /// comment gave: there is no home page and no new-tab page of tiles to put
+    /// there. But copying the current page is not neutral either — it is a
+    /// second copy of something the reader did not ask to duplicate, and it
+    /// re-fetches it to get there. Nothing is the honest third option, and it
+    /// is what the address bar being ready to type into is for.
+    fn blank(id: crate::fetches::TabId) -> Self {
+        Self::new(
+            id,
+            Loaded {
+                body: Vec::new(),
+                content_type: None,
+                // No origin at all is the truthful answer, and an empty-hosted
+                // `file:` origin is how this browser already spells one: it is
+                // what every `file:` URL parses to.
+                origin: net::Origin {
+                    scheme: net::Scheme::File,
+                    host: String::new(),
+                    port: 0,
+                },
+                path: String::new(),
+            },
+            String::new(),
+        )
     }
 }
 
@@ -383,6 +569,21 @@ impl PendingResize {
 struct App {
     tabs: crate::tabs::Tabs<Tab>,
     fetcher: net::Fetcher,
+    /// Requests in flight, served off this thread (#207).
+    ///
+    /// The whole of "a busy tab must not hang the window": a fetch is a DNS
+    /// lookup, a connection, a handshake and however long a server takes, and
+    /// every one of them used to happen inside the event handler that asked
+    /// for it.
+    fetches: crate::fetches::Fetches,
+    /// The number the next tab opened will carry.
+    next_tab: crate::fetches::TabId,
+    /// Where a saved picture goes (#205).
+    ///
+    /// Held rather than resolved at each save, so that a test can point it
+    /// somewhere else and so the answer cannot change under the reader
+    /// mid-session.
+    downloads: std::path::PathBuf,
     /// Spawns renderer children. One per page, killed when the page is
     /// replaced (ADR-0012).
     renderer: sandbox::Renderer,
@@ -421,13 +622,9 @@ struct App {
     /// through are known and unequal, and saying which one it is in is more
     /// use than saying that something is happening.
     loading: Option<f32>,
-    /// A scrollbar drag in progress, and how far down the thumb it was
-    /// started. `None` when the pointer is not holding the thumb.
-    ///
-    /// The offset is what stops the thumb jumping so its top is under the
-    /// pointer the moment it is pressed, which would move the page before the
-    /// drag had begun.
-    dragging: Option<f32>,
+    /// A scrollbar drag in progress. `None` when the pointer is not holding a
+    /// thumb.
+    dragging: Option<ThumbDrag>,
     /// The context menu, while one is open (#54).
     menu: Option<crate::menu::Menu>,
     /// The system clipboard, opened on the first copy and then kept.
@@ -435,12 +632,38 @@ struct App {
     /// `None` until something is copied, and still `None` where there is no
     /// clipboard to be had.
     clipboard: Option<arboard::Clipboard>,
+    /// The bridge to the platform's accessibility API (ADR-0019, #178).
+    ///
+    /// `None` until the window exists, because AccessKit has to be given the
+    /// window before it is first shown. After that it is always present and
+    /// almost always idle: nothing is built, and the child is never asked, until
+    /// an assistive technology attaches and `update_if_active` starts calling
+    /// the closure it is handed.
+    adapter: Option<accesskit_winit::Adapter>,
+    /// The page's tree, once something has asked for it (#178).
+    ///
+    /// Kept so that a scroll does not cost a round trip to the child: the tree
+    /// is the same, and only the transform on its root moves. Cleared by
+    /// `forget_accessibility` when a render replaces the page it describes.
+    a11y_tree: Option<sandbox::access::Tree>,
+    /// Whether an assistive technology is attached right now.
+    ///
+    /// Kept beside the adapter rather than asked of it, because it is what
+    /// decides whether to go to the *child* for a tree — and that is a round
+    /// trip to another process, which is exactly the cost ADR-0019's third term
+    /// exists to avoid paying when nobody is listening.
+    listening: bool,
     /// Where a text selection drag started, in document coordinates.
     ///
     /// `None` when the pointer is not selecting. Set on press rather than on
     /// the first move, because the anchor is where the press was and by the
     /// time a move arrives the pointer is somewhere else.
     selecting: Option<(f32, f32)>,
+    /// A press in progress in the URL bar's text (#199).
+    ///
+    /// `None` when the pointer is not dragging through the address. What it
+    /// remembers is only what the release needs to tell a click from a drag.
+    url_drag: Option<UrlDrag>,
     /// Which colour scheme the chrome draws in.
     theme: crate::chrome::Theme,
     /// Held because a key event does not carry the modifier state with it.
@@ -459,11 +682,21 @@ struct App {
     ///
     /// `None` only in tests and before the loop starts, where nothing is
     /// waiting to be woken.
-    waker: Option<winit::event_loop::EventLoopProxy<BandReady>>,
+    waker: Option<winit::event_loop::EventLoopProxy<Wake>>,
     /// Where that list is written back to.
     bookmarks_path: std::path::PathBuf,
+    /// Where the reader has been, kept between runs (#197, ADR-0021).
+    visits: crate::visits::Visits,
+    /// Where that list is written back to.
+    visits_path: std::path::PathBuf,
     /// The open site panel, if the padlock has been pressed (#118).
     panel: Option<crate::site_panel::Panel>,
+    /// The open dropdown, if a `<select>` on the page has been pressed.
+    ///
+    /// Held here rather than in the renderer because it floats over the page
+    /// and the page's canvas has no room for it. What is in it came from the
+    /// child; what it means is the child's to decide when a row is chosen.
+    dropdown: Option<crate::dropdown::Dropdown>,
     /// Where the granted exceptions are written back to.
     ///
     /// The policy itself lives on the two fetchers — this window's, for
@@ -500,6 +733,12 @@ impl App {
         let viewport = self.viewport_height();
         let span = self.band_span();
         let scroll = self.tab().scroll;
+        // The horizontal axis gets no margin, because there is nowhere to put
+        // one: a band is painted exactly as wide as the window, so the only
+        // column it can start at is the one the reader is looking at. Scrolling
+        // sideways therefore always costs a band, which is affordable because
+        // there is nothing to scroll sideways on almost every page (#204).
+        let left = self.tab().scroll_x as u32;
         let Some(page) = self.tab().page.as_ref() else {
             return;
         };
@@ -515,16 +754,19 @@ impl App {
         // document's own edge where there is no more page to have.
         let wanted_top = (scroll - viewport).max(0.0);
         let wanted_bottom = (scroll + viewport * 2.0).min(content);
-        if wanted_top >= band_top && wanted_bottom <= band_top + band_height {
+        if wanted_top >= band_top
+            && wanted_bottom <= band_top + band_height
+            && left == page.band_left()
+        {
             return;
         }
         let furthest = (content - span as f32).max(0.0);
         let desired = (scroll - viewport).clamp(0.0, furthest) as u32;
-        if desired == page.band_top() {
+        if desired == page.band_top() && left == page.band_left() {
             return;
         }
         if let Some(page) = self.tab_mut().page.as_mut() {
-            let _ = page.request_band(desired, span);
+            let _ = page.request_band(left, desired, span);
         }
     }
 
@@ -605,7 +847,7 @@ impl App {
                     // that is otherwise asleep.
                     if let Some(waker) = waker.clone() {
                         page.set_wake(Box::new(move || {
-                            let _ = waker.send_event(BandReady);
+                            let _ = waker.send_event(Wake::Band(BandReady));
                         }));
                     }
                     tab.page = Some(page);
@@ -624,7 +866,16 @@ impl App {
         if let Some(page) = tab.page.as_ref() {
             tab.can_toggle_layout = page.can_toggle_layout();
             tab.scroll = clamp_scroll(tab.scroll, page.scrollable_height(), viewport);
+            tab.scroll_x = clamp_scroll(tab.scroll_x, page.scrollable_width(), width as f32);
         }
+        // The page now has a title, which is what the history list wants to
+        // call it (#197). The address was recorded when the navigation landed;
+        // this names it, once the borrow of the tab above is over.
+        let named = tab
+            .page
+            .as_ref()
+            .and_then(crate::viewport::Viewport::title)
+            .map(|title| (tab.history.current().to_owned(), title.to_owned()));
 
         // The old selection pointed at the old layout, and unlike a query there
         // is nothing to re-run it from: the two points it was dragged between
@@ -640,6 +891,9 @@ impl App {
                 None => Vec::new(),
             };
             tab.current_match = tab.current_match.min(tab.matches.len().saturating_sub(1));
+        }
+        if let Some((url, title)) = named {
+            self.record_visit(&url, &title);
         }
         // Same reason: the focused link is still the same link, but it is no
         // longer in the same place.
@@ -666,6 +920,11 @@ impl App {
         // not there, the rows they are looking at have to be asked for.
         self.refresh_band();
         self.refresh_chrome();
+        // The tree described the page that has just been replaced (#178). Both
+        // calls, and in this order: forget what was, then send what is — and
+        // both do nothing at all unless something is listening.
+        self.forget_accessibility();
+        self.push_accessibility();
     }
 
     /// Fetches `url` and shows it, without touching history.
@@ -673,20 +932,23 @@ impl App {
     /// Used by back and forward as well as by following a link, so the history
     /// bookkeeping stays in one place rather than being repeated per caller.
     fn show(&mut self, url: &str) {
-        // A navigation is synchronous — the fetch blocks, and so does the round
-        // trip to the child that lays the page out — so the event loop cannot
-        // repaint while one is in flight. The bar is therefore painted from
-        // here, at each stage, rather than left to a redraw that will not
-        // happen until the page is already up. It steps rather than sliding,
-        // and the steps are the real ones.
-        self.stage(Some(FETCHING));
+        // Asked for and not waited on (#207). The request goes to a worker and
+        // the event loop carries straight on drawing — so the page the reader
+        // is already looking at stays scrollable, selectable and alive while
+        // the next one is on its way, in this tab or any other.
+        //
         // Raw, not decoded: the encoding sniffer lives with every other parser
         // on the far side of the boundary, so the parent never turns a
         // stranger's bytes into text (ADR-0012).
-        let fetched = self
-            .fetcher
-            .fetch_raw(url, None, net::RequestKind::Navigation);
-        self.install(fetched);
+        let tab = self.tab().id;
+        let seq = self.fetches.ask(
+            tab,
+            crate::fetches::Want::Navigate {
+                url: url.to_owned(),
+            },
+        );
+        self.tab_mut().pending = Some(seq);
+        self.stage(Some(FETCHING));
     }
 
     /// Sends a form and shows what comes back (#110).
@@ -696,56 +958,196 @@ impl App {
     /// has to mean it. Everything after the request is identical, because what
     /// comes back from a form is a page like any other.
     fn send(&mut self, url: &str, body: &str) {
+        let tab = self.tab().id;
+        let seq = self.fetches.ask(
+            tab,
+            crate::fetches::Want::Submit {
+                url: url.to_owned(),
+                body: body.to_owned(),
+            },
+        );
+        self.tab_mut().pending = Some(seq);
         self.stage(Some(FETCHING));
-        let fetched = self.fetcher.post(url, body);
-        self.install(fetched);
+    }
+
+    /// Takes whatever the workers have answered, and acts on each (#207).
+    ///
+    /// Called from the wake, and from nowhere else: the channel is the one
+    /// place an answer arrives and this is the one place it is read.
+    fn collect_fetches(&mut self) {
+        for done in self.fetches.take() {
+            self.finish(done);
+        }
+    }
+
+    /// Acts on one answer.
+    ///
+    /// Two ways an answer is no longer wanted, and both are ordinary rather
+    /// than exceptional: the tab was closed while it was in flight, or the
+    /// reader asked for something else in the same tab and this is the older
+    /// request. Neither is an error and neither says anything to the reader —
+    /// what they asked for last is what they get.
+    fn finish(&mut self, done: crate::fetches::Done) {
+        let Some(at) = self.tabs.position(|tab| tab.id == done.asked.tab) else {
+            return;
+        };
+        if let crate::fetches::Want::SaveImage { into, .. } = &done.asked.want {
+            let outcome = match &done.outcome {
+                Ok(fetched) => crate::downloads::save(into, done.asked.want.url(), &fetched.body),
+                Err(why) => Err(why.clone()),
+            };
+            // Said where every other outcome is said, including a failure:
+            // silently not saving looks exactly like saving.
+            if let Some(tab) = self.tabs.get_mut(at) {
+                tab.error = Some(match outcome {
+                    Ok(path) => format!("saved {}", path.display()),
+                    Err(why) => format!("could not save the image: {why}"),
+                });
+            }
+            self.loading = None;
+            self.refresh_chrome();
+            return;
+        }
+        let stale = self
+            .tabs
+            .get_mut(at)
+            .is_none_or(|tab| tab.pending != Some(done.asked.seq));
+        if stale {
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(at) {
+            tab.pending = None;
+        }
+        self.install_into(at, done.outcome);
     }
 
     /// Installs whatever a navigation came back with, or says why it did not.
-    fn install(&mut self, fetched: Result<net::Fetched, net::FetchError>) {
-        // Painted before the page is cleared, so what stays on screen behind
-        // the bar is the page being left rather than a white window.
-        self.stage(Some(LAYING_OUT));
+    ///
+    /// `at` rather than the active tab, because an answer arrives whenever it
+    /// arrives and the reader may have switched away (#207). A background tab
+    /// takes its bytes and is *not* laid out here: rendering is the expensive
+    /// half and doing it for a page nobody is looking at would put the freeze
+    /// back, one tab removed. It renders when the reader switches to it.
+    fn install_into(&mut self, at: usize, fetched: Result<Box<net::Fetched>, String>) {
+        let active = at == self.tabs.active_index();
+        if active {
+            // Painted before the page is cleared, so what stays on screen
+            // behind the bar is the page being left rather than a white window.
+            self.stage(Some(LAYING_OUT));
+        }
+        let mut landed = None;
         match fetched {
             Ok(fetched) => {
-                self.tab_mut().local_root = fetched.trust == net::Trust::LocalRoot;
-                self.tab_mut().loaded = Loaded {
-                    body: fetched.body,
-                    content_type: fetched.content_type,
+                // Somewhere the reader has now been, so the next page that
+                // links here draws that link purple (#181). Recorded on the
+                // fetch *landing* rather than on the click, because a link that
+                // refused to load is not a place you have been — and recorded
+                // from the fetched origin and path rather than the URL asked
+                // for, so a redirect records where it arrived.
+                // Resolved the same way `link_targets` resolves an href, so
+                // the two strings agree: what is recorded here is exactly what
+                // a link pointing back at this page will ask about.
+                let landed_on = net::resolve(&fetched.origin, &fetched.path, &fetched.path);
+                self.renderer.record_visit(&landed_on);
+                let Some(tab) = self.tabs.get_mut(at) else {
+                    return;
+                };
+                // And the bar says where the page came from rather than where
+                // it was asked for. A redirect otherwise leaves the address,
+                // the padlock's site and every link on the page disagreeing
+                // about which site the reader is on — and Back would return to
+                // the address that only redirects again.
+                tab.history.arrived_at(landed_on.clone());
+                // And the reader has been here (#197). Recorded on the landing
+                // rather than on the click, for the same reason the purple-link
+                // list is: a page that refused to load is not a place you have
+                // been. The title is not known yet — it arrives from the
+                // renderer — so this records the address and the render below
+                // fills the name in. Done after the borrow of the tab ends,
+                // because the history is the browser's and not the tab's.
+                landed = Some(landed_on.clone());
+                tab.local_root = fetched.trust == net::Trust::LocalRoot;
+                // A 4xx or a 5xx keeps whatever the server sent, because what
+                // it sent is the answer: a site's own "not found", a proxy's
+                // block notice. Only a status with *nothing* behind it gets a
+                // page of the browser's own — otherwise the reader is left with
+                // a blank window and a code in the chrome (#203).
+                let (body, content_type) = crate::status::substitute(
+                    fetched.status,
+                    fetched.body,
+                    fetched.content_type,
+                    &landed_on,
+                );
+                tab.status = fetched.status;
+                tab.loaded = Loaded {
+                    body,
+                    content_type,
                     origin: fetched.origin,
                     path: fetched.path,
                 };
                 // A fresh document means a fresh renderer: the old child holds
                 // the page that just left, and dropping it kills that process.
-                self.tab_mut().page = None;
-                self.tab_mut().error = None;
-                self.tab_mut().scroll = 0.0;
+                tab.page = None;
+                tab.error = None;
+                tab.scroll = 0.0;
+                tab.scroll_x = 0.0;
                 // A decision about the previous page, not a setting. Both of
                 // them: a reader who asked one page for a plain view has not
                 // asked for one of every page they go on to visit.
-                self.tab_mut().forcing_authored = false;
-                self.tab_mut().forcing_document = false;
+                tab.forcing_authored = false;
+                tab.forcing_document = false;
                 // Focus belonged to a link on the page that just left.
-                self.tab_mut().focused_link = None;
-                self.tab_mut().focused_rects.clear();
+                tab.focused_link = None;
+                tab.focused_rects.clear();
             }
             // The page that failed stays on screen rather than being replaced
             // with a blank one: what was there is more useful than nothing, and
             // the title says what happened.
-            Err(error) => self.tab_mut().error = Some(error.to_string()),
+            Err(error) => {
+                if let Some(tab) = self.tabs.get_mut(at) {
+                    tab.error = Some(error);
+                }
+            }
         }
-        self.rerender();
-        self.loading = None;
+        // The visit is recorded outside the borrow above, which is also where
+        // it belongs: it is the browser's record rather than the tab's.
+        if let Some(landed_on) = landed {
+            self.record_visit(&landed_on, "");
+        }
+        if active {
+            self.rerender();
+        }
+        // The bar belongs to the window, not to a tab, so it goes when nothing
+        // at all is still being waited for. A tab that finished while another
+        // was still loading must not take the bar down with it (#207).
+        self.settle_loading();
+        self.refresh_chrome();
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
+    /// Takes the loading bar down once nothing is waiting for an answer.
+    ///
+    /// Asked of every tab rather than of the one that just finished: with
+    /// requests in flight in more than one tab, the window is still busy after
+    /// any single one of them lands, and a bar that vanished on the first would
+    /// say the rest had finished too.
+    fn settle_loading(&mut self) {
+        if self.tabs.iter().all(|tab| tab.pending.is_none()) {
+            self.loading = None;
+        }
+    }
+
     /// Moves the loading bar and puts it on screen at once.
     ///
-    /// The `draw` is the point: nothing else is going to run until the
-    /// navigation finishes, so a stage that only set the field would be shown
-    /// for no time at all and then replaced by the finished page.
+    /// The `draw` used to be the point, because nothing else was going to run
+    /// until the navigation finished and a stage that only set the field would
+    /// have been shown for no time at all. That is no longer true — a fetch is
+    /// served off this thread now (#207) and the loop keeps drawing — but
+    /// painting it here is still right: it is what puts the bar up in the same
+    /// gesture that starts the request, rather than on whatever redraw happens
+    /// to come next.
     fn stage(&mut self, progress: Option<f32>) {
         self.loading = progress;
         self.draw();
@@ -765,6 +1167,17 @@ impl App {
     /// to do nothing.
     fn reload(&mut self) {
         let url = self.tab().history.current().to_owned();
+        // An empty tab has nothing to fetch again, and asking would answer
+        // with "malformed URL" — an error about a page nobody navigated to.
+        if url.is_empty() {
+            return;
+        }
+        // ADR-0018's sixth term: reload bypasses the cache. Only this site's
+        // entries go, because reloading one page says nothing about any other
+        // — and a reload that served the same bytes back would leave the one
+        // control a reader has over staleness doing nothing at all.
+        self.renderer
+            .forget(net::parse_url(&url).ok().map(|(origin, _)| origin).as_ref());
         self.show(&url);
     }
 
@@ -876,6 +1289,57 @@ impl App {
         self.refresh_chrome();
     }
 
+    /// Starts a press in the URL bar's text (#199).
+    ///
+    /// The caret goes where the pointer is, which is the thing that was
+    /// missing: the bar could only ever be focused with everything selected,
+    /// so the only way to reach one character of a long URL was the arrow
+    /// keys. Whether this turns out to be a click or a drag is decided when
+    /// the button comes up.
+    fn press_url(&mut self) {
+        let was_focused = self.editing.is_some();
+        if !was_focused {
+            self.editing = Some(crate::field::Field::with_cursor_at_end(
+                self.tab().history.current(),
+            ));
+        }
+        self.drag_url_to(self.pointer.0, false);
+        self.url_drag = Some(UrlDrag {
+            was_focused,
+            moved: false,
+        });
+    }
+
+    /// Moves the caret in the URL bar to a window x (#199).
+    fn drag_url_to(&mut self, x: f32, extend: bool) {
+        let Some(field) = &self.editing else { return };
+        let at = crate::chrome::offset_in_url(&mut self.fonts, field.text(), x);
+        if let Some(field) = &mut self.editing {
+            field.place(at, extend);
+        }
+        self.refresh_chrome();
+    }
+
+    /// Ends a press in the URL bar (#199).
+    ///
+    /// A click that never moved, on a bar that was not already focused,
+    /// selects the whole URL — which is what focusing an address bar has
+    /// always done, and what the common next action wants: replace it. Once
+    /// the bar is focused the same click places the caret instead, and a drag
+    /// always selects what it crossed.
+    fn release_url(&mut self) {
+        let Some(drag) = self.url_drag.take() else {
+            return;
+        };
+        if !drag.moved
+            && !drag.was_focused
+            && let Some(field) = &mut self.editing
+        {
+            field.select_all();
+            self.refresh_chrome();
+        }
+    }
+
     /// Tells the page a point on it was pressed (#110).
     ///
     /// The child works out whether there is a form control there — the box tree
@@ -883,11 +1347,14 @@ impl App {
     /// (ADR-0012). All that comes back is a fresh render and one bit saying
     /// whether anything is now taking the typing.
     fn press_page(&mut self) {
-        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)
-        else {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.scroll()) else {
             return;
         };
         let was = self.page_is_editing();
+        // Asked before the press, because a control that changes when it is
+        // pressed changes the pixels without changing the focus — a ticked box
+        // takes no typing — and the redraw below would otherwise never happen.
+        let on_control = self.control_on_page_under_pointer();
         let Some(page) = self.tab_mut().page.as_mut() else {
             return;
         };
@@ -895,12 +1362,32 @@ impl App {
         // A redraw only when something changed. Pressing the margin of a page
         // with nothing focused is the commonest click there is, and repainting
         // the window for it would be work nobody asked for.
-        if (was || now)
+        if (was || now || on_control)
             && let Some(window) = &self.window
         {
             window.request_redraw();
         }
         self.act_on_page();
+    }
+
+    /// Whether the pointer is over a control on the page that answers a press.
+    ///
+    /// The rectangles come from the child with the page, because the parent
+    /// has no box tree — so a control missing from those lists is one the
+    /// cursor says nothing about, which is exactly as wrong as it is honest.
+    fn control_on_page_under_pointer(&self) -> bool {
+        let Some((x, y)) = document_point(self.pointer, self.chrome_height(), self.scroll()) else {
+            return false;
+        };
+        let Some(page) = &self.tab().page else {
+            return false;
+        };
+        page.buttons()
+            .into_iter()
+            .chain(page.pressables())
+            .any(|rect| {
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
     }
 
     /// Sends a form the page asked to send (#110).
@@ -942,6 +1429,14 @@ impl App {
 
     /// Carries out whatever the page asked for after a press or a keystroke.
     fn act_on_page(&mut self) {
+        let opened = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .and_then(crate::viewport::Viewport::take_dropdown);
+        if let Some(opened) = opened {
+            self.open_dropdown(opened);
+        }
         let asked = self
             .tab_mut()
             .page
@@ -952,7 +1447,120 @@ impl App {
         }
     }
 
-    /// Whether a form control on the page is taking the typing (#110).
+    /// Opens the list a `<select>` on the page asked for.
+    ///
+    /// The rectangle arrives in document coordinates, because that is the only
+    /// frame the child has, and is moved into the window's: down by the chrome,
+    /// up by the scroll. A list is pinned where it opened rather than following
+    /// the control, which is why it closes on a scroll.
+    fn open_dropdown(&mut self, asked: sandbox::message::Dropdown) {
+        let top = self.chrome_height() as f32 - self.tab().scroll;
+        let box_ = layout::Rect {
+            x: asked.rect.x - self.tab().scroll_x,
+            y: asked.rect.y + top,
+            ..asked.rect
+        };
+        self.dropdown = crate::dropdown::Dropdown::open(
+            box_,
+            asked.options,
+            asked.on as usize,
+            asked.node,
+            &mut self.fonts,
+            self.size,
+        );
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Acts on whatever row the pointer is over, and closes the list.
+    ///
+    /// A press outside it closes it and chooses nothing, which is what pressing
+    /// outside an open list means everywhere — and importantly does *not* then
+    /// fall through to the page, or dismissing a list would click whatever was
+    /// behind it.
+    fn choose_from_dropdown(&mut self) {
+        let Some(dropdown) = self.dropdown.take() else {
+            return;
+        };
+        if let Some(row) = dropdown.row_at(self.pointer.0, self.pointer.1)
+            && let Some(page) = self.tab_mut().page.as_mut()
+        {
+            page.choose(dropdown.node, row as u32);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Closes the dropdown if one is open. Whether there was one to close.
+    fn close_dropdown(&mut self) -> bool {
+        let had = self.dropdown.take().is_some();
+        if had && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        had
+    }
+
+    /// One keystroke while a dropdown's list is open. Whether it was taken.
+    ///
+    /// Up and Down move through the rows, Enter takes the one they are on, and
+    /// Escape gives up — the same four keys the list answers in every browser.
+    /// Everything else is swallowed too, deliberately: while a list is open it
+    /// has the keyboard, and a key that fell through to scroll the page would
+    /// scroll it out from under the list, which is pinned where it opened.
+    ///
+    /// What it does *not* swallow is a chord, for the reason [`App::page_key`]
+    /// gives: Ctrl+T and Ctrl+L belong to the window wherever the keyboard is,
+    /// and a reader who could not open a tab because a dropdown was open would
+    /// think the browser had hung.
+    fn dropdown_key(&mut self, key: &Key, alt: bool, ctrl: bool) -> bool {
+        if alt || ctrl {
+            return false;
+        }
+        let Some(dropdown) = &mut self.dropdown else {
+            return false;
+        };
+        let rows = dropdown.rows();
+        // Starting from the row the control is already on, so the first Down
+        // moves off the current answer rather than to the top of the list.
+        let at = dropdown.hovered.unwrap_or(dropdown.on);
+        match key {
+            Key::Named(NamedKey::ArrowUp) => {
+                dropdown.hovered = Some(at.saturating_sub(1));
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                dropdown.hovered = Some((at + 1).min(rows.saturating_sub(1)));
+            }
+            Key::Named(NamedKey::Home) => dropdown.hovered = Some(0),
+            Key::Named(NamedKey::End) => dropdown.hovered = Some(rows.saturating_sub(1)),
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                let (node, row) = (dropdown.node, at);
+                self.dropdown = None;
+                if let Some(page) = self.tab_mut().page.as_mut() {
+                    page.choose(node, row as u32);
+                }
+            }
+            Key::Named(NamedKey::Escape) => self.dropdown = None,
+            // Swallowed without doing anything, rather than handed on.
+            _ => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
+    }
+
+    /// Whether what has the keyboard on the page is pressed rather than typed
+    /// in (#151).
+    fn page_focus_is_pressable(&self) -> bool {
+        self.tab()
+            .page
+            .as_ref()
+            .is_some_and(crate::viewport::Viewport::focus_is_pressable)
+    }
+
+    /// Whether a form control on the page has the keyboard (#110, #151).
     fn page_is_editing(&self) -> bool {
         self.tab()
             .page
@@ -960,15 +1568,52 @@ impl App {
             .is_some_and(crate::viewport::Viewport::editing)
     }
 
-    /// Hands one keystroke to the page's focused control.
+    /// Hands one keystroke to the page's focused control (#207).
+    ///
+    /// Sent and not waited for. The page changes when the child answers, which
+    /// is a wake-up like a painted band — so the window keeps drawing, and a
+    /// reader typing quickly is never typing into a frozen one.
     fn type_into_page(&mut self, key: sandbox::message::Key) {
+        self.tab_mut().typing.push(key);
+        self.flush_typing();
+    }
+
+    /// Sends whatever has been typed, if the child is free to take it.
+    ///
+    /// One render in flight at a time per tab. A second would be answered after
+    /// the first and immediately replace it — a page nobody saw, laid out and
+    /// painted for nothing, which is exactly the cost this is removing.
+    fn flush_typing(&mut self) {
+        let free = self
+            .tab()
+            .page
+            .as_ref()
+            .is_some_and(|page| !page.typing_outstanding());
+        if !free || self.tab().typing.is_empty() {
+            return;
+        }
+        let keys = std::mem::take(&mut self.tab_mut().typing);
         if let Some(page) = self.tab_mut().page.as_mut() {
-            page.type_key(key);
+            page.request_type(keys);
         }
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    }
+
+    /// Shows a page that typing changed, and sends whatever was typed since.
+    ///
+    /// Returns whether anything changed, which is what decides a redraw.
+    fn accept_typed(&mut self) -> bool {
+        let changed = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .is_some_and(crate::viewport::Viewport::accept_typed);
+        if changed {
+            // Everything typed while that render was running goes now, as one
+            // run. This is the second of the two renders a burst costs.
+            self.flush_typing();
+            self.act_on_page();
         }
-        self.act_on_page();
+        changed
     }
 
     /// Gives up editing without navigating.
@@ -978,48 +1623,53 @@ impl App {
         }
     }
 
+    /// Opens an empty tab beside the current one, ready to be typed into (#196).
+    ///
+    /// The URL bar takes the focus, because an empty tab with the focus
+    /// somewhere else is a page with nothing on it and nothing to do — the
+    /// address is the only thing a reader can possibly want next.
+    fn open_blank_tab(&mut self) {
+        let id = self.fresh_tab_id();
+        self.tabs.open(Tab::blank(id));
+        self.editing = Some(crate::field::Field::with_all_selected(""));
+        self.rerender();
+    }
+
     /// Opens a new tab showing `url`, beside the current one.
     fn open_tab(&mut self, url: &str) {
-        // A new tab is a navigation like any other, and a slow one leaves the
-        // window showing the page the reader middle-clicked from with nothing
-        // to say a tab is on its way.
-        self.stage(Some(FETCHING));
-        let fetched = self
-            .fetcher
-            .fetch_raw(url, None, net::RequestKind::Navigation);
-        self.stage(Some(LAYING_OUT));
-        match fetched {
-            Ok(fetched) => {
-                let local_root = fetched.trust == net::Trust::LocalRoot;
-                let loaded = Loaded {
-                    body: fetched.body,
-                    content_type: fetched.content_type,
-                    origin: fetched.origin,
-                    path: fetched.path,
-                };
-                let mut tab = Tab::new(loaded, url.to_owned());
-                tab.local_root = local_root;
-                self.tabs.open(tab);
-            }
-            Err(error) => {
-                // A tab that failed still opens, showing nothing and saying
-                // why. Silently not opening one looks like a broken click.
-                let mut tab = Tab::new(
-                    Loaded {
-                        body: Vec::new(),
-                        content_type: None,
-                        origin: self.tab().loaded.origin.clone(),
-                        path: self.tab().loaded.path.clone(),
-                    },
-                    url.to_owned(),
-                );
-                tab.error = Some(error.to_string());
-                self.tabs.open(tab);
-            }
-        }
+        // The tab appears at once and fills in when the answer arrives (#207).
+        // It used to be the other way round — fetch, then open — so a slow site
+        // left the reader looking at the page they middle-clicked from with
+        // nothing at all to say a tab was on its way, and the whole window
+        // frozen for as long as it took.
+        let id = self.fresh_tab_id();
+        let mut tab = Tab::new(
+            id,
+            Loaded {
+                body: Vec::new(),
+                content_type: None,
+                // Nothing has been fetched yet, so the honest origin is the one
+                // a blank tab has.
+                origin: net::Origin {
+                    scheme: net::Scheme::File,
+                    host: String::new(),
+                    port: 0,
+                },
+                path: String::new(),
+            },
+            url.to_owned(),
+        );
+        let seq = self.fetches.ask(
+            id,
+            crate::fetches::Want::Navigate {
+                url: url.to_owned(),
+            },
+        );
+        tab.pending = Some(seq);
+        self.tabs.open(tab);
         self.editing = None;
-        self.rerender();
-        self.loading = None;
+        self.stage(Some(FETCHING));
+        self.refresh_chrome();
     }
 
     /// Closes a tab. The last one cannot be closed.
@@ -1036,6 +1686,10 @@ impl App {
         if index == self.tabs.active_index() {
             return;
         }
+        // Anything typed into the tab being left goes out before it stops
+        // being the one `flush_typing` acts on. Those keys were typed into
+        // *that* page and belong to it (#207).
+        self.flush_typing();
         self.tabs.select(index);
         self.editing = None;
         // The new tab may never have been rendered, or was rendered at another
@@ -1076,6 +1730,7 @@ impl App {
         self.tab_mut().focused_link = Some(at);
         self.tab_mut().focused_rects = links[at].rects.clone();
         self.scroll_into_view(links[at].bounds());
+        self.scroll_into_view_across(links[at].bounds());
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -1174,6 +1829,7 @@ impl App {
         // will be. Back to the top, which is what a resize does and for the
         // same reason.
         self.tab_mut().scroll = 0.0;
+        self.tab_mut().scroll_x = 0.0;
         self.rerender();
     }
 
@@ -1185,7 +1841,7 @@ impl App {
     /// keystroke: the message is two points and the answer is a few rectangles.
     fn extend_selection(&mut self) {
         let Some(from) = self.selecting else { return };
-        let Some(to) = document_point(self.pointer, self.chrome_height(), self.tab().scroll) else {
+        let Some(to) = document_point(self.pointer, self.chrome_height(), self.scroll()) else {
             return;
         };
         let Some(page) = self.tabs.active_mut().page.as_mut() else {
@@ -1206,9 +1862,15 @@ impl App {
     /// out — an entry that cannot do anything is left out, which is shorter to
     /// read and cannot be clicked in hope.
     fn open_menu(&mut self) {
+        // Something is being typed in when a control on the page has the
+        // keyboard, or when the address bar does — a right-click on the page
+        // does not take the focus away from either.
+        let typing = self.page_focus_is_typing() || self.editing.is_some();
         let items = crate::menu::items_for(
             self.link_under_pointer(),
+            self.picture_under_pointer(),
             !self.tab().selected.is_empty(),
+            typing,
             self.tab().history.can_go_back(),
             self.tab().history.can_go_forward(),
         );
@@ -1412,7 +2074,13 @@ impl App {
             Some(crate::menu::Item::Reload) => self.reload(),
             Some(crate::menu::Item::OpenInNewTab(url)) => self.open_tab(&url),
             Some(crate::menu::Item::CopyLink(url)) => self.copy(url),
+            Some(crate::menu::Item::CopyImageAddress(url)) => self.copy(url),
+            Some(crate::menu::Item::OpenImage(url)) => self.open_tab(&url),
+            Some(crate::menu::Item::SaveImage(url)) => self.save_image(&url),
             Some(crate::menu::Item::CopySelection) => self.copy_selection(),
+            Some(crate::menu::Item::Paste) => self.paste_into_focus(),
+            Some(crate::menu::Item::ViewSource) => self.open_source(),
+            Some(crate::menu::Item::PageInformation) => self.open_page_information(),
             // A click outside the menu dismisses it and does nothing else.
             None => {}
         }
@@ -1437,6 +2105,28 @@ impl App {
             },
         };
         let _ = clipboard.set_text(text);
+    }
+
+    /// Takes text off the system clipboard.
+    ///
+    /// The other half of [`App::copy`], and it keeps the same handle for the
+    /// same reason. `None` when there is no clipboard, when it holds something
+    /// that is not text, or when it is empty — all three are "nothing to
+    /// paste", and a reader who pressed Ctrl+V by accident should get nothing
+    /// rather than a complaint.
+    ///
+    /// Newlines survive. A one-line field turns them into spaces itself,
+    /// because that is a decision about the field rather than about the
+    /// clipboard: a `<textarea>` wants them kept.
+    fn paste(&mut self) -> Option<String> {
+        let clipboard = match &mut self.clipboard {
+            Some(clipboard) => clipboard,
+            None => match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard.insert(clipboard),
+                Err(_) => return None,
+            },
+        };
+        clipboard.get_text().ok().filter(|text| !text.is_empty())
     }
 
     /// Closes the menu if one is open. Whether there was one to close.
@@ -1479,6 +2169,34 @@ impl App {
         self.refresh_band();
     }
 
+    /// The same, sideways (#204).
+    ///
+    /// Separate from [`Self::scroll_into_view`] and called beside it, because
+    /// the two answer independently: a match can be below the window and within
+    /// it across, and moving both axes when only one needed it is exactly the
+    /// disorientation the "only when it is off screen" rule exists to avoid.
+    fn scroll_into_view_across(&mut self, bounds: layout::Rect) {
+        let Some(content) = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::scrollable_width)
+        else {
+            return;
+        };
+        let window = self.size.0 as f32;
+        let (left, right) = (self.tab().scroll_x, self.tab().scroll_x + window);
+        if bounds.x >= left && bounds.x + bounds.width <= right {
+            return;
+        }
+        // A third of the way in, for the reason the vertical one lands a third
+        // of the way down: against the edge, there is nothing on one side of
+        // what the reader was looking for.
+        let target = bounds.x - window / 3.0;
+        self.tab_mut().scroll_x = clamp_scroll(target, content, window);
+        self.refresh_band();
+    }
+
     /// Saves the current page, or forgets it if it is already saved.
     ///
     /// Written through immediately rather than on exit: a browser that lost
@@ -1500,6 +2218,208 @@ impl App {
             self.tab_mut().error = Some(format!("could not save bookmarks: {error}"));
         }
         self.refresh_chrome();
+    }
+
+    /// Writes a picture from the page to the reader's disk (#205).
+    ///
+    /// Fetched again rather than taken from the child. The bytes are over
+    /// there, and asking for them would be a new message whose answer is
+    /// whatever the renderer felt like sending — a process that is untrusted by
+    /// construction (ADR-0012) deciding what lands in the reader's files. The
+    /// second fetch goes through the same policy as the first and usually
+    /// through the cache that already holds the picture (ADR-0018).
+    ///
+    /// A `Subresource`, not a navigation: it is the same request the page made,
+    /// so it must answer to the same third-party rule (ADR-0006, ADR-0020). A
+    /// picture the page was not allowed to load is not one the menu can save
+    /// by asking a second time.
+    ///
+    /// Where it went is said in the place every other outcome is said, and so
+    /// is a failure — silently not saving looks exactly like saving.
+    fn save_image(&mut self, url: &str) {
+        let tab = self.tab().id;
+        let document = self.tab().loaded.origin.clone();
+        let into = self.downloads.clone();
+        // Through the pool like every other request (#207). A picture is as
+        // capable of being on a slow server as a page is, and waiting for one
+        // inside the menu handler froze the window just the same.
+        self.fetches.ask(
+            tab,
+            crate::fetches::Want::SaveImage {
+                url: url.to_owned(),
+                document: Box::new(document),
+                into,
+            },
+        );
+        self.stage(Some(FETCHING));
+    }
+
+    /// Records a page in the history, and writes the list out (#197).
+    ///
+    /// Written on every navigation rather than on the way out, for the reason
+    /// bookmarks gives: a browser that lost where you had been because it was
+    /// closed the wrong way would be worse than one that never remembered, and
+    /// the file is a few tens of kilobytes.
+    ///
+    /// A failed write is said once, in the place every other failure is said.
+    /// Silently not recording looks exactly like recording.
+    fn record_visit(&mut self, url: &str, title: &str) {
+        // Not the generated views of the browser's own lists. They are written
+        // fresh every time they are opened, so remembering them says only that
+        // you once pressed Ctrl+B — and it would put the history list in the
+        // history list.
+        if url.is_empty()
+            || url == net::file_url(&crate::bookmarks::page_path())
+            || url == net::file_url(&crate::visits::page_path())
+            || net::parse_url(url).ok().is_some_and(|(_, path)| {
+                crate::devtools::is_generated(std::path::Path::new(net::policy::to_file_path(
+                    &path,
+                )))
+            })
+        {
+            return;
+        }
+        self.visits.record(
+            url,
+            title,
+            crate::visits::stamp(std::time::SystemTime::now()),
+        );
+        if let Err(error) = self.visits.save(&self.visits_path) {
+            self.tab_mut().error = Some(format!("could not save the history: {error}"));
+        }
+    }
+
+    /// Opens the history, as a page, in a new tab (#197).
+    fn open_history(&mut self) {
+        let path = crate::visits::page_path();
+        let html = crate::visits::page(&self.visits);
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&net::file_url(&path)),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write the history: {error}"));
+                self.refresh_chrome();
+            }
+        }
+    }
+
+    /// Forgets every page in the history (#197).
+    ///
+    /// The whole list rather than a page of it, and one keystroke rather than a
+    /// confirmation. A reader who wants this gone usually wants it gone now,
+    /// and the alternative — a dialog — is a second piece of interface for a
+    /// thing that can be done again in a second if it was a mistake.
+    fn clear_history(&mut self) {
+        self.visits.clear();
+        if let Err(error) = self.visits.save(&self.visits_path) {
+            self.tab_mut().error = Some(format!("could not clear the history: {error}"));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Opens this page's markup, as a page (#198).
+    ///
+    /// The bytes the parent already holds, decoded the way the document itself
+    /// was decoded — so what is shown is what was *parsed*, not a second guess
+    /// at the encoding. Nothing is fetched again: a source view that re-asked
+    /// the server could show something the page on screen never was.
+    fn open_source(&mut self) {
+        let html = crate::devtools::source_page(
+            self.tab().history.current(),
+            &self.tab().loaded.body,
+            self.tab().loaded.content_type.as_deref(),
+        );
+        self.open_generated(crate::devtools::source_path(), html, "the source");
+    }
+
+    /// Opens what the browser knows about this page (#198).
+    fn open_page_information(&mut self) {
+        let stores = vec![
+            crate::devtools::Store::of(
+                "Bookmarks",
+                self.bookmarks_path.clone(),
+                self.bookmarks.len(),
+                "§1",
+            ),
+            crate::devtools::Store::of(
+                "Site exceptions",
+                self.sites_path.clone(),
+                self.renderer.policy().exceptions.len(),
+                "ADR-0006",
+            ),
+            crate::devtools::Store::of(
+                "History",
+                self.visits_path.clone(),
+                self.visits.len(),
+                "ADR-0021",
+            ),
+        ];
+        // Asked of the child, which is the only thing that has it: the tree is
+        // built from the box tree, and the box tree never crosses the boundary
+        // (ADR-0012, ADR-0019).
+        let tree = self
+            .tab_mut()
+            .page
+            .as_mut()
+            .map(crate::viewport::Viewport::accessibility)
+            .unwrap_or_default();
+        let withheld = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::withheld)
+            .unwrap_or_default();
+        let mode = self
+            .tab()
+            .page
+            .as_ref()
+            .map(crate::viewport::Viewport::mode)
+            .unwrap_or(layout::RenderMode::Authored);
+        let html = crate::devtools::page(&crate::devtools::Report {
+            url: self.tab().history.current(),
+            content_type: self.tab().loaded.content_type.as_deref(),
+            bytes: self.tab().loaded.body.len(),
+            status: self.tab().status,
+            local_root: self.tab().local_root,
+            explanation: mode.explanation(),
+            mode,
+            error: self.tab().error.as_deref(),
+            images_loaded: self
+                .tab()
+                .page
+                .as_ref()
+                .map(crate::viewport::Viewport::images_loaded)
+                .unwrap_or(0),
+            withheld: withheld.urls().to_vec(),
+            withheld_hosts: withheld.hosts().to_vec(),
+            tree,
+            stores,
+        });
+        self.open_generated(crate::devtools::page_path(), html, "the page information");
+    }
+
+    /// Writes one of the browser's own pages out and opens it in a new tab.
+    ///
+    /// Written to disk and loaded like any other file so that back, forward,
+    /// find and the links on it all work without a second code path — which is
+    /// what the saved list and the history already do.
+    fn open_generated(&mut self, path: std::path::PathBuf, html: String, what: &str) {
+        let written = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| std::fs::write(&path, html));
+        match written {
+            Ok(()) => self.open_tab(&net::file_url(&path)),
+            Err(error) => {
+                self.tab_mut().error = Some(format!("could not write {what}: {error}"));
+                self.refresh_chrome();
+            }
+        }
     }
 
     /// Opens the saved list, as a page, in a new tab.
@@ -1584,6 +2504,7 @@ impl App {
             return;
         };
         self.scroll_into_view(rect);
+        self.scroll_into_view_across(rect);
     }
 
     /// Handles a key while find is open.
@@ -1613,9 +2534,35 @@ impl App {
             Key::Named(NamedKey::End) => field.end(shift),
             Key::Named(NamedKey::Space) => field.insert(" "),
             Key::Character(text) if ctrl => {
-                if text.as_str() == "a" {
-                    field.select_all();
-                    self.refresh_chrome();
+                // The same chords as the address bar, for the same reason: a
+                // search term is very often something you have just copied.
+                match text.as_str() {
+                    "a" => {
+                        field.select_all();
+                        self.refresh_chrome();
+                    }
+                    "c" => {
+                        let copied = field.selected_text().map(str::to_owned);
+                        if let Some(text) = copied {
+                            self.copy(text);
+                        }
+                    }
+                    "x" => {
+                        if let Some(text) = field.cut() {
+                            self.copy(text);
+                            self.refresh_matches();
+                        }
+                    }
+                    "v" => {
+                        if let Some(pasted) = self.paste() {
+                            let pasted = one_line(&pasted);
+                            if let Some(field) = &mut self.tab_mut().finding {
+                                field.insert(&pasted);
+                            }
+                            self.refresh_matches();
+                        }
+                    }
+                    _ => {}
                 }
                 return true;
             }
@@ -1663,10 +2610,41 @@ impl App {
             Key::Named(NamedKey::End) => field.end(shift),
             Key::Named(NamedKey::Space) => field.insert(" "),
             Key::Character(text) if ctrl => {
-                if text.as_str() == "a" {
-                    field.select_all();
-                } else {
-                    return true;
+                // The clipboard chords, which the address bar used to swallow
+                // along with every other Ctrl chord — so the one field in the
+                // browser you most often want to copy out of or paste into was
+                // the one field that could do neither.
+                match text.as_str() {
+                    "a" => field.select_all(),
+                    "c" => {
+                        let copied = field.selected_text().map(str::to_owned);
+                        if let Some(text) = copied {
+                            self.copy(text);
+                        }
+                        return true;
+                    }
+                    "x" => {
+                        if let Some(text) = field.cut() {
+                            self.copy(text);
+                            self.refresh_chrome();
+                        }
+                        return true;
+                    }
+                    "v" => {
+                        let Some(pasted) = self.paste() else {
+                            return true;
+                        };
+                        // An address is one line. A pasted paragraph becomes
+                        // one too rather than arriving as a field with
+                        // newlines in it that nothing here can show.
+                        let pasted = one_line(&pasted);
+                        if let Some(field) = &mut self.editing {
+                            field.insert(&pasted);
+                        }
+                        self.refresh_chrome();
+                        return true;
+                    }
+                    _ => return true,
                 }
             }
             Key::Character(text) => field.insert(text.as_str()),
@@ -1717,25 +2695,110 @@ impl App {
             // keeps the parent from having to model the page.
             Key::Named(NamedKey::Enter) => Typed::Insert("\n".to_owned()),
             Key::Named(NamedKey::Space) => Typed::Insert(" ".to_owned()),
-            Key::Character(text) if ctrl => {
-                if text.as_str() != "a" {
-                    // Every other Ctrl chord is the window's.
-                    return false;
+            Key::Character(text) if ctrl => match text.as_str() {
+                "a" => Typed::SelectAll,
+                // Copying out of a control is the one thing that needs the
+                // child to say what is in it, so it is asked rather than
+                // carried on every render (ADR-0012).
+                "c" => {
+                    let copied = self.copy_from_page();
+                    if copied.is_empty() {
+                        // Nothing selected in the control — and a checkbox has
+                        // the keyboard as readily as a field does, with nothing
+                        // in it to copy at all. So the chord is not the
+                        // control's, and it falls through to the page's own
+                        // selection rather than being swallowed.
+                        return false;
+                    }
+                    self.copy(copied);
+                    return true;
                 }
-                Typed::SelectAll
-            }
+                // A cut is that copy and then an insertion of nothing, which
+                // is what the child's field does to a selection anyway. Only
+                // when something was selected: a cut with no selection takes
+                // nothing rather than eating the next character.
+                "x" => {
+                    let copied = self.copy_from_page();
+                    if copied.is_empty() {
+                        return false;
+                    }
+                    self.copy(copied);
+                    self.type_into_page(Typed::Insert(String::new()));
+                    return true;
+                }
+                // And a paste is one insertion, whole. The child's field
+                // replaces its selection with it, the way typing over a
+                // selection already does — so `Insert` needed nothing added
+                // to it, and a `<textarea>` keeps the newlines a one-line
+                // field would have to flatten.
+                "v" => {
+                    let Some(pasted) = self.paste() else {
+                        return true;
+                    };
+                    self.type_into_page(Typed::Insert(pasted));
+                    return true;
+                }
+                // Every other Ctrl chord is the window's.
+                _ => return false,
+            },
             Key::Character(text) if alt => {
                 let _ = text;
                 return false;
             }
             Key::Character(text) => Typed::Insert(text.to_string()),
-            // Arrows up and down, the page keys, the function keys: not the
-            // field's, so the window keeps them and the page still scrolls
-            // under a caret.
+            // Up and Down are a `<select>`'s, and nobody else's. In a field
+            // they stay the window's, so the page still scrolls under a caret
+            // — which is why this asks what kind of control has the keyboard
+            // rather than sending them always and hoping (#151).
+            Key::Named(NamedKey::ArrowUp) if self.page_focus_is_pressable() => Typed::Up,
+            Key::Named(NamedKey::ArrowDown) if self.page_focus_is_pressable() => Typed::Down,
+            // The page keys, the function keys, and the arrows in every other
+            // case: not the control's, so the window keeps them.
             _ => return false,
         };
         self.type_into_page(typed);
         true
+    }
+
+    /// Whether a text control on the page has the keyboard.
+    ///
+    /// Not the same as "a control has it": a checkbox takes keystrokes with
+    /// nothing to type, and pasting into one means nothing (#151).
+    fn page_focus_is_typing(&self) -> bool {
+        self.page_is_editing() && !self.page_focus_is_pressable()
+    }
+
+    /// Puts the clipboard into whatever is being typed in.
+    ///
+    /// The pointer's half of paste. The keyboard chords go to whichever field
+    /// has the focus because that field handles the key; this has to ask, since
+    /// the menu is not in either of them.
+    fn paste_into_focus(&mut self) {
+        let Some(pasted) = self.paste() else { return };
+        if self.editing.is_some() {
+            let flattened = one_line(&pasted);
+            if let Some(field) = &mut self.editing {
+                field.insert(&flattened);
+            }
+            self.refresh_chrome();
+            return;
+        }
+        if self.page_focus_is_typing() {
+            self.type_into_page(sandbox::message::Key::Insert(pasted));
+        }
+    }
+
+    /// What is selected inside the page's focused control.
+    ///
+    /// Empty when there is nothing to copy, which is what the caller does
+    /// nothing about: a copy chord pressed with nothing selected should leave
+    /// the clipboard alone rather than emptying it.
+    fn copy_from_page(&mut self) -> String {
+        self.tab_mut()
+            .page
+            .as_mut()
+            .map(crate::viewport::Viewport::copy_focused)
+            .unwrap_or_default()
     }
 
     /// The chrome control under the pointer, if any.
@@ -1804,9 +2867,23 @@ impl App {
             return None;
         }
         let page = self.tab().page.as_ref()?;
-        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
-        page.target_at(x, y)
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.scroll())?;
+        page.target_at(x, y, self.scroll())
             .map(|(url, jump_to)| (url.to_owned(), jump_to))
+    }
+
+    /// The picture under the pointer, whether or not it arrived (#205).
+    ///
+    /// Beside [`Self::missing_under_pointer`] rather than instead of it: that
+    /// one answers a *press* on a placeholder, and this answers what the
+    /// right-hand button has to offer over any `<img>` at all.
+    fn picture_under_pointer(&self) -> Option<String> {
+        if self.scrollbar_grab().is_some() {
+            return None;
+        }
+        let page = self.tab().page.as_ref()?;
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.scroll())?;
+        page.picture_at(x, y).map(str::to_owned)
     }
 
     /// The image the placeholder under the pointer was asking for (#118).
@@ -1815,40 +2892,187 @@ impl App {
             return None;
         }
         let page = self.tab().page.as_ref()?;
-        let (x, y) = document_point(self.pointer, self.chrome_height(), self.tab().scroll)?;
+        let (x, y) = document_point(self.pointer, self.chrome_height(), self.scroll())?;
         page.missing_at(x, y).map(str::to_owned)
     }
 
-    /// Where the pointer falls on the scrollbar, if it falls on one at all.
+    /// Where the pointer falls on a scrollbar, if it falls on one at all.
     ///
-    /// `None` when the page fits, since then no bar is drawn and the column it
-    /// would have occupied is ordinary page.
-    fn scrollbar_grab(&self) -> Option<crate::scrollbar::Grab> {
+    /// `None` when the page fits, since then no bar is drawn and the strip it
+    /// would have occupied is ordinary page. The vertical bar is asked first
+    /// where both are drawn: they overlap in the bottom-right corner, and the
+    /// one a reader means there is the one they have been using all along.
+    fn scrollbar_grab(&self) -> Option<(bool, crate::scrollbar::Grab)> {
         let page = self.tab().page.as_ref()?;
         let bar = self.chrome_height() as f32;
-        let left = self.size.0.saturating_sub(crate::scrollbar::WIDTH) as f32;
-        if self.pointer.1 < bar || self.pointer.0 < left {
+        if self.pointer.1 < bar {
             return None;
         }
-        crate::scrollbar::grab(
-            self.pointer.1 - bar,
-            self.tab().scroll,
-            page.scrollable_height(),
-            self.viewport_height(),
-        )
+        let left = self.size.0.saturating_sub(crate::scrollbar::WIDTH) as f32;
+        if self.pointer.0 >= left
+            && let Some(grab) = crate::scrollbar::grab(
+                self.pointer.1 - bar,
+                self.tab().scroll,
+                page.scrollable_height(),
+                self.viewport_height(),
+            )
+        {
+            return Some((false, grab));
+        }
+        let top = self.size.1.saturating_sub(crate::scrollbar::WIDTH) as f32;
+        if self.pointer.1 >= top.max(bar) {
+            return crate::scrollbar::grab(
+                self.pointer.0,
+                self.tab().scroll_x,
+                page.scrollable_width(),
+                self.size.0 as f32,
+            )
+            .map(|grab| (true, grab));
+        }
+        None
     }
 
-    /// Scrolls so the top of the thumb sits at `top` in the track.
-    fn drag_thumb_to(&mut self, top: f32) {
+    /// How long the thumb of one of the two bars is.
+    ///
+    /// What a press on the *track* needs: it puts the middle of the thumb under
+    /// the pointer, and the middle of a thumb cannot be found without its
+    /// length.
+    fn thumb_length(&self, across: bool) -> Option<f32> {
+        let page = self.tab().page.as_ref()?;
+        let (scroll, content, track) = if across {
+            (
+                self.tab().scroll_x,
+                page.scrollable_width(),
+                self.size.0 as f32,
+            )
+        } else {
+            (
+                self.tab().scroll,
+                page.scrollable_height(),
+                self.viewport_height(),
+            )
+        };
+        crate::scrollbar::thumb(scroll, content, track).map(|(_, length)| length)
+    }
+
+    /// Scrolls so the near edge of the thumb sits at `along` in its track.
+    fn drag_thumb_to(&mut self, across: bool, along: f32) {
         let Some(page) = &self.tab().page else { return };
-        let content = page.scrollable_height();
-        let to = crate::scrollbar::scroll_at(top, content, self.viewport_height());
-        self.scroll_by(to - self.tab().scroll);
+        if across {
+            let content = page.scrollable_width();
+            let to = crate::scrollbar::scroll_at(along, content, self.size.0 as f32);
+            self.scroll_x_by(to - self.tab().scroll_x);
+        } else {
+            let content = page.scrollable_height();
+            let to = crate::scrollbar::scroll_at(along, content, self.viewport_height());
+            self.scroll_by(to - self.tab().scroll);
+        }
     }
 
     /// Total chrome height: the URL bar and the tab strip above it.
     fn chrome_height(&self) -> u32 {
         crate::chrome::total_height()
+    }
+
+    /// What AccessKit is told about the window, so the page lands where it is
+    /// drawn (#178).
+    fn a11y_viewport(&self) -> crate::a11y::Viewport {
+        crate::a11y::Viewport {
+            chrome: self.chrome_height() as f32,
+            scroll: self.tab().scroll,
+            scroll_x: self.tab().scroll_x,
+        }
+    }
+
+    /// The window's title, which is also what a screen reader reads first.
+    fn window_title(&self) -> String {
+        let tab = self.tabs.active();
+        let mode = tab.page.as_ref().map(crate::viewport::Viewport::mode);
+        title_for(
+            tab.label(),
+            &mode.unwrap_or(layout::RenderMode::Authored),
+            tab.error.as_deref(),
+        )
+    }
+
+    /// AccessKit has something to say about who is listening (#178).
+    fn accessibility_event(&mut self, event: accesskit_winit::WindowEvent) {
+        match event {
+            // Somebody has attached. This is the only thing that turns the
+            // machinery on: until it arrives the child is never asked for a
+            // tree and none is built, which is ADR-0019's third term and the
+            // cheapest mitigation there is for the parsing surface it added.
+            accesskit_winit::WindowEvent::InitialTreeRequested => {
+                self.listening = true;
+                self.push_accessibility();
+            }
+            // And gone again. Back to costing nothing.
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => self.listening = false,
+            // A screen reader asking for something to be done — a button
+            // pressed, a node focused. Not offered yet: every action this
+            // browser has goes through the child, and routing one from here
+            // means deciding what a stranger's page may be made to do on a
+            // reader's behalf. Ignored rather than half-answered.
+            accesskit_winit::WindowEvent::ActionRequested(_) => {}
+        }
+    }
+
+    /// Sends the current page's tree, if anything is listening.
+    ///
+    /// Two guards, and they are not the same guard. `listening` says an
+    /// assistive technology has attached at all, and is what stops the *child*
+    /// being asked; `update_if_active` is AccessKit's own check that the tree
+    /// has been initialised. Without the first, every render would be a round
+    /// trip to another process for an answer nobody wanted.
+    ///
+    /// The tree is kept until the page changes, so this is cheap to call often.
+    /// Scrolling is the reason: it moves every node and changes none of them,
+    /// so it needs a new transform on the root and the same tree underneath —
+    /// which is the whole point of putting the transform there.
+    fn push_accessibility(&mut self) {
+        if !self.listening {
+            return;
+        }
+        if self.a11y_tree.is_none() {
+            self.a11y_tree = Some(match self.tabs.active_mut().page.as_mut() {
+                Some(page) => page.accessibility(),
+                // Attached before the first page finished. "Nothing here yet"
+                // is an answer; silence is a window an assistive technology
+                // decides is broken.
+                None => sandbox::access::Tree::default(),
+            });
+        }
+        let title = self.window_title();
+        let viewport = self.a11y_viewport();
+        let tree = self.a11y_tree.as_ref().expect("just filled");
+        if let Some(adapter) = &mut self.adapter {
+            adapter.update_if_active(|| crate::a11y::update(tree, &title, viewport));
+        }
+    }
+
+    /// Forgets the tree, because the page it described is gone.
+    ///
+    /// Called where a *render* happened rather than where the view moved. The
+    /// distinction is the saving: a new page has to be asked for across the
+    /// process boundary, and a scroll must not be.
+    fn forget_accessibility(&mut self) {
+        self.a11y_tree = None;
+    }
+
+    /// A number no other tab in this window has or will have.
+    fn fresh_tab_id(&mut self) -> crate::fetches::TabId {
+        let id = self.next_tab;
+        self.next_tab += 1;
+        id
+    }
+
+    /// How far this tab has been scrolled, as `(across, down)`.
+    ///
+    /// The pair rather than the two fields, because everything that turns a
+    /// point on the screen into a point in the document needs both, and one of
+    /// them silently defaulting to zero is exactly the bug #204 was.
+    fn scroll(&self) -> (f32, f32) {
+        (self.tab().scroll_x, self.tab().scroll)
     }
 
     /// Height of the page area, which is the window less the chrome.
@@ -1857,6 +3081,11 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: f32) {
+        // A list is pinned where it opened, so a page that scrolled under it
+        // would leave it hanging over a control that had moved. Closing it is
+        // what every browser does and is the only one of the three that does
+        // not need the reader to have noticed.
+        self.close_dropdown();
         let Some(page) = &self.tab().page else { return };
         let before = self.tab().scroll;
         self.tab_mut().scroll = clamp_scroll(
@@ -1865,13 +3094,43 @@ impl App {
             self.viewport_height(),
         );
         if self.tab().scroll != before {
-            // Before the reader gets there, which is the whole point of asking
-            // speculatively: the rows ahead are usually painted by the time
-            // they are scrolled to.
-            self.refresh_band();
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            self.after_scrolling();
+        }
+    }
+
+    /// The same, sideways (#204).
+    ///
+    /// Its own function rather than a second argument to [`Self::scroll_by`],
+    /// because every caller moves one axis: a wheel notch, an arrow key and a
+    /// scrollbar drag each belong to one direction, and a pair of deltas at
+    /// every call site would be a zero written out thirty times.
+    fn scroll_x_by(&mut self, delta: f32) {
+        self.close_dropdown();
+        let Some(page) = &self.tab().page else { return };
+        let before = self.tab().scroll_x;
+        self.tab_mut().scroll_x = clamp_scroll(
+            self.tab().scroll_x + delta,
+            page.scrollable_width(),
+            self.size.0 as f32,
+        );
+        if self.tab().scroll_x != before {
+            self.after_scrolling();
+        }
+    }
+
+    /// What follows a scroll on either axis.
+    fn after_scrolling(&mut self) {
+        // Before the reader gets there, which is the whole point of asking
+        // speculatively: the rows ahead are usually painted by the time
+        // they are scrolled to.
+        self.refresh_band();
+        // Every node moved and none of them changed, so this is a new
+        // transform over the tree already held rather than a new tree
+        // (#178). No round trip to the child, which is what makes it
+        // affordable on every scroll step.
+        self.push_accessibility();
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -1891,6 +3150,7 @@ impl App {
             theme,
             over_link,
             panel,
+            dropdown,
             ..
         } = self;
         let tab = tabs.active();
@@ -1908,6 +3168,10 @@ impl App {
         };
 
         let offset = tab.scroll as u32;
+        // How far the window has moved right of the band's own left edge. A
+        // band that has caught up makes this zero, which is every page that
+        // does not scroll sideways and every moment after one that does has
+        // settled (#204).
         let viewport_width = width.get() as usize;
         let strip_height = crate::chrome::TAB_HEIGHT.min(height.get());
         let bar_height = (strip_height + crate::chrome::HEIGHT).min(height.get());
@@ -1946,6 +3210,7 @@ impl App {
                 // offset in document coordinates can be turned into a row of
                 // the band.
                 let band_top = page.band_top();
+                let shift = i64::from(tab.scroll_x as u32) - i64::from(page.band_left());
                 for row in bar_height..height.get() {
                     let document_row = row - bar_height + offset;
                     let start = row as usize * viewport_width;
@@ -1955,6 +3220,7 @@ impl App {
                         document_row
                             .checked_sub(band_top)
                             .filter(|it| *it < page_height),
+                        shift,
                         page_width,
                         blank,
                     );
@@ -1963,6 +3229,14 @@ impl App {
                     &mut buffer,
                     tab.scroll,
                     page.scrollable_height(),
+                    (width.get(), height.get()),
+                    bar_height,
+                    blank,
+                );
+                draw_horizontal_scrollbar(
+                    &mut buffer,
+                    tab.scroll_x,
+                    page.scrollable_width(),
                     (width.get(), height.get()),
                     bar_height,
                     blank,
@@ -1979,7 +3253,7 @@ impl App {
         highlight_selection(
             &mut buffer,
             &tab.selection,
-            tab.scroll,
+            (tab.scroll_x, tab.scroll),
             (width.get(), height.get()),
             bar_height,
         );
@@ -1987,14 +3261,14 @@ impl App {
             &mut buffer,
             &tab.matches,
             tab.current_match,
-            tab.scroll,
+            (tab.scroll_x, tab.scroll),
             (width.get(), height.get()),
             bar_height,
         );
         outline_focus(
             &mut buffer,
             &tab.focused_rects,
-            tab.scroll,
+            (tab.scroll_x, tab.scroll),
             (width.get(), height.get()),
             bar_height,
         );
@@ -2018,6 +3292,20 @@ impl App {
         if let Some(panel) = panel {
             let pixmap = panel.render(fonts, *theme);
             let rect = panel.rect();
+            blit_over(
+                &mut buffer,
+                &pixmap,
+                (rect.x as u32, rect.y as u32),
+                (width.get(), height.get()),
+            );
+        }
+        // A dropdown sits with the site panel: over the page, under the menu.
+        // Its rectangle is already in window coordinates — it was opened from
+        // where the control was drawn on screen, not from where it is in the
+        // document — so it does not move when the page scrolls under it.
+        if let Some(dropdown) = dropdown {
+            let pixmap = dropdown.render(fonts, *theme);
+            let rect = dropdown.rect();
             blit_over(
                 &mut buffer,
                 &pixmap,
@@ -2159,10 +3447,20 @@ fn blit_over(buffer: &mut [u32], pixmap: &paint::Pixmap, at: (u32, u32), size: (
 /// previous band's pixels, which would be showing the wrong part of the page
 /// under the right offset, and worse than showing none of it. The colour comes
 /// from the page because a white strip beside a dark rendering is a hole in it.
+///
+/// `shift` is the same idea along the other axis (#204): how many columns to
+/// the right of the band's own left edge the window starts. A band is painted
+/// exactly as wide as the window, so a page scrolled sideways is showing a band
+/// that has not caught up — and the columns it has no pixel for get `blank`, by
+/// exactly the rule the rows above it follow. The reader sees the page move at
+/// once with a strip of canvas at its edge, and the strip fills in when the
+/// band arrives. Showing the old columns instead would be a page that did not
+/// appear to move at all.
 fn compose_row(
     out: &mut [u32],
     pixels: &[u8],
     source_row: Option<u32>,
+    shift: i64,
     page_width: u32,
     blank: u32,
 ) {
@@ -2181,10 +3479,15 @@ fn compose_row(
         // there: it runs into the *next row*. Widening a window drew the page
         // twice, the second copy sheared one row up, because every row was
         // finished off with the beginning of the row below it.
-        let at = source_start + column * 4;
+        let source_column = column as i64 + shift;
+        let Ok(source_column) = usize::try_from(source_column) else {
+            *slot = blank;
+            continue;
+        };
+        let at = source_start + source_column * 4;
         *slot = match pixels
             .get(at..at + 3)
-            .filter(|_| column < page_width as usize)
+            .filter(|_| source_column < page_width as usize)
         {
             Some(rgb) => (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]),
             None => blank,
@@ -2228,6 +3531,45 @@ fn draw_scrollbar(
     }
 }
 
+/// Draws the page's horizontal scrollbar along the bottom of the page area.
+///
+/// The same bar turned on its side, and the same arithmetic: [`crate::scrollbar`]
+/// is written in terms of a scroll, a content length and a track, and none of
+/// those three words names an axis.
+///
+/// Nothing is drawn when the page fits across, which is nearly every page —
+/// so nearly every page is exactly as it was before #204, with no strip of
+/// furniture along the bottom saying there is nothing to the right.
+fn draw_horizontal_scrollbar(
+    buffer: &mut [u32],
+    scroll: f32,
+    content: f32,
+    size: (u32, u32),
+    bar_height: u32,
+    page_background: u32,
+) {
+    let (width, height) = size;
+    let track = width as f32;
+    let Some((left, thumb_width)) = crate::scrollbar::thumb(scroll, content, track) else {
+        return;
+    };
+    // The page area's own bottom edge, and never above the chrome: a very short
+    // window is all chrome, and a bar drawn into it would be a bar over the
+    // address field.
+    let thickness = crate::scrollbar::WIDTH.min(height.saturating_sub(bar_height));
+    if thickness == 0 {
+        return;
+    }
+    let first = left as usize;
+    let last = (first + thumb_width.round() as usize).min(width as usize);
+
+    let thumb_colour = contrasting(page_background);
+    for row in (height - thickness)..height {
+        let start = row as usize * width as usize;
+        buffer[start + first..start + last].fill(thumb_colour);
+    }
+}
+
 /// A colour that shows against `background` without shouting at it.
 ///
 /// Each channel moved 45% of the way towards whichever end of the scale is
@@ -2259,16 +3601,17 @@ const FOCUS_WIDTH: i64 = 2;
 fn outline_focus(
     buffer: &mut [u32],
     rects: &[layout::Rect],
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
     let (width, height) = size;
+    let (scroll_x, scroll) = scroll;
     for rect in rects {
         // A pixel or two of air, so the outline sits around the text rather
         // than on it.
-        let left = rect.x.round() as i64 - FOCUS_WIDTH;
-        let right = (rect.x + rect.width).round() as i64 + FOCUS_WIDTH;
+        let left = (rect.x - scroll_x).round() as i64 - FOCUS_WIDTH;
+        let right = (rect.x + rect.width - scroll_x).round() as i64 + FOCUS_WIDTH;
         let top = (rect.y - scroll + bar_height as f32).round() as i64 - FOCUS_WIDTH;
         let bottom =
             (rect.y + rect.height - scroll + bar_height as f32).round() as i64 + FOCUS_WIDTH;
@@ -2307,7 +3650,7 @@ fn highlight_matches(
     buffer: &mut [u32],
     matches: &[layout::Rect],
     current: usize,
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
@@ -2333,7 +3676,7 @@ fn highlight_matches(
 fn highlight_selection(
     buffer: &mut [u32],
     selection: &[layout::Rect],
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
@@ -2351,16 +3694,15 @@ fn tint_rect(
     buffer: &mut [u32],
     rect: layout::Rect,
     tint: (u32, u32, u32),
-    scroll: f32,
+    scroll: (f32, f32),
     size: (u32, u32),
     bar_height: u32,
 ) {
     let (width, height) = size;
+    let (scroll_x, scroll) = scroll;
     let top = rect.y - scroll + bar_height as f32;
-    let (x0, x1) = (
-        rect.x.max(0.0) as u32,
-        (rect.x + rect.width).max(0.0) as u32,
-    );
+    let left = rect.x - scroll_x;
+    let (x0, x1) = (left.max(0.0) as u32, (left + rect.width).max(0.0) as u32);
     let (y0, y1) = (
         top.max(bar_height as f32) as u32,
         (top + rect.height).max(0.0) as u32,
@@ -2380,7 +3722,7 @@ fn tint_rect(
     }
 }
 
-impl ApplicationHandler<BandReady> for App {
+impl ApplicationHandler<Wake> for App {
     /// Every event that had arrived has been handled, so the loop is about to
     /// sleep. The last thing to do before that is lay the page out for whatever
     /// size the window ended up.
@@ -2401,12 +3743,24 @@ impl ApplicationHandler<BandReady> for App {
         }
     }
 
-    /// A band painted on a renderer thread has arrived.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: BandReady) {
-        if self.accept_band()
-            && let Some(window) = &self.window
-        {
-            window.request_redraw();
+    /// Something other than the reader has woken the window.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Wake) {
+        match event {
+            Wake::Band(_) => {
+                // A band and a typed page arrive through the same wake,
+                // because the child answers both on the same thread and the
+                // window has no way to tell which woke it. Asking for both
+                // costs two `try_recv`s and removes the question.
+                let band = self.accept_band();
+                let typed = self.accept_typed();
+                if (band || typed)
+                    && let Some(window) = &self.window
+                {
+                    window.request_redraw();
+                }
+            }
+            Wake::Accessibility(event) => self.accessibility_event(event.window_event),
+            Wake::Fetched => self.collect_fetches(),
         }
     }
 
@@ -2427,12 +3781,29 @@ impl ApplicationHandler<BandReady> for App {
         let attributes = Window::default_attributes()
             .with_title(self.tab().history.current())
             .with_window_icon(window_icon())
+            // Invisible until the accessibility adapter has been attached
+            // below: AccessKit must be given the window before it is first
+            // shown, and says so by panicking if it is not. Shown again a few
+            // lines down, before anything is rendered into it.
+            .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(wanted.0, wanted.1));
         let Ok(window) = event_loop.create_window(attributes) else {
             event_loop.exit();
             return;
         };
         let window = Rc::new(window);
+
+        // ADR-0019, #178. Costs nothing until something attaches: the handlers
+        // below only ever post an event, and no tree is built and no child is
+        // asked until one of them says an assistive technology is there.
+        if let Some(waker) = &self.waker {
+            self.adapter = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+                event_loop,
+                &window,
+                waker.clone(),
+            ));
+        }
+        window.set_visible(true);
 
         let context = match softbuffer::Context::new(window.clone()) {
             Ok(context) => context,
@@ -2456,6 +3827,12 @@ impl ApplicationHandler<BandReady> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // AccessKit sees every window event first, and needs to: it tracks
+        // focus and size to tell the platform where the window is. It consumes
+        // nothing, so the match below is unaffected.
+        if let (Some(adapter), Some(window)) = (&mut self.adapter, &self.window) {
+            adapter.process_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -2471,9 +3848,16 @@ impl ApplicationHandler<BandReady> for App {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             WindowEvent::MouseWheel { delta, .. } => {
-                let pixels = match delta {
-                    MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE_HEIGHT,
-                    MouseScrollDelta::PixelDelta(position) => -position.y as f32,
+                // Both axes: a trackpad and a tilting wheel both report a
+                // sideways component, and until #204 it was dropped on the
+                // floor along with everywhere it could have scrolled to.
+                let (across, pixels) = match delta {
+                    MouseScrollDelta::LineDelta(columns, lines) => {
+                        (-columns * WHEEL_LINE_HEIGHT, -lines * WHEEL_LINE_HEIGHT)
+                    }
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (-position.x as f32, -position.y as f32)
+                    }
                 };
                 // Ctrl and the wheel is zoom everywhere else, and a reader
                 // who tries it and gets a scroll has been told the browser
@@ -2482,8 +3866,14 @@ impl ApplicationHandler<BandReady> for App {
                     // Up the page is in, which is what every other browser and
                     // every trackpad has agreed on.
                     self.zoom_by(if pixels < 0.0 { 1 } else { -1 });
+                } else if self.modifiers.state().shift_key() {
+                    // Shift turns a plain wheel sideways, which is how a mouse
+                    // with one wheel has reached the right of a page since long
+                    // before there was a trackpad to tilt.
+                    self.scroll_x_by(pixels);
                 } else {
                     self.scroll_by(pixels);
+                    self.scroll_x_by(across);
                 }
             }
             // The pointer left the window without passing over anything that
@@ -2503,9 +3893,13 @@ impl ApplicationHandler<BandReady> for App {
                 // check that the pointer is still over the bar: a hand dragging
                 // a thumb wanders off it constantly, and a bar that let go
                 // every time would be unusable.
-                if let Some(held) = self.dragging {
-                    let top = self.pointer.1 - self.chrome_height() as f32 - held;
-                    self.drag_thumb_to(top);
+                if let Some(ThumbDrag { across, held }) = self.dragging {
+                    let along = if across {
+                        self.pointer.0
+                    } else {
+                        self.pointer.1 - self.chrome_height() as f32
+                    };
+                    self.drag_thumb_to(across, along - held);
                     return;
                 }
                 // A menu takes the pointer while it is open: the row under it
@@ -2532,6 +3926,24 @@ impl ApplicationHandler<BandReady> for App {
                     }
                     return;
                 }
+                // And an open dropdown, the same way again.
+                if let Some(dropdown) = &mut self.dropdown {
+                    let hovered = dropdown.row_at(self.pointer.0, self.pointer.1);
+                    if hovered != dropdown.hovered {
+                        dropdown.hovered = hovered;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                if self.url_drag.is_some() {
+                    if let Some(drag) = &mut self.url_drag {
+                        drag.moved = true;
+                    }
+                    self.drag_url_to(self.pointer.0, true);
+                    return;
+                }
                 if self.selecting.is_some() {
                     self.extend_selection();
                     return;
@@ -2551,12 +3963,15 @@ impl ApplicationHandler<BandReady> for App {
                     // shape change.
                     window.request_redraw();
                 }
-                // A placeholder is pressable too (#118), and a button that
-                // leaves the cursor an arrow reads as dead. Tracked separately
+                // A placeholder is pressable too (#118), and so is a form
+                // control — a button or a checkbox that leaves the cursor an
+                // arrow reads as dead. Tracked separately
                 // from the address above because it is a different question
                 // with a different answer: the strip says where a link goes,
                 // and a placeholder is not going anywhere.
-                let pressable = self.over_link.is_some() || self.missing_under_pointer().is_some();
+                let pressable = self.over_link.is_some()
+                    || self.missing_under_pointer().is_some()
+                    || self.control_on_page_under_pointer();
                 if pressable != self.over_pressable
                     && let Some(window) = &self.window
                 {
@@ -2572,46 +3987,84 @@ impl ApplicationHandler<BandReady> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => match self.scrollbar_grab() {
-                Some(crate::scrollbar::Grab::Thumb(held)) => self.dragging = Some(held),
-                // A press on the track puts the middle of the thumb where the
-                // pointer is — one movement to anywhere in the document — and
-                // then goes on holding it, so a press that turns into a drag
-                // carries on from there rather than needing a second grab.
-                Some(crate::scrollbar::Grab::Track) => {
-                    let page = self
-                        .tab()
-                        .page
-                        .as_ref()
-                        .map(|page| page.scrollable_height());
-                    let Some(content) = page else { return };
-                    let track = self.viewport_height();
-                    let Some((_, height)) =
-                        crate::scrollbar::thumb(self.tab().scroll, content, track)
-                    else {
-                        return;
-                    };
-                    let y = self.pointer.1 - self.chrome_height() as f32;
-                    self.dragging = Some(height / 2.0);
-                    self.drag_thumb_to(y - height / 2.0);
+            } => {
+                // An open overlay owns the whole click and not just the end of
+                // it. The release below already knows this; the press did not,
+                // and the two halves disagreeing is #182.
+                //
+                // A menu is drawn *over* the page, so the press under it landed
+                // on the page as far as this arm was concerned: it started a
+                // selection, and then the release was claimed by the overlay
+                // and returned before anything cleared it. The pointer was left
+                // selecting with no button held, so the next movement — a bare
+                // move, on the way to anywhere — dragged a highlight across the
+                // page. And the same press wiped the selection the menu was
+                // opened to act on, which is why Copy copied nothing.
+                //
+                // Nothing to do rather than something careful: with an overlay
+                // up there is no press on the page or the scrollbar to be had.
+                if self.menu.is_some() || self.panel.is_some() || self.dropdown.is_some() {
+                    return;
                 }
-                // Not on the bar: a press on the page is where a selection
-                // starts. Whether it turns out to be one is decided on release
-                // — a press that never moved is a click.
-                None => {
-                    self.selecting =
-                        document_point(self.pointer, self.chrome_height(), self.tab().scroll);
-                    if self.selecting.is_some() {
-                        self.clear_selection();
+                // A press in the bar's text is where selecting a URL starts
+                // (#199). Above the bar is the tab strip and its controls are
+                // pressed on release, so neither is this.
+                if self.pointer.1 >= crate::chrome::TAB_HEIGHT as f32
+                    && self.pointer.1 < self.chrome_height() as f32
+                {
+                    if self.control_under_pointer().is_none() && self.tab().finding.is_none() {
+                        self.press_url();
+                    }
+                    return;
+                }
+                match self.scrollbar_grab() {
+                    Some((across, crate::scrollbar::Grab::Thumb(held))) => {
+                        self.dragging = Some(ThumbDrag { across, held });
+                    }
+                    // A press on the track puts the middle of the thumb where the
+                    // pointer is — one movement to anywhere in the document — and
+                    // then goes on holding it, so a press that turns into a drag
+                    // carries on from there rather than needing a second grab.
+                    Some((across, crate::scrollbar::Grab::Track)) => {
+                        let Some(length) = self.thumb_length(across) else {
+                            return;
+                        };
+                        let along = if across {
+                            self.pointer.0
+                        } else {
+                            self.pointer.1 - self.chrome_height() as f32
+                        };
+                        self.dragging = Some(ThumbDrag {
+                            across,
+                            held: length / 2.0,
+                        });
+                        self.drag_thumb_to(across, along - length / 2.0);
+                    }
+                    // Not on the bar: a press on the page is where a selection
+                    // starts. Whether it turns out to be one is decided on
+                    // release — a press that never moved is a click.
+                    None => {
+                        self.selecting =
+                            document_point(self.pointer, self.chrome_height(), self.scroll());
+                        if self.selecting.is_some() {
+                            self.clear_selection();
+                        }
                     }
                 }
-            },
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button,
                 ..
             } => match button {
                 MouseButton::Left => {
+                    // The button is up, so the pointer is not selecting —
+                    // whatever else this release turns out to be. Unconditional
+                    // and first because the cost of getting it wrong is not a
+                    // lost click but a pointer that goes on selecting with
+                    // nothing held down (#182), and every early return below is
+                    // a chance to get it wrong.
+                    self.selecting = None;
                     // An open menu owns the next click, wherever it lands: on
                     // an entry it chooses, anywhere else it dismisses. Either
                     // way the click does not also reach the page under it.
@@ -2629,6 +4082,15 @@ impl ApplicationHandler<BandReady> for App {
                         self.choose_from_site_panel();
                         return;
                     }
+                    // And an open dropdown owns the next click the same way a
+                    // menu does: on a row it chooses, anywhere else it
+                    // dismisses, and either way the click does not also reach
+                    // the page — dismissing a list must not press whatever was
+                    // behind it.
+                    if self.dropdown.is_some() {
+                        self.choose_from_dropdown();
+                        return;
+                    }
                     // Letting go of the thumb is not a click on whatever the
                     // pointer happens to be over by then.
                     if self.dragging.take().is_some() {
@@ -2638,7 +4100,6 @@ impl ApplicationHandler<BandReady> for App {
                     // a drag across the text and not a click on whatever is
                     // under the pointer at the end of it — which on a page of
                     // prose is very often a link.
-                    self.selecting = None;
                     if !self.tab().selected.is_empty() {
                         return;
                     }
@@ -2651,12 +4112,10 @@ impl ApplicationHandler<BandReady> for App {
                             self.pointer.0,
                             self.pointer.1,
                         ) {
-                            // A new tab shows the page you are on, which is
-                            // what Ctrl+T does and the only thing this browser
-                            // could put there.
+                            // A new tab is empty, with the address bar ready
+                            // to be typed into (#196).
                             Some(crate::chrome::StripClick::NewTab) => {
-                                let url = self.tab().history.current().to_owned();
-                                self.open_tab(&url);
+                                self.open_blank_tab();
                             }
                             Some(crate::chrome::StripClick::Close(index)) => {
                                 self.close_tab(index);
@@ -2688,9 +4147,11 @@ impl ApplicationHandler<BandReady> for App {
                                     window.request_redraw();
                                 }
                             }
-                            // Anywhere else in the bar is the URL, and clicking
-                            // a URL bar is how most people focus one.
-                            None => self.focus_url(),
+                            // Anywhere else in the bar is the URL. The press
+                            // already put the caret where the pointer was, so
+                            // all that is left is to decide whether it was a
+                            // click or a drag (#199).
+                            None => self.release_url(),
                         }
                     } else {
                         // A click on the page is a click on the page, even if
@@ -2751,6 +4212,13 @@ impl ApplicationHandler<BandReady> for App {
                     self.find_key(&event.logical_key, alt, ctrl, shift);
                     return;
                 }
+                // An open dropdown owns the keyboard the way it owns the next
+                // click: it is the innermost thing in progress, and a list you
+                // can open with a key and only close with the pointer is half
+                // a control (#151).
+                if self.dropdown_key(&event.logical_key, alt, ctrl) {
+                    return;
+                }
                 // A control on the page, after the chrome's own fields and
                 // before everything else: the chrome is focused deliberately
                 // and wins, and the page's scrolling is what a keystroke aimed
@@ -2764,12 +4232,10 @@ impl ApplicationHandler<BandReady> for App {
                 }
                 if ctrl {
                     match &event.logical_key {
-                        // A new tab shows the page you are on, which is the
-                        // only thing this browser could put there: there is no
-                        // home page and no new-tab page to fill with tiles.
+                        // A new tab is empty, and the address bar takes the
+                        // focus so it can be typed into straight away (#196).
                         Key::Character(c) if c == "t" => {
-                            let url = self.tab().history.current().to_owned();
-                            self.open_tab(&url);
+                            self.open_blank_tab();
                             return;
                         }
                         Key::Character(c) if c == "w" => {
@@ -2806,6 +4272,30 @@ impl ApplicationHandler<BandReady> for App {
                         }
                         Key::Character(c) if c == "b" => {
                             self.open_bookmarks();
+                            return;
+                        }
+                        // Ctrl+H shows where you have been, and Ctrl+Shift+H
+                        // forgets it — the destructive one behind a second
+                        // modifier, because "show me" and "throw it away" are
+                        // not two keystrokes that should be one slip apart
+                        // (#197).
+                        Key::Character(c) if c.eq_ignore_ascii_case("h") => {
+                            if shift {
+                                self.clear_history();
+                            } else {
+                                self.open_history();
+                            }
+                            return;
+                        }
+                        // Ctrl+U shows the markup, as it has everywhere since
+                        // Netscape, and Ctrl+Shift+I shows what the browser
+                        // knows about the page (#198).
+                        Key::Character(c) if c.eq_ignore_ascii_case("u") => {
+                            self.open_source();
+                            return;
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("i") && shift => {
+                            self.open_page_information();
                             return;
                         }
                         // Ctrl+R reloads, as it has everywhere since Netscape.
@@ -2910,9 +4400,11 @@ impl ApplicationHandler<BandReady> for App {
                     Key::Named(NamedKey::Escape) => {
                         // An open menu is the innermost thing in progress, so
                         // it is the first thing Escape gives up — then the
-                        // site panel, which is opened the same deliberate way
-                        // and must not need a click somewhere else to close.
+                        // dropdown and the site panel, both opened the same
+                        // deliberate way and neither of which must need a click
+                        // somewhere else to close.
                         if !self.close_menu()
+                            && !self.close_dropdown()
                             && !self.close_site_panel()
                             && !self.clear_focused_link()
                         {
@@ -2921,11 +4413,25 @@ impl ApplicationHandler<BandReady> for App {
                     }
                     Key::Named(NamedKey::ArrowDown) => self.scroll_by(SCROLL_STEP),
                     Key::Named(NamedKey::ArrowUp) => self.scroll_by(-SCROLL_STEP),
+                    // Without Alt, which is history and was matched above. A
+                    // page with nothing to its right ignores these, so the key
+                    // does nothing on nearly every page rather than doing
+                    // something surprising (#204).
+                    Key::Named(NamedKey::ArrowRight) => self.scroll_x_by(SCROLL_STEP),
+                    Key::Named(NamedKey::ArrowLeft) => self.scroll_x_by(-SCROLL_STEP),
                     Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
                         self.scroll_by(viewport * 0.9);
                     }
                     Key::Named(NamedKey::PageUp) => self.scroll_by(-viewport * 0.9),
-                    Key::Named(NamedKey::Home) => self.scroll_by(f32::NEG_INFINITY),
+                    // Home and End are the document's ends, and a reader who
+                    // has scrolled sideways to read the end of a long line
+                    // means both edges by "the beginning": arriving at the top
+                    // of the page still four screens to the right of its first
+                    // column is arriving nowhere in particular.
+                    Key::Named(NamedKey::Home) => {
+                        self.scroll_by(f32::NEG_INFINITY);
+                        self.scroll_x_by(f32::NEG_INFINITY);
+                    }
                     Key::Named(NamedKey::End) => self.scroll_by(f32::INFINITY),
                     Key::Character(ref c) if c == "q" => event_loop.exit(),
                     _ => {}
@@ -2976,7 +4482,7 @@ pub fn open(
 
     // With a user event, so a band painted on a renderer thread can wake a
     // window that is otherwise asleep waiting for input.
-    let event_loop = EventLoop::<BandReady>::with_user_event()
+    let event_loop = EventLoop::<Wake>::with_user_event()
         .build()
         .map_err(|error| {
             format!("could not start the event loop ({error}); is a display available?")
@@ -2985,8 +4491,20 @@ pub fn open(
     // polling would burn CPU against the resource-weight goal for no benefit.
     event_loop.set_control_flow(ControlFlow::Wait);
 
+    // The pool is started before the window so the first navigation from it has
+    // somewhere to go, and it is handed a waker only once the loop exists —
+    // hence the proxy below rather than a closure captured here.
+    let fetcher = net::Fetcher {
+        policy: allowed.clone(),
+    };
+    let proxy = event_loop.create_proxy();
+    let fetches = crate::fetches::Fetches::start(fetcher.clone(), move || {
+        let _ = proxy.send_event(Wake::Fetched);
+    });
+
     let mut app = App {
         tabs: crate::tabs::Tabs::new(Tab::new(
+            FIRST_TAB,
             Loaded {
                 body,
                 content_type,
@@ -2995,7 +4513,10 @@ pub fn open(
             },
             url,
         )),
+        fetches,
+        next_tab: FIRST_TAB + 1,
         fetcher: net::Fetcher { policy: allowed },
+        downloads: crate::downloads::default_directory(),
         renderer,
         fonts: FontStore::new(),
         window: None,
@@ -3011,6 +4532,10 @@ pub fn open(
         loading: None,
         dragging: None,
         selecting: None,
+        url_drag: None,
+        adapter: None,
+        listening: false,
+        a11y_tree: None,
         menu: None,
         clipboard: None,
         theme: crate::chrome::Theme::LIGHT,
@@ -3020,7 +4545,10 @@ pub fn open(
         editing: None,
         bookmarks: crate::bookmarks::Bookmarks::load(&crate::bookmarks::default_path()),
         bookmarks_path: crate::bookmarks::default_path(),
+        visits: crate::visits::Visits::load(&crate::visits::default_path()),
+        visits_path: crate::visits::default_path(),
         panel: None,
+        dropdown: None,
         sites_path: crate::sites::default_path(),
         waker: Some(event_loop.create_proxy()),
     };
@@ -3184,14 +4712,14 @@ mod tests {
     #[test]
     fn a_click_on_the_chrome_is_not_a_click_on_the_page() {
         let chrome = crate::chrome::total_height();
-        assert_eq!(document_point((10.0, 0.0), chrome, 0.0), None);
+        assert_eq!(document_point((10.0, 0.0), chrome, (0.0, 0.0)), None);
         assert_eq!(
-            document_point((10.0, chrome as f32 - 1.0), chrome, 0.0),
+            document_point((10.0, chrome as f32 - 1.0), chrome, (0.0, 0.0)),
             None
         );
         // The first row of the page is the first row of the document.
         assert_eq!(
-            document_point((10.0, chrome as f32), chrome, 0.0),
+            document_point((10.0, chrome as f32), chrome, (0.0, 0.0)),
             Some((10.0, 0.0))
         );
     }
@@ -3199,15 +4727,35 @@ mod tests {
     #[test]
     fn scrolling_moves_the_document_under_the_pointer() {
         let chrome = crate::chrome::total_height();
-        let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, scroll);
+        let at = |scroll| document_point((0.0, chrome as f32 + 100.0), chrome, (0.0, scroll));
         assert_eq!(at(0.0), Some((0.0, 100.0)));
         assert_eq!(at(973.0), Some((0.0, 1073.0)));
-        // x is never touched: nothing is scrolled sideways.
+        // A page not scrolled sideways leaves x alone, which is every page that
+        // fits across its window.
         assert_eq!(
-            document_point((42.0, chrome as f32), chrome, 500.0)
+            document_point((42.0, chrome as f32), chrome, (0.0, 500.0))
                 .unwrap()
                 .0,
             42.0
+        );
+    }
+
+    #[test]
+    fn scrolling_sideways_moves_the_document_under_the_pointer_too() {
+        // #204: the pointer is over a column of the *window*, and the document
+        // column beneath it is however far the page has been pushed left. A
+        // browser that got this wrong would draw a link in one place and follow
+        // it from another, which is the same failure the row arithmetic below
+        // has a test for.
+        let chrome = crate::chrome::total_height();
+        let at = |scroll_x| document_point((30.0, chrome as f32), chrome, (scroll_x, 0.0));
+        assert_eq!(at(0.0), Some((30.0, 0.0)));
+        assert_eq!(at(400.0), Some((430.0, 0.0)));
+        // And the chrome still owns its own clicks whatever the page has done.
+        assert_eq!(
+            document_point((30.0, 0.0), chrome, (400.0, 0.0)),
+            None,
+            "a press on the bar is not a press on the page"
         );
     }
 
@@ -3224,7 +4772,7 @@ mod tests {
         for row in [bar, bar + 1, bar + 250, bar + 4000] {
             for scroll in [0_u32, 1, 973, 10_000] {
                 let drawn = row - bar + scroll;
-                let (_, hit) = document_point((0.0, row as f32), chrome, scroll as f32)
+                let (_, hit) = document_point((0.0, row as f32), chrome, (0.0, scroll as f32))
                     .expect("a row at or below the bar is on the page");
                 assert_eq!(
                     hit as u32, drawn,
@@ -3413,7 +4961,7 @@ mod highlight_tests {
                 height: 2.0,
             }],
             0,
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -3439,7 +4987,7 @@ mod highlight_tests {
             },
         ];
         let mut buffer = buffer();
-        highlight_matches(&mut buffer, &rects, 1, 0.0, (4, 4), 0);
+        highlight_matches(&mut buffer, &rects, 1, (0.0, 0.0), (4, 4), 0);
         assert_ne!(buffer[0], buffer[2]);
     }
 
@@ -3452,9 +5000,9 @@ mod highlight_tests {
             height: 1.0,
         };
         let mut at_top = buffer();
-        highlight_matches(&mut at_top, &[rect], 0, 0.0, (4, 4), 0);
+        highlight_matches(&mut at_top, &[rect], 0, (0.0, 0.0), (4, 4), 0);
         let mut scrolled = buffer();
-        highlight_matches(&mut scrolled, &[rect], 0, 2.0, (4, 4), 0);
+        highlight_matches(&mut scrolled, &[rect], 0, (0.0, 2.0), (4, 4), 0);
         assert_ne!(at_top, scrolled);
         assert_eq!(tinted(&scrolled), 4, "still one row, higher up");
     }
@@ -3472,7 +5020,7 @@ mod highlight_tests {
                 height: 4.0,
             }],
             0,
-            3.0,
+            (0.0, 3.0),
             (4, 4),
             2,
         );
@@ -3492,7 +5040,7 @@ mod highlight_tests {
                 height: 100.0,
             }],
             0,
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -3502,7 +5050,7 @@ mod highlight_tests {
     #[test]
     fn no_matches_leaves_the_buffer_alone() {
         let mut buffer = buffer();
-        highlight_matches(&mut buffer, &[], 0, 0.0, (4, 4), 0);
+        highlight_matches(&mut buffer, &[], 0, (0.0, 0.0), (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
     }
 
@@ -3525,7 +5073,7 @@ mod highlight_tests {
                     height: 1.0,
                 },
             ],
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -3547,7 +5095,7 @@ mod highlight_tests {
                 width: 1.0,
                 height: 1.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (4, 4),
             0,
         );
@@ -3559,7 +5107,7 @@ mod highlight_tests {
     #[test]
     fn nothing_selected_leaves_the_buffer_alone() {
         let mut buffer = buffer();
-        highlight_selection(&mut buffer, &[], 0.0, (4, 4), 0);
+        highlight_selection(&mut buffer, &[], (0.0, 0.0), (4, 4), 0);
         assert_eq!(tinted(&buffer), 0);
     }
 }
@@ -3590,7 +5138,7 @@ mod focus_outline_tests {
                 width: 4.0,
                 height: 4.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (12, 12),
             0,
         );
@@ -3610,9 +5158,15 @@ mod focus_outline_tests {
             height: 1.0,
         };
         let mut one = buffer();
-        outline_focus(&mut one, &[piece(3.0)], 0.0, (12, 12), 0);
+        outline_focus(&mut one, &[piece(3.0)], (0.0, 0.0), (12, 12), 0);
         let mut both = buffer();
-        outline_focus(&mut both, &[piece(3.0), piece(8.0)], 0.0, (12, 12), 0);
+        outline_focus(
+            &mut both,
+            &[piece(3.0), piece(8.0)],
+            (0.0, 0.0),
+            (12, 12),
+            0,
+        );
         assert_ne!(one, both);
         assert!(
             both.iter().filter(|p| **p == FOCUS_OUTLINE).count()
@@ -3633,7 +5187,7 @@ mod focus_outline_tests {
                 width: 12.0,
                 height: 2.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (12, 12),
             5,
         );
@@ -3658,7 +5212,7 @@ mod focus_outline_tests {
                 width: 500.0,
                 height: 500.0,
             }],
-            0.0,
+            (0.0, 0.0),
             (12, 12),
             0,
         );
@@ -3671,7 +5225,7 @@ mod focus_outline_tests {
     #[test]
     fn nothing_focused_leaves_the_buffer_alone() {
         let mut buffer = buffer();
-        outline_focus(&mut buffer, &[], 0.0, (12, 12), 0);
+        outline_focus(&mut buffer, &[], (0.0, 0.0), (12, 12), 0);
         assert!(buffer.iter().all(|p| *p == 0x00ff_ffff));
     }
 
@@ -3700,14 +5254,14 @@ mod focus_outline_tests {
         // painted. White here was invisible while every page was white and is a
         // lit strip beside the document rendering, which is dark.
         let mut out = [0u32; 2];
-        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), None, 2, DARK);
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), None, 0, 2, DARK);
         assert_eq!(out, [DARK, DARK]);
     }
 
     #[test]
     fn a_row_the_band_covers_comes_from_the_band() {
         let mut out = [0u32; 2];
-        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 0, 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233]);
     }
 
@@ -3716,7 +5270,7 @@ mod focus_outline_tests {
         // What a resize the child has not caught up with looks like: the band
         // is still the old width, and the columns past it have no pixel.
         let mut out = [0u32; 4];
-        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 2, DARK);
+        compose_row(&mut out, &page_row((0x11, 0x22, 0x33)), Some(0), 0, 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
     }
 
@@ -3728,14 +5282,59 @@ mod focus_outline_tests {
         // is no row below.
         let page = page(&[(0x11, 0x22, 0x33), (0x44, 0x55, 0x66)]);
         let mut out = [0u32; 4];
-        compose_row(&mut out, &page, Some(0), 2, DARK);
+        compose_row(&mut out, &page, Some(0), 0, 2, DARK);
         assert_eq!(out, [0x0011_2233, 0x0011_2233, DARK, DARK]);
+    }
+
+    /// A four-pixel row of four distinguishable colours.
+    fn striped() -> Vec<u8> {
+        [
+            (0x11, 0x11, 0x11),
+            (0x22, 0x22, 0x22),
+            (0x33, 0x33, 0x33),
+            (0x44, 0x44, 0x44),
+        ]
+        .iter()
+        .flat_map(|(r, g, b)| [*r, *g, *b, 0xff])
+        .collect()
+    }
+
+    #[test]
+    fn a_page_scrolled_sideways_shows_the_columns_it_has_and_blanks_the_rest() {
+        // #204, and the moment that matters: the reader has scrolled right and
+        // the band painted at the old left edge has not arrived yet. The
+        // columns it does hold are still the right ones for where they now are,
+        // and the rest is the page's own colour — the same bargain the rows
+        // above make, rather than a page that appears not to have moved.
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &striped(), Some(0), 2, 4, DARK);
+        assert_eq!(out, [0x0033_3333, 0x0044_4444, DARK, DARK]);
+    }
+
+    #[test]
+    fn a_band_ahead_of_the_window_fills_from_its_own_left() {
+        // The other direction: the band arrived for a scroll the reader has
+        // since undone, so it starts to the *right* of the window. Those
+        // columns are blank rather than read from a negative index — which as
+        // unsigned would wrap into some other row entirely.
+        let mut out = [0u32; 4];
+        compose_row(&mut out, &striped(), Some(0), -2, 4, DARK);
+        assert_eq!(out, [DARK, DARK, 0x0011_1111, 0x0022_2222]);
+    }
+
+    #[test]
+    fn a_band_that_has_caught_up_is_drawn_exactly_as_it_was_before() {
+        // The overwhelmingly common case: nothing is scrolled sideways, so a
+        // shift of zero has to be the page byte for byte.
+        let mut before = [0u32; 4];
+        compose_row(&mut before, &striped(), Some(0), 0, 4, DARK);
+        assert_eq!(before, [0x0011_1111, 0x0022_2222, 0x0033_3333, 0x0044_4444]);
     }
 }
 
 #[cfg(test)]
 mod scrollbar_tests {
-    use super::{contrasting, draw_scrollbar};
+    use super::{contrasting, draw_horizontal_scrollbar, draw_scrollbar};
 
     const WHITE: u32 = 0x00ff_ffff;
     const DARK_PAGE: u32 = 0x001c_1b22;
@@ -3757,6 +5356,60 @@ mod scrollbar_tests {
         (BAR..HEIGHT)
             .filter(|row| at(buffer, WIDTH - 1, *row) != WHITE)
             .collect()
+    }
+
+    /// Columns of the bottom row that have been drawn on.
+    fn horizontal_thumb_columns(buffer: &[u32]) -> Vec<u32> {
+        (0..WIDTH)
+            .filter(|column| at(buffer, *column, HEIGHT - 1) != WHITE)
+            .collect()
+    }
+
+    #[test]
+    fn a_page_that_fits_across_gets_no_bar_along_the_bottom() {
+        // Which is nearly every page (#204). The horizontal bar has to be
+        // invisible on a page laid out to its window, or every page in the
+        // browser grows a strip of furniture saying there is nothing to the
+        // right of it.
+        let mut buffer = window();
+        draw_horizontal_scrollbar(&mut buffer, 0.0, WIDTH as f32, (WIDTH, HEIGHT), BAR, WHITE);
+        assert!(horizontal_thumb_columns(&buffer).is_empty());
+    }
+
+    #[test]
+    fn a_page_wider_than_its_window_gets_a_thumb_that_moves() {
+        let mut at_left = window();
+        draw_horizontal_scrollbar(&mut at_left, 0.0, 160.0, (WIDTH, HEIGHT), BAR, WHITE);
+        let left = horizontal_thumb_columns(&at_left);
+        assert!(!left.is_empty(), "a page four windows wide has a thumb");
+        assert_eq!(left.first(), Some(&0), "at the left it starts at the edge");
+
+        let mut at_right = window();
+        draw_horizontal_scrollbar(&mut at_right, 120.0, 160.0, (WIDTH, HEIGHT), BAR, WHITE);
+        let right = horizontal_thumb_columns(&at_right);
+        assert_eq!(
+            right.last(),
+            Some(&(WIDTH - 1)),
+            "at the far right the thumb reaches the end of the track"
+        );
+        assert_eq!(
+            left.len(),
+            right.len(),
+            "the thumb changed length by being moved"
+        );
+    }
+
+    #[test]
+    fn the_horizontal_bar_stays_out_of_the_chrome() {
+        // A window that is almost all chrome. The bar belongs to the page area,
+        // and one drawn into the rows above it would be drawn over the address.
+        let mut buffer = window();
+        draw_horizontal_scrollbar(&mut buffer, 0.0, 160.0, (WIDTH, HEIGHT), HEIGHT - 2, WHITE);
+        for row in 0..(HEIGHT - 2) {
+            for column in 0..WIDTH {
+                assert_eq!(at(&buffer, column, row), WHITE, "chrome row {row}");
+            }
+        }
     }
 
     #[test]
@@ -3953,5 +5606,285 @@ mod loading_tests {
         let mut buffer = vec![WHITE; (WIDTH * BAR) as usize];
         draw_loading(&mut buffer, Some(0.5), (WIDTH, BAR), BAR);
         assert!(buffer.iter().all(|pixel| *pixel == WHITE));
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    //! Coalescing keystrokes (#207).
+    //!
+    //! A keystroke costs the child a whole re-render, and a person types faster
+    //! than that. The rules for what is sent and what waits are small, and
+    //! getting one wrong loses a letter — which is the kind of bug a reader
+    //! notices immediately and cannot reproduce on purpose.
+    //!
+    //! So they are here as arithmetic, without a child process to run them
+    //! against. `flush_typing` is the same two questions: is the child free,
+    //! and is there anything to send.
+
+    use sandbox::message::Key;
+
+    /// What `flush_typing` does, without a window.
+    ///
+    /// Returns what goes out now, leaving behind what waits.
+    fn flush(buffer: &mut Vec<Key>, child_free: bool) -> Vec<Key> {
+        if !child_free || buffer.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(buffer)
+    }
+
+    fn letter(which: &str) -> Key {
+        Key::Insert(which.to_owned())
+    }
+
+    #[test]
+    fn the_first_keystroke_goes_out_at_once() {
+        // Nothing is gained by making the first letter wait: the child is idle,
+        // and a reader who types one character wants to see it.
+        let mut buffer = vec![letter("h")];
+        assert_eq!(flush(&mut buffer, true), vec![letter("h")]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn keys_typed_during_a_render_wait_rather_than_queueing_renders() {
+        // The whole point. Four letters typed while the first is rendering must
+        // not become four more renders — each would be laid out and painted for
+        // a page the next letter immediately invalidates.
+        let mut buffer = Vec::new();
+        for which in ["e", "l", "l", "o"] {
+            buffer.push(letter(which));
+            assert!(
+                flush(&mut buffer, false).is_empty(),
+                "a keystroke was sent while the child was busy"
+            );
+        }
+        assert_eq!(buffer.len(), 4, "a keystroke was lost while waiting");
+    }
+
+    #[test]
+    fn everything_that_waited_goes_out_together() {
+        // And in order, because "hello" typed as h-e-l-l-o is not the same
+        // string as any other arrangement of those letters.
+        let mut buffer: Vec<Key> = ["e", "l", "l", "o"].iter().map(|it| letter(it)).collect();
+        let sent = flush(&mut buffer, true);
+        assert_eq!(
+            sent,
+            vec![letter("e"), letter("l"), letter("l"), letter("o")]
+        );
+        assert!(buffer.is_empty(), "something was left behind");
+    }
+
+    #[test]
+    fn a_burst_costs_two_renders_rather_than_one_per_letter() {
+        // Counted rather than asserted in prose. The first letter goes at once;
+        // the rest wait for that render and then go as one.
+        let mut buffer = Vec::new();
+        let mut renders = 0;
+        let mut busy = false;
+        for which in ["h", "e", "l", "l", "o"] {
+            buffer.push(letter(which));
+            if !flush(&mut buffer, !busy).is_empty() {
+                renders += 1;
+                busy = true;
+            }
+        }
+        // The first render finishes; whatever waited goes now.
+        busy = false;
+        if !flush(&mut buffer, !busy).is_empty() {
+            renders += 1;
+        }
+        assert_eq!(renders, 2, "five letters cost {renders} renders");
+    }
+
+    #[test]
+    fn nothing_typed_sends_nothing() {
+        // Called on every wake, including wakes that were about a band. An
+        // empty run would be a render asked for with nothing to render.
+        let mut buffer: Vec<Key> = Vec::new();
+        assert!(flush(&mut buffer, true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! Where a late answer belongs (#207).
+    //!
+    //! A request is asked for and answered later, and in between the reader can
+    //! open tabs, close tabs and ask for something else. The rules for which
+    //! answers still count are small, and getting one wrong shows up as a page
+    //! appearing in the wrong tab or a page the reader has navigated away from
+    //! replacing the one they asked for — both of which are the kind of bug
+    //! that is nearly impossible to reproduce on purpose.
+    //!
+    //! So the rules are here as arithmetic rather than only inside the event
+    //! loop, where nothing can reach them.
+
+    use super::{FIRST_TAB, Tab};
+    use crate::fetches::TabId;
+    use crate::tabs::Tabs;
+
+    /// The two questions `finish` asks, without a window to ask them in.
+    fn wanted(tabs: &Tabs<Tab>, tab: TabId, seq: u64) -> bool {
+        let Some(at) = tabs.position(|it| it.id == tab) else {
+            return false;
+        };
+        tabs.iter()
+            .nth(at)
+            .is_some_and(|it| it.pending == Some(seq))
+    }
+
+    fn waiting(id: TabId, seq: u64) -> Tab {
+        let mut tab = Tab::blank(id);
+        tab.pending = Some(seq);
+        tab
+    }
+
+    #[test]
+    fn an_answer_reaches_the_tab_that_asked_even_when_it_is_not_the_active_one() {
+        let mut tabs = Tabs::new(waiting(FIRST_TAB, 1));
+        tabs.open(waiting(FIRST_TAB + 1, 2));
+        // The second tab is active, and the first one's answer is still wanted.
+        assert_eq!(tabs.active_index(), 1);
+        assert!(wanted(&tabs, FIRST_TAB, 1));
+        assert!(wanted(&tabs, FIRST_TAB + 1, 2));
+    }
+
+    #[test]
+    fn an_answer_for_a_closed_tab_is_dropped() {
+        // Not an error and not worth saying anything about: the reader closed
+        // the tab, which is a perfectly clear instruction about what they want
+        // done with the page that was coming.
+        let mut tabs = Tabs::new(waiting(FIRST_TAB, 1));
+        tabs.open(waiting(FIRST_TAB + 1, 2));
+        tabs.close(1);
+        assert!(!wanted(&tabs, FIRST_TAB + 1, 2));
+        assert!(wanted(&tabs, FIRST_TAB, 1), "the surviving tab still waits");
+    }
+
+    #[test]
+    fn the_older_of_two_answers_in_one_tab_is_dropped() {
+        // A reader who types an address, waits, and types another has two in
+        // flight and wants the second. Without this, the first to arrive wins
+        // and the page they asked for last is replaced by the one they gave up
+        // on — which looks exactly like the browser ignoring them.
+        let mut tabs = Tabs::new(waiting(FIRST_TAB, 1));
+        // They ask again before the first comes back.
+        if let Some(tab) = tabs.get_mut(0) {
+            tab.pending = Some(2);
+        }
+        assert!(!wanted(&tabs, FIRST_TAB, 1), "the abandoned request won");
+        assert!(wanted(&tabs, FIRST_TAB, 2));
+    }
+
+    #[test]
+    fn a_tab_that_asked_for_nothing_wants_no_answer() {
+        let tabs = Tabs::new(Tab::blank(FIRST_TAB));
+        assert!(!wanted(&tabs, FIRST_TAB, 1));
+    }
+
+    #[test]
+    fn closing_a_tab_does_not_make_another_one_answer_for_it() {
+        // Ids rather than indices, and this is why: closing the first tab moves
+        // the second one into index 0, and an answer routed by position would
+        // then land in the wrong page. It happens whenever somebody closes a
+        // tab while another is loading, which is not rare.
+        let mut tabs = Tabs::new(waiting(FIRST_TAB, 1));
+        tabs.open(waiting(FIRST_TAB + 1, 2));
+        tabs.close(0);
+        assert_eq!(tabs.len(), 1);
+        assert!(
+            !wanted(&tabs, FIRST_TAB, 1),
+            "the closed tab's answer found the surviving tab"
+        );
+        assert!(wanted(&tabs, FIRST_TAB + 1, 2));
+    }
+}
+
+#[cfg(test)]
+mod blank_tab_tests {
+    //! The empty tab a new tab starts as (#196).
+
+    use super::{FIRST_TAB, Tab};
+
+    #[test]
+    fn a_new_tab_holds_nothing_and_says_so() {
+        let tab = Tab::blank(FIRST_TAB);
+        assert!(tab.is_blank());
+        assert!(tab.loaded.body.is_empty(), "a blank tab has no document");
+        assert_eq!(tab.history.current(), "", "and no address");
+        assert_eq!(
+            tab.label(),
+            "New tab",
+            "an unnamed tab would be a nameless gap in the strip"
+        );
+    }
+
+    #[test]
+    fn a_tab_with_an_address_is_not_blank() {
+        let tab = Tab::blank(FIRST_TAB);
+        let mut loaded = tab.loaded.clone();
+        loaded.path = "/index.html".to_owned();
+        let tab = Tab::new(
+            FIRST_TAB,
+            loaded,
+            "https://example.com/index.html".to_owned(),
+        );
+        assert!(!tab.is_blank());
+        assert_eq!(tab.label(), "https://example.com/index.html");
+    }
+
+    #[test]
+    fn a_blank_tab_has_nowhere_to_go_back_to() {
+        // It is one entry like any other history, and that entry is nothing.
+        let tab = Tab::blank(FIRST_TAB);
+        assert!(!tab.history.can_go_back());
+        assert!(!tab.history.can_go_forward());
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    //! Flattening what arrives from the clipboard into a one-line field.
+
+    use super::one_line;
+
+    #[test]
+    fn a_pasted_address_is_unchanged() {
+        assert_eq!(
+            one_line("https://example.com/a?b=1&c=2"),
+            "https://example.com/a?b=1&c=2"
+        );
+    }
+
+    #[test]
+    fn a_pasted_paragraph_becomes_one_line() {
+        // A one-line field cannot show a newline and nothing here would draw
+        // one, so text with breaks in it would leave the field holding
+        // characters the reader can neither see nor delete by eye.
+        assert_eq!(one_line("one\ntwo\nthree"), "one two three");
+    }
+
+    #[test]
+    fn a_run_of_breaks_is_one_space() {
+        // `a\r\n\r\nb` is two paragraphs, not four spaces' worth of gap in the
+        // middle of an address.
+        assert_eq!(one_line("a\r\n\r\nb"), "a b");
+        assert_eq!(one_line("a\n\n\n\nb"), "a b");
+    }
+
+    #[test]
+    fn breaks_at_the_edges_add_nothing() {
+        // Copying a line out of a terminal very often takes the newline with
+        // it, and a leading space in an address bar is not what anybody meant.
+        assert_eq!(one_line("\nhttps://example.com/\n"), "https://example.com/");
+        assert_eq!(one_line("\r\n\r\n"), "");
+    }
+
+    #[test]
+    fn what_is_not_a_break_is_left_alone() {
+        // Tabs included: they are not line breaks, and a field can hold one.
+        assert_eq!(one_line("a\tb  c"), "a\tb  c");
     }
 }

@@ -52,7 +52,19 @@ pub fn parse(text: &str) -> Policy {
         {
             continue;
         }
-        policy.allow(site, host);
+        // Lowercased, because this file is the one place a host arrives typed
+        // by a person rather than parsed out of a URL, and a host is not
+        // case-sensitive. `Example.com` in the file and `example.com` from the
+        // address bar are the same permission, and matching them as strings
+        // would quietly make them two.
+        let (site, host) = (site.to_ascii_lowercase(), host.to_ascii_lowercase());
+        // Through the site rule on the way in, so a file written before
+        // ADR-0020 still grants what it says it grants. The key used to be the
+        // document's whole host; it is now the registrable domain, and a line
+        // reading `www.example.com` would otherwise match no page at all —
+        // a permission that silently stopped applying, which is the one way
+        // for this file to be worse than not having it.
+        policy.allow(net::site(&site), &host);
     }
     policy
 }
@@ -149,6 +161,26 @@ mod tests {
         // allowed to load from itself — a permission nobody typed.
         let policy = parse("\tcdn.example.net\n");
         assert!(policy.exceptions.is_empty(), "{:?}", policy.exceptions);
+    }
+
+    #[test]
+    fn a_hand_typed_line_does_not_have_to_match_case() {
+        // This file is the one place a host arrives typed rather than parsed,
+        // and a host is not case-sensitive. The address bar produces
+        // lowercase, so an uppercase line would be a permission that appears
+        // in the list and never applies.
+        let policy = parse("Example.COM\tCDN.Example.NET\n");
+        assert!(policy.allows("example.com", "cdn.example.net"));
+    }
+
+    #[test]
+    fn a_grant_written_against_a_whole_host_still_applies() {
+        // Written before ADR-0020, when the key was the document's host. The
+        // key is the site now, and a line nobody could match any more would be
+        // a permission that expired without saying so.
+        let policy = parse("www.example.com\tcdn.example.net\n");
+        assert_eq!(policy.allowed_on("example.com"), ["cdn.example.net"]);
+        assert!(policy.allows("example.com", "cdn.example.net"));
     }
 
     #[test]

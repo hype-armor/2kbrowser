@@ -919,7 +919,7 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         }
     }
 
-    let url_x = PADDING * 2.0 + BUTTON * 2.0 + RELOAD + SITE;
+    let url_x = url_text_x();
 
     // Find takes the bar over while it is open, the same way editing does, and
     // for the same reason: what you are doing is more important than where you
@@ -1058,6 +1058,43 @@ pub fn render(state: &State<'_>, width: u32, fonts: &mut FontStore) -> Pixmap {
         HEIGHT,
     )
     .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"))
+}
+
+/// Where the URL bar's text begins.
+///
+/// Fixed rather than measured: everything to its left is a control of a known
+/// width, so the text starts in the same place on every page. Named because
+/// two things need it — the drawing below, and the arithmetic that turns a
+/// click back into a place in the text (#199).
+pub fn url_text_x() -> f32 {
+    PADDING * 2.0 + BUTTON * 2.0 + RELOAD + SITE
+}
+
+/// Which byte of the URL bar's text a click at window `x` lands on (#199).
+///
+/// The inverse of what [`draw_field`] does to place the caret, and it has to be
+/// the inverse of exactly that: the same style, the same starting x, the same
+/// shaper. Anything else and the caret appears somewhere other than where the
+/// pointer was, which is worse than not being able to click at all.
+///
+/// The nearest character boundary rather than the one before the click, so the
+/// left half of a letter puts the caret in front of it and the right half puts
+/// it behind — which is what every text field has done since text fields.
+pub fn offset_in_url(fonts: &mut FontStore, text: &str, x: f32) -> usize {
+    let style = ui_style(14.0);
+    let wanted = x - url_text_x();
+    let mut best = (0usize, f32::INFINITY);
+    for at in text
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(text.len()))
+    {
+        let distance = (measure(fonts, &text[..at], &style) - wanted).abs();
+        if distance < best.1 {
+            best = (at, distance);
+        }
+    }
+    best.0
 }
 
 /// Draws the URL bar in its editing state.

@@ -157,9 +157,19 @@ impl Viewport {
         self.page.content_height
     }
 
+    /// Width of the content, which may exceed the canvas (#204).
+    pub fn content_width(&self) -> f32 {
+        self.page.content_width
+    }
+
     /// The document row the painted band starts at.
     pub fn band_top(&self) -> u32 {
         self.page.top
+    }
+
+    /// The document column the painted band starts at (#204).
+    pub fn band_left(&self) -> u32 {
+        self.page.left
     }
 
     /// How far the page can be scrolled, in document pixels.
@@ -175,12 +185,22 @@ impl Viewport {
         self.page.content_height.max(self.page.height as f32)
     }
 
+    /// How far the page can be scrolled sideways, in document pixels (#204).
+    ///
+    /// The counterpart of [`Viewport::scrollable_height`], and the same rule:
+    /// the content, or the canvas where the content is narrower than it. A page
+    /// that fits has nothing to the right of the window, and the `max` is what
+    /// says so rather than reporting a width smaller than the window itself.
+    pub fn scrollable_width(&self) -> f32 {
+        self.page.content_width.max(self.page.width as f32)
+    }
+
     /// Asks for the rows around `top` without waiting for them.
     ///
     /// The speculative half of scrolling a long page: the rows ahead of the
     /// reader are painted while the window carries on drawing the rows it has.
-    pub fn request_band(&mut self, top: u32, height: u32) -> Result<(), Error> {
-        self.session.request_band(top, height)
+    pub fn request_band(&mut self, left: u32, top: u32, height: u32) -> Result<(), Error> {
+        self.session.request_band(left, top, height)
     }
 
     /// Whether a band has been asked for and not yet arrived.
@@ -301,14 +321,15 @@ impl Viewport {
     /// This runs on every pointer move, and a round trip per mouse motion would
     /// be absurd — but it is also all the parent *can* do, since the box tree it
     /// would hit-test against is on the other side.
-    pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
-        self.wire_link_at(x, y).map(|link| link.url.as_str())
+    pub fn link_at(&self, x: f32, y: f32, scroll: (f32, f32)) -> Option<&str> {
+        self.wire_link_at(x, y, scroll)
+            .map(|link| link.url.as_str())
     }
 
     /// The same, with where on this page the link goes if it does not leave
     /// it — so a caller can tell a page to fetch from a place to scroll to.
-    pub fn target_at(&self, x: f32, y: f32) -> Option<(&str, Option<f32>)> {
-        self.wire_link_at(x, y)
+    pub fn target_at(&self, x: f32, y: f32, scroll: (f32, f32)) -> Option<(&str, Option<f32>)> {
+        self.wire_link_at(x, y, scroll)
             .map(|link| (link.url.as_str(), link.jump_to))
     }
 
@@ -331,10 +352,48 @@ impl Viewport {
             .map(|missing| missing.url.as_str())
     }
 
-    fn wire_link_at(&self, x: f32, y: f32) -> Option<&sandbox::message::Link> {
+    /// The picture at this point, and where it came from (#205).
+    ///
+    /// Every `<img>`, whether or not its picture arrived — a placeholder is
+    /// still something a reader can ask to save, and refusing to offer would be
+    /// the browser deciding on their behalf that a failed fetch cannot be
+    /// retried by other means.
+    ///
+    /// Topmost first, which is paint order: a picture drawn over another is the
+    /// one the pointer is on.
+    pub fn picture_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.page
+            .pictures
+            .iter()
+            .rev()
+            .find(|picture| {
+                let rect = picture.rect;
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            })
+            .map(|picture| picture.url.as_str())
+    }
+
+    /// `y` is a document coordinate and `scroll` is how far the page has been
+    /// scrolled, which is what turns it back into a window one for a link that
+    /// does not move with the page.
+    ///
+    /// A `position: fixed` link's rectangle is in window coordinates (#108) —
+    /// the box stays put, so adding the scroll to find it misses by however
+    /// far the reader has come down the page. That is the difference between a
+    /// fixed navigation bar and a fixed navigation bar you can click.
+    fn wire_link_at(&self, x: f32, y: f32, scroll: (f32, f32)) -> Option<&sandbox::message::Link> {
         // Reverse order: a link drawn later sits on top of one drawn earlier.
         self.page.links.iter().rev().find(|link| {
             let rect = link.rect;
+            // Both axes for a pinned link, because its rectangle is in window
+            // coordinates along both: a fixed sidebar on a page scrolled
+            // sideways stays where it is on screen, so a click on it arrives
+            // carrying a horizontal scroll the rectangle never had (#204).
+            let (x, y) = if link.pinned {
+                (x - scroll.0, y - scroll.1)
+            } else {
+                (x, y)
+            };
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
         })
     }
@@ -349,6 +408,29 @@ impl Viewport {
         self.session
             .select(from, to)
             .unwrap_or_else(|_| (Vec::new(), String::new()))
+    }
+
+    /// What is selected inside the focused control, for the clipboard.
+    ///
+    /// Empty when nothing has the keyboard, when what has it is not a text
+    /// control, or when the child could not answer — all of which mean the same
+    /// thing to the caller, which is that there is nothing to copy.
+    pub fn copy_focused(&mut self) -> String {
+        self.session.copy_focused().unwrap_or_default()
+    }
+
+    /// The page as a screen reader would read it (ADR-0019, #178).
+    ///
+    /// Asked of the child, because the DOM and the box tree it is built from
+    /// never cross the boundary. Asked *only* when something is listening —
+    /// that is the caller's part of the bargain, and it is what keeps a page
+    /// costing nothing when nothing is.
+    ///
+    /// An empty tree where the child could not answer, which is what a window
+    /// hands to an assistive technology that attached before the first page
+    /// finished: "nothing here yet" rather than a failure.
+    pub fn accessibility(&mut self) -> sandbox::access::Tree {
+        self.session.accessibility().unwrap_or_default()
     }
 
     /// Where `query` appears, asked of the child holding the page.
@@ -369,7 +451,7 @@ impl Viewport {
         match self.session.focus((x, y)) {
             Ok(page) => {
                 self.page = page;
-                self.page.editing
+                self.page.focused != sandbox::message::Focused::Nothing
             }
             // A child that cannot answer is not one to start routing keystrokes
             // at. The page on screen stays as it was, which is the same answer
@@ -385,6 +467,41 @@ impl Viewport {
         }
     }
 
+    /// Sends a run of keystrokes without waiting for the page (#207).
+    ///
+    /// What the window uses. A keystroke costs the child a whole re-render, and
+    /// a person types faster than a page renders — so waiting for each one
+    /// froze the window for the length of a word. The blocking version above is
+    /// kept for callers with nothing else to do while they wait, which is the
+    /// tests and the timings harness.
+    pub fn request_type(&mut self, keys: Vec<sandbox::message::Key>) {
+        // A failure here is a child that has gone. The page on screen stays as
+        // it was, which is what every other failed question of it does.
+        let _ = self.session.request_type(keys);
+    }
+
+    /// Whether typing has been sent and its page not yet collected.
+    pub fn typing_outstanding(&self) -> bool {
+        self.session.typing_outstanding()
+    }
+
+    /// Shows the page typing changed, if it has arrived. Never blocks.
+    ///
+    /// Returns whether anything changed, which is what decides a redraw.
+    pub fn accept_typed(&mut self) -> bool {
+        match self.session.take_typed() {
+            // A re-render that failed leaves the page on screen alone, the same
+            // way a band that failed to paint does: what the reader is looking
+            // at is still the page, and blanking it to report a keystroke would
+            // be far worse than the keystroke not showing.
+            Some(Ok(page)) => {
+                self.page = page;
+                true
+            }
+            Some(Err(_)) | None => false,
+        }
+    }
+
     /// Where this page's buttons are, in document order (#110).
     ///
     /// Asked of the child at render time and carried with the page, for the
@@ -392,6 +509,12 @@ impl Viewport {
     /// missing from this list is a button that does nothing when pressed.
     pub fn buttons(&self) -> Vec<Rect> {
         self.page.buttons.clone()
+    }
+
+    /// Where this page's other pressable controls are: a checkbox, a radio, a
+    /// `<select>`. Carried with the page for the same reason the buttons are.
+    pub fn pressables(&self) -> Vec<Rect> {
+        self.page.pressables.clone()
     }
 
     /// A form the page asked to send, if it did (#110).
@@ -402,9 +525,35 @@ impl Viewport {
         self.page.submit.take()
     }
 
-    /// Whether a form control on this page is taking the typing.
+    /// A dropdown the page asked to open, if it did.
+    ///
+    /// Taken rather than read, for the reason the submission above is: one
+    /// press opens one list, and a dropdown left here would spring open again
+    /// the next time anything asked.
+    pub fn take_dropdown(&mut self) -> Option<sandbox::message::Dropdown> {
+        self.page.open.take()
+    }
+
+    /// Tells the child which row of the dropdown it opened was chosen.
+    pub fn choose(&mut self, node: u32, index: u32) {
+        if let Ok(page) = self.session.choose(node, index) {
+            self.page = page;
+        }
+    }
+
+    /// Whether a form control on this page has the keyboard.
+    ///
+    /// Any control, not only one being typed in: the question the window asks
+    /// with this is whether a keystroke belongs to the page, and a focused
+    /// checkbox answers Space and Enter while having nothing to type.
     pub fn editing(&self) -> bool {
-        self.page.editing
+        self.page.focused != sandbox::message::Focused::Nothing
+    }
+
+    /// Whether what has the keyboard is pressed rather than typed in, so the
+    /// window knows the arrows are the page's rather than the scroll's (#151).
+    pub fn focus_is_pressable(&self) -> bool {
+        self.page.focused == sandbox::message::Focused::Pressable
     }
 
     /// Re-renders at a new width, in the same child.
@@ -535,6 +684,7 @@ mod tests {
             url: url.to_owned(),
             group,
             jump_to: None,
+            pinned: false,
         }
     }
 
@@ -573,6 +723,51 @@ mod tests {
         // and therefore document order.
         assert_eq!(grouped[0].url, "https://example.com/third");
         assert_eq!(grouped[1].url, "https://example.com/first");
+    }
+
+    /// The pinned-link hit test alone, without a child process: a link's
+    /// rectangle, the scroll, and whether the point lands on it.
+    fn hits(link: &WireLink, x: f32, y: f32, scroll: (f32, f32)) -> bool {
+        let rect = link.rect;
+        let (x, y) = if link.pinned {
+            (x - scroll.0, y - scroll.1)
+        } else {
+            (x, y)
+        };
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    }
+
+    #[test]
+    fn a_fixed_link_is_found_at_the_same_place_however_the_page_has_scrolled() {
+        // #108 along both axes (#204). A pinned link's rectangle is in window
+        // coordinates, and a point arrives in the document's — so both offsets
+        // have to come back off it, or a fixed sidebar on a page scrolled
+        // sideways stays on screen and stops being clickable.
+        let mut link = wire(0, "https://example.com/", 0.0);
+        link.pinned = true;
+        link.rect = rect(10.0, 10.0, 40.0, 20.0);
+
+        // Nothing scrolled: the point is where it is drawn.
+        assert!(hits(&link, 20.0, 20.0, (0.0, 0.0)));
+        // Scrolled 500 across and 300 down, the pointer is over the same screen
+        // pixel — which is 500 and 300 further into the document.
+        assert!(hits(&link, 520.0, 320.0, (500.0, 300.0)));
+        // And the document coordinates it was at before are now somewhere else
+        // on the screen, so they are not a hit any more.
+        assert!(!hits(&link, 20.0, 20.0, (500.0, 300.0)));
+    }
+
+    #[test]
+    fn an_ordinary_link_ignores_the_scroll_because_the_point_already_carries_it() {
+        let link = {
+            let mut link = wire(0, "https://example.com/", 0.0);
+            link.rect = rect(600.0, 400.0, 40.0, 20.0);
+            link
+        };
+        // The caller turned the pointer into a document point before asking, so
+        // the scroll must not be subtracted a second time.
+        assert!(hits(&link, 610.0, 410.0, (500.0, 300.0)));
+        assert!(!hits(&link, 110.0, 110.0, (500.0, 300.0)));
     }
 
     #[test]
