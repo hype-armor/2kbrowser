@@ -35,7 +35,8 @@ const MAX_BINARY_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 /// fits the binary budget comfortably and avoids runtime path resolution. It
 /// does not scale — adding Noto CJK and colour emoji would blow the binary
 /// budget outright — so fonts must move out of the binary before the full
-/// payload lands. Tracked with the vendor-versus-fetch decision in issue #7.
+/// payload lands. The acquisition decision is recorded in ADR-0010; moving fonts
+/// out of the binary remains a follow-up before the full payload lands.
 const MAX_FONT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How many times each interaction is repeated, with the worst one reported.
