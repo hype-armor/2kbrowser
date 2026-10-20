@@ -130,13 +130,12 @@ fn main() -> ExitCode {
     report(&checks)
 }
 
-/// Peak resident memory for the browser rendering a real page.
+/// Peak resident memory of the budget harness and renderer while rendering a page.
 ///
-/// One of the four claims in PLAN.md §1 is "tens of MB, not hundreds", and it
-/// has been reporting PENDING since it was written. It is measurable now
-/// because the renderer is a separate process with a process id the parent can
-/// ask about: the number that matters is the *pair*, since a browser that moved
-/// its memory into a child did not save anyone anything.
+/// This sums the harness's and renderer's peak RSS. The harness is not the
+/// browser's parent process, so this does not measure the browser's total memory.
+/// One of the four claims in PLAN.md §1 is "tens of MB, not hundreds"; this is a
+/// partial measurement of that claim, not the browser's full footprint.
 ///
 /// Peak rather than current. Rendering allocates a canvas, a box tree, and
 /// decoded images and then lets most of it go, so sampling afterwards would
@@ -149,7 +148,7 @@ fn main() -> ExitCode {
 /// more than one that runs nowhere, and this is the platform CI renders on
 /// most.
 fn resident_memory() -> Check {
-    let name = "peak memory rendering a page";
+    let name = "peak memory rendering a page (harness + renderer)";
     // Generous against the claim it is checking: PLAN.md says tens of MB, and
     // this is the number at which "tens" has stopped being true. A budget set
     // at the current measurement would fail on the first honest change.
@@ -242,11 +241,11 @@ fn resident_memory() -> Check {
         }
     };
 
-    let parent = peak_rss_kib("self");
+    let harness = peak_rss_kib("self");
     let child = peak_rss_kib(&page.child_id().to_string());
     drop(page);
 
-    let (Some(parent), Some(child)) = (parent, child) else {
+    let (Some(harness), Some(child)) = (harness, child) else {
         return Check {
             name,
             limit,
@@ -256,10 +255,10 @@ fn resident_memory() -> Check {
             },
         };
     };
-    let total_mb = (parent + child) as f64 / 1024.0;
+    let total_mb = (harness + child) as f64 / 1024.0;
     let measured = format!(
-        "{total_mb:.1} MB — {:.1} parent + {:.1} renderer",
-        parent as f64 / 1024.0,
+        "{total_mb:.1} MB — {:.1} harness + {:.1} renderer",
+        harness as f64 / 1024.0,
         child as f64 / 1024.0
     );
     Check {
@@ -512,9 +511,10 @@ fn repo_root() -> Option<PathBuf> {
 /// possibly — and the run then reports
 ///
 /// ```text
-/// peak memory rendering a page    FAIL  (the page did not render: renderer
-///                                        sent a malformed message: length
-///                                        field does not fit the frame)
+/// peak memory rendering a page (harness + renderer)    FAIL  (the page did not render:
+///                                                            renderer sent a malformed
+///                                                            message: length field does
+///                                                            not fit the frame)
 /// ```
 ///
 /// which reads as "this change broke the wire format" and means "the binary on
