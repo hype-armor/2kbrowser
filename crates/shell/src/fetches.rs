@@ -351,6 +351,74 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_navigation_does_not_block_other_requests_or_shutdown() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let wait = Duration::from_secs(5);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds a port");
+        let url = format!("http://{}/slow", listener.local_addr().unwrap());
+        let (arrived, started) = channel();
+        let (release, released) = channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts the navigation");
+            stream.set_read_timeout(Some(wait)).unwrap();
+            stream.set_write_timeout(Some(wait)).unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).expect("reads the request");
+                headers.push(byte[0]);
+            }
+            arrived.send(()).unwrap();
+            // Hold a real socket open, not a sleep standing in for a fetch.
+            // The timeout also releases the worker if the test fails.
+            let _ = released.recv_timeout(wait * 2);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+            );
+        });
+        let (wake, woken) = channel();
+        let mut fetches = Fetches::start(fetcher(), move || {
+            let _ = wake.send(());
+        });
+        let slow = fetches.ask(1, Want::Navigate { url });
+        started
+            .recv_timeout(wait)
+            .expect("navigation reached the server");
+        assert!(fetches.take().is_empty(), "the server has not replied");
+
+        let fast = fetches.ask(
+            2,
+            Want::Navigate {
+                url: "file:///definitely/not/here.html".to_owned(),
+            },
+        );
+        woken
+            .recv_timeout(wait)
+            .expect("another tab must finish while the navigation is stalled");
+        let done = fetches.take();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].asked.tab, 2);
+        assert_eq!(done[0].asked.seq, fast);
+        assert_ne!(done[0].asked.seq, slow);
+        assert!(done[0].outcome.is_err());
+
+        let (closed, closing) = channel();
+        let shutdown = std::thread::spawn(move || {
+            drop(fetches);
+            closed.send(()).unwrap();
+        });
+        closing
+            .recv_timeout(wait)
+            .expect("closing the window must not wait for the server");
+        release.send(()).unwrap();
+        server.join().unwrap();
+        shutdown.join().unwrap();
+    }
+
+    #[test]
     fn a_want_knows_the_address_it_is_for() {
         // The bar shows it while the request is in flight, so every shape has
         // to be able to say it.
