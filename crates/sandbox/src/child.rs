@@ -190,7 +190,7 @@ fn answer_until_the_parent_goes(
                     Ok(page) => ToParent::Rendered(Box::new(page)),
                     Err(message) => ToParent::Failed { message },
                 };
-                write_frame(output, &answer.encode())?;
+                answer.write_to(output)?;
             }
             // An answer with nothing outstanding means the parent is not what
             // we think it is. Refusing beats guessing.
@@ -314,7 +314,7 @@ fn serve_render(
         Ok(page) => ToParent::Rendered(Box::new(page)),
         Err(message) => ToParent::Failed { message },
     };
-    write_frame(output, &reply.encode())
+    reply.write_to(output)
 }
 
 #[cfg(test)]

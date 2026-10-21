@@ -119,11 +119,20 @@ impl From<WireError> for Error {
 /// Flushed rather than left to the buffer: the other end is blocked waiting for
 /// this, so a frame sitting in a buffer is a deadlock rather than a delay.
 pub fn write_frame(to: &mut (impl Write + ?Sized), frame: &[u8]) -> Result<(), Error> {
-    if frame.len() > MAX_FRAME {
-        return Err(Error::Wire(WireError::BadLength));
+    write_frame_parts(to, &[frame])
+}
+
+/// Writes borrowed segments as one frame, checking the total before writing.
+fn write_frame_parts(to: &mut (impl Write + ?Sized), parts: &[&[u8]]) -> Result<(), Error> {
+    let length = parts
+        .iter()
+        .try_fold(0usize, |length, part| length.checked_add(part.len()))
+        .filter(|length| *length <= MAX_FRAME)
+        .ok_or(WireError::BadLength)?;
+    to.write_all(&(length as u32).to_le_bytes())?;
+    for part in parts {
+        to.write_all(part)?;
     }
-    to.write_all(&(frame.len() as u32).to_le_bytes())?;
-    to.write_all(frame)?;
     to.flush()?;
     Ok(())
 }
@@ -204,6 +213,24 @@ mod tests {
         let mut pipe = Vec::new();
         write_frame(&mut pipe, b"").expect("writes");
         assert_eq!(read_frame(&mut pipe.as_slice()).expect("reads"), b"");
+    }
+
+    #[test]
+    fn frame_parts_are_bounded_as_a_whole_before_anything_is_written() {
+        let part = vec![0; MAX_FRAME / 2];
+        let mut pipe = Vec::new();
+        assert!(matches!(
+            write_frame_parts(&mut pipe, &[&part, &part, &[0]]),
+            Err(Error::Wire(WireError::BadLength))
+        ));
+        assert!(pipe.is_empty());
+    }
+
+    #[test]
+    fn frame_parts_at_the_limit_are_accepted() {
+        let part = vec![0; MAX_FRAME / 2];
+        let mut pipe = std::io::sink();
+        write_frame_parts(&mut pipe, &[&part, &[], &part]).expect("writes");
     }
 
     #[test]

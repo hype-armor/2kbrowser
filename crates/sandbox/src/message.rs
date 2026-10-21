@@ -903,7 +903,26 @@ pub struct Rendered {
 impl ToParent {
     /// Encodes to a frame.
     pub fn encode(&self) -> Vec<u8> {
+        let (mut header, pixels, tail) = self.encode_parts();
+        header.reserve(pixels.len() + tail.len());
+        header.extend_from_slice(pixels);
+        header.extend_from_slice(&tail);
+        header
+    }
+
+    /// Writes and flushes one frame without copying the rendered pixel buffer.
+    ///
+    /// The wire format is unchanged: only the small header and metadata are
+    /// encoded into buffers; the pixels are written directly from the page.
+    pub fn write_to(&self, to: &mut (impl std::io::Write + ?Sized)) -> Result<(), crate::Error> {
+        let (header, pixels, tail) = self.encode_parts();
+        crate::write_frame_parts(to, &[&header, pixels, &tail])
+    }
+
+    fn encode_parts(&self) -> (Vec<u8>, &[u8], Vec<u8>) {
         let mut writer = Writer::new();
+        let mut header = None;
+        let mut pixels: &[u8] = &[];
         match self {
             ToParent::Fetch { urls, kind } => {
                 writer.tag(0);
@@ -918,7 +937,10 @@ impl ToParent {
             }
             ToParent::Rendered(page) => {
                 writer.tag(1);
-                writer.bytes(&page.pixels);
+                writer.u32(page.pixels.len() as u32);
+                header = Some(writer.finish());
+                writer = Writer::new();
+                pixels = &page.pixels;
                 writer.u32(page.width);
                 writer.u32(page.height);
                 writer.u32(page.top);
@@ -1015,7 +1037,10 @@ impl ToParent {
                 writer.str(text);
             }
         }
-        writer.finish()
+        match header {
+            Some(header) => (header, pixels, writer.finish()),
+            None => (writer.finish(), pixels, Vec::new()),
+        }
     }
 
     /// Decodes a frame.
@@ -1377,6 +1402,108 @@ mod tests {
     fn a_rendered_page_round_trips() {
         let message = ToParent::Rendered(Box::new(rendered(4, 3)));
         assert_eq!(ToParent::decode(&message.encode()), Ok(message));
+    }
+
+    #[test]
+    fn streamed_replies_match_the_encoded_wire_format() {
+        for message in [
+            ToParent::Rendered(Box::new(rendered(4, 3))),
+            ToParent::Rendered(Box::new(rendered(0, 0))),
+            ToParent::Failed {
+                message: "could not render".to_owned(),
+            },
+        ] {
+            let mut expected = Vec::new();
+            crate::write_frame(&mut expected, &message.encode()).expect("writes");
+            let mut streamed = Vec::new();
+            message.write_to(&mut streamed).expect("streams");
+            assert_eq!(streamed, expected);
+            let frame = crate::read_frame(&mut streamed.as_slice()).expect("reads");
+            assert_eq!(ToParent::decode(&frame), Ok(message));
+        }
+    }
+
+    #[test]
+    fn streaming_writes_the_original_pixels_and_flushes_despite_short_writes() {
+        struct ShortPipe<'a> {
+            pixels: &'a [u8],
+            saw_pixels: bool,
+            flushed: bool,
+            bytes: Vec<u8>,
+        }
+
+        impl std::io::Write for ShortPipe<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.saw_pixels && bytes.as_ptr() == self.pixels.as_ptr() {
+                    assert_eq!(bytes.len(), self.pixels.len());
+                    self.saw_pixels = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = bytes.len().min(7);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+
+        let mut page = rendered(4, 3);
+        for (index, pixel) in page.pixels.iter_mut().enumerate() {
+            *pixel = index as u8;
+        }
+        let message = ToParent::Rendered(Box::new(page));
+        let ToParent::Rendered(page) = &message else {
+            unreachable!()
+        };
+        let mut pipe = ShortPipe {
+            pixels: &page.pixels,
+            saw_pixels: false,
+            flushed: false,
+            bytes: Vec::new(),
+        };
+        message.write_to(&mut pipe).expect("streams");
+        assert!(pipe.saw_pixels);
+        assert!(pipe.flushed);
+        let frame = crate::read_frame(&mut pipe.bytes.as_slice()).expect("reads");
+        assert_eq!(ToParent::decode(&frame), Ok(message));
+    }
+
+    #[test]
+    #[ignore = "measurement: run in release mode with --ignored --nocapture"]
+    fn compare_rendered_frame_preparation_cost() {
+        struct Sink;
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                std::hint::black_box(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // No pipe or decoder: isolate the copy removed from frame preparation.
+        let message = ToParent::Rendered(Box::new(rendered(1000, 800)));
+        let repeats = 100;
+        let started = std::time::Instant::now();
+        for _ in 0..repeats {
+            let frame = std::hint::black_box(message.encode());
+            crate::write_frame(&mut Sink, &frame).expect("writes");
+        }
+        let buffered = started.elapsed() / repeats;
+        let started = std::time::Instant::now();
+        for _ in 0..repeats {
+            std::hint::black_box(&message)
+                .write_to(&mut Sink)
+                .expect("streams");
+        }
+        let streamed = started.elapsed() / repeats;
+        eprintln!("1000x800 frame preparation: buffered {buffered:?}, streamed {streamed:?}");
     }
 
     #[test]
