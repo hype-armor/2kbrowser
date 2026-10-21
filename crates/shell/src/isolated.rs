@@ -91,8 +91,7 @@ pub struct PageRenderer {
     zoom: f32,
     /// The render request this page came from (#110).
     ///
-    /// Typing changes the layout, so it needs a whole render rather than a
-    /// repaint — and a render needs everything the parent said the first time.
+    /// A full render still needs everything the parent said the first time.
     /// Kept here rather than asked for again, because a keystroke that had to
     /// go back to the parent for the document's bytes would be a keystroke that
     /// crossed the boundary twice.
@@ -107,8 +106,8 @@ pub struct PageRenderer {
     band_left: u32,
     /// What has been typed into this page's controls, by node.
     ///
-    /// The document is re-parsed on every render and these are re-applied to
-    /// it. Node ids survive that because parsing the same bytes builds the same
+    /// Re-applied whenever a full render re-parses the document. Node ids
+    /// survive that because parsing the same bytes builds the same
     /// arena in the same order — and the bytes are the same bytes, since they
     /// are the ones in `last`.
     values: Vec<(dom::NodeId, String)>,
@@ -609,7 +608,12 @@ impl Render for PageRenderer {
         request: &ToChild,
         parent: &mut dyn sandbox::child::Parent,
     ) -> Result<Rendered, String> {
-        // Typing, focusing and choosing are re-renders of the page already
+        let interaction = matches!(
+            request,
+            ToChild::Focus { .. } | ToChild::Type { .. } | ToChild::Choose { .. }
+        );
+        let previous_chosen = self.chosen.clone();
+        // Typing, focusing and choosing are updates of the page already
         // held, so they borrow the request it came from. Kept here rather than asked for
         // again: a keystroke that had to go back over the pipe for the
         // document's bytes would cross the boundary twice to move a cursor.
@@ -661,78 +665,85 @@ impl Render for PageRenderer {
             return Err("expected a render request".to_owned());
         };
 
-        let base = origin.as_ref().map(|origin| (origin, path.as_str()));
-        let own_url = base.map(|(origin, path)| net::resolve(origin, path, path));
-
-        // A picture opened by its own address is not a document, and decoding a
-        // JPEG as text produces a page of mojibake (#201). A document is
-        // invented to hold it instead, so it gets the same layout, scrollbar
-        // and placeholder as an image inside a page — decided here rather than
-        // by the parent, because deciding it needs the bytes, and the bytes
-        // stay on this side (ADR-0012).
-        let picture = crate::render::document_for_a_picture(
-            body,
-            content_type.as_deref(),
-            own_url.as_deref(),
-        );
-        // Decoded here rather than by the parent, so the encoding sniffer stays
-        // on the sandboxed side with every other parser.
-        let html = match &picture {
-            Some(document) => document.clone(),
-            None => net::encoding::decode_document(body, content_type.as_deref()).0,
+        let settings = crate::render::Settings {
+            fill_height: false,
+            force_authored: *force_authored,
+            force_document: *force_document,
+            zoom: *zoom,
+            values: self.values.clone(),
+            chosen: self.chosen.clone(),
+            focus: self.focus.as_ref().map(|focus| match focus {
+                Focus::Typing { node, field } => (*node, Some(field.cursor())),
+                Focus::Pressable { node } => (*node, None),
+            }),
         };
+        let reused = interaction
+            && self.chosen == previous_chosen
+            && self.page.as_mut().is_some_and(|page| {
+                page.edit_text(&mut self.fonts, &settings, self.band_left, *top, *height)
+            });
+        let page = if reused {
+            self.page.take().expect("reused page")
+        } else {
+            let base = origin.as_ref().map(|origin| (origin, path.as_str()));
+            let own_url = base.map(|(origin, path)| net::resolve(origin, path, path));
 
-        // Every subresource — images, stylesheets, `@import` chains, frames —
-        // goes over the pipe. Nothing in this process opens a socket or a file.
-        let mut pipe_loader = PipeLoader { parent };
-        // Except the picture above, which is already here: asking for it would
-        // fetch the same photograph a second time to put it in the page
-        // invented to show it.
-        let mut held;
-        let loader: &mut dyn crate::render::Loader = match (&picture, &own_url) {
-            (Some(_), Some(url)) => {
-                held = crate::render::Preloaded::new(
-                    url.clone(),
-                    crate::render::Loaded {
-                        bytes: body.clone(),
-                        content_type: content_type.clone(),
-                    },
-                    &mut pipe_loader,
-                );
-                &mut held
-            }
-            _ => &mut pipe_loader,
+            // A picture opened by its own address is not a document, and decoding a
+            // JPEG as text produces a page of mojibake (#201). A document is
+            // invented to hold it instead, so it gets the same layout, scrollbar
+            // and placeholder as an image inside a page — decided here rather than
+            // by the parent, because deciding it needs the bytes, and the bytes
+            // stay on this side (ADR-0012).
+            let picture = crate::render::document_for_a_picture(
+                body,
+                content_type.as_deref(),
+                own_url.as_deref(),
+            );
+            // Decoded here rather than by the parent, so the encoding sniffer stays
+            // on the sandboxed side with every other parser.
+            let html = match &picture {
+                Some(document) => document.clone(),
+                None => net::encoding::decode_document(body, content_type.as_deref()).0,
+            };
+
+            // Every subresource — images, stylesheets, `@import` chains, frames —
+            // goes over the pipe. Nothing in this process opens a socket or a file.
+            let mut pipe_loader = PipeLoader { parent };
+            // Except the picture above, which is already here: asking for it would
+            // fetch the same photograph a second time to put it in the page
+            // invented to show it.
+            let mut held;
+            let loader: &mut dyn crate::render::Loader = match (&picture, &own_url) {
+                (Some(_), Some(url)) => {
+                    held = crate::render::Preloaded::new(
+                        url.clone(),
+                        crate::render::Loaded {
+                            bytes: body.clone(),
+                            content_type: content_type.clone(),
+                        },
+                        &mut pipe_loader,
+                    );
+                    &mut held
+                }
+                _ => &mut pipe_loader,
+            };
+            // Both set is a request the parent never makes, and this side is where
+            // messages from a stranger arrive — so it is decided rather than
+            // assumed away. The author's layout wins, because it is the one that
+            // shows the page as written; a reader given the wrong one of these can
+            // at least see what they were denied.
+            crate::render::render_sized(
+                &html,
+                *width,
+                self.band_left,
+                *top,
+                *height,
+                settings,
+                &mut self.fonts,
+                loader,
+                base,
+            )
         };
-        // Both set is a request the parent never makes, and this side is where
-        // messages from a stranger arrive — so it is decided rather than
-        // assumed away. The author's layout wins, because it is the one that
-        // shows the page as written; a reader given the wrong one of these can
-        // at least see what they were denied.
-        let page = crate::render::render_sized(
-            &html,
-            *width,
-            self.band_left,
-            *top,
-            *height,
-            crate::render::Settings {
-                fill_height: false,
-                force_authored: *force_authored,
-                force_document: *force_document,
-                zoom: *zoom,
-                values: self.values.clone(),
-                chosen: self.chosen.clone(),
-                focus: self.focus.as_ref().map(|focus| match focus {
-                    Focus::Typing { node, field } => (*node, Some(field.cursor())),
-                    // A ring and no caret: there is nothing in a checkbox to
-                    // put one in, and a caret drawn in one would be a cursor
-                    // promising an insertion point that does not exist.
-                    Focus::Pressable { node } => (*node, None),
-                }),
-            },
-            &mut self.fonts,
-            loader,
-            base,
-        );
 
         self.force_authored = *force_authored;
         self.force_document = *force_document && !*force_authored;
@@ -1018,6 +1029,194 @@ mod tests {
         fn visited(&mut self, urls: &[String]) -> Vec<bool> {
             vec![false; urls.len()]
         }
+    }
+
+    fn form_request(html: &str, document: bool) -> ToChild {
+        let (origin, path) = net::parse_url("https://example.org/form").expect("url");
+        let mut request = overriding(html.as_bytes(), 300, false, document);
+        if let ToChild::Render {
+            origin: base,
+            path: at,
+            height,
+            ..
+        } = &mut request
+        {
+            *base = Some(origin);
+            *at = path;
+            *height = 200;
+        }
+        request
+    }
+
+    fn assert_full_render_matches(renderer: &PageRenderer, actual: &Rendered) {
+        let mut full = PageRenderer::new();
+        full.values = renderer.values.clone();
+        full.chosen = renderer.chosen.clone();
+        full.focus = renderer.focus.clone();
+        let expected = full
+            .render(renderer.last.as_ref().expect("request"), &mut Nothing)
+            .expect("full render");
+        assert_eq!(actual.pixels, expected.pixels);
+        assert_eq!(actual.content_height, expected.content_height);
+        assert_eq!(actual.content_width, expected.content_width);
+        assert_eq!(actual.focused, expected.focused);
+        assert_eq!(
+            renderer.page.as_ref().expect("page").find("changed"),
+            full.page.as_ref().expect("page").find("changed")
+        );
+    }
+
+    #[test]
+    fn text_edits_match_full_layout_in_each_control_context() {
+        use sandbox::message::Key;
+        for document in [false, true] {
+            for control in [
+                "<input value='default'>",
+                "<input type=password value='default'>",
+                "<textarea rows=1>default</textarea>",
+                "<input style='display:block;width:50%;padding:4%'>",
+                "<input style='float:left'>",
+                "<input style='position:absolute;top:50px'>",
+                "<input style='visibility:hidden'>",
+                "<table><tr><td><textarea rows=1></textarea></td></tr></table>",
+                "<span style='display:inline-block'><textarea rows=1></textarea></span>",
+            ] {
+                let html = format!(
+                    "<style>input[value=default] {{ color: red }}\
+                     p:before {{ content: 'unchanged' }}</style>\
+                     <body><form>{control}</form><p>Surrounding text wraps here.</p></body>"
+                );
+                let mut renderer = PageRenderer::new();
+                let mut request = form_request(&html, document);
+                if let ToChild::Render { zoom, .. } = &mut request {
+                    *zoom = 1.25;
+                }
+                renderer.render(&request, &mut Nothing).expect("opens");
+                for keys in [
+                    vec![Key::Tab { back: false }],
+                    vec![Key::SelectAll, Key::Insert("changed אבג".to_owned())],
+                    vec![Key::Left { extend: false, word: false }],
+                    vec![Key::SelectAll, Key::Insert("changed\nsecond\nthird\nfourth\nfifth\nsixth\nseventh\neighth\nninth\ntenth".to_owned())],
+                    vec![Key::SelectAll, Key::Delete],
+                    vec![Key::Escape],
+                ] {
+                    let result = renderer
+                        .render(&ToChild::Type { keys }, &mut Nothing)
+                        .expect("edits");
+                    assert_full_render_matches(&renderer, &result);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_keystroke_retains_the_two_thousand_paragraph_layout() {
+        use sandbox::message::Key;
+        let html = format!(
+            "<body><input><p>{}</p></body>",
+            "Unchanged paragraph text.</p><p>".repeat(2000)
+        );
+        let mut renderer = PageRenderer::new();
+        renderer
+            .render(&form_request(&html, false), &mut Nothing)
+            .expect("opens");
+        let boxes = renderer.page.as_ref().expect("page").frames[0]
+            .layout
+            .root
+            .children
+            .as_ptr();
+        let mut no_fetch = Supplying(|_: &[String], _: net::RequestKind| {
+            panic!("editing must not reload resources")
+        });
+        for keys in [
+            vec![Key::Tab { back: false }],
+            vec![Key::Insert("changed".to_owned())],
+            vec![Key::SelectAll, Key::Delete],
+        ] {
+            let result = renderer
+                .render(&ToChild::Type { keys }, &mut no_fetch)
+                .expect("edits");
+            assert_eq!(
+                boxes,
+                renderer.page.as_ref().expect("page").frames[0]
+                    .layout
+                    .root
+                    .children
+                    .as_ptr(),
+                "the box tree was replaced"
+            );
+            assert_full_render_matches(&renderer, &result);
+        }
+        let band = renderer.band(120, 20, 200).expect("scrolls both axes");
+        let typed = renderer
+            .render(
+                &ToChild::Type {
+                    keys: vec![Key::Insert("changed".to_owned())],
+                },
+                &mut no_fetch,
+            )
+            .expect("edits after scrolling");
+        assert_eq!((typed.left, typed.top), (band.left, band.top));
+        assert_eq!(
+            typed.pixels,
+            renderer.band(120, 20, 200).expect("updated band").pixels
+        );
+    }
+
+    #[test]
+    fn choices_and_new_render_requests_replace_layout() {
+        use sandbox::message::Key;
+        let mut renderer = PageRenderer::new();
+        let mut request = form_request("<body><input type=checkbox><p>Text</p></body>", false);
+        renderer.render(&request, &mut Nothing).expect("opens");
+        let boxes = renderer.page.as_ref().expect("page").frames[0]
+            .layout
+            .root
+            .children
+            .as_ptr();
+        let result = renderer
+            .render(
+                &ToChild::Type {
+                    keys: vec![Key::Tab { back: false }, Key::Insert(" ".to_owned())],
+                },
+                &mut Nothing,
+            )
+            .expect("ticks");
+        assert_ne!(
+            boxes,
+            renderer.page.as_ref().expect("page").frames[0]
+                .layout
+                .root
+                .children
+                .as_ptr()
+        );
+        assert_full_render_matches(&renderer, &result);
+        let boxes = renderer.page.as_ref().expect("page").frames[0]
+            .layout
+            .root
+            .children
+            .as_ptr();
+        if let ToChild::Render {
+            width,
+            zoom,
+            force_document,
+            ..
+        } = &mut request
+        {
+            *width = 500;
+            *zoom = 1.5;
+            *force_document = true;
+        }
+        let result = renderer.render(&request, &mut Nothing).expect("resizes");
+        assert_ne!(
+            boxes,
+            renderer.page.as_ref().expect("page").frames[0]
+                .layout
+                .root
+                .children
+                .as_ptr()
+        );
+        assert_full_render_matches(&renderer, &result);
     }
 
     /// A real PNG, so a decode that succeeds means the bytes arrived intact.
