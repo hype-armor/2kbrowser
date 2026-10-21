@@ -674,6 +674,52 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Reshapes changed text-control labels without changing any box geometry.
+    ///
+    /// Text, password and textarea sizes depend on style and markup, never on
+    /// their live values. Callers must keep those layout inputs unchanged.
+    pub fn refresh_text_controls(
+        &mut self,
+        doc: &Document,
+        fonts: &mut FontStore,
+        changed: &[NodeId],
+    ) {
+        fn refresh(
+            box_: &mut LayoutBox,
+            doc: &Document,
+            fonts: &mut FontStore,
+            changed: &[NodeId],
+        ) {
+            if let Some(node) = box_.node
+                && changed.contains(&node)
+                && let Some(
+                    control @ (forms::Control::Text
+                    | forms::Control::Password
+                    | forms::Control::TextArea),
+                ) = forms::control_of(doc, node)
+            {
+                box_.text = control_parts(
+                    doc,
+                    fonts,
+                    node,
+                    control,
+                    &box_.style,
+                    (box_.rect.width, box_.rect.height),
+                    box_.content_width,
+                )
+                .label;
+                return;
+            }
+            for child in &mut box_.children {
+                refresh(child, doc, fonts, changed);
+            }
+        }
+        if !changed.is_empty() {
+            refresh(&mut self.root, doc, fonts, changed);
+            self.height = self.root.rect.height.max(ink_bottom(&self.root, 0.0));
+        }
+    }
+
     /// The element at a point, in canvas coordinates.
     ///
     /// Later boxes win, which is paint order: whatever was drawn last is what

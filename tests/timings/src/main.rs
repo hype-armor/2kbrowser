@@ -119,7 +119,10 @@ struct Row {
 /// fast zero, which is what a *failure* looks like and not what a speed looks
 /// like. The warning below caught it, which is the point of the warning.
 fn measure(browser: &Path, source: &Path, present: &str) -> Option<Row> {
-    let body = std::fs::read(source).ok()?;
+    let mut body = std::fs::read(source).ok()?;
+    // Every fixture needs an editable control: typing with nothing focused
+    // measures a no-op repaint rather than incremental layout.
+    body.extend_from_slice(b"<input name='timing-field'>");
     let url = net::file_url(source);
     let (origin, path) = net::parse_url(&url).ok()?;
     let renderer = sandbox::Renderer::with_program(browser.to_path_buf());
@@ -165,10 +168,13 @@ fn measure(browser: &Path, source: &Path, present: &str) -> Option<Row> {
         started.elapsed()
     });
 
-    // A keystroke. The child re-renders the whole page for one — parse,
-    // cascade, layout, paint — because the document is not kept between
-    // renders, so this is the operation most likely to be felt as a hang while
-    // filling in a form.
+    page.type_key(sandbox::message::Key::Tab { back: false });
+    if !page.editing() {
+        eprintln!("warning: no field was focused; the keypress measurement is invalid");
+        return None;
+    }
+    // A real edit: unchanged paragraphs should retain their layout, leaving
+    // only the control's label, display-list construction and painting.
     let keypress = worst(|| {
         let started = Instant::now();
         page.type_key(sandbox::message::Key::Insert("a".to_owned()));

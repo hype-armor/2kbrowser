@@ -3,6 +3,22 @@
 //! Deliberately headless. Reference tests (ADR-0005) need to render on CI
 //! machines with no display server, so the window is a thin consumer of this
 //! rather than the only way to produce output.
+//!
+//! # Layout invalidation
+//!
+//! A live text-control value is not a DOM attribute: selectors and generated
+//! content still read the original markup. Text fields, password fields and
+//! textareas are atomic boxes whose size is independent of that live value.
+//! Editing one therefore invalidates only its shaped label, the display list
+//! (including the focus overlay), and pixels — not surrounding layout.
+//!
+//! This reuse is restricted to interactions on the retained, single-document
+//! page. A new render request (including resize, zoom, mode or resource changes)
+//! replaces it completely. Choices retain the full-render path because a
+//! select's label can change its intrinsic width. Framesets and edits within
+//! inline-blocks also retain that path: an inline-block's baseline can depend
+//! on its descendants' labels. This is not a general cache for arbitrary DOM
+//! or style mutations.
 
 use std::collections::HashMap;
 
@@ -88,9 +104,73 @@ pub struct Page {
 struct BandSource {
     list: paint::DisplayList,
     images: paint::ImageStore,
+    styles: css::cascade::StyleMap,
 }
 
 impl Page {
+    /// Updates live text values and focus while retaining document geometry.
+    ///
+    /// Returns false without changing the page when it cannot safely reuse it.
+    pub(crate) fn edit_text(
+        &mut self,
+        fonts: &mut FontStore,
+        settings: &Settings,
+        left: u32,
+        top: u32,
+        height: u32,
+    ) -> bool {
+        let Some(source) = self.source.as_mut() else {
+            return false;
+        };
+        let [frame] = self.frames.as_mut_slice() else {
+            return false;
+        };
+        if settings.values.iter().any(|(node, value)| {
+            !matches!(
+                layout::forms::control_of(&frame.doc, *node),
+                Some(
+                    layout::forms::Control::Text
+                        | layout::forms::Control::Password
+                        | layout::forms::Control::TextArea
+                )
+            ) || (frame.doc.value_of(*node) != Some(value.as_str())
+                && frame.doc.ancestors(*node).any(|ancestor| {
+                    source
+                        .styles
+                        .get(ancestor)
+                        .is_some_and(|style| style.display == css::style::Display::InlineBlock)
+                }))
+        }) {
+            return false;
+        }
+        let mut changed = Vec::new();
+        for (node, value) in &settings.values {
+            if frame.doc.value_of(*node) != Some(value.as_str()) {
+                frame.doc.set_value(*node, value.clone());
+                changed.push(*node);
+            }
+        }
+        frame
+            .layout
+            .refresh_text_controls(&frame.doc, fonts, &changed);
+        self.content_height = frame.layout.height;
+        frame.rect.height = self.content_height.max(height as f32);
+        source.list = build_display_list(&frame.layout);
+        mark_focus(
+            &mut source.list,
+            &frame.layout,
+            &source.styles,
+            settings.focus,
+        );
+        self.content_width = paint::content_width(&source.list);
+        self.pixmap = self
+            .paint_band(fonts, left, top, height)
+            .unwrap_or_else(|| Pixmap::new(1, 1).expect("1x1 pixmap"));
+        self.band_left = left;
+        self.band_top = top;
+        true
+    }
+
     /// Paints a different band of this page, without laying it out again.
     ///
     /// This is what makes a long page affordable: the parse, the cascade, and
@@ -1565,7 +1645,11 @@ pub(crate) fn render_sized(
         band_top,
         band_left,
         background: list.canvas,
-        source: Some(Box::new(BandSource { list, images })),
+        source: Some(Box::new(BandSource {
+            list,
+            images,
+            styles,
+        })),
     }
 }
 
