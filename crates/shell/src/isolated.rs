@@ -355,8 +355,8 @@ impl PageRenderer {
     /// Records what a press changed, for the next render to apply.
     ///
     /// Kept beside the document rather than written into it, the same way a
-    /// typed value is and for the same reason: the document is re-parsed on
-    /// every render, and anything written into the old one would be gone.
+    /// typed value is and for the same reason: a full render re-parses the
+    /// document, and anything written only into the old one would be gone.
     fn record(&mut self, changes: Vec<(dom::NodeId, bool)>) {
         for (node, on) in changes {
             match self.chosen.iter_mut().find(|(at, _)| *at == node) {
@@ -782,8 +782,8 @@ impl Render for PageRenderer {
 
     fn band(&mut self, left: u32, top: u32, height: u32) -> Result<Rendered, String> {
         // Remembered so that a keystroke re-renders the rows the reader is
-        // looking at (#110). Typing is a re-render of the whole page, built
-        // from the request the page came from — and that request names the band
+        // looking at (#110). Text edits reuse layout where possible, but take
+        // their band from the request — and that request names the band
         // the page *opened* at. Without this, clicking into a field halfway
         // down a long page would answer by painting the top of it.
         if let Some(ToChild::Render {
